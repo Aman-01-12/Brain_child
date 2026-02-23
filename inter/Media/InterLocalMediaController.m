@@ -157,6 +157,13 @@ static const void *InterLocalMediaSessionQueueKey = &InterLocalMediaSessionQueue
 
         [strongSelf->_session startRunning];
         strongSelf.running = strongSelf->_session.isRunning;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [strongSelf updatePreviewMirroringPolicyOnMainThread];
+        });
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.20 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            [strongSelf updatePreviewMirroringPolicyOnMainThread];
+        });
     });
 }
 
@@ -314,6 +321,7 @@ static const void *InterLocalMediaSessionQueueKey = &InterLocalMediaSessionQueue
         [self->_previewLayer removeFromSuperlayer];
         self->_previewLayer.frame = view.bounds;
         [view.layer addSublayer:self->_previewLayer];
+        [self updatePreviewMirroringPolicyOnMainThread];
         self->_previewHostView = view;
     });
 }
@@ -452,6 +460,9 @@ static const void *InterLocalMediaSessionQueueKey = &InterLocalMediaSessionQueue
             _videoInput = input;
         }
         [_session commitConfiguration];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self updatePreviewMirroringPolicyOnMainThread];
+        });
 
         self.cameraEnabled = canAdd;
         return canAdd;
@@ -462,10 +473,33 @@ static const void *InterLocalMediaSessionQueueKey = &InterLocalMediaSessionQueue
         [_session removeInput:_videoInput];
         [_session commitConfiguration];
         _videoInput = nil;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self updatePreviewMirroringPolicyOnMainThread];
+        });
     }
 
     self.cameraEnabled = NO;
     return YES;
+}
+
+- (void)updatePreviewMirroringPolicyOnMainThread {
+    if (!self->_previewLayer) {
+        return;
+    }
+
+    AVCaptureDevicePosition cameraPosition = AVCaptureDevicePositionUnspecified;
+    if (self->_videoInput.device) {
+        cameraPosition = self->_videoInput.device.position;
+    }
+
+    BOOL shouldFlipDisplay = (cameraPosition != AVCaptureDevicePositionBack);
+
+    // UI-only fix: leave capture stream behavior unchanged and flip only displayed preview.
+    if (shouldFlipDisplay) {
+        self->_previewLayer.affineTransform = CGAffineTransformMakeScale(-1.0, 1.0);
+    } else {
+        self->_previewLayer.affineTransform = CGAffineTransformIdentity;
+    }
 }
 
 - (BOOL)setAudioInputEnabledLocked:(BOOL)enabled {
