@@ -53,7 +53,7 @@
 }
 
 - (void)enterInterviewMode {
-    // Backward compatibility with old interview entry path.
+    
     [self joinInterviewAsInterviewee];
 }
 
