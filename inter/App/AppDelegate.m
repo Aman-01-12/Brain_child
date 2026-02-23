@@ -1,5 +1,8 @@
 #import "AppDelegate.h"
 #import "CapWindow.h"
+#import "InterLocalMediaController.h"
+#import "InterLocalCallControlPanel.h"
+#import "InterSurfaceShareController.h"
 #import "MetalSurfaceView.h"
 #import "SecureWindowController.h"
 
@@ -10,6 +13,9 @@
 @property (nonatomic, strong) MetalSurfaceView *setupRenderView;
 @property (nonatomic, strong) NSWindow *normalCallWindow;
 @property (nonatomic, strong) MetalSurfaceView *normalRenderView;
+@property (nonatomic, strong) InterLocalMediaController *normalMediaController;
+@property (nonatomic, strong) InterSurfaceShareController *normalSurfaceShareController;
+@property (nonatomic, strong) InterLocalCallControlPanel *normalControlPanel;
 @property (nonatomic, assign, readwrite) InterCallMode currentCallMode;
 @property (nonatomic, assign, readwrite) InterInterviewRole currentInterviewRole;
 @property (nonatomic, assign) BOOL isScreenObserverRegistered;
@@ -258,19 +264,136 @@
     self.normalRenderView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
     [view addSubview:self.normalRenderView];
 
+    [self attachNormalCallControlsInView:view];
+    [self startNormalLocalMediaFlow];
+
+    [self.normalControlPanel setCameraEnabled:self.normalMediaController.isCameraEnabled];
+    [self.normalControlPanel setMicrophoneEnabled:self.normalMediaController.isMicrophoneEnabled];
+    [self.normalControlPanel setSharingEnabled:self.normalSurfaceShareController.isSharing];
+
+    [self.normalControlPanel setShareStatusText:@"Secure surface share is off."];
+
+    [self.normalCallWindow makeKeyAndOrderFront:nil];
+}
+
+- (void)attachNormalCallControlsInView:(NSView *)view {
     NSTextField *label = [NSTextField labelWithString:@"Metal surface shell for secure video call UI composition."];
     label.frame = NSMakeRect(70, 560, 480, 24);
+    label.autoresizingMask = NSViewMaxXMargin | NSViewMinYMargin;
     label.font = [NSFont systemFontOfSize:15];
     label.textColor = [NSColor colorWithWhite:0.92 alpha:1.0];
     [view addSubview:label];
 
     NSButton *exitButton = [[NSButton alloc] initWithFrame:NSMakeRect(40, 40, 160, 42)];
+    exitButton.autoresizingMask = NSViewMaxXMargin | NSViewMaxYMargin;
     [exitButton setTitle:@"End Call"];
     [exitButton setTarget:self];
     [exitButton setAction:@selector(requestExitCurrentMode)];
     [view addSubview:exitButton];
 
-    [self.normalCallWindow makeKeyAndOrderFront:nil];
+    NSRect panelFrame = NSMakeRect(view.bounds.size.width - 300.0,
+                                   22.0,
+                                   278.0,
+                                   410.0);
+    self.normalControlPanel = [[InterLocalCallControlPanel alloc] initWithFrame:panelFrame];
+    self.normalControlPanel.autoresizingMask = NSViewMinXMargin | NSViewMaxYMargin;
+    [self.normalControlPanel setPanelTitleText:@"Normal Call Controls"];
+    [view addSubview:self.normalControlPanel];
+
+    __weak typeof(self) weakSelf = self;
+    self.normalControlPanel.cameraToggleHandler = ^{
+        [weakSelf toggleNormalCamera];
+    };
+    self.normalControlPanel.microphoneToggleHandler = ^{
+        [weakSelf toggleNormalMicrophone];
+    };
+    self.normalControlPanel.shareToggleHandler = ^{
+        [weakSelf toggleNormalSurfaceShare];
+    };
+}
+
+- (void)startNormalLocalMediaFlow {
+    self.normalMediaController = [[InterLocalMediaController alloc] init];
+    self.normalSurfaceShareController = [[InterSurfaceShareController alloc] init];
+
+    __weak typeof(self) weakSelf = self;
+    self.normalSurfaceShareController.statusHandler = ^(NSString *statusText) {
+        [weakSelf.normalControlPanel setShareStatusText:statusText];
+    };
+
+    [self.normalMediaController attachPreviewToView:self.normalControlPanel.previewContainerView];
+    [self.normalControlPanel setMediaStatusText:@"Requesting camera/mic permission..."];
+
+    [self.normalMediaController prepareWithCompletion:^(BOOL success, NSString * _Nullable failureReason) {
+        if (!success) {
+            NSString *message = failureReason ?: @"Camera/mic initialization failed.";
+            [weakSelf.normalControlPanel setMediaStatusText:message];
+            [weakSelf.normalControlPanel setCameraEnabled:NO];
+            [weakSelf.normalControlPanel setMicrophoneEnabled:NO];
+            return;
+        }
+
+        [weakSelf.normalMediaController start];
+        [weakSelf.normalControlPanel setCameraEnabled:weakSelf.normalMediaController.isCameraEnabled];
+        [weakSelf.normalControlPanel setMicrophoneEnabled:weakSelf.normalMediaController.isMicrophoneEnabled];
+
+        NSString *message = [weakSelf normalMediaStateSummary];
+        if (failureReason.length > 0) {
+            message = failureReason;
+        }
+        [weakSelf.normalControlPanel setMediaStatusText:message];
+    }];
+}
+
+- (NSString *)normalMediaStateSummary {
+    BOOL cameraOn = self.normalMediaController.isCameraEnabled;
+    BOOL microphoneOn = self.normalMediaController.isMicrophoneEnabled;
+    return [NSString stringWithFormat:@"Camera %@, Mic %@.",
+            cameraOn ? @"on" : @"off",
+            microphoneOn ? @"on" : @"off"];
+}
+
+- (void)toggleNormalCamera {
+    BOOL shouldEnable = !self.normalMediaController.isCameraEnabled;
+    __weak typeof(self) weakSelf = self;
+    [self.normalMediaController setCameraEnabled:shouldEnable completion:^(BOOL success) {
+        if (!success) {
+            [weakSelf.normalControlPanel setMediaStatusText:@"Unable to change camera state."];
+            return;
+        }
+
+        [weakSelf.normalControlPanel setCameraEnabled:weakSelf.normalMediaController.isCameraEnabled];
+        [weakSelf.normalControlPanel setMediaStatusText:[weakSelf normalMediaStateSummary]];
+    }];
+}
+
+- (void)toggleNormalMicrophone {
+    BOOL shouldEnable = !self.normalMediaController.isMicrophoneEnabled;
+    __weak typeof(self) weakSelf = self;
+    [self.normalMediaController setMicrophoneEnabled:shouldEnable completion:^(BOOL success) {
+        if (!success) {
+            [weakSelf.normalControlPanel setMediaStatusText:@"Unable to change microphone state."];
+            return;
+        }
+
+        [weakSelf.normalControlPanel setMicrophoneEnabled:weakSelf.normalMediaController.isMicrophoneEnabled];
+        [weakSelf.normalControlPanel setMediaStatusText:[weakSelf normalMediaStateSummary]];
+    }];
+}
+
+- (void)toggleNormalSurfaceShare {
+    if (!self.normalRenderView) {
+        return;
+    }
+
+    if (self.normalSurfaceShareController.isSharing) {
+        [self.normalSurfaceShareController stopSharingFromSurfaceView:self.normalRenderView];
+        [self.normalControlPanel setSharingEnabled:NO];
+        return;
+    }
+
+    [self.normalSurfaceShareController startSharingFromSurfaceView:self.normalRenderView];
+    [self.normalControlPanel setSharingEnabled:YES];
 }
 
 - (BOOL)windowShouldClose:(NSWindow *)sender {
@@ -288,6 +411,19 @@
 }
 
 - (void)teardownActiveWindows {
+    if (self.normalControlPanel) {
+        self.normalControlPanel.cameraToggleHandler = nil;
+        self.normalControlPanel.microphoneToggleHandler = nil;
+        self.normalControlPanel.shareToggleHandler = nil;
+    }
+
+    [self.normalSurfaceShareController stopSharingFromSurfaceView:self.normalRenderView];
+    self.normalSurfaceShareController = nil;
+
+    [self.normalMediaController shutdown];
+    self.normalMediaController = nil;
+    self.normalControlPanel = nil;
+
     [self.secureController destroySecureWindow];
     self.secureController = nil;
 
