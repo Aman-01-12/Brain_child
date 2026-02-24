@@ -1,5 +1,6 @@
 #import "AppDelegate.h"
 #import "CapWindow.h"
+#import "InterCallSessionCoordinator.h"
 #import "InterLocalMediaController.h"
 #import "InterLocalCallControlPanel.h"
 #import "InterSurfaceShareController.h"
@@ -16,20 +17,26 @@
 @property (nonatomic, strong) InterLocalMediaController *normalMediaController;
 @property (nonatomic, strong) InterSurfaceShareController *normalSurfaceShareController;
 @property (nonatomic, strong) InterLocalCallControlPanel *normalControlPanel;
-@property (nonatomic, assign, readwrite) InterCallMode currentCallMode;
-@property (nonatomic, assign, readwrite) InterInterviewRole currentInterviewRole;
+@property (nonatomic, strong) InterCallSessionCoordinator *sessionCoordinator;
 @property (nonatomic, assign) BOOL isScreenObserverRegistered;
 @property (nonatomic, assign) BOOL isShowingExternalDisplayAlert;
-@property (nonatomic, assign) BOOL isExitingCurrentMode;
 @property (nonatomic, weak) NSWindow *fullScreenExitPendingWindow;
 @end
 
 @implementation AppDelegate
 
 - (void)applicationDidFinishLaunching:(NSNotification *)aNotification {
-    self.currentCallMode = InterCallModeNone;
-    self.currentInterviewRole = InterInterviewRoleNone;
+    self.sessionCoordinator = [[InterCallSessionCoordinator alloc] init];
     [self launchSetupUI];
+    [self preflightMediaPermissions];
+}
+
+- (InterCallMode)currentCallMode {
+    return self.sessionCoordinator.currentCallMode;
+}
+
+- (InterInterviewRole)currentInterviewRole {
+    return self.sessionCoordinator.currentInterviewRole;
 }
 
 - (void)applicationWillTerminate:(NSNotification *)notification {
@@ -42,6 +49,13 @@
                                                       object:self.fullScreenExitPendingWindow];
         self.fullScreenExitPendingWindow = nil;
     }
+}
+
+- (void)preflightMediaPermissions {
+    [InterLocalMediaController preflightCapturePermissionsWithCompletion:^(__unused AVAuthorizationStatus videoStatus,
+                                                                           __unused AVAuthorizationStatus audioStatus) {
+        // Intentionally no UI interruption here. Call flows already handle denied states.
+    }];
 }
 
 #pragma mark - Mode Actions
@@ -64,11 +78,9 @@
 }
 
 - (void)exitCurrentMode {
-    if (self.currentCallMode == InterCallModeNone || self.isExitingCurrentMode) {
+    if (![self.sessionCoordinator beginExit]) {
         return;
     }
-
-    self.isExitingCurrentMode = YES;
 
     BOOL shouldExitFullScreenFirst =
     self.normalCallWindow != nil &&
@@ -88,7 +100,8 @@
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
             __strong typeof(weakSelf) strongSelf = weakSelf;
-            if (!strongSelf || !strongSelf.isExitingCurrentMode) {
+            if (!strongSelf ||
+                strongSelf.sessionCoordinator.phase != InterCallSessionPhaseExiting) {
                 return;
             }
             if (strongSelf.fullScreenExitPendingWindow != pendingWindow) {
@@ -124,26 +137,33 @@
         return;
     }
 
+    if (![self.sessionCoordinator beginEnteringMode:mode role:role]) {
+        return;
+    }
+
     [self teardownActiveWindows];
     [self.setupWindow orderOut:nil];
     [self.setupRenderView removeFromSuperview];
     self.setupRenderView = nil;
     self.setupWindow = nil;
 
-    self.currentCallMode = mode;
-    self.currentInterviewRole = role;
-
     if (isIntervieweeMode) {
         [self applyKioskRestrictions];
         [self startScreenMonitoring];
         self.secureController = [[SecureWindowController alloc] init];
+        __weak typeof(self) weakSelf = self;
+        self.secureController.exitSessionHandler = ^{
+            [weakSelf requestExitCurrentMode];
+        };
         [self.secureController createSecureWindow];
+        [self.sessionCoordinator markActive];
         return;
     }
 
     [NSApp setPresentationOptions:NSApplicationPresentationDefault];
     [self stopScreenMonitoring];
     [self launchNormalCallWindow];
+    [self.sessionCoordinator markActive];
 }
 
 #pragma mark - UI
@@ -468,11 +488,8 @@
 
     [self teardownActiveWindows];
 
-    self.currentCallMode = InterCallModeNone;
-    self.currentInterviewRole = InterInterviewRoleNone;
+    [self.sessionCoordinator finishExit];
     [self launchSetupUI];
-
-    self.isExitingCurrentMode = NO;
 }
 
 #pragma mark - Screen Monitoring

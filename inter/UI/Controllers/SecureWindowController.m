@@ -1,5 +1,4 @@
 #import "SecureWindowController.h"
-#import "AppDelegate.h"
 #import "InterLocalCallControlPanel.h"
 #import "InterLocalMediaController.h"
 #import "InterSurfaceShareController.h"
@@ -69,8 +68,10 @@
 }
 
 - (void)exitSession {
-    AppDelegate *delegate = (AppDelegate *)NSApp.delegate;
-    [delegate exitCurrentMode];
+    dispatch_block_t exitHandler = self.exitSessionHandler;
+    if (exitHandler) {
+        exitHandler();
+    }
 }
 
 - (void)destroySecureWindow {
@@ -93,6 +94,7 @@
 
     [self.secureWindow orderOut:nil];
     self.secureWindow = nil;
+    self.exitSessionHandler = nil;
 }
 
 #pragma mark - Controls

@@ -6,6 +6,8 @@
 @property (atomic, assign, readwrite, getter=isCameraEnabled) BOOL cameraEnabled;
 @property (atomic, assign, readwrite, getter=isMicrophoneEnabled) BOOL microphoneEnabled;
 @property (atomic, assign, getter=isShuttingDown) BOOL shuttingDown;
++ (void)resolveAuthorizationStatusForMediaType:(AVMediaType)mediaType
+                                    completion:(void (^)(AVAuthorizationStatus status))completion;
 @end
 
 static const void *InterLocalMediaSessionQueueKey = &InterLocalMediaSessionQueueKey;
@@ -19,6 +21,31 @@ static const void *InterLocalMediaSessionQueueKey = &InterLocalMediaSessionQueue
 
     __weak NSView *_previewHostView;
     AVCaptureVideoPreviewLayer *_previewLayer;
+}
+
++ (void)preflightCapturePermissionsWithCompletion:(void (^ _Nullable)(AVAuthorizationStatus videoStatus,
+                                                                       AVAuthorizationStatus audioStatus))completion {
+    dispatch_group_t permissionGroup = dispatch_group_create();
+    __block AVAuthorizationStatus videoStatus = AVAuthorizationStatusNotDetermined;
+    __block AVAuthorizationStatus audioStatus = AVAuthorizationStatusNotDetermined;
+
+    dispatch_group_enter(permissionGroup);
+    [self resolveAuthorizationStatusForMediaType:AVMediaTypeVideo completion:^(AVAuthorizationStatus status) {
+        videoStatus = status;
+        dispatch_group_leave(permissionGroup);
+    }];
+
+    dispatch_group_enter(permissionGroup);
+    [self resolveAuthorizationStatusForMediaType:AVMediaTypeAudio completion:^(AVAuthorizationStatus status) {
+        audioStatus = status;
+        dispatch_group_leave(permissionGroup);
+    }];
+
+    dispatch_group_notify(permissionGroup, dispatch_get_main_queue(), ^{
+        if (completion) {
+            completion(videoStatus, audioStatus);
+        }
+    });
 }
 
 - (instancetype)init {
@@ -331,6 +358,28 @@ static const void *InterLocalMediaSessionQueueKey = &InterLocalMediaSessionQueue
 }
 
 #pragma mark - Internal
+
++ (void)resolveAuthorizationStatusForMediaType:(AVMediaType)mediaType
+                                    completion:(void (^)(AVAuthorizationStatus status))completion {
+    if (!completion) {
+        return;
+    }
+
+    AVAuthorizationStatus currentStatus = [AVCaptureDevice authorizationStatusForMediaType:mediaType];
+    if (currentStatus != AVAuthorizationStatusNotDetermined) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            completion(currentStatus);
+        });
+        return;
+    }
+
+    [AVCaptureDevice requestAccessForMediaType:mediaType completionHandler:^(__unused BOOL granted) {
+        AVAuthorizationStatus updatedStatus = [AVCaptureDevice authorizationStatusForMediaType:mediaType];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            completion(updatedStatus);
+        });
+    }];
+}
 
 - (void)stopSynchronously {
     [self performSynchronouslyOnSessionQueue:^{

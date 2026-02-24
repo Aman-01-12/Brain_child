@@ -13,6 +13,9 @@ typedef void (^InterLocalMediaPrepareCompletion)(BOOL success, NSString * _Nulla
 @property (atomic, readonly, getter=isCameraEnabled) BOOL cameraEnabled;
 @property (atomic, readonly, getter=isMicrophoneEnabled) BOOL microphoneEnabled;
 
++ (void)preflightCapturePermissionsWithCompletion:(void (^ _Nullable)(AVAuthorizationStatus videoStatus,
+                                                                      AVAuthorizationStatus audioStatus))completion;
+
 - (void)prepareWithCompletion:(InterLocalMediaPrepareCompletion)completion;
 - (void)start;
 - (void)stop;
