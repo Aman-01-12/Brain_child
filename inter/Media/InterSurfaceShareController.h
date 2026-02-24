@@ -1,15 +1,25 @@
+#import <CoreMedia/CoreMedia.h>
 #import <Foundation/Foundation.h>
 
+#import "InterShareTypes.h"
 #import "MetalSurfaceView.h"
 
 NS_ASSUME_NONNULL_BEGIN
 
 typedef void (^InterSurfaceShareStatusHandler)(NSString *statusText);
+typedef void (^InterSurfaceShareAudioSampleHandler)(CMSampleBufferRef sampleBuffer);
+typedef void (^InterSurfaceShareAudioSampleObserverRegistrationBlock)(InterSurfaceShareAudioSampleHandler _Nullable handler);
 
 @interface InterSurfaceShareController : NSObject
 
 @property (atomic, readonly, getter=isSharing) BOOL sharing;
 @property (nonatomic, copy, nullable) InterSurfaceShareStatusHandler statusHandler;
+@property (nonatomic, copy, nullable) InterSurfaceShareAudioSampleObserverRegistrationBlock audioSampleObserverRegistrationBlock;
+@property (nonatomic, readonly) InterShareSessionConfiguration *configuration;
+
+- (void)configureWithSessionKind:(InterShareSessionKind)sessionKind
+                       shareMode:(InterShareMode)shareMode
+                recordingEnabled:(BOOL)recordingEnabled;
 
 - (void)startSharingFromSurfaceView:(MetalSurfaceView *)surfaceView;
 - (void)stopSharingFromSurfaceView:(nullable MetalSurfaceView *)surfaceView;

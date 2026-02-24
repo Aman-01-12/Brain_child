@@ -79,6 +79,7 @@
         self.controlPanel.cameraToggleHandler = nil;
         self.controlPanel.microphoneToggleHandler = nil;
         self.controlPanel.shareToggleHandler = nil;
+        self.controlPanel.shareModeChangedHandler = nil;
     }
 
     [self.surfaceShareController stopSharingFromSurfaceView:self.renderView];
@@ -107,6 +108,8 @@
     self.controlPanel = [[InterLocalCallControlPanel alloc] initWithFrame:panelFrame];
     self.controlPanel.autoresizingMask = NSViewMinXMargin | NSViewMaxYMargin;
     [self.controlPanel setPanelTitleText:@"Interview Controls"];
+    [self.controlPanel setShareModeSelectorHidden:YES];
+    [self.controlPanel setShareMode:InterShareModeThisApp];
     [self.controlPanel setShareStatusText:@"Secure surface share is off."];
     [view addSubview:self.controlPanel];
 
@@ -125,10 +128,17 @@
 - (void)startLocalMediaFlow {
     self.localMediaController = [[InterLocalMediaController alloc] init];
     self.surfaceShareController = [[InterSurfaceShareController alloc] init];
+    [self.surfaceShareController configureWithSessionKind:InterShareSessionKindInterview
+                                                shareMode:InterShareModeThisApp
+                                         recordingEnabled:YES];
 
     __weak typeof(self) weakSelf = self;
     self.surfaceShareController.statusHandler = ^(NSString *statusText) {
         [weakSelf.controlPanel setShareStatusText:statusText];
+    };
+    self.surfaceShareController.audioSampleObserverRegistrationBlock =
+    ^(InterSurfaceShareAudioSampleHandler _Nullable sampleHandler) {
+        weakSelf.localMediaController.audioSampleBufferHandler = sampleHandler;
     };
 
     [self.controlPanel setMediaStatusText:@"Requesting camera/mic permission..."];
@@ -198,12 +208,12 @@
 
     if (self.surfaceShareController.isSharing) {
         [self.surfaceShareController stopSharingFromSurfaceView:self.renderView];
-        [self.controlPanel setSharingEnabled:NO];
+        [self.controlPanel setSharingEnabled:self.surfaceShareController.isSharing];
         return;
     }
 
     [self.surfaceShareController startSharingFromSurfaceView:self.renderView];
-    [self.controlPanel setSharingEnabled:YES];
+    [self.controlPanel setSharingEnabled:self.surfaceShareController.isSharing];
 }
 
 @end

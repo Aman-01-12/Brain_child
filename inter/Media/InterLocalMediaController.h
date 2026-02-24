@@ -5,6 +5,7 @@
 NS_ASSUME_NONNULL_BEGIN
 
 typedef void (^InterLocalMediaPrepareCompletion)(BOOL success, NSString * _Nullable failureReason);
+typedef void (^InterLocalMediaAudioSampleBufferHandler)(CMSampleBufferRef sampleBuffer);
 
 @interface InterLocalMediaController : NSObject
 
@@ -12,6 +13,7 @@ typedef void (^InterLocalMediaPrepareCompletion)(BOOL success, NSString * _Nulla
 @property (atomic, readonly, getter=isRunning) BOOL running;
 @property (atomic, readonly, getter=isCameraEnabled) BOOL cameraEnabled;
 @property (atomic, readonly, getter=isMicrophoneEnabled) BOOL microphoneEnabled;
+@property (nonatomic, copy, nullable) InterLocalMediaAudioSampleBufferHandler audioSampleBufferHandler;
 
 + (void)preflightCapturePermissionsWithCompletion:(void (^ _Nullable)(AVAuthorizationStatus videoStatus,
                                                                       AVAuthorizationStatus audioStatus))completion;

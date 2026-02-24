@@ -1,6 +1,7 @@
 #import "AppDelegate.h"
 #import "CapWindow.h"
 #import "InterCallSessionCoordinator.h"
+#import "InterAppSettings.h"
 #import "InterLocalMediaController.h"
 #import "InterLocalCallControlPanel.h"
 #import "InterSurfaceShareController.h"
@@ -12,6 +13,8 @@
 @property (nonatomic, strong) SecureWindowController *secureController;
 @property (nonatomic, strong) NSWindow *setupWindow;
 @property (nonatomic, strong) MetalSurfaceView *setupRenderView;
+@property (nonatomic, strong) NSWindow *settingsWindow;
+@property (nonatomic, strong) NSTextField *settingsRecordingPathValueLabel;
 @property (nonatomic, strong) NSWindow *normalCallWindow;
 @property (nonatomic, strong) MetalSurfaceView *normalRenderView;
 @property (nonatomic, strong) InterLocalMediaController *normalMediaController;
@@ -142,6 +145,7 @@
     }
 
     [self teardownActiveWindows];
+    [self.settingsWindow orderOut:nil];
     [self.setupWindow orderOut:nil];
     [self.setupRenderView removeFromSuperview];
     self.setupRenderView = nil;
@@ -241,6 +245,13 @@
     [joinInterviewButton setTarget:self];
     [joinInterviewButton setAction:@selector(joinInterviewAsInterviewee)];
     [panelView addSubview:joinInterviewButton];
+
+    NSButton *settingsButton = [[NSButton alloc] initWithFrame:NSMakeRect(250, 210, 112, 26)];
+    settingsButton.autoresizingMask = NSViewMinXMargin | NSViewMinYMargin;
+    [settingsButton setTitle:@"Settings"];
+    [settingsButton setTarget:self];
+    [settingsButton setAction:@selector(openSettingsWindow)];
+    [panelView addSubview:settingsButton];
 }
 
 - (void)launchNormalCallWindow {
@@ -291,7 +302,7 @@
     [self.normalControlPanel setMicrophoneEnabled:self.normalMediaController.isMicrophoneEnabled];
     [self.normalControlPanel setSharingEnabled:self.normalSurfaceShareController.isSharing];
 
-    [self.normalControlPanel setShareStatusText:@"Secure surface share is off."];
+    [self.normalControlPanel setShareStatusText:@"Secure surface share is off. Window and full-screen sharing will be enabled in the next ScreenCaptureKit phase."];
 
     [self.normalCallWindow makeKeyAndOrderFront:nil];
 }
@@ -318,6 +329,10 @@
     self.normalControlPanel = [[InterLocalCallControlPanel alloc] initWithFrame:panelFrame];
     self.normalControlPanel.autoresizingMask = NSViewMinXMargin | NSViewMaxYMargin;
     [self.normalControlPanel setPanelTitleText:@"Normal Call Controls"];
+    [self.normalControlPanel setShareModeSelectorHidden:NO];
+    [self.normalControlPanel setShareMode:InterShareModeThisApp];
+    [self.normalControlPanel setShareModeOptionEnabled:NO forMode:InterShareModeWindow];
+    [self.normalControlPanel setShareModeOptionEnabled:NO forMode:InterShareModeEntireScreen];
     [view addSubview:self.normalControlPanel];
 
     __weak typeof(self) weakSelf = self;
@@ -330,15 +345,25 @@
     self.normalControlPanel.shareToggleHandler = ^{
         [weakSelf toggleNormalSurfaceShare];
     };
+    self.normalControlPanel.shareModeChangedHandler = ^(InterShareMode shareMode) {
+        [weakSelf handleNormalShareModeChanged:shareMode];
+    };
 }
 
 - (void)startNormalLocalMediaFlow {
     self.normalMediaController = [[InterLocalMediaController alloc] init];
     self.normalSurfaceShareController = [[InterSurfaceShareController alloc] init];
+    [self.normalSurfaceShareController configureWithSessionKind:InterShareSessionKindNormal
+                                                      shareMode:self.normalControlPanel.selectedShareMode
+                                               recordingEnabled:YES];
 
     __weak typeof(self) weakSelf = self;
     self.normalSurfaceShareController.statusHandler = ^(NSString *statusText) {
         [weakSelf.normalControlPanel setShareStatusText:statusText];
+    };
+    self.normalSurfaceShareController.audioSampleObserverRegistrationBlock =
+    ^(InterSurfaceShareAudioSampleHandler _Nullable sampleHandler) {
+        weakSelf.normalMediaController.audioSampleBufferHandler = sampleHandler;
     };
 
     [self.normalMediaController attachPreviewToView:self.normalControlPanel.previewContainerView];
@@ -363,6 +388,25 @@
         }
         [weakSelf.normalControlPanel setMediaStatusText:message];
     }];
+}
+
+- (void)handleNormalShareModeChanged:(InterShareMode)shareMode {
+    if (self.normalSurfaceShareController.isSharing) {
+        [self.normalControlPanel setShareMode:InterShareModeThisApp];
+        [self.normalControlPanel setShareStatusText:@"Stop sharing before changing source mode."];
+        return;
+    }
+
+    [self.normalSurfaceShareController configureWithSessionKind:InterShareSessionKindNormal
+                                                      shareMode:shareMode
+                                               recordingEnabled:YES];
+
+    if (shareMode == InterShareModeThisApp) {
+        [self.normalControlPanel setShareStatusText:@"Share This App is ready."];
+        return;
+    }
+
+    [self.normalControlPanel setShareStatusText:@"Window and full-screen sharing will be enabled in the next ScreenCaptureKit phase."];
 }
 
 - (NSString *)normalMediaStateSummary {
@@ -406,14 +450,130 @@
         return;
     }
 
-    if (self.normalSurfaceShareController.isSharing) {
-        [self.normalSurfaceShareController stopSharingFromSurfaceView:self.normalRenderView];
+    if (self.normalControlPanel.selectedShareMode != InterShareModeThisApp) {
         [self.normalControlPanel setSharingEnabled:NO];
+        [self.normalControlPanel setShareStatusText:@"Window and full-screen sharing will be enabled in the next ScreenCaptureKit phase."];
         return;
     }
 
+    if (self.normalSurfaceShareController.isSharing) {
+        [self.normalSurfaceShareController stopSharingFromSurfaceView:self.normalRenderView];
+        [self.normalControlPanel setSharingEnabled:self.normalSurfaceShareController.isSharing];
+        return;
+    }
+
+    [self.normalSurfaceShareController configureWithSessionKind:InterShareSessionKindNormal
+                                                      shareMode:self.normalControlPanel.selectedShareMode
+                                               recordingEnabled:YES];
     [self.normalSurfaceShareController startSharingFromSurfaceView:self.normalRenderView];
-    [self.normalControlPanel setSharingEnabled:YES];
+    [self.normalControlPanel setSharingEnabled:self.normalSurfaceShareController.isSharing];
+}
+
+#pragma mark - Settings
+
+- (void)openSettingsWindow {
+    if (!self.settingsWindow) {
+        self.settingsWindow =
+        [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 620, 240)
+                                    styleMask:(NSWindowStyleMaskTitled |
+                                               NSWindowStyleMaskClosable)
+                                      backing:NSBackingStoreBuffered
+                                        defer:NO];
+        [self.settingsWindow setTitle:@"Settings"];
+        [self.settingsWindow setSharingType:NSWindowSharingNone];
+
+        NSView *contentView = [[NSView alloc] initWithFrame:self.settingsWindow.contentView.bounds];
+        contentView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+        [self.settingsWindow setContentView:contentView];
+
+        NSTextField *titleLabel = [NSTextField labelWithString:@"Recording Storage"];
+        titleLabel.frame = NSMakeRect(24, 188, 220, 24);
+        titleLabel.font = [NSFont boldSystemFontOfSize:16];
+        [contentView addSubview:titleLabel];
+
+        NSTextField *subtitleLabel = [NSTextField labelWithString:@"Choose one folder for meeting recordings before joining calls."];
+        subtitleLabel.frame = NSMakeRect(24, 162, 560, 20);
+        subtitleLabel.font = [NSFont systemFontOfSize:12];
+        subtitleLabel.textColor = [NSColor secondaryLabelColor];
+        [contentView addSubview:subtitleLabel];
+
+        NSTextField *pathLabel = [NSTextField labelWithString:@"Recording Folder"];
+        pathLabel.frame = NSMakeRect(24, 128, 140, 18);
+        pathLabel.font = [NSFont systemFontOfSize:12];
+        [contentView addSubview:pathLabel];
+
+        self.settingsRecordingPathValueLabel = [NSTextField labelWithString:@"Not configured"];
+        self.settingsRecordingPathValueLabel.frame = NSMakeRect(24, 96, 572, 24);
+        self.settingsRecordingPathValueLabel.font = [NSFont monospacedSystemFontOfSize:12 weight:NSFontWeightRegular];
+        self.settingsRecordingPathValueLabel.lineBreakMode = NSLineBreakByTruncatingMiddle;
+        self.settingsRecordingPathValueLabel.textColor = [NSColor labelColor];
+        [contentView addSubview:self.settingsRecordingPathValueLabel];
+
+        NSButton *chooseFolderButton = [[NSButton alloc] initWithFrame:NSMakeRect(24, 44, 150, 34)];
+        [chooseFolderButton setTitle:@"Choose Folder..."];
+        [chooseFolderButton setTarget:self];
+        [chooseFolderButton setAction:@selector(selectRecordingFolderFromSettings)];
+        [contentView addSubview:chooseFolderButton];
+
+        NSButton *closeButton = [[NSButton alloc] initWithFrame:NSMakeRect(504, 44, 92, 34)];
+        [closeButton setTitle:@"Close"];
+        [closeButton setTarget:self];
+        [closeButton setAction:@selector(closeSettingsWindow)];
+        [contentView addSubview:closeButton];
+    }
+
+    [self refreshSettingsRecordingPathLabel];
+    [self.settingsWindow center];
+    [self.settingsWindow makeKeyAndOrderFront:nil];
+    [NSApp activateIgnoringOtherApps:YES];
+}
+
+- (void)refreshSettingsRecordingPathLabel {
+    NSString *recordingPath = [InterAppSettings configuredRecordingDirectoryDisplayPath];
+    if (recordingPath.length == 0) {
+        self.settingsRecordingPathValueLabel.stringValue = @"Not configured";
+        self.settingsRecordingPathValueLabel.textColor = [NSColor secondaryLabelColor];
+        return;
+    }
+
+    self.settingsRecordingPathValueLabel.stringValue = recordingPath;
+    self.settingsRecordingPathValueLabel.textColor = [NSColor labelColor];
+}
+
+- (void)selectRecordingFolderFromSettings {
+    if (!self.settingsWindow) {
+        return;
+    }
+
+    NSOpenPanel *openPanel = [NSOpenPanel openPanel];
+    openPanel.canChooseFiles = NO;
+    openPanel.canChooseDirectories = YES;
+    openPanel.allowsMultipleSelection = NO;
+    openPanel.canCreateDirectories = YES;
+    openPanel.prompt = @"Select";
+    openPanel.message = @"Meeting recordings will be saved to this folder.";
+
+    [openPanel beginSheetModalForWindow:self.settingsWindow completionHandler:^(NSModalResponse response) {
+        if (response != NSModalResponseOK || openPanel.URL == nil) {
+            return;
+        }
+
+        NSError *settingsError = nil;
+        BOOL saved = [InterAppSettings setRecordingDirectoryURL:openPanel.URL error:&settingsError];
+        if (!saved) {
+            NSAlert *alert = [[NSAlert alloc] init];
+            alert.messageText = @"Unable to save recording folder";
+            alert.informativeText = settingsError.localizedDescription ?: @"Please choose a different folder.";
+            [alert beginSheetModalForWindow:self.settingsWindow completionHandler:nil];
+            return;
+        }
+
+        [self refreshSettingsRecordingPathLabel];
+    }];
+}
+
+- (void)closeSettingsWindow {
+    [self.settingsWindow orderOut:nil];
 }
 
 - (BOOL)windowShouldClose:(NSWindow *)sender {
@@ -435,6 +595,7 @@
         self.normalControlPanel.cameraToggleHandler = nil;
         self.normalControlPanel.microphoneToggleHandler = nil;
         self.normalControlPanel.shareToggleHandler = nil;
+        self.normalControlPanel.shareModeChangedHandler = nil;
     }
 
     [self.normalSurfaceShareController stopSharingFromSurfaceView:self.normalRenderView];

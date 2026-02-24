@@ -4,9 +4,11 @@
 @property (nonatomic, strong) NSTextField *titleLabel;
 @property (nonatomic, strong) NSTextField *mediaStatusLabel;
 @property (nonatomic, strong) NSTextField *shareStatusLabel;
+@property (nonatomic, strong) NSTextField *shareModeLabel;
 @property (nonatomic, strong) NSButton *cameraButton;
 @property (nonatomic, strong) NSButton *microphoneButton;
 @property (nonatomic, strong) NSButton *shareButton;
+@property (nonatomic, strong) NSPopUpButton *shareModePopUpButton;
 @property (nonatomic, strong, readwrite) NSView *previewContainerView;
 @end
 
@@ -67,26 +69,50 @@
     self.shareStatusLabel.textColor = [NSColor colorWithWhite:0.85 alpha:1.0];
     [self addSubview:self.shareStatusLabel];
 
-    self.cameraButton = [[NSButton alloc] initWithFrame:NSMakeRect(16, 132, self.bounds.size.width - 32, 38)];
+    self.shareModeLabel = [NSTextField labelWithString:@"Share Source"];
+    self.shareModeLabel.frame = NSMakeRect(16, 146, 120, 18);
+    self.shareModeLabel.autoresizingMask = NSViewMaxXMargin | NSViewMaxYMargin;
+    self.shareModeLabel.font = [NSFont systemFontOfSize:11];
+    self.shareModeLabel.textColor = [NSColor colorWithWhite:0.85 alpha:1.0];
+    [self addSubview:self.shareModeLabel];
+
+    self.shareModePopUpButton = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(16, 118, self.bounds.size.width - 32, 26)
+                                                            pullsDown:NO];
+    self.shareModePopUpButton.autoresizingMask = NSViewWidthSizable | NSViewMaxYMargin;
+    [self.shareModePopUpButton addItemWithTitle:@"Share This App"];
+    [self.shareModePopUpButton addItemWithTitle:@"Share Window (Next Step)"];
+    [self.shareModePopUpButton addItemWithTitle:@"Share Entire Screen (Next Step)"];
+    [self.shareModePopUpButton setTarget:self];
+    [self.shareModePopUpButton setAction:@selector(handleShareModeChange:)];
+
+    [self.shareModePopUpButton.itemArray[0] setTag:InterShareModeThisApp];
+    [self.shareModePopUpButton.itemArray[1] setTag:InterShareModeWindow];
+    [self.shareModePopUpButton.itemArray[2] setTag:InterShareModeEntireScreen];
+
+    [self addSubview:self.shareModePopUpButton];
+
+    self.cameraButton = [[NSButton alloc] initWithFrame:NSMakeRect(16, 88, self.bounds.size.width - 32, 30)];
     self.cameraButton.autoresizingMask = NSViewWidthSizable | NSViewMaxYMargin;
     [self.cameraButton setTitle:@"Turn Camera On"];
     [self.cameraButton setTarget:self];
     [self.cameraButton setAction:@selector(handleCameraToggle:)];
     [self addSubview:self.cameraButton];
 
-    self.microphoneButton = [[NSButton alloc] initWithFrame:NSMakeRect(16, 86, self.bounds.size.width - 32, 38)];
+    self.microphoneButton = [[NSButton alloc] initWithFrame:NSMakeRect(16, 56, self.bounds.size.width - 32, 30)];
     self.microphoneButton.autoresizingMask = NSViewWidthSizable | NSViewMaxYMargin;
     [self.microphoneButton setTitle:@"Turn Mic On"];
     [self.microphoneButton setTarget:self];
     [self.microphoneButton setAction:@selector(handleMicrophoneToggle:)];
     [self addSubview:self.microphoneButton];
 
-    self.shareButton = [[NSButton alloc] initWithFrame:NSMakeRect(16, 40, self.bounds.size.width - 32, 38)];
+    self.shareButton = [[NSButton alloc] initWithFrame:NSMakeRect(16, 20, self.bounds.size.width - 32, 30)];
     self.shareButton.autoresizingMask = NSViewWidthSizable | NSViewMaxYMargin;
     [self.shareButton setTitle:@"Start Surface Share"];
     [self.shareButton setTarget:self];
     [self.shareButton setAction:@selector(handleShareToggle:)];
     [self addSubview:self.shareButton];
+
+    [self setShareMode:InterShareModeThisApp];
 }
 
 - (void)setPanelTitleText:(NSString *)title {
@@ -113,6 +139,36 @@
     self.shareStatusLabel.stringValue = text ?: @"";
 }
 
+- (void)setShareMode:(InterShareMode)shareMode {
+    NSMenuItem *item = [self shareModeMenuItemForMode:shareMode];
+    if (item) {
+        [self.shareModePopUpButton selectItem:item];
+    }
+}
+
+- (InterShareMode)selectedShareMode {
+    NSMenuItem *selectedItem = self.shareModePopUpButton.selectedItem;
+    if (!selectedItem) {
+        return InterShareModeThisApp;
+    }
+
+    return (InterShareMode)selectedItem.tag;
+}
+
+- (void)setShareModeOptionEnabled:(BOOL)enabled forMode:(InterShareMode)shareMode {
+    NSMenuItem *item = [self shareModeMenuItemForMode:shareMode];
+    if (!item) {
+        return;
+    }
+
+    item.enabled = enabled;
+}
+
+- (void)setShareModeSelectorHidden:(BOOL)hidden {
+    self.shareModeLabel.hidden = hidden;
+    self.shareModePopUpButton.hidden = hidden;
+}
+
 - (void)handleCameraToggle:(id)sender {
 #pragma unused(sender)
     dispatch_block_t handler = self.cameraToggleHandler;
@@ -135,6 +191,25 @@
     if (handler) {
         handler();
     }
+}
+
+- (void)handleShareModeChange:(id)sender {
+#pragma unused(sender)
+    void (^handler)(InterShareMode) = self.shareModeChangedHandler;
+    if (!handler) {
+        return;
+    }
+
+    handler([self selectedShareMode]);
+}
+
+- (NSMenuItem *)shareModeMenuItemForMode:(InterShareMode)shareMode {
+    for (NSMenuItem *item in self.shareModePopUpButton.itemArray) {
+        if (item.tag == (NSInteger)shareMode) {
+            return item;
+        }
+    }
+    return nil;
 }
 
 @end

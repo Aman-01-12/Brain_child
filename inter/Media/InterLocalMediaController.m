@@ -1,6 +1,6 @@
 #import "InterLocalMediaController.h"
 
-@interface InterLocalMediaController ()
+@interface InterLocalMediaController () <AVCaptureAudioDataOutputSampleBufferDelegate>
 @property (atomic, assign, readwrite, getter=isConfigured) BOOL configured;
 @property (atomic, assign, readwrite, getter=isRunning) BOOL running;
 @property (atomic, assign, readwrite, getter=isCameraEnabled) BOOL cameraEnabled;
@@ -15,9 +15,12 @@ static const void *InterLocalMediaSessionQueueKey = &InterLocalMediaSessionQueue
 @implementation InterLocalMediaController {
     dispatch_queue_t _sessionQueue;
     AVCaptureSession *_session;
+    dispatch_queue_t _audioSampleOutputQueue;
+    dispatch_queue_t _audioSampleCallbackQueue;
 
     AVCaptureDeviceInput *_videoInput;
     AVCaptureDeviceInput *_audioInput;
+    AVCaptureAudioDataOutput *_audioDataOutput;
 
     __weak NSView *_previewHostView;
     AVCaptureVideoPreviewLayer *_previewLayer;
@@ -56,6 +59,10 @@ static const void *InterLocalMediaSessionQueueKey = &InterLocalMediaSessionQueue
 
     _sessionQueue = dispatch_queue_create("secure.inter.media.local.session",
                                           DISPATCH_QUEUE_SERIAL);
+    _audioSampleOutputQueue = dispatch_queue_create("secure.inter.media.local.audio.output",
+                                                    DISPATCH_QUEUE_SERIAL);
+    _audioSampleCallbackQueue = dispatch_queue_create("secure.inter.media.local.audio.callback",
+                                                      DISPATCH_QUEUE_SERIAL);
     dispatch_queue_set_specific(_sessionQueue,
                                 InterLocalMediaSessionQueueKey,
                                 (void *)InterLocalMediaSessionQueueKey,
@@ -240,12 +247,14 @@ static const void *InterLocalMediaSessionQueueKey = &InterLocalMediaSessionQueue
             [self->_session removeInput:self->_audioInput];
             self->_audioInput = nil;
         }
+        [self removeAudioDataOutputLocked];
         [self->_session commitConfiguration];
 
         self.cameraEnabled = NO;
         self.microphoneEnabled = NO;
         self.configured = NO;
         self->_session = nil;
+        self.audioSampleBufferHandler = nil;
     }];
 }
 
@@ -468,6 +477,9 @@ static const void *InterLocalMediaSessionQueueKey = &InterLocalMediaSessionQueue
     }
     if (allowAudio) {
         addedAnyInput |= [self setAudioInputEnabledLocked:YES];
+        if (self.isMicrophoneEnabled) {
+            [self ensureAudioDataOutputLocked];
+        }
     }
 
     [_session commitConfiguration];
@@ -582,6 +594,7 @@ static const void *InterLocalMediaSessionQueueKey = &InterLocalMediaSessionQueue
         if (canAdd) {
             [_session addInput:input];
             _audioInput = input;
+            [self ensureAudioDataOutputLocked];
         }
         [_session commitConfiguration];
 
@@ -591,6 +604,7 @@ static const void *InterLocalMediaSessionQueueKey = &InterLocalMediaSessionQueue
 
     if (_audioInput != nil) {
         [_session beginConfiguration];
+        [self removeAudioDataOutputLocked];
         [_session removeInput:_audioInput];
         [_session commitConfiguration];
         _audioInput = nil;
@@ -598,6 +612,68 @@ static const void *InterLocalMediaSessionQueueKey = &InterLocalMediaSessionQueue
 
     self.microphoneEnabled = NO;
     return YES;
+}
+
+- (void)ensureAudioDataOutputLocked {
+    if (self.isShuttingDown || !_session || !_audioInput) {
+        return;
+    }
+
+    if (_audioDataOutput != nil) {
+        return;
+    }
+
+    AVCaptureAudioDataOutput *audioDataOutput = [[AVCaptureAudioDataOutput alloc] init];
+    if (![_session canAddOutput:audioDataOutput]) {
+        return;
+    }
+
+    [_session addOutput:audioDataOutput];
+    [audioDataOutput setSampleBufferDelegate:self queue:_audioSampleOutputQueue];
+    _audioDataOutput = audioDataOutput;
+}
+
+- (void)removeAudioDataOutputLocked {
+    if (!_audioDataOutput || !_session) {
+        return;
+    }
+
+    [_audioDataOutput setSampleBufferDelegate:nil queue:NULL];
+    if ([_session.outputs containsObject:_audioDataOutput]) {
+        [_session removeOutput:_audioDataOutput];
+    }
+    _audioDataOutput = nil;
+}
+
+- (void)captureOutput:(AVCaptureOutput *)output
+didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
+       fromConnection:(AVCaptureConnection *)connection {
+#pragma unused(connection)
+    if (output != _audioDataOutput || !sampleBuffer || self.isShuttingDown) {
+        return;
+    }
+
+    InterLocalMediaAudioSampleBufferHandler sampleHandler = self.audioSampleBufferHandler;
+    if (!sampleHandler) {
+        return;
+    }
+
+    CFRetain(sampleBuffer);
+    __weak typeof(self) weakSelf = self;
+    dispatch_async(_audioSampleCallbackQueue, ^{
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf || strongSelf.isShuttingDown) {
+            CFRelease(sampleBuffer);
+            return;
+        }
+
+        InterLocalMediaAudioSampleBufferHandler callback = strongSelf.audioSampleBufferHandler;
+        if (callback) {
+            callback(sampleBuffer);
+        }
+
+        CFRelease(sampleBuffer);
+    });
 }
 
 - (AVCaptureDevice *)preferredVideoDevice {

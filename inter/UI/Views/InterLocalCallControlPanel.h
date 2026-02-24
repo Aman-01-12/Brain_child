@@ -1,5 +1,7 @@
 #import <Cocoa/Cocoa.h>
 
+#import "InterShareTypes.h"
+
 NS_ASSUME_NONNULL_BEGIN
 
 @interface InterLocalCallControlPanel : NSView
@@ -7,6 +9,7 @@ NS_ASSUME_NONNULL_BEGIN
 @property (nonatomic, copy, nullable) dispatch_block_t cameraToggleHandler;
 @property (nonatomic, copy, nullable) dispatch_block_t microphoneToggleHandler;
 @property (nonatomic, copy, nullable) dispatch_block_t shareToggleHandler;
+@property (nonatomic, copy, nullable) void (^shareModeChangedHandler)(InterShareMode shareMode);
 
 @property (nonatomic, strong, readonly) NSView *previewContainerView;
 
@@ -16,6 +19,10 @@ NS_ASSUME_NONNULL_BEGIN
 - (void)setSharingEnabled:(BOOL)enabled;
 - (void)setMediaStatusText:(NSString *)text;
 - (void)setShareStatusText:(NSString *)text;
+- (void)setShareMode:(InterShareMode)shareMode;
+- (InterShareMode)selectedShareMode;
+- (void)setShareModeOptionEnabled:(BOOL)enabled forMode:(InterShareMode)shareMode;
+- (void)setShareModeSelectorHidden:(BOOL)hidden;
 
 @end
 
