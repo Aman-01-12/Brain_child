@@ -5,6 +5,7 @@
 #import "InterLocalMediaController.h"
 #import "InterLocalCallControlPanel.h"
 #import "InterSurfaceShareController.h"
+#import "InterScreenCaptureVideoSource.h"
 #import "MetalSurfaceView.h"
 #import "SecureWindowController.h"
 
@@ -27,6 +28,8 @@
 @end
 
 @implementation AppDelegate
+
+static NSString *const InterScreenCaptureStartupPromptedKey = @"InterScreenCaptureStartupPrompted";
 
 - (void)applicationDidFinishLaunching:(NSNotification *)aNotification {
     self.sessionCoordinator = [[InterCallSessionCoordinator alloc] init];
@@ -55,10 +58,36 @@
 }
 
 - (void)preflightMediaPermissions {
+    dispatch_group_t permissionGroup = dispatch_group_create();
+
+    dispatch_group_enter(permissionGroup);
     [InterLocalMediaController preflightCapturePermissionsWithCompletion:^(__unused AVAuthorizationStatus videoStatus,
                                                                            __unused AVAuthorizationStatus audioStatus) {
-        // Intentionally no UI interruption here. Call flows already handle denied states.
+        dispatch_group_leave(permissionGroup);
     }];
+
+    dispatch_group_enter(permissionGroup);
+    dispatch_async(dispatch_get_main_queue(), ^{
+        NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+        BOOL hasAccess = [InterScreenCaptureVideoSource preflightScreenCaptureAccess];
+        if (hasAccess) {
+            [defaults setBool:YES forKey:InterScreenCaptureStartupPromptedKey];
+            dispatch_group_leave(permissionGroup);
+            return;
+        }
+
+        BOOL hasPromptedBefore = [defaults boolForKey:InterScreenCaptureStartupPromptedKey];
+        if (!hasPromptedBefore) {
+            [InterScreenCaptureVideoSource requestScreenCaptureAccessIfNeeded];
+            [defaults setBool:YES forKey:InterScreenCaptureStartupPromptedKey];
+        }
+
+        dispatch_group_leave(permissionGroup);
+    });
+
+    dispatch_group_notify(permissionGroup, dispatch_get_main_queue(), ^{
+        // Intentionally no UI interruption here. Call flows already handle denied states.
+    });
 }
 
 #pragma mark - Mode Actions
@@ -302,7 +331,7 @@
     [self.normalControlPanel setMicrophoneEnabled:self.normalMediaController.isMicrophoneEnabled];
     [self.normalControlPanel setSharingEnabled:self.normalSurfaceShareController.isSharing];
 
-    [self.normalControlPanel setShareStatusText:@"Secure surface share is off. Window and full-screen sharing will be enabled in the next ScreenCaptureKit phase."];
+    [self.normalControlPanel setShareStatusText:@"Secure surface share is off. Select a source to begin."];
 
     [self.normalCallWindow makeKeyAndOrderFront:nil];
 }
@@ -331,8 +360,8 @@
     [self.normalControlPanel setPanelTitleText:@"Normal Call Controls"];
     [self.normalControlPanel setShareModeSelectorHidden:NO];
     [self.normalControlPanel setShareMode:InterShareModeThisApp];
-    [self.normalControlPanel setShareModeOptionEnabled:NO forMode:InterShareModeWindow];
-    [self.normalControlPanel setShareModeOptionEnabled:NO forMode:InterShareModeEntireScreen];
+    [self.normalControlPanel setShareModeOptionEnabled:YES forMode:InterShareModeWindow];
+    [self.normalControlPanel setShareModeOptionEnabled:YES forMode:InterShareModeEntireScreen];
     [view addSubview:self.normalControlPanel];
 
     __weak typeof(self) weakSelf = self;
@@ -392,7 +421,7 @@
 
 - (void)handleNormalShareModeChanged:(InterShareMode)shareMode {
     if (self.normalSurfaceShareController.isSharing) {
-        [self.normalControlPanel setShareMode:InterShareModeThisApp];
+        [self.normalControlPanel setShareMode:self.normalSurfaceShareController.configuration.shareMode];
         [self.normalControlPanel setShareStatusText:@"Stop sharing before changing source mode."];
         return;
     }
@@ -406,7 +435,12 @@
         return;
     }
 
-    [self.normalControlPanel setShareStatusText:@"Window and full-screen sharing will be enabled in the next ScreenCaptureKit phase."];
+    if (shareMode == InterShareModeWindow) {
+        [self.normalControlPanel setShareStatusText:@"Share Window is ready."];
+        return;
+    }
+
+    [self.normalControlPanel setShareStatusText:@"Share Entire Screen is ready."];
 }
 
 - (NSString *)normalMediaStateSummary {
@@ -447,12 +481,6 @@
 
 - (void)toggleNormalSurfaceShare {
     if (!self.normalRenderView) {
-        return;
-    }
-
-    if (self.normalControlPanel.selectedShareMode != InterShareModeThisApp) {
-        [self.normalControlPanel setSharingEnabled:NO];
-        [self.normalControlPanel setShareStatusText:@"Window and full-screen sharing will be enabled in the next ScreenCaptureKit phase."];
         return;
     }
 

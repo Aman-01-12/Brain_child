@@ -128,7 +128,7 @@
         CMTime pts = frame.presentationTime;
         if (self->_hasLastVideoPTS && CMTIME_COMPARE_INLINE(pts, <=, self->_lastVideoPTS)) {
             self->_droppedOutOfOrderVideoFrameCount += 1;
-            return;
+            pts = CMTimeAdd(self->_lastVideoPTS, CMTimeMake(1, 1000));
         }
 
         if (!self->_assetWriter) {
@@ -190,8 +190,7 @@
 
         if (self->_hasLastAudioPTS && CMTIME_COMPARE_INLINE(pts, <=, self->_lastAudioPTS)) {
             self->_droppedOutOfOrderAudioSampleCount += 1;
-            CFRelease(sampleBuffer);
-            return;
+            pts = CMTimeAdd(self->_lastAudioPTS, CMTimeMake(1, 1000));
         }
 
         if (!self->_audioInput.readyForMoreMediaData) {
@@ -199,12 +198,33 @@
             return;
         }
 
-        BOOL appended = [self->_audioInput appendSampleBuffer:sampleBuffer];
+        CMSampleBufferRef monotonicSampleBuffer = sampleBuffer;
+        if (self->_hasLastAudioPTS && CMTIME_COMPARE_INLINE(pts, >, CMSampleBufferGetPresentationTimeStamp(sampleBuffer))) {
+            CMSampleTimingInfo timingInfo;
+            timingInfo.duration = CMSampleBufferGetDuration(sampleBuffer);
+            timingInfo.decodeTimeStamp = CMSampleBufferGetDecodeTimeStamp(sampleBuffer);
+            timingInfo.presentationTimeStamp = pts;
+
+            CMSampleBufferRef retimedBuffer = NULL;
+            OSStatus status = CMSampleBufferCreateCopyWithNewTiming(kCFAllocatorDefault,
+                                                                     sampleBuffer,
+                                                                     1,
+                                                                     &timingInfo,
+                                                                     &retimedBuffer);
+            if (status == noErr && retimedBuffer != NULL) {
+                monotonicSampleBuffer = retimedBuffer;
+            }
+        }
+
+        BOOL appended = [self->_audioInput appendSampleBuffer:monotonicSampleBuffer];
         if (appended) {
             self->_lastAudioPTS = pts;
             self->_hasLastAudioPTS = YES;
         }
 
+        if (monotonicSampleBuffer != sampleBuffer) {
+            CFRelease(monotonicSampleBuffer);
+        }
         CFRelease(sampleBuffer);
     });
 }

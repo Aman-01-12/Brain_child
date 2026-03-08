@@ -16,6 +16,7 @@
     id<InterShareVideoSource> _videoSource;
     NSArray<id<InterShareSink>> *_sinks;
     uint64_t _routingGeneration;
+    uint64_t _activeStatusGeneration;
 }
 
 - (instancetype)init {
@@ -30,6 +31,7 @@
     _configuration = [InterShareSessionConfiguration defaultConfiguration];
     _sinks = @[];
     _routingGeneration = 0;
+    _activeStatusGeneration = 0;
     return self;
 }
 
@@ -44,7 +46,7 @@
 }
 
 - (void)startSharingFromSurfaceView:(MetalSurfaceView *)surfaceView {
-    if (!surfaceView || self.isSharing) {
+    if (self.isSharing) {
         return;
     }
 
@@ -54,11 +56,6 @@
     configuration.shareMode != InterShareModeThisApp;
     if (invalidInterviewMode) {
         [self emitStatusText:@"Interview mode only supports Share This App."];
-        return;
-    }
-
-    if (configuration.shareMode != InterShareModeThisApp) {
-        [self emitStatusText:@"Window and full-screen sharing will be enabled in the next ScreenCaptureKit phase."];
         return;
     }
 
@@ -80,6 +77,7 @@
         self.sharing = YES;
         _routingGeneration += 1;
         generation = _routingGeneration;
+        _activeStatusGeneration = 0;
         _videoSource = videoSource;
         _sinks = sinks;
     }
@@ -90,7 +88,12 @@
     };
 
     videoSource.errorHandler = ^(NSError *error) {
+        if (!weakSelf || ![weakSelf isGenerationActive:generation]) {
+            return;
+        }
+
         NSString *status = error.localizedDescription ?: @"Sharing source failed.";
+        [weakSelf teardownSharingResourcesEmitStatus:NO];
         [weakSelf emitStatusText:status];
     };
 
@@ -105,14 +108,18 @@
         }];
     }
 
-    [videoSource start];
-
-    if (!videoSource.isRunning) {
-        [self teardownSharingResourcesEmitStatus:NO];
-        return;
+    if ([videoSource isKindOfClass:[InterScreenCaptureVideoSource class]]) {
+        InterScreenCaptureVideoSource *screenSource = (InterScreenCaptureVideoSource *)videoSource;
+        if (configuration.shareMode == InterShareModeWindow) {
+            [screenSource startCaptureForSelectedWindow];
+        } else {
+            [screenSource startCaptureForSelectedDisplay];
+        }
+    } else {
+        [videoSource start];
     }
 
-    [self emitStatusText:[self activeStatusTextForConfiguration:configuration]];
+    [self emitStatusText:[self startingStatusTextForConfiguration:configuration]];
 }
 
 - (void)stopSharingFromSurfaceView:(MetalSurfaceView *)surfaceView {
@@ -181,6 +188,19 @@
             return;
         }
 
+        BOOL shouldEmitActiveStatus = NO;
+        InterShareSessionConfiguration *configurationSnapshot = nil;
+        @synchronized(self) {
+            if (_activeStatusGeneration != generation) {
+                _activeStatusGeneration = generation;
+                shouldEmitActiveStatus = YES;
+                configurationSnapshot = [self.configuration copy];
+            }
+        }
+        if (shouldEmitActiveStatus && configurationSnapshot) {
+            [self emitStatusText:[self activeStatusTextForConfiguration:configurationSnapshot]];
+        }
+
         NSArray<id<InterShareSink>> *sinks = [self currentSinksSnapshot];
         for (id<InterShareSink> sink in sinks) {
             [sink appendVideoFrame:frame];
@@ -212,6 +232,7 @@
 
         self.sharing = NO;
         _routingGeneration += 1;
+        _activeStatusGeneration = 0;
 
         videoSource = _videoSource;
         sinks = [_sinks copy];
@@ -249,15 +270,35 @@
 }
 
 - (NSString *)activeStatusTextForConfiguration:(InterShareSessionConfiguration *)configuration {
-    if (configuration.shareMode != InterShareModeThisApp) {
-        return @"Window and full-screen sharing will be enabled in the next ScreenCaptureKit phase.";
-    }
-
+    NSString *sourceLabel = [self sourceLabelForShareMode:configuration.shareMode];
     if (configuration.isRecordingEnabled) {
-        return @"Secure surface share is active. Recording setup in progress.";
+        return [NSString stringWithFormat:@"%@ share is active. Recording destination is ready.",
+                                          sourceLabel];
     }
 
-    return @"Secure surface share is active.";
+    return [NSString stringWithFormat:@"%@ share is active.", sourceLabel];
+}
+
+- (NSString *)startingStatusTextForConfiguration:(InterShareSessionConfiguration *)configuration {
+    NSString *sourceLabel = [self sourceLabelForShareMode:configuration.shareMode];
+    if (configuration.isRecordingEnabled) {
+        return [NSString stringWithFormat:@"Starting %@ share. Recording destination is being prepared.",
+                                          sourceLabel.lowercaseString];
+    }
+
+    return [NSString stringWithFormat:@"Starting %@ share.", sourceLabel.lowercaseString];
+}
+
+- (NSString *)sourceLabelForShareMode:(InterShareMode)shareMode {
+    switch (shareMode) {
+        case InterShareModeWindow:
+            return @"Window";
+        case InterShareModeEntireScreen:
+            return @"Entire Screen";
+        case InterShareModeThisApp:
+        default:
+            return @"This App";
+    }
 }
 
 - (void)emitStatusText:(NSString *)text {

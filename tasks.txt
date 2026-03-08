@@ -1,0 +1,615 @@
+# LiveKit Integration — Implementation Plan
+
+> **Status**: Phase 0 complete. Phase 1 complete. Phase 2 next.  
+> **Last updated**: 3 March 2026  
+> **Tracking**: Changes logged in `work_done.md`
+
+---
+
+## Table of Contents
+
+- [Architectural Decisions](#architectural-decisions)
+- [Phase 0 — Infrastructure & Dependencies](#phase-0-infrastructure--dependencies)
+- [Phase 1 — Networking Layer (New Files)](#phase-1-networking-layer--new-files)
+- [Phase 2 — Modifications to Existing Files](#phase-2-modifications-to-existing-files)
+- [Phase 3 — UI Layer](#phase-3-ui-layer)
+- [Phase 4 — Production Hardening](#phase-4-production-hardening)
+- [Phase 5 — Production Deployment](#phase-5-production-deployment)
+- [Build Order & Critical Path](#build-order--critical-path)
+
+---
+
+## Architectural Decisions
+
+These were resolved before the plan was written. They inform every step below.
+
+### Decision 1: Audio — Single-Source Fan-Out [G1]
+
+**Problem**: LiveKit's Swift SDK uses `AVAudioEngine` for mic capture. The app already uses `AVCaptureAudioDataOutput`. Running both on the same mic can cause conflicts on some hardware.
+
+**Resolution**: Audio captured ONCE via existing `AVCaptureAudioDataOutput`. Raw `CMSampleBuffer`s fanned out to two consumers:
+- `InterRecordingSink` (existing, disk)
+- `InterLiveKitAudioBridge` (new, network — converts CMSampleBuffer → AVAudioPCMBuffer → LiveKit AudioCapturer)
+
+LiveKit's built-in `LocalAudioTrack.createTrack()` is NOT used. Custom `AudioCapturer` replaces it.
+
+### Decision 2: Camera — Add AVCaptureVideoDataOutput
+
+**Problem**: `InterLocalMediaController` has no `AVCaptureVideoDataOutput`. LiveKit needs raw frames.
+
+**Resolution**: Add `AVCaptureVideoDataOutput` to the existing `AVCaptureSession`. Zero-copy — CVPixelBuffer passed by reference. Do NOT use LiveKit's `CameraCapturer` (creates duplicate session).
+
+### Decision 3: Swift / Objective-C Bridging
+
+**Problem**: Codebase is Objective-C. LiveKit SDK is Swift.
+
+**Resolution**: New networking files in Swift with `@objc` annotations. Bridging header imports ObjC headers. ObjC side imports `inter-Swift.h`.
+
+### Decision 4: Entitlement Gap
+
+**Problem**: Sandbox has no network entitlement. WebRTC needs TCP + UDP.
+
+**Resolution**: Add `com.apple.security.network.client = YES`.
+
+### Decision 5: Camera/Mic Toggle Ordering [G2]
+
+**Problem**: `setCameraEnabled:NO` stops the capture device. LiveKit mute is a separate signal. Order matters to avoid black/frozen frames on remote side.
+
+**Resolution**: Two-phase toggle with state machine (`active → muting → muted → enabling → active`):
+- **Disable**: Mute LiveKit track FIRST → then stop capture device.
+- **Enable**: Start capture device FIRST → wait for first real frame → then unmute LiveKit track.
+
+### Decision 6: Subscriber Pixel Format [G3]
+
+**Problem**: LiveKit/WebRTC decoder outputs NV12 (YUV). Can't render as BGRA.
+
+**Resolution**: Dedicated Metal shader in `InterRemoteVideoView`. YUV→RGB via BT.709 matrix. Zero-copy via `CVMetalTextureCache`. Format detection supports NV12, full-range NV12, and BGRA fallback.
+
+### Decision 7: Mode Transitions [G4]
+
+**Problem**: Normal↔Interview mode switches destroy and recreate all media controllers. What happens to the LiveKit room?
+
+**Resolution**: Room persists across mode transitions (owned by AppDelegate). Publishers are unpublished and rebuilt. Subscribers stay active. No reconnect delay. `transitionMode()` API on `InterRoomController`.
+
+### Decision 8: Router Queue Bottleneck [G5]
+
+**Problem**: `InterSurfaceShareController` routes frames to sinks sequentially on a serial queue. A blocking sink delays all others.
+
+**Resolution**: All sinks MUST return from `appendVideoFrame:` in < 1ms. Each sink dispatches heavy work internally to its own private queue. Debug assertion enforces this in DEBUG builds.
+
+### Decision 9: Participant Presence [G6]
+
+**Problem**: No "waiting for participant" UI state.
+
+**Resolution**: `InterParticipantPresenceState` enum (`.alone`, `.participantJoined`, `.participantLeft`). 3-second grace period before showing "left" (avoids flicker during reconnections). KVO-driven UI updates.
+
+### Decision 10: Room Discovery [G7]
+
+**Problem**: How does Participant B know which room to join?
+
+**Resolution**: Host-generated 6-char room codes. Token server has `/room/create` and `/room/join` endpoints. Codes expire in 24h. Non-guessable (30^6 = 729M). Redis-backed in production.
+
+### Decision 11: Local Pipeline Isolation [G8]
+
+**Problem**: Network failures must never affect local camera, mic, or recording.
+
+**Resolution**: Architectural invariant — the entire `Networking/` layer is side-effect-free and failure-tolerant. All network errors are swallowed with logging. If `_roomController` is nil, the app functions identically to its current state. CI test enforces this.
+
+### Decision 12: Logging & Diagnostics [G9]
+
+**Problem**: No observability for network events, quality metrics, or debugging.
+
+**Resolution**: `os_log`-based structured logging (zero-cost when not observed). Periodic WebRTC stats collection (10s intervals, 1h circular buffer). On-demand diagnostic snapshot (JSON) for support.
+
+---
+
+## Phase 0: Infrastructure & Dependencies
+
+### 0.1 — LiveKit Server (Local Dev)
+
+- [x] 0.1.1 — Install via `brew install livekit` or Docker
+- [x] 0.1.2 — Generate dev keys: `livekit-server generate-keys`
+- [x] 0.1.3 — Create `livekit.yaml`: single-node, dev mode, WS on `ws://localhost:7880`
+- [x] 0.1.4 — Configure `use_ice_lite: true` in `livekit.yaml`. Required because the macOS app runs in App Sandbox — mDNS ICE candidates may be blocked without ICE Lite. Add TURN server credentials (coturn or LiveKit's built-in TURN) for firewall/NAT fallback
+- [x] 0.1.5 — Run and verify: `livekit-server --config livekit.yaml --dev` + `curl http://localhost:7880`
+- [x] 0.1.6 — Validate: connect from **sandboxed** macOS app (or LiveKit Meet browser) through ICE Lite, confirm bidirectional video works without mDNS
+
+### 0.2 — Token Server [G7]
+
+- [x] 0.2.1 — Minimal Node.js or Go service (~130 lines), 3 endpoints
+- [x] 0.2.2 — `POST /room/create`: generate 6-char room code, sign JWT, return `{ roomCode, token }`
+- [x] 0.2.3 — `POST /room/join`: validate code, sign JWT, return `{ token }`. 404/410 on invalid/expired
+- [x] 0.2.4 — `POST /token/refresh`: issue fresh JWT for already-joined participant
+- [x] 0.2.5 — NEVER embed API secret in client binary
+- [x] 0.2.6 — Rate limit: 10 req/min per identity. Localhost in dev, HTTPS in prod
+- [x] 0.2.7 — [G9] Audit logging: room creates/joins. Never log tokens
+- [x] 0.2.8 — Validate: curl create → curl join → decode JWTs
+
+### 0.3 — Xcode Project Setup
+
+- [x] 0.3.1 — Add LiveKit Swift SDK via SPM (pin exact release tag, e.g. `2.0.x`). **Before proceeding to Phase 1.4**, verify the SDK exposes `BufferCapturer` (or `AudioCustomProcessingDelegate`) for custom audio injection — this is the plan's most fragile API dependency
+- [x] 0.3.2 — Create `inter/Bridging-Header.h` with ObjC imports. Set build setting
+- [x] 0.3.3 — Pin `SWIFT_VERSION = 5` in target build settings (or set `SWIFT_STRICT_CONCURRENCY = minimal`). Without this, Xcode 26.1.1 defaults to Swift 6 strict concurrency — LiveKit SDK import will trigger Sendable/actor-isolation errors
+- [x] 0.3.4 — Verify `inter-Swift.h` is importable from ObjC
+- [x] 0.3.5 — Add `com.apple.security.network.client = YES` to `inter.entitlements`
+- [x] 0.3.6 — Validate: clean build succeeds, `import LiveKit` compiles, entitlement present, no Swift concurrency errors
+
+---
+
+## Phase 1: Networking Layer — New Files
+
+### File Map (`inter/Networking/`)
+
+```
+Networking/
+├── InterNetworkTypes.swift              — 1.1
+├── InterLogSubsystem.swift              — 1.2 [G9]
+├── InterTokenService.swift              — 1.3
+├── InterLiveKitAudioBridge.swift        — 1.4 [G1]
+├── InterLiveKitCameraSource.swift       — 1.5
+├── InterLiveKitScreenShareSource.swift  — 1.6
+├── InterLiveKitPublisher.swift          — 1.7
+├── InterLiveKitSubscriber.swift         — 1.8
+├── InterRoomController.swift            — 1.9
+├── InterCallStatsCollector.swift        — 1.10 [G9]
+└── InterRemoteVideoView.swift           — 1.11 [G3] (in Rendering/)
+```
+
+### 1.1 — `InterNetworkTypes.swift`
+
+- [x] 1.1.1 — `@objc enum InterRoomConnectionState: Int` — disconnected, connecting, connected, reconnecting, disconnectedWithError
+- [x] 1.1.2 — `@objc enum InterTrackKind: Int` — camera, microphone, screenShare
+- [x] 1.1.3 — [G6] `@objc enum InterParticipantPresenceState: Int` — alone, participantJoined, participantLeft
+- [x] 1.1.4 — [G2] `enum InterCameraNetworkState` (Swift-only) — active, muting, muted, enabling. Valid transitions: active→muting→muted→enabling→active
+- [x] 1.1.5 — `@objc class InterRoomConfiguration: NSObject, NSCopying` — serverURL, tokenServerURL, roomCode [G7], participantIdentity, participantName, isHost [G7]
+- [x] 1.1.6 — `InterNetworkErrorDomain` with codes: tokenFetchFailed, connectionFailed, publishFailed, subscribeFailed, tokenExpired, serverUnreachable, roomCodeInvalid [G7], roomCodeExpired [G7]
+- [x] 1.1.7 — [G8] Top-of-file isolation invariant comment
+
+### 1.2 — `InterLogSubsystem.swift` [G9]
+
+- [x] 1.2.1 — OSLog categories: `.networking`, `.media`, `.room`
+- [x] 1.2.2 — Privacy: non-PII → `%{public}@`, PII → `%{private}@`
+- [x] 1.2.3 — Zero runtime cost when not observed
+
+### 1.3 — `InterTokenService.swift`
+
+- [x] 1.3.1 — `@objc class InterTokenService: NSObject`
+- [x] 1.3.2 — [G7] `createRoom(serverURL:, identity:, displayName:, completion:)` → POST /room/create
+- [x] 1.3.3 — [G7] `joinRoom(serverURL:, roomCode:, identity:, displayName:, completion:)` → POST /room/join (404/410 handling)
+- [x] 1.3.4 — `refreshToken(serverURL:, roomCode:, identity:, completion:)` → POST /token/refresh
+- [x] 1.3.5 — URLSession-based. 10s timeout. 1 retry on 5xx/timeout. No retry on 4xx
+- [x] 1.3.6 — Token caching: return cached if >60s remaining
+- [x] 1.3.7 — Completion on main queue
+- [x] 1.3.8 — [G9] Log fetch attempts, success (TTL), failure (status). Never log token
+- [x] 1.3.9 — Unit tests: happy path, 401, 404, 410, 500, timeout, malformed JSON
+
+### 1.4 — `InterLiveKitAudioBridge.swift` [G1]
+
+- [x] 1.4.1 — `@objc class InterLiveKitAudioBridge: NSObject` conforming to `InterShareSink`
+- [x] 1.4.2 — Owns `LocalAudioTrack` + custom `AudioCapturer` (NOT SDK default mic)
+- [x] 1.4.3 — `appendAudioSampleBuffer:` receives CMSampleBufferRef from router queue
+- [x] 1.4.4 — Conversion: CMSampleBuffer → AudioBufferList → AVAudioFormat → AVAudioPCMBuffer → capturer.capture()
+- [x] 1.4.5 — AudioCaptureOptions: echoCancellation=false, noiseSuppression=false, autoGainControl=false
+- [x] 1.4.6 — `appendVideoFrame:` — no-op
+- [x] 1.4.7 — `stopWithCompletion:` — unpublish track, nil capturer
+- [x] 1.4.8 — [G5] Non-blocking: CFRetain + dispatch_async, returns in <500ns
+- [x] 1.4.9 — [G8] All errors swallowed with os_log. Never propagate
+- [x] 1.4.10 — [G2] pendingUnmuteCallback: first CMSampleBuffer after re-enable triggers unmute
+- [x] 1.4.11 — Memory: ~23 KB total (3 × 7.7 KB PCM buffers)
+- [x] 1.4.12 — Tests: conversion correctness, nil buffer safety, <500ns return time
+
+### 1.5 — `InterLiveKitCameraSource.swift`
+
+- [x] 1.5.1 — `AVCaptureVideoDataOutputSampleBufferDelegate`
+- [x] 1.5.2 — Owns `LocalVideoTrack` + `VideoCapturer`
+- [x] 1.5.3 — `start(captureSession:, sessionQueue:)`: add AVCaptureVideoDataOutput with `alwaysDiscardsLateVideoFrames=true`, dedicated serial queue `inter.camera.livekit.encode`. **Set explicit `videoSettings`** to force pixel format (e.g. `kCVPixelFormatType_32BGRA`) — prevents AVFoundation from renegotiating the session format when the output is added alongside the existing AVCaptureVideoPreviewLayer. Add on sessionQueue inside `beginConfiguration`/`commitConfiguration`
+- [x] 1.5.4 — `stop(captureSession:, sessionQueue:)`: remove output on sessionQueue
+- [x] 1.5.5 — `captureOutput`: extract CVPixelBuffer → `capturer.capture()`. Zero-copy
+- [x] 1.5.6 — `captureOutput:didDrop`: log. No panic
+- [x] 1.5.7 — 1280×720 from session preset. Simulcast 3 layers auto
+- [x] 1.5.8 — [G2] pendingUnmuteCallback on first frame after re-enable
+- [x] 1.5.9 — [G8] capturer failures caught and logged. Never propagate
+- [x] 1.5.10 — Memory: ~28 MB (8 buffers × 1280×720×4)
+- [x] 1.5.11 — Tests: frame flow, no dropped frames normally, no allocation growth
+
+### 1.6 — `InterLiveKitScreenShareSource.swift`
+
+- [x] 1.6.1 — `@objc class InterLiveKitScreenShareSource: NSObject, InterShareSink`
+- [x] 1.6.2 — Owns `LocalVideoTrack` + `VideoCapturer` with `source: .screenShareVideo`
+- [x] 1.6.3 — Private encoderQueue (serial, .userInitiated)
+- [x] 1.6.4 — Publish with `VideoEncoding(maxBitrate: 2_500_000, maxFps: 15)`, simulcast off
+- [x] 1.6.5 — [G5] `appendVideoFrame:` fast path: guard active, throttle check (66ms/15FPS), CVPixelBufferRetain + dispatch_async → return <200ns
+- [x] 1.6.6 — `appendAudioSampleBuffer:` — no-op (future: system audio)
+- [x] 1.6.7 — Resolution cap: if >1920 or >1080, downscale via `vImageScale_ARGB8888`. Prevents 280 MB explosion at 5K
+- [x] 1.6.8 — `stopWithCompletion:` — active=false, drain encoder queue, unpublish, nil, completion
+- [x] 1.6.9 — [G8] Errors caught and logged. Increment droppedFrameCount
+- [x] 1.6.10 — [G9] Log: published, stopped, frames sent, frames dropped, avg FPS
+- [x] 1.6.11 — Memory: 40 MB max (1920×1080×4 × 5 encoder slots)
+- [x] 1.6.12 — Tests: frame flow, ≤15 FPS, Instruments <60 MB
+
+### 1.7 — `InterLiveKitPublisher.swift`
+
+- [x] 1.7.1 — `@objc class InterLiveKitPublisher: NSObject`
+- [x] 1.7.2 — [G2] Internal cameraNetworkState + micNetworkState state machines
+- [x] 1.7.3 — `publishCamera(captureSession:, sessionQueue:)` → create source, start, publish H264 720p simulcast
+- [x] 1.7.4 — `unpublishCamera()` → unpublish, stop, nil
+- [x] 1.7.5 — [G2] `muteCameraTrack(_:localMediaController:completion:)` — two-phase toggle (mute→stop or start→wait-first-frame→unmute). Rapid toggle queued
+- [x] 1.7.6 — `publishMicrophone()` → create InterLiveKitAudioBridge, start
+- [x] 1.7.7 — [G2] `muteMicrophoneTrack(_:localMediaController:completion:)` — same two-phase pattern
+- [x] 1.7.8 — `createScreenShareSink()` → factory, returns InterLiveKitScreenShareSource
+- [x] 1.7.9 — `unpublishAll(completion:)` → iterate and unpublish. Called by disconnect + transitionMode
+- [x] 1.7.10 — [G4] `detachAllSources()` → nil references without unpublishing (used during mode transition)
+- [x] 1.7.11 — [G9] Log every publish, unpublish, mute, unmute
+- [x] 1.7.12 — Memory: 3 track references max. Deterministic cleanup
+- [x] 1.7.13 — Tests: publish→verify, mute→verify, rapid toggle x10→no crash
+
+### 1.8 — `InterLiveKitSubscriber.swift`
+
+- [x] 1.8.1 — `@objc class InterLiveKitSubscriber: NSObject`
+- [x] 1.8.2 — RoomDelegate: didSubscribe / didUnsubscribe track callbacks
+- [x] 1.8.3 — VideoRenderer per video track → decoded CVPixelBuffer frames
+- [x] 1.8.4 — [G3] Format detection: check CVPixelBufferGetPixelFormatType on first frame. Store format flag
+- [x] 1.8.5 — Track ID via track.source (.camera / .screenShareVideo) → route to correct InterRemoteVideoView
+- [x] 1.8.6 — InterRemoteTrackRenderer protocol: didReceiveRemoteCameraFrame, didReceiveRemoteScreenShareFrame, remoteTrackDidMute/Unmute/End
+- [x] 1.8.7 — Remote audio: automatic via LiveKit AVAudioEngine. No custom work
+- [x] 1.8.8 — Adaptive quality: .high for primary, .low for thumbnails
+- [x] 1.8.9 — Single-slot atomic buffer (os_unfair_lock). Latest-frame-wins. Never queue
+- [x] 1.8.10 — [G9] Log: subscribed (kind, identity, codec), unsubscribed, quality changes
+- [x] 1.8.11 — Memory: ~8 MB (6 frames × 720p NV12)
+- [x] 1.8.12 — Tests: dual track receive, no frame leaks, quality switching
+
+### 1.9 — `InterRoomController.swift`
+
+- [x] 1.9.1 — `@objc class InterRoomController: NSObject`. Owns LiveKit.Room
+- [x] 1.9.2 — `@objc dynamic var connectionState: InterRoomConnectionState` (KVO). Private serial queue for transitions
+- [x] 1.9.3 — [G6] `@objc dynamic var participantPresenceState` + `remoteParticipantCount`
+- [x] 1.9.4 — [G7] `@objc dynamic var roomCode: String`
+- [x] 1.9.5 — Owns: publisher, subscriber, tokenService, statsCollector
+- [x] 1.9.6 — `connect(configuration:, completion:)`: if host → createRoom, if joiner → joinRoom. Then room.connect(). State transitions
+- [x] 1.9.7 — `disconnect()`: unpublishAll, stop stats, room.disconnect, nil publisher/subscriber, reset presence
+- [x] 1.9.8 — [G4] `transitionMode(completion:)`: unpublishAll → detachAllSources → subscriber stays active → completion on main queue
+- [x] 1.9.9 — RoomDelegate connection events: state mapping, disconnect handling, token expiry auto-refresh
+- [x] 1.9.10 — [G6] RoomDelegate participant events: join → increment + .participantJoined. Leave → decrement, 3s grace timer before .participantLeft
+- [x] 1.9.11 — Reconnection: observe .reconnecting, surface to UI. SDK exhausts retries → disconnectedWithError
+- [x] 1.9.12 — [G8] Owned by AppDelegate. Outlives call modes. Passed by reference to SecureWindowController. If nil → local-only
+- [x] 1.9.13 — [G9] Log: connect, connected (latencyMs), disconnected (reason, duration), reconnecting, participant events, token refresh, quality
+- [x] 1.9.14 — Thread safety: private serial queue, [weak self] everywhere, no retain cycles
+- [x] 1.9.15 — Tests: full lifecycle, double-connect, disconnect-during-connect, mode transition, token refresh
+
+### 1.10 — `InterCallStatsCollector.swift` [G9]
+
+- [x] 1.10.1 — Owned by InterRoomController. Created on connect, destroyed on disconnect
+- [x] 1.10.2 — 10s timer → getStats() on local + remote participants
+- [x] 1.10.3 — Circular buffer: 360 entries (1 hour). Fields: timestamp, bitrates, RTT, packetLoss, FPS, jitter, quality
+- [x] 1.10.4 — Memory: 36 KB
+- [ ] 1.10.5 — On disconnect: optionally write JSON to file
+- [x] 1.10.6 — `captureDiagnosticSnapshot() → String`: room state, tracks, last 10 stats, memory, CPU, network interface
+
+### 1.11 — `InterRemoteVideoView.swift` [G3]
+
+- [x] 1.11.1 — `@objc class InterRemoteVideoView: NSView` with CAMetalLayer
+- [x] 1.11.2 — Reuses MetalRenderEngine.sharedEngine.device + commandQueue
+- [x] 1.11.3 — CVMetalTextureCache created once on init
+- [x] 1.11.4 — CVDisplayLink render loop (semaphore=2)
+- [x] 1.11.5 — Two inline MSL pipeline states:
+  - **NV12**: fullscreen triangle vertex, fragment samples Y (r8Unorm plane 0) + CbCr (rg8Unorm plane 1), BT.709 matrix multiply
+  - **BGRA**: passthrough texture sample
+- [x] 1.11.6 — BT.709 video-range matrix: `[1.1644,0,1.7927,-0.9729; 1.1644,-0.2132,-0.5329,0.3015; 1.1644,2.1124,0,-1.1334; 0,0,0,1]`
+- [x] 1.11.7 — CVMetalTextureCacheCreateTextureFromImage: zero-copy (IOSurface shared GPU memory)
+- [x] 1.11.8 — Format detection on first frame: NV12 video-range, NV12 full-range, BGRA
+- [x] 1.11.9 — Aspect-fit via vertex uniforms
+- [x] 1.11.10 — `updateFrame(_ pixelBuffer:)` → os_unfair_lock single-slot (latest-frame-wins)
+- [x] 1.11.11 — No-frame: re-present previous. Never-set: render black
+- [x] 1.11.12 — Memory: 4–8 MB per view
+- [x] 1.11.13 — Tests: NV12 correct colors, BGRA correct, aspect-fit, no allocation growth
+
+---
+
+## Phase 2: Modifications to Existing Files
+
+> Proceed only after Phase 1 compiles cleanly.
+
+### 2.1 — `InterLocalMediaController.h/.m`
+
+- [ ] 2.1.1 — Expose: `@property (nonatomic, readonly) AVCaptureSession *captureSession;`
+- [ ] 2.1.2 — Expose: `@property (nonatomic, readonly) dispatch_queue_t sessionQueue;`
+- [ ] 2.1.3 — No other changes. Preview, mic, permissions all untouched
+- [ ] 2.1.4 — Documentation: "Callers MUST use sessionQueue. Callers MUST NOT call startRunning/stopRunning."
+
+### 2.2 — `InterShareTypes.h/.m`
+
+- [ ] 2.2.1 — Add: `@property (nonatomic, assign, getter=isNetworkPublishEnabled) BOOL networkPublishEnabled;`
+- [ ] 2.2.2 — Update `copyWithZone:` to copy it
+- [ ] 2.2.3 — Default: `networkPublishEnabled = NO`
+
+### 2.3 — `InterSurfaceShareController.h/.m`
+
+- [ ] 2.3.1 — Add: `@property (nonatomic, strong, nullable) id<InterShareSink> networkPublishSink;`
+- [ ] 2.3.2 — [G8] In `sinksForConfiguration:`: add networkPublishSink to array when non-nil
+- [ ] 2.3.3 — No routing logic changes. Sink array iteration is transparent
+- [ ] 2.3.4 — No teardown changes. dispatch_group already handles multiple sinks
+- [ ] 2.3.5 — [G5] Debug assertion in `routeVideoFrame:generation:`: assert <5ms total routing time
+
+### 2.4 — `inter.entitlements`
+
+- [ ] 2.4.1 — Add `<key>com.apple.security.network.client</key><true/>`
+
+### 2.5 — `AppDelegate.h/.m`
+
+- [ ] 2.5.1 — `#import "inter-Swift.h"`
+- [ ] 2.5.2 — Add ivar `InterRoomController *_roomController`. Create in `applicationDidFinishLaunching:`. [G8] If fails → log, continue
+- [ ] 2.5.3 — [G4] In `enterMode:role:`: if connected + mode switching → call `transitionMode(completion:)` before teardown
+- [ ] 2.5.4 — In `startNormalLocalMediaFlow`: if connected → publishCamera + wire sinks
+- [ ] 2.5.5 — Wire network sinks: set networkPublishSink on surface share controller
+- [ ] 2.5.6 — [G2] Toggle handlers: two-phase mute via publisher. [G8] Guarded by connection state check. Local toggle always proceeds
+- [ ] 2.5.7 — In `finalizeCurrentModeExit`: disconnect room. [G8] Guarded: skip if nil
+- [ ] 2.5.8 — [G6] KVO: observe connectionState + participantPresenceState → update UI
+- [ ] 2.5.9 — [G9] Log state transitions
+- [ ] 2.5.10 — [G8] Crash resilience: unexpected disconnect → show Reconnect / Continue offline
+
+### 2.6 — `SecureWindowController.h/.m`
+
+- [ ] 2.6.1 — Add weak property: `InterRoomController *roomController`
+- [ ] 2.6.2 — [G4] Same publisher wiring in `startLocalMediaFlow` as AppDelegate
+- [ ] 2.6.3 — Same two-phase toggles, same KVO
+- [ ] 2.6.4 — Interview: share mode locked to ThisApp. Network sink wired same way
+- [ ] 2.6.5 — In `destroySecureWindow`: do NOT disconnect room. Just nil sinks/sources
+
+### 2.7 — `MetalSurfaceView.h/.m`
+
+- [ ] 2.7.1 — **No modifications.** Remote rendering handled by InterRemoteVideoView
+
+---
+
+## Phase 3: UI Layer
+
+### 3.1 — Connection UI (Setup Panel)
+
+- [ ] 3.1.1 — Add fields: Server URL, Token Server URL, Display Name, Room Code [G7]
+- [ ] 3.1.2 — [G7] Host buttons (Start Call / Create Interview): generate room code → display prominently → connect
+- [ ] 3.1.3 — [G7] Join button: validate room code → connect. Handle 404 ("Invalid code") / 410 ("Expired")
+- [ ] 3.1.4 — Connection state indicator: green=connected, yellow=connecting, red=error
+
+### 3.2 — Remote Video Layout (Normal Mode)
+
+- [ ] 3.2.1 — Two InterRemoteVideoView instances: remoteCameraView + remoteScreenShareView. Initially hidden
+- [ ] 3.2.2 — Layout rules:
+  - Camera only: remote fills center-left, local bottom-right
+  - Camera + screen share: screen share 80%, camera PiP top-right (160×120)
+  - Screen share only: fills center
+  - Neither: local preview only
+- [ ] 3.2.3 — NSLayoutConstraint animations (200ms ease-in-out)
+- [ ] 3.2.4 — [G6] "Waiting for participant..." overlay when alone + connected
+- [ ] 3.2.5 — [G6] "Participant left." overlay with Wait / End Call buttons
+
+### 3.3 — Remote Video Layout (Secure Mode)
+
+- [ ] 3.3.1 — Same InterRemoteVideoView instances in SecureWindow
+- [ ] 3.3.2 — Security: inherits NSWindowSharingNone
+- [ ] 3.3.3 — [G6] Same waiting/left overlays
+
+### 3.4 — Call Controls Updates
+
+- [ ] 3.4.1 — Connection status label bound to InterRoomConnectionState
+- [ ] 3.4.2 — [G7] "Room Code: X7K29M" label (visible when host)
+- [ ] 3.4.3 — [G2] Toggle handlers use two-phase mute (no panel code change — block callbacks fire as before)
+- [ ] 3.4.4 — Network quality indicator: signal bars from connectionQuality
+- [ ] 3.4.5 — [G9] Hidden debug: triple-click status → copy diagnostic snapshot to clipboard
+
+---
+
+## Phase 4: Production Hardening
+
+### 4.1 — Error Handling Matrix
+
+| Error | Detection | Response | Local Impact |
+|-------|-----------|----------|-------------|
+| Token server unreachable | InterTokenService timeout | Alert + retry | None |
+| Invalid room code [G7] | 404 from /room/join | "Invalid code" alert | None |
+| Expired room code [G7] | 410 from /room/join | "Room expired" alert | None |
+| Token expired mid-call | RoomDelegate.tokenExpired | Auto-refresh | None |
+| WebSocket disconnect | RoomDelegate.didDisconnect | Auto-reconnect. Banner. 30s → manual retry | None |
+| ICE failure | didFailToConnect with ICE error | "Check firewall" alert | None |
+| Encoder failure | didFailToPublish | Log + "Publishing failed" | None |
+| Participant left | participantDidLeave | [G6] Remove views after 3s grace | None |
+| Audio bridge error [G1] | Exception in conversion | [G8] Swallowed. os_log | None |
+| Screen share error | capturer.capture() fails | [G8] Swallowed. Increment counter | None |
+| Memory pressure | DispatchSource memory pressure | Reduce screen share res. Switch to .low simulcast | None |
+| SDK crash | WebRTC assertion | [G8] Room disconnects. "Reconnect / Offline" dialog | None |
+
+### 4.2 — Memory Budget
+
+| Component | Max | Enforcement |
+|-----------|-----|-------------|
+| Camera publish | 30 MB | alwaysDiscardsLateVideoFrames |
+| Screen share publish | 60 MB | 1920×1080 cap + 15 FPS throttle |
+| Audio bridge [G1] | < 1 MB | 3 × 7.7 KB buffers |
+| Remote decode (per track) | 8 MB | Single-slot atomic buffer |
+| Remote render (per view) [G3] | 8 MB | 1 CVPixelBuffer + zero-copy textures |
+| Stats collector [G9] | < 1 MB | 360 × 100 bytes |
+| **Total network overhead** | **< 120 MB** | task_info() monitoring in debug |
+
+### 4.3 — Threading Rules
+
+| Queue | Owner | Rules |
+|-------|-------|-------|
+| `inter.camera.livekit.encode` | CameraSource | Never blocks. Drops late frames |
+| `inter.livekit.audio.bridge` [G1] | AudioBridge | Returns <500ns from router queue |
+| `inter.livekit.screenshare.encoder` | ScreenShareSource | Returns <200ns from router queue |
+| `secure.inter.media.surface.share.router` | SurfaceShareController | [G5] All sinks <1ms. Debug-asserted |
+| LiveKit signaling (internal) | SDK | Don't touch |
+| LiveKit WebRTC worker (internal) | SDK | Don't touch |
+| CVDisplayLink threads | Surface/Remote views | Never call LiveKit APIs |
+| `inter.room.state` | RoomController | All state transitions. Main queue delivery |
+| Main thread | AppKit/UI | Never block on network |
+
+Lock discipline: `os_unfair_lock` for frame buffers. `@synchronized` only where already used.
+
+### 4.4 — Bandwidth & Quality
+
+| Track | Codec | Bitrate | FPS | Simulcast |
+|-------|-------|---------|-----|-----------|
+| Camera | H.264 Baseline | 1.5 Mbps | 30 | 3 layers |
+| Screen share | H.264 High | 2.5 Mbps | 15 | Off |
+| Audio [G1] | Opus, DTX | ~32 Kbps / ~1 Kbps silent | — | — |
+
+### 4.5 — Security
+
+- [ ] 4.5.1 — WSS (TLS 1.3) in production
+- [ ] 4.5.2 — SRTP for media (automatic)
+- [ ] 4.5.3 — Optional: LiveKit E2EE (SFrame)
+- [ ] 4.5.4 — Token TTL 6h, auto-refresh at 80%, never log
+- [ ] 4.5.5 — API secret only on server
+- [ ] 4.5.6 — [G7] Room codes: non-guessable, 24h expiry, server-validated
+
+### 4.6 — Isolation Tests [G8]
+
+- [ ] 4.6.1 — Test: `_roomController = nil` → full flow → zero crashes, identical to current app
+- [ ] 4.6.2 — Test: force disconnect mid-call → local preview + recording continue
+- [ ] 4.6.3 — Run in CI every build
+
+### 4.7 — Full Test Suite
+
+- [ ] 4.7.1 — Unit: TokenService, RoomController state machine, throttle logic, audio conversion, [G2] mute state machine
+- [ ] 4.7.2 — Integration: 2 instances, bidirectional AV, mute propagation, screen share track, [G7] code flow, [G6] presence
+- [ ] 4.7.3 — [G3] Rendering: NV12 + BGRA pixel buffer → correct colors
+- [ ] 4.7.4 — Memory: 30-min call + screen share. Heap growth < 10 MB
+- [ ] 4.7.5 — Network: Link Conditioner — 5%/15%/30% loss, 300ms latency, 500 Kbps
+- [ ] 4.7.6 — [G4] Mode transition: Normal→Interview→Normal while connected
+- [ ] 4.7.7 — Stress: 4 participants. CPU < 50% M1. Memory < 400 MB
+
+---
+
+## Phase 5: Production Deployment
+
+### 5.1 — LiveKit Server
+
+- [ ] 5.1.1 — Cloud VM: 4 vCPU, 8 GB RAM minimum (<50 concurrent)
+- [ ] 5.1.2 — Reverse proxy (Caddy/nginx) for TLS on WebSocket
+- [ ] 5.1.3 — TURN server for corporate NATs (~15% users need it)
+- [ ] 5.1.4 — [G9] Prometheus → Grafana: rooms, tracks, bandwidth, CPU
+
+### 5.2 — Token Server
+
+- [ ] 5.2.1 — HTTPS + auth middleware
+- [ ] 5.2.2 — Rate limit: 10/min per identity
+- [ ] 5.2.3 — [G7] Redis for room code map (survives restart)
+- [ ] 5.2.4 — [G9] Audit log
+
+### 5.3 — App Distribution
+
+- [ ] 5.3.1 — Re-sign with updated entitlements. Full sandbox test
+- [ ] 5.3.2 — Size: +15–20 MB (LiveKit + WebRTC framework)
+- [ ] 5.3.3 — Min macOS: 13+ (already required by ScreenCaptureKit)
+
+---
+
+## Build Order & Critical Path
+
+```
+                    PHASE 0 (Infrastructure)
+                    0.3 Xcode/SPM → 0.1 LiveKit Server → 0.2 Token Server
+                            │
+            ┌───────────────┴──────────────────┐
+            ▼                                  ▼
+     PUBLISH PATH                        SUBSCRIBE PATH
+            │                                  │
+      1.1 Types                          1.1 Types (shared)
+      1.2 Logging [G9]                   1.2 Logging [G9] (shared)
+            │                                  │
+      1.3 Token Service                  1.11 Remote Video View [G3]
+            │                                  │
+      1.4 Audio Bridge [G1]             1.8 Subscriber
+      1.5 Camera Source                        │
+            │                            ─── merge point ───
+      1.6 Screen Share Source                  │
+            │                            1.9 Room Controller
+      1.7 Publisher [G2]                       │
+            │                            1.10 Stats Collector [G9]
+            └──────────┬───────────────────────┘
+                       │
+                 PHASE 2 (Existing file mods)
+                 2.1 InterLocalMediaController (+2 properties)
+                 2.2 InterShareTypes (+1 property)
+                 2.3 InterSurfaceShareController (+1 property, +debug assert)
+                 2.4 Entitlements (+1 line)
+                 2.5 AppDelegate (imports, wiring, toggles, KVO)
+                 2.6 SecureWindowController (same pattern)
+                       │
+                 PHASE 3 (UI)
+                 3.1 Connection UI + Room Code [G7]
+                 3.2 Remote Layout (Normal) + Waiting [G6]
+                 3.3 Remote Layout (Secure) + Waiting [G6]
+                 3.4 Controls + Quality Indicator
+                       │
+                 PHASE 4 (Hardening)
+                 4.1–4.5 Error handling, memory, threading, bandwidth, security
+                 4.6 Isolation tests [G8]
+                 4.7 Full test suite
+                       │
+                 PHASE 5 (Deploy)
+```
+
+Publish and Subscribe paths can be developed in parallel.
+
+---
+
+## Gap Reference
+
+| Tag | Gap | Resolution |
+|-----|-----|-----------|
+| G1 | Audio dual-capture conflict | Single-source fan-out via InterLiveKitAudioBridge |
+| G2 | Camera toggle ordering | Two-phase state machine with first-frame callback |
+| G3 | YUV→RGB subscriber rendering | NV12 Metal shader + CVMetalTextureCache zero-copy |
+| G4 | Mode transition with active connection | Room persists, publishers rebuilt via transitionMode() |
+| G5 | Router queue bottleneck | Non-blocking sink contract + internal dispatch + debug assert |
+| G6 | "Waiting for participant" state | ParticipantPresenceState + 3s grace + KVO |
+| G7 | Room discovery / invite flow | 6-char room codes via token server |
+| G8 | Local pipeline must survive network failure | Isolation invariant + nil-safe + swallowed errors + CI test |
+| G9 | Logging / diagnostics | os_log + WebRTC stats + diagnostic snapshot |
+
+---
+
+## Addendum — Execution Efficiency Path (No Changes to Original Plan)
+
+> This is a separate implementation track to improve delivery speed and reduce risk.
+> It does **not** replace or modify any original phase/step above.
+
+### Goal
+
+Reach first real end-to-end online call capability quickly, then layer full production hardening from the original plan.
+
+### Accelerated Vertical Slice (Recommended Order)
+
+- [ ] A1 — Complete dependency/bootstrap first: **0.3 + 0.2**
+  - Add LiveKit SDK, bridging setup, network entitlement.
+  - Bring up token server endpoints (`/room/create`, `/room/join`) with secure secret handling.
+
+- [ ] A2 — Build minimum connection control plane
+  - Implement minimal `InterRoomController` connect/disconnect.
+  - Host/join room-code flow works end-to-end.
+
+- [ ] A3 — Normal mode publish baseline
+  - Publish **camera + microphone only** in normal mode.
+  - Keep current local pipeline as source of truth.
+  - No screen-share publish in this step.
+
+- [ ] A4 — Remote receive baseline
+  - Subscribe and render remote camera with a minimal renderer path.
+  - Keep this intentionally simple to validate transport reliability first.
+
+- [ ] A5 — Reliability gate before expansion
+  - Validate: connect, reconnect, mute/unmute, participant join/leave.
+  - Add core logging and basic stats visibility before adding advanced media paths.
+
+- [ ] A6 — Expand to planned advanced architecture
+  - Add screen share publish sink.
+  - Add custom NV12/BGRA rendering path.
+  - Add mode-transition persistence behavior.
+  - Add full diagnostics, memory/thread assertions, and complete test matrix.
+
+### Why This Addendum Exists
+
+- Reduces first-value time and integration uncertainty.
+- Prevents large-batch failures from 2.7k+ lines of new networking/media code landing at once.
+- Preserves the original production-grade architecture while improving execution efficiency.

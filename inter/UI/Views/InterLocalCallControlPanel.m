@@ -80,8 +80,8 @@
                                                             pullsDown:NO];
     self.shareModePopUpButton.autoresizingMask = NSViewWidthSizable | NSViewMaxYMargin;
     [self.shareModePopUpButton addItemWithTitle:@"Share This App"];
-    [self.shareModePopUpButton addItemWithTitle:@"Share Window (Next Step)"];
-    [self.shareModePopUpButton addItemWithTitle:@"Share Entire Screen (Next Step)"];
+    [self.shareModePopUpButton addItemWithTitle:@"Share Window"];
+    [self.shareModePopUpButton addItemWithTitle:@"Share Entire Screen"];
     [self.shareModePopUpButton setTarget:self];
     [self.shareModePopUpButton setAction:@selector(handleShareModeChange:)];
 
