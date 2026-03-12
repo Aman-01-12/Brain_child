@@ -108,7 +108,10 @@ import LiveKit
     // MARK: - InterShareSink: Append Video
 
     /// Receives screen capture frames from the router queue.
-    /// [G5] Returns quickly. CVPixelBuffer is captured by the closure (ARC retains it).
+    /// [G5] MUST return in <1ms. Never extract CVPixelBuffer on this queue —
+    /// IOSurface-backed buffers trigger a kernel roundtrip on CFRetain.
+    /// Capture the lightweight frame wrapper and access pixelBuffer on the
+    /// encoder queue instead.
     @objc public func append(_ frame: InterShareVideoFrame) {
         guard isActive, let capturer = bufferCapturer else { return }
 
@@ -120,11 +123,15 @@ import LiveKit
         }
         lastFrameTime = now
 
-        // Capture the pixel buffer — Swift ARC retains it for the closure lifetime.
-        let pixelBuffer = frame.pixelBuffer
-
+        // [G5] Capture the frame wrapper — NOT the pixelBuffer directly.
+        // InterShareVideoFrame is a lightweight NSObject (16 bytes + refcount).
+        // The CVPixelBuffer retain (IOSurface kernel call) happens on the
+        // encoder queue when we access frame.pixelBuffer below.
         encoderQueue.async { [weak self] in
             guard let self = self, self.isActive else { return }
+
+            // Access pixelBuffer here on the encoder queue, not the router queue.
+            let pixelBuffer = frame.pixelBuffer
 
             // Check if downscaling is needed [1.6.7]
             let width = CVPixelBufferGetWidth(pixelBuffer)

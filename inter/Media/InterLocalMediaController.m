@@ -80,6 +80,16 @@ static const void *InterLocalMediaSessionQueueKey = &InterLocalMediaSessionQueue
     [self shutdown];
 }
 
+#pragma mark - Exposed Session Properties (2.1.1, 2.1.2)
+
+- (AVCaptureSession *)captureSession {
+    return _session;
+}
+
+- (dispatch_queue_t)sessionQueue {
+    return _sessionQueue;
+}
+
 - (void)prepareWithCompletion:(InterLocalMediaPrepareCompletion)completion {
     if (!completion) {
         return;

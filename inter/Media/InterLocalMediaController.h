@@ -15,6 +15,14 @@ typedef void (^InterLocalMediaAudioSampleBufferHandler)(CMSampleBufferRef sample
 @property (atomic, readonly, getter=isMicrophoneEnabled) BOOL microphoneEnabled;
 @property (nonatomic, copy, nullable) InterLocalMediaAudioSampleBufferHandler audioSampleBufferHandler;
 
+/// The underlying AVCaptureSession. Callers MUST use sessionQueue for all
+/// session-related work. Callers MUST NOT call startRunning/stopRunning.
+@property (nonatomic, readonly, nullable) AVCaptureSession *captureSession;
+
+/// The serial dispatch queue that guards the capture session.
+/// All external interaction with captureSession MUST be dispatched on this queue.
+@property (nonatomic, readonly, nullable) dispatch_queue_t sessionQueue;
+
 + (void)preflightCapturePermissionsWithCompletion:(void (^ _Nullable)(AVAuthorizationStatus videoStatus,
                                                                       AVAuthorizationStatus audioStatus))completion;
 

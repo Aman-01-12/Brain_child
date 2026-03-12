@@ -199,6 +199,12 @@ import LiveKit
 
         let newRoom = Room(delegate: self, connectOptions: connectOptions, roomOptions: roomOptions)
 
+        // Clean up previous room if any (e.g. retry after error)
+        if let oldRoom = self.room {
+            self.subscriber.detach()
+            oldRoom.remove(delegate: self)
+        }
+
         self.room = newRoom
         self.publisher.localParticipant = newRoom.localParticipant
         self.subscriber.attach(to: newRoom)
@@ -231,8 +237,20 @@ import LiveKit
                 }
             } catch {
                 let latencyMs = Int((CFAbsoluteTimeGetCurrent() - self.connectStartTime) * 1000)
+
+                // Extract LiveKit error details when available for diagnostics
+                let detail: String
+                if let lkError = error as? NSError,
+                   lkError.domain == "io.livekit.swift-sdk" {
+                    let underlying = lkError.userInfo[NSUnderlyingErrorKey] as? NSError
+                    detail = "code=\(lkError.code) desc=\(lkError.localizedDescription)"
+                        + (underlying.map { " underlying=\($0.localizedDescription)" } ?? "")
+                } else {
+                    detail = error.localizedDescription
+                }
+
                 interLogError(InterLog.networking, "RoomController: connect failed after %dms: %{public}@",
-                              latencyMs, error.localizedDescription)
+                              latencyMs, detail)
 
                 self.isConnecting = false
                 self.setConnectionState(.disconnectedWithError)

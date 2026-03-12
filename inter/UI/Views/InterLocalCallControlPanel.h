@@ -13,6 +13,15 @@ NS_ASSUME_NONNULL_BEGIN
 
 @property (nonatomic, strong, readonly) NSView *previewContainerView;
 
+/// [3.4.1] Connection status label — bound to InterRoomConnectionState text.
+- (void)setConnectionStatusText:(NSString *)text;
+
+/// [3.4.2] [G7] Show room code when hosting. Pass nil to hide.
+- (void)setRoomCodeText:(nullable NSString *)code;
+
+/// [3.4.4] Container view for the network quality indicator.
+@property (nonatomic, strong, readonly) NSView *networkStatusContainerView;
+
 - (void)setPanelTitleText:(NSString *)title;
 - (void)setCameraEnabled:(BOOL)enabled;
 - (void)setMicrophoneEnabled:(BOOL)enabled;

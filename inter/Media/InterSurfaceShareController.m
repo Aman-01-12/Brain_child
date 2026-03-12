@@ -1,5 +1,8 @@
 #import "InterSurfaceShareController.h"
 
+#import <mach/mach_time.h>
+#import <os/log.h>
+
 #import "InterAppSurfaceVideoSource.h"
 #import "InterScreenCaptureVideoSource.h"
 #import "InterRecordingSink.h"
@@ -111,6 +114,7 @@
     if ([videoSource isKindOfClass:[InterScreenCaptureVideoSource class]]) {
         InterScreenCaptureVideoSource *screenSource = (InterScreenCaptureVideoSource *)videoSource;
         if (configuration.shareMode == InterShareModeWindow) {
+            screenSource.selectedWindowIdentifier = configuration.selectedWindowIdentifier;
             [screenSource startCaptureForSelectedWindow];
         } else {
             [screenSource startCaptureForSelectedDisplay];
@@ -144,6 +148,11 @@
     NSMutableArray<id<InterShareSink>> *sinks = [NSMutableArray array];
     if (configuration.isRecordingEnabled) {
         [sinks addObject:[[InterRecordingSink alloc] init]];
+    }
+    // [G8] Network publish sink — added when non-nil
+    id<InterShareSink> networkSink = self.networkPublishSink;
+    if (networkSink) {
+        [sinks addObject:networkSink];
     }
     return [sinks copy];
 }
@@ -202,9 +211,29 @@
         }
 
         NSArray<id<InterShareSink>> *sinks = [self currentSinksSnapshot];
+#if DEBUG
+        uint64_t routeStart = mach_absolute_time();
+#endif
         for (id<InterShareSink> sink in sinks) {
             [sink appendVideoFrame:frame];
         }
+#if DEBUG
+        // [G5] Debug timing check: total routing time should be < 5ms.
+        // Use os_log instead of NSAssert — occasional scheduling jitter, thread
+        // preemption, or IOSurface kernel calls can cause transient spikes that
+        // are NOT indicative of a broken sink contract. A crash here masks the
+        // real production experience.
+        uint64_t routeEnd = mach_absolute_time();
+        mach_timebase_info_data_t info;
+        mach_timebase_info(&info);
+        double elapsedMs = (double)(routeEnd - routeStart) * (double)info.numer / (double)info.denom / 1e6;
+        if (elapsedMs > 5.0) {
+            os_log_fault(OS_LOG_DEFAULT,
+                         "[G5] Router queue frame routing took %.2fms (>5ms limit) — "
+                         "check sink appendVideoFrame: implementations for blocking work",
+                         elapsedMs);
+        }
+#endif
     });
 }
 

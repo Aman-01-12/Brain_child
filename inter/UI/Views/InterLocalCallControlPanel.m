@@ -2,6 +2,8 @@
 
 @interface InterLocalCallControlPanel ()
 @property (nonatomic, strong) NSTextField *titleLabel;
+@property (nonatomic, strong) NSTextField *connectionStatusLabel;
+@property (nonatomic, strong) NSTextField *roomCodeLabel;
 @property (nonatomic, strong) NSTextField *mediaStatusLabel;
 @property (nonatomic, strong) NSTextField *shareStatusLabel;
 @property (nonatomic, strong) NSTextField *shareModeLabel;
@@ -10,6 +12,7 @@
 @property (nonatomic, strong) NSButton *shareButton;
 @property (nonatomic, strong) NSPopUpButton *shareModePopUpButton;
 @property (nonatomic, strong, readwrite) NSView *previewContainerView;
+@property (nonatomic, strong, readwrite) NSView *networkStatusContainerView;
 @end
 
 @implementation InterLocalCallControlPanel
@@ -41,6 +44,28 @@
     self.titleLabel.font = [NSFont boldSystemFontOfSize:14];
     self.titleLabel.textColor = [NSColor colorWithWhite:0.94 alpha:1.0];
     [self addSubview:self.titleLabel];
+
+    // [3.4.1] Connection status label
+    self.connectionStatusLabel = [NSTextField labelWithString:@""];
+    self.connectionStatusLabel.frame = NSMakeRect(16, self.bounds.size.height - 56, self.bounds.size.width - 72, 14);
+    self.connectionStatusLabel.autoresizingMask = NSViewWidthSizable | NSViewMinYMargin;
+    self.connectionStatusLabel.font = [NSFont systemFontOfSize:10];
+    self.connectionStatusLabel.textColor = [NSColor colorWithWhite:0.70 alpha:1.0];
+    [self addSubview:self.connectionStatusLabel];
+
+    // [3.4.4] Network status container (for signal bars view)
+    self.networkStatusContainerView = [[NSView alloc] initWithFrame:NSMakeRect(self.bounds.size.width - 56, self.bounds.size.height - 56, 40, 16)];
+    self.networkStatusContainerView.autoresizingMask = NSViewMinXMargin | NSViewMinYMargin;
+    [self addSubview:self.networkStatusContainerView];
+
+    // [3.4.2] Room code label (hidden by default)
+    self.roomCodeLabel = [NSTextField labelWithString:@""];
+    self.roomCodeLabel.frame = NSMakeRect(16, self.bounds.size.height - 72, self.bounds.size.width - 32, 14);
+    self.roomCodeLabel.autoresizingMask = NSViewWidthSizable | NSViewMinYMargin;
+    self.roomCodeLabel.font = [NSFont monospacedSystemFontOfSize:11 weight:NSFontWeightMedium];
+    self.roomCodeLabel.textColor = [NSColor systemGreenColor];
+    self.roomCodeLabel.hidden = YES;
+    [self addSubview:self.roomCodeLabel];
 
     self.previewContainerView = [[NSView alloc] initWithFrame:NSMakeRect(16,
                                                                           self.bounds.size.height - 200,
@@ -117,6 +142,22 @@
 
 - (void)setPanelTitleText:(NSString *)title {
     self.titleLabel.stringValue = title ?: @"Local Media Controls";
+}
+
+// [3.4.1] Connection status text
+- (void)setConnectionStatusText:(NSString *)text {
+    self.connectionStatusLabel.stringValue = text ?: @"";
+}
+
+// [3.4.2] Room code display
+- (void)setRoomCodeText:(NSString *)code {
+    if (code.length > 0) {
+        self.roomCodeLabel.stringValue = [NSString stringWithFormat:@"Room: %@", code];
+        self.roomCodeLabel.hidden = NO;
+    } else {
+        self.roomCodeLabel.stringValue = @"";
+        self.roomCodeLabel.hidden = YES;
+    }
 }
 
 - (void)setCameraEnabled:(BOOL)enabled {

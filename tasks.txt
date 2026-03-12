@@ -1,7 +1,7 @@
 # LiveKit Integration — Implementation Plan
 
-> **Status**: Phase 0 complete. Phase 1 complete. Phase 2 next.  
-> **Last updated**: 3 March 2026  
+> **Status**: Phase 0 complete. Phase 1 complete. Phase 2 complete. Phase 3 complete. Post-Phase 3 (bug fixes + UI polish + window picker) complete. Phase 4 next.  
+> **Last updated**: 12 March 2026  
 > **Tracking**: Changes logged in `work_done.md`
 
 ---
@@ -311,53 +311,53 @@ Networking/
 
 ### 2.1 — `InterLocalMediaController.h/.m`
 
-- [ ] 2.1.1 — Expose: `@property (nonatomic, readonly) AVCaptureSession *captureSession;`
-- [ ] 2.1.2 — Expose: `@property (nonatomic, readonly) dispatch_queue_t sessionQueue;`
-- [ ] 2.1.3 — No other changes. Preview, mic, permissions all untouched
-- [ ] 2.1.4 — Documentation: "Callers MUST use sessionQueue. Callers MUST NOT call startRunning/stopRunning."
+- [x] 2.1.1 — Expose: `@property (nonatomic, readonly) AVCaptureSession *captureSession;`
+- [x] 2.1.2 — Expose: `@property (nonatomic, readonly) dispatch_queue_t sessionQueue;`
+- [x] 2.1.3 — No other changes. Preview, mic, permissions all untouched
+- [x] 2.1.4 — Documentation: "Callers MUST use sessionQueue. Callers MUST NOT call startRunning/stopRunning."
 
 ### 2.2 — `InterShareTypes.h/.m`
 
-- [ ] 2.2.1 — Add: `@property (nonatomic, assign, getter=isNetworkPublishEnabled) BOOL networkPublishEnabled;`
-- [ ] 2.2.2 — Update `copyWithZone:` to copy it
-- [ ] 2.2.3 — Default: `networkPublishEnabled = NO`
+- [x] 2.2.1 — Add: `@property (nonatomic, assign, getter=isNetworkPublishEnabled) BOOL networkPublishEnabled;`
+- [x] 2.2.2 — Update `copyWithZone:` to copy it
+- [x] 2.2.3 — Default: `networkPublishEnabled = NO`
 
 ### 2.3 — `InterSurfaceShareController.h/.m`
 
-- [ ] 2.3.1 — Add: `@property (nonatomic, strong, nullable) id<InterShareSink> networkPublishSink;`
-- [ ] 2.3.2 — [G8] In `sinksForConfiguration:`: add networkPublishSink to array when non-nil
-- [ ] 2.3.3 — No routing logic changes. Sink array iteration is transparent
-- [ ] 2.3.4 — No teardown changes. dispatch_group already handles multiple sinks
-- [ ] 2.3.5 — [G5] Debug assertion in `routeVideoFrame:generation:`: assert <5ms total routing time
+- [x] 2.3.1 — Add: `@property (nonatomic, strong, nullable) id<InterShareSink> networkPublishSink;`
+- [x] 2.3.2 — [G8] In `sinksForConfiguration:`: add networkPublishSink to array when non-nil
+- [x] 2.3.3 — No routing logic changes. Sink array iteration is transparent
+- [x] 2.3.4 — No teardown changes. dispatch_group already handles multiple sinks
+- [x] 2.3.5 — [G5] Debug assertion in `routeVideoFrame:generation:`: assert <5ms total routing time
 
 ### 2.4 — `inter.entitlements`
 
-- [ ] 2.4.1 — Add `<key>com.apple.security.network.client</key><true/>`
+- [x] 2.4.1 — Add `<key>com.apple.security.network.client</key><true/>`
 
 ### 2.5 — `AppDelegate.h/.m`
 
-- [ ] 2.5.1 — `#import "inter-Swift.h"`
-- [ ] 2.5.2 — Add ivar `InterRoomController *_roomController`. Create in `applicationDidFinishLaunching:`. [G8] If fails → log, continue
-- [ ] 2.5.3 — [G4] In `enterMode:role:`: if connected + mode switching → call `transitionMode(completion:)` before teardown
-- [ ] 2.5.4 — In `startNormalLocalMediaFlow`: if connected → publishCamera + wire sinks
-- [ ] 2.5.5 — Wire network sinks: set networkPublishSink on surface share controller
-- [ ] 2.5.6 — [G2] Toggle handlers: two-phase mute via publisher. [G8] Guarded by connection state check. Local toggle always proceeds
-- [ ] 2.5.7 — In `finalizeCurrentModeExit`: disconnect room. [G8] Guarded: skip if nil
-- [ ] 2.5.8 — [G6] KVO: observe connectionState + participantPresenceState → update UI
-- [ ] 2.5.9 — [G9] Log state transitions
-- [ ] 2.5.10 — [G8] Crash resilience: unexpected disconnect → show Reconnect / Continue offline
+- [x] 2.5.1 — `#import "inter-Swift.h"`
+- [x] 2.5.2 — Add ivar `InterRoomController *_roomController`. Create in `applicationDidFinishLaunching:`. [G8] If fails → log, continue
+- [x] 2.5.3 — [G4] In `enterMode:role:`: if connected + mode switching → call `transitionMode(completion:)` before teardown
+- [x] 2.5.4 — In `startNormalLocalMediaFlow`: if connected → publishCamera + wire sinks
+- [x] 2.5.5 — Wire network sinks: set networkPublishSink on surface share controller
+- [x] 2.5.6 — [G2] Toggle handlers: two-phase mute via publisher. [G8] Guarded by connection state check. Local toggle always proceeds
+- [x] 2.5.7 — In `finalizeCurrentModeExit`: disconnect room. [G8] Guarded: skip if nil
+- [x] 2.5.8 — [G6] KVO: observe connectionState + participantPresenceState → update UI
+- [x] 2.5.9 — [G9] Log state transitions
+- [x] 2.5.10 — [G8] Crash resilience: unexpected disconnect → show Reconnect / Continue offline
 
 ### 2.6 — `SecureWindowController.h/.m`
 
-- [ ] 2.6.1 — Add weak property: `InterRoomController *roomController`
-- [ ] 2.6.2 — [G4] Same publisher wiring in `startLocalMediaFlow` as AppDelegate
-- [ ] 2.6.3 — Same two-phase toggles, same KVO
-- [ ] 2.6.4 — Interview: share mode locked to ThisApp. Network sink wired same way
-- [ ] 2.6.5 — In `destroySecureWindow`: do NOT disconnect room. Just nil sinks/sources
+- [x] 2.6.1 — Add weak property: `InterRoomController *roomController`
+- [x] 2.6.2 — [G4] Same publisher wiring in `startLocalMediaFlow` as AppDelegate
+- [x] 2.6.3 — Same two-phase toggles, same KVO
+- [x] 2.6.4 — Interview: share mode locked to ThisApp. Network sink wired same way
+- [x] 2.6.5 — In `destroySecureWindow`: do NOT disconnect room. Just nil sinks/sources
 
 ### 2.7 — `MetalSurfaceView.h/.m`
 
-- [ ] 2.7.1 — **No modifications.** Remote rendering handled by InterRemoteVideoView
+- [x] 2.7.1 — **No modifications.** Remote rendering handled by InterRemoteVideoView
 
 ---
 
@@ -365,36 +365,75 @@ Networking/
 
 ### 3.1 — Connection UI (Setup Panel)
 
-- [ ] 3.1.1 — Add fields: Server URL, Token Server URL, Display Name, Room Code [G7]
-- [ ] 3.1.2 — [G7] Host buttons (Start Call / Create Interview): generate room code → display prominently → connect
-- [ ] 3.1.3 — [G7] Join button: validate room code → connect. Handle 404 ("Invalid code") / 410 ("Expired")
-- [ ] 3.1.4 — Connection state indicator: green=connected, yellow=connecting, red=error
+- [x] 3.1.1 — Add fields: Server URL, Token Server URL, Display Name, Room Code [G7]
+- [x] 3.1.2 — [G7] Host buttons (Start Call / Create Interview): generate room code → display prominently → connect
+- [x] 3.1.3 — [G7] Join button: validate room code → connect. Handle 404 ("Invalid code") / 410 ("Expired")
+- [x] 3.1.4 — Connection state indicator: green=connected, yellow=connecting, red=error
 
 ### 3.2 — Remote Video Layout (Normal Mode)
 
-- [ ] 3.2.1 — Two InterRemoteVideoView instances: remoteCameraView + remoteScreenShareView. Initially hidden
-- [ ] 3.2.2 — Layout rules:
+- [x] 3.2.1 — Two InterRemoteVideoView instances: remoteCameraView + remoteScreenShareView. Initially hidden
+- [x] 3.2.2 — Layout rules:
   - Camera only: remote fills center-left, local bottom-right
   - Camera + screen share: screen share 80%, camera PiP top-right (160×120)
   - Screen share only: fills center
   - Neither: local preview only
-- [ ] 3.2.3 — NSLayoutConstraint animations (200ms ease-in-out)
-- [ ] 3.2.4 — [G6] "Waiting for participant..." overlay when alone + connected
-- [ ] 3.2.5 — [G6] "Participant left." overlay with Wait / End Call buttons
+- [x] 3.2.3 — NSLayoutConstraint animations (200ms ease-in-out)
+- [x] 3.2.4 — [G6] "Waiting for participant..." overlay when alone + connected
+- [x] 3.2.5 — [G6] "Participant left." overlay with Wait / End Call buttons
 
 ### 3.3 — Remote Video Layout (Secure Mode)
 
-- [ ] 3.3.1 — Same InterRemoteVideoView instances in SecureWindow
-- [ ] 3.3.2 — Security: inherits NSWindowSharingNone
-- [ ] 3.3.3 — [G6] Same waiting/left overlays
+- [x] 3.3.1 — Same InterRemoteVideoView instances in SecureWindow
+- [x] 3.3.2 — Security: inherits NSWindowSharingNone
+- [x] 3.3.3 — [G6] Same waiting/left overlays
 
 ### 3.4 — Call Controls Updates
 
-- [ ] 3.4.1 — Connection status label bound to InterRoomConnectionState
-- [ ] 3.4.2 — [G7] "Room Code: X7K29M" label (visible when host)
-- [ ] 3.4.3 — [G2] Toggle handlers use two-phase mute (no panel code change — block callbacks fire as before)
-- [ ] 3.4.4 — Network quality indicator: signal bars from connectionQuality
-- [ ] 3.4.5 — [G9] Hidden debug: triple-click status → copy diagnostic snapshot to clipboard
+- [x] 3.4.1 — Connection status label bound to InterRoomConnectionState
+- [x] 3.4.2 — [G7] "Room Code: X7K29M" label (visible when host)
+- [x] 3.4.3 — [G2] Toggle handlers use two-phase mute (no panel code change — block callbacks fire as before)
+- [x] 3.4.4 — Network quality indicator: signal bars from connectionQuality
+- [x] 3.4.5 — [G9] Hidden debug: triple-click status → copy diagnostic snapshot to clipboard
+
+---
+
+## Post-Phase 3: Bug Fixes, UI Polish & Window Picker
+
+> Completed 12 March 2026. These tasks address bugs discovered during testing and UI improvements to match Google Meet/Zoom quality.
+
+### PF.1 — Bug Fixes
+
+- [x] PF.1.1 — Fix: `publishScreenShare()` was never called — screen share frames were captured and recorded locally but never published to the network. Added publish call in statusHandler for both normal mode (AppDelegate) and secure mode (SecureWindowController)
+- [x] PF.1.2 — Fix: [G5] Router queue crash — IOSurface `CVPixelBufferRetain` on router queue caused kernel lock contention deadlock. Moved retain into async encoder queue dispatch block in `InterLiveKitScreenShareSource.swift`
+- [x] PF.1.3 — Fix: Double-publish guard — added early return in `InterLiveKitPublisher.publishScreenShare` if `screenShareSource` already exists, preventing duplicate track publication
+
+### PF.2 — Google Meet/Zoom-Style Layout Rewrite
+
+- [x] PF.2.1 — Complete rewrite of `InterRemoteVideoLayoutManager.h/.m` with stage + filmstrip layout architecture
+- [x] PF.2.2 — New `InterRemoteVideoTileView` NSView wrapper: name label, hover highlight (NSTrackingArea), click-to-spotlight, rounded corners, semi-transparent label bar
+- [x] PF.2.3 — Stage + Filmstrip layout: main stage 75% width for primary content, sidebar filmstrip 25% (min 160px, max 280px) for camera tiles
+- [x] PF.2.4 — Five layout modes: None, SingleCamera, MultiCamera (grid), ScreenShareOnly, ScreenShareWithCameras (stage+filmstrip)
+- [x] PF.2.5 — Spotlight: click any tile to promote to main stage, click again to unspotlight
+- [x] PF.2.6 — Animated transitions: 300ms ease-in-out via NSAnimationContext
+- [x] PF.2.7 — Scrollable filmstrip (NSScrollView) for multi-participant scenarios
+
+### PF.3 — Background Color Consistency
+
+- [x] PF.3.1 — Fixed 7 sources of inconsistent black/grey backgrounds across SecureWindowController, AppDelegate (normal + setup windows), InterRemoteVideoLayoutManager, MetalRenderEngine (clear color), MetalSurfaceView (CAMetalLayer background)
+- [x] PF.3.2 — All surfaces now uniform pure black (#000000)
+
+### PF.4 — Window Picker UI (ScreenCaptureKit)
+
+- [x] PF.4.1 — Created `InterWindowPickerPanel.h/.m` — modal sheet window picker with Google Meet/Zoom-style grid
+- [x] PF.4.2 — ScreenCaptureKit enumeration: `SCShareableContent getShareableContentExcludingDesktopWindows:onScreenWindowsOnly:` — no deprecated CG APIs
+- [x] PF.4.3 — Live thumbnails via `SCScreenshotManager captureImageWithFilter:configuration:` (480×320, parallel capture with dispatch_group)
+- [x] PF.4.4 — 3-column scrollable grid of tiles: window thumbnail, app icon, window title, app name subtitle
+- [x] PF.4.5 — Interaction: hover highlight, click-to-select (blue border), Cancel/Share buttons, Enter key shortcut
+- [x] PF.4.6 — Filtering: excludes own app, non-layer-0 windows, off-screen, <100×60 windows
+- [x] PF.4.7 — Added `selectedWindowIdentifier` to `InterShareSessionConfiguration` — passes chosen CGWindowID through share pipeline
+- [x] PF.4.8 — Wired in `InterSurfaceShareController.m`: forwards identifier to `InterScreenCaptureVideoSource` before capture start
+- [x] PF.4.9 — Wired in `AppDelegate.m`: Window mode presents picker sheet first, share starts only after user selects and confirms
 
 ---
 

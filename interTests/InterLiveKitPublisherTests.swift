@@ -118,10 +118,9 @@ final class InterLiveKitPublisherTests: XCTestCase {
     }
 
     func testUnpublishMicrophone_nothingPublished_doesNotCrash() {
-        // When audioBridge is nil, the optional chain skips the stop
-        // closure entirely, so completion is never called — that's expected.
-        let exp = expectation(description: "noCallback")
-        exp.isInverted = true
+        // When nothing is published and audioBridge is nil, the completion
+        // is called synchronously via the direct-track path's else branch.
+        let exp = expectation(description: "completed")
 
         publisher.unpublishMicrophone {
             exp.fulfill()

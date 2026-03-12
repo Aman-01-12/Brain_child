@@ -49,8 +49,12 @@ import LiveKit
     /// Camera video source. Non-nil while camera is published.
     public private(set) var cameraSource: InterLiveKitCameraSource?
 
-    /// Audio bridge (mic). Non-nil while mic is published.
+    /// Audio bridge (mic). Non-nil while mic is published via surface share path.
     public private(set) var audioBridge: InterLiveKitAudioBridge?
+
+    /// Direct microphone track for normal calls (no bridge needed).
+    /// LiveKit captures the mic natively when this track is published.
+    public private(set) var microphoneTrack: LocalAudioTrack?
 
     /// Screen share source. Created on demand via factory.
     public private(set) var screenShareSource: InterLiveKitScreenShareSource?
@@ -168,7 +172,9 @@ import LiveKit
 
     /// Publish the microphone audio track.
     ///
-    /// Creates an `InterLiveKitAudioBridge` and publishes to the room.
+    /// For normal calls, creates a plain `LocalAudioTrack` and lets LiveKit's
+    /// built-in mic capture handle audio. No `InterLiveKitAudioBridge` needed —
+    /// the bridge is only for surface share fan-out.
     @objc public func publishMicrophone(completion: ((NSError?) -> Void)? = nil) {
         guard let participant = localParticipant else {
             let error = InterNetworkErrorCode.publishFailed.error(message: "No local participant")
@@ -177,44 +183,38 @@ import LiveKit
             return
         }
 
-        interLogInfo(InterLog.media, "Publisher: publishing microphone")
+        interLogInfo(InterLog.media, "Publisher: publishing microphone (native capture)")
 
-        let bridge = InterLiveKitAudioBridge()
-        self.audioBridge = bridge
+        // Create a track using LiveKit's native mic capture.
+        // No capturePostProcessingDelegate — WebRTC captures and encodes the mic directly.
+        let track = LocalAudioTrack.createTrack(
+            name: "inter-mic",
+            options: AudioCaptureOptions(),
+            reportStatistics: false
+        )
+        self.microphoneTrack = track
 
-        let config = InterShareSessionConfiguration.default()
-        bridge.start(with: config) { [weak self] active, statusText in
-            guard active, let track = bridge.audioTrack else {
-                let error = InterNetworkErrorCode.publishFailed.error(
-                    message: "Audio bridge start failed: \(statusText ?? "unknown")"
+        let options = AudioPublishOptions(
+            encoding: .presetSpeech,
+            dtx: true,
+            red: true
+        )
+
+        Task {
+            do {
+                let pub = try await participant.publish(audioTrack: track, options: options)
+                self.microphonePublication = pub
+                self.micNetworkState = .active
+                interLogInfo(InterLog.media, "Publisher: microphone published")
+                DispatchQueue.main.async { completion?(nil) }
+            } catch {
+                interLogError(InterLog.media, "Publisher: mic publish failed: %{public}@",
+                              error.localizedDescription)
+                let nsError = InterNetworkErrorCode.publishFailed.error(
+                    message: "Microphone publish failed",
+                    underlyingError: error
                 )
-                interLogError(InterLog.media, "Publisher: mic bridge start failed")
-                completion?(error)
-                return
-            }
-
-            let options = AudioPublishOptions(
-                encoding: .presetSpeech,
-                dtx: true,
-                red: true
-            )
-
-            Task {
-                do {
-                    let pub = try await participant.publish(audioTrack: track, options: options)
-                    self?.microphonePublication = pub
-                    self?.micNetworkState = .active
-                    interLogInfo(InterLog.media, "Publisher: microphone published")
-                    DispatchQueue.main.async { completion?(nil) }
-                } catch {
-                    interLogError(InterLog.media, "Publisher: mic publish failed: %{public}@",
-                                  error.localizedDescription)
-                    let nsError = InterNetworkErrorCode.publishFailed.error(
-                        message: "Microphone publish failed",
-                        underlyingError: error
-                    )
-                    DispatchQueue.main.async { completion?(nsError) }
-                }
+                DispatchQueue.main.async { completion?(nsError) }
             }
         }
     }
@@ -235,10 +235,16 @@ import LiveKit
         }
         microphonePublication = nil
 
-        audioBridge?.stop(completion: { [weak self] in
-            self?.audioBridge = nil
+        // Tear down bridge path if it was used (surface share case)
+        if let bridge = audioBridge {
+            bridge.stop(completion: { [weak self] in
+                self?.audioBridge = nil
+                completion?()
+            })
+        } else {
+            microphoneTrack = nil
             completion?()
-        })
+        }
     }
 
     // MARK: - Screen Share
@@ -254,6 +260,12 @@ import LiveKit
 
     /// Publish the screen share track (after the source has received at least one frame).
     @objc public func publishScreenShare(completion: ((NSError?) -> Void)? = nil) {
+        // Guard against double-publish
+        guard screenSharePublication == nil else {
+            completion?(nil)
+            return
+        }
+
         guard let participant = localParticipant else {
             let error = InterNetworkErrorCode.publishFailed.error(message: "No local participant")
             completion?(error)
@@ -334,12 +346,33 @@ import LiveKit
 
     /// Two-phase mic mute. [G2]
     @objc public func muteMicrophoneTrack(completion: @escaping () -> Void) {
-        audioBridge?.beginMute(completion: completion)
+        if let bridge = audioBridge {
+            // Surface share path — bridge handles mute
+            bridge.beginMute(completion: completion)
+        } else if let track = microphoneTrack ?? microphonePublication?.track as? LocalAudioTrack {
+            // Normal call path — mute the track directly
+            Task {
+                try? await track.mute()
+                interLogInfo(InterLog.media, "Publisher: mic track muted")
+                DispatchQueue.main.async { completion() }
+            }
+        } else {
+            completion()
+        }
     }
 
     /// Two-phase mic unmute. [G2]
     @objc public func unmuteMicrophoneTrack() {
-        audioBridge?.beginEnable()
+        if let bridge = audioBridge {
+            // Surface share path
+            bridge.beginEnable()
+        } else if let track = microphoneTrack ?? microphonePublication?.track as? LocalAudioTrack {
+            // Normal call path — unmute the track directly
+            Task {
+                try? await track.unmute()
+                interLogInfo(InterLog.media, "Publisher: mic track unmuted")
+            }
+        }
     }
 
     // MARK: - Bulk Operations
@@ -391,6 +424,7 @@ import LiveKit
         interLogInfo(InterLog.media, "Publisher: detaching all sources (mode transition)")
         cameraSource = nil
         audioBridge = nil
+        microphoneTrack = nil
         screenShareSource = nil
     }
 }

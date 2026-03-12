@@ -33,22 +33,24 @@ import LiveKit
 // MARK: - InterRemoteTrackRenderer Protocol
 
 /// Delegate protocol for receiving decoded remote media frames.
-/// Typically implemented by InterRemoteVideoView (Phase 1.11).
+/// Typically implemented by InterTrackRendererBridge → InterRemoteVideoLayoutManager.
+/// All callbacks include the originating participant identity so the subscriber
+/// can forward frames from multiple remote participants simultaneously.
 @objc public protocol InterRemoteTrackRenderer: AnyObject {
-    /// A new camera frame was decoded from the remote participant.
-    @objc func didReceiveRemoteCameraFrame(_ pixelBuffer: CVPixelBuffer)
+    /// A new camera frame was decoded from a remote participant.
+    @objc func didReceiveRemoteCameraFrame(_ pixelBuffer: CVPixelBuffer, fromParticipant participantId: String)
 
-    /// A new screen share frame was decoded from the remote participant.
-    @objc func didReceiveRemoteScreenShareFrame(_ pixelBuffer: CVPixelBuffer)
+    /// A new screen share frame was decoded from a remote participant.
+    @objc func didReceiveRemoteScreenShareFrame(_ pixelBuffer: CVPixelBuffer, fromParticipant participantId: String)
 
-    /// The remote track was muted by the remote participant.
-    @objc func remoteTrackDidMute(_ kind: InterTrackKind)
+    /// A remote track was muted by the remote participant.
+    @objc func remoteTrackDidMute(_ kind: InterTrackKind, forParticipant participantId: String)
 
-    /// The remote track was unmuted by the remote participant.
-    @objc func remoteTrackDidUnmute(_ kind: InterTrackKind)
+    /// A remote track was unmuted by the remote participant.
+    @objc func remoteTrackDidUnmute(_ kind: InterTrackKind, forParticipant participantId: String)
 
-    /// The remote track ended (participant unpublished or left).
-    @objc func remoteTrackDidEnd(_ kind: InterTrackKind)
+    /// A remote track ended (participant unpublished or left).
+    @objc func remoteTrackDidEnd(_ kind: InterTrackKind, forParticipant participantId: String)
 }
 
 // MARK: - InterLiveKitSubscriber
@@ -68,17 +70,17 @@ import LiveKit
 
     // MARK: - Private Properties
 
-    /// Internal renderer for the remote camera track.
-    private var cameraFrameRenderer: RemoteFrameRenderer?
+    /// Per-participant camera frame renderers keyed by participant identity.
+    private var cameraRenderers: [String: RemoteFrameRenderer] = [:]
 
-    /// Internal renderer for the remote screen share track.
-    private var screenShareFrameRenderer: RemoteFrameRenderer?
+    /// Per-participant camera video tracks keyed by participant identity.
+    private var cameraTracks: [String: RemoteVideoTrack] = [:]
 
-    /// The remote video track for camera (retained to remove renderer on unsubscribe).
-    private var remoteCameraTrack: RemoteVideoTrack?
+    /// Per-participant screen share renderers keyed by participant identity.
+    private var screenShareRenderers: [String: RemoteFrameRenderer] = [:]
 
-    /// The remote video track for screen share.
-    private var remoteScreenShareTrack: RemoteVideoTrack?
+    /// Per-participant screen share video tracks keyed by participant identity.
+    private var screenShareTracks: [String: RemoteVideoTrack] = [:]
 
     /// Weak reference to the room for delegate management.
     private weak var room: Room?
@@ -96,9 +98,13 @@ import LiveKit
     @objc public func detach() {
         interLogInfo(InterLog.media, "Subscriber: detaching")
 
-        // Remove renderers from any active tracks
-        cleanUpTrack(source: .camera)
-        cleanUpTrack(source: .screenShareVideo)
+        // Remove all per-participant renderers
+        for pid in Array(cameraTracks.keys) {
+            cleanUpTrack(source: .camera, participantId: pid)
+        }
+        for pid in Array(screenShareTracks.keys) {
+            cleanUpTrack(source: .screenShareVideo, participantId: pid)
+        }
 
         if let room = room {
             room.remove(delegate: self)
@@ -108,20 +114,22 @@ import LiveKit
 
     // MARK: - Private Helpers
 
-    private func cleanUpTrack(source: Track.Source) {
+    private func cleanUpTrack(source: Track.Source, participantId: String) {
         switch source {
         case .camera:
-            if let renderer = cameraFrameRenderer, let track = remoteCameraTrack {
+            if let renderer = cameraRenderers[participantId],
+               let track = cameraTracks[participantId] {
                 track.remove(videoRenderer: renderer)
             }
-            cameraFrameRenderer = nil
-            remoteCameraTrack = nil
+            cameraRenderers.removeValue(forKey: participantId)
+            cameraTracks.removeValue(forKey: participantId)
         case .screenShareVideo:
-            if let renderer = screenShareFrameRenderer, let track = remoteScreenShareTrack {
+            if let renderer = screenShareRenderers[participantId],
+               let track = screenShareTracks[participantId] {
                 track.remove(videoRenderer: renderer)
             }
-            screenShareFrameRenderer = nil
-            remoteScreenShareTrack = nil
+            screenShareRenderers.removeValue(forKey: participantId)
+            screenShareTracks.removeValue(forKey: participantId)
         default:
             break
         }
@@ -150,10 +158,15 @@ extension InterLiveKitSubscriber: RoomDelegate {
                      source.rawValue, publication.kind.rawValue,
                      publication.sid.stringValue, participant.identity?.stringValue ?? "(unknown)")
 
-        // Video tracks: attach a renderer
+        let participantId = participant.identity?.stringValue ?? "(unknown)"
+
+        // Video tracks: attach a per-participant renderer
         if let videoTrack = track as? RemoteVideoTrack {
             switch source {
             case .camera:
+                // Clean up previous renderer for this participant if any
+                cleanUpTrack(source: .camera, participantId: participantId)
+
                 let renderer = RemoteFrameRenderer(kind: .camera) { [weak self] pixelBuffer, format in
                     if self?.detectedCameraFormat == 0 {
                         self?.detectedCameraFormat = format
@@ -164,15 +177,17 @@ extension InterLiveKitSubscriber: RoomDelegate {
                                             (format >> 8) & 0xFF,
                                             format & 0xFF))
                     }
-                    self?.trackRenderer?.didReceiveRemoteCameraFrame(pixelBuffer)
+                    self?.trackRenderer?.didReceiveRemoteCameraFrame(pixelBuffer, fromParticipant: participantId)
                 }
-                self.cameraFrameRenderer = renderer
-                self.remoteCameraTrack = videoTrack
+                self.cameraRenderers[participantId] = renderer
+                self.cameraTracks[participantId] = videoTrack
                 videoTrack.add(videoRenderer: renderer)
 
-                interLogInfo(InterLog.media, "Subscriber: camera renderer attached")
+                interLogInfo(InterLog.media, "Subscriber: camera renderer attached for %{public}@", participantId)
 
             case .screenShareVideo:
+                cleanUpTrack(source: .screenShareVideo, participantId: participantId)
+
                 let renderer = RemoteFrameRenderer(kind: .screenShare) { [weak self] pixelBuffer, format in
                     if self?.detectedScreenShareFormat == 0 {
                         self?.detectedScreenShareFormat = format
@@ -183,13 +198,13 @@ extension InterLiveKitSubscriber: RoomDelegate {
                                             (format >> 8) & 0xFF,
                                             format & 0xFF))
                     }
-                    self?.trackRenderer?.didReceiveRemoteScreenShareFrame(pixelBuffer)
+                    self?.trackRenderer?.didReceiveRemoteScreenShareFrame(pixelBuffer, fromParticipant: participantId)
                 }
-                self.screenShareFrameRenderer = renderer
-                self.remoteScreenShareTrack = videoTrack
+                self.screenShareRenderers[participantId] = renderer
+                self.screenShareTracks[participantId] = videoTrack
                 videoTrack.add(videoRenderer: renderer)
 
-                interLogInfo(InterLog.media, "Subscriber: screen share renderer attached")
+                interLogInfo(InterLog.media, "Subscriber: screen share renderer attached for %{public}@", participantId)
 
             default:
                 break
@@ -210,18 +225,18 @@ extension InterLiveKitSubscriber: RoomDelegate {
         didUnsubscribeTrack publication: RemoteTrackPublication
     ) {
         let source = publication.source
+        let participantId = participant.identity?.stringValue ?? "(unknown)"
 
         interLogInfo(InterLog.media, "Subscriber: unsubscribed track source=%d sid=%{public}@ participant=%{public}@",
-                     source.rawValue, publication.sid.stringValue,
-                     participant.identity?.stringValue ?? "(unknown)")
+                     source.rawValue, publication.sid.stringValue, participantId)
 
         switch source {
         case .camera:
-            cleanUpTrack(source: .camera)
-            trackRenderer?.remoteTrackDidEnd(.camera)
+            cleanUpTrack(source: .camera, participantId: participantId)
+            trackRenderer?.remoteTrackDidEnd(.camera, forParticipant: participantId)
         case .screenShareVideo:
-            cleanUpTrack(source: .screenShareVideo)
-            trackRenderer?.remoteTrackDidEnd(.screenShare)
+            cleanUpTrack(source: .screenShareVideo, participantId: participantId)
+            trackRenderer?.remoteTrackDidEnd(.screenShare, forParticipant: participantId)
         default:
             break
         }
@@ -238,28 +253,29 @@ extension InterLiveKitSubscriber: RoomDelegate {
 
         let source = publication.source
         let muted = publication.isMuted
+        let participantId = participant.identity?.stringValue ?? "(unknown)"
 
-        interLogInfo(InterLog.media, "Subscriber: track mute changed source=%d muted=%d",
-                     source.rawValue, muted ? 1 : 0)
+        interLogInfo(InterLog.media, "Subscriber: track mute changed source=%d muted=%d participant=%{public}@",
+                     source.rawValue, muted ? 1 : 0, participantId)
 
         switch source {
         case .camera:
             if muted {
-                trackRenderer?.remoteTrackDidMute(.camera)
+                trackRenderer?.remoteTrackDidMute(.camera, forParticipant: participantId)
             } else {
-                trackRenderer?.remoteTrackDidUnmute(.camera)
+                trackRenderer?.remoteTrackDidUnmute(.camera, forParticipant: participantId)
             }
         case .microphone:
             if muted {
-                trackRenderer?.remoteTrackDidMute(.microphone)
+                trackRenderer?.remoteTrackDidMute(.microphone, forParticipant: participantId)
             } else {
-                trackRenderer?.remoteTrackDidUnmute(.microphone)
+                trackRenderer?.remoteTrackDidUnmute(.microphone, forParticipant: participantId)
             }
         case .screenShareVideo:
             if muted {
-                trackRenderer?.remoteTrackDidMute(.screenShare)
+                trackRenderer?.remoteTrackDidMute(.screenShare, forParticipant: participantId)
             } else {
-                trackRenderer?.remoteTrackDidUnmute(.screenShare)
+                trackRenderer?.remoteTrackDidUnmute(.screenShare, forParticipant: participantId)
             }
         default:
             break

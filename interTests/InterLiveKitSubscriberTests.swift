@@ -13,25 +13,31 @@ private class MockTrackRenderer: NSObject, InterRemoteTrackRenderer {
     var mutedKinds: [InterTrackKind] = []
     var unmutedKinds: [InterTrackKind] = []
     var endedKinds: [InterTrackKind] = []
+    var lastParticipantId: String?
 
-    func didReceiveRemoteCameraFrame(_ pixelBuffer: CVPixelBuffer) {
+    func didReceiveRemoteCameraFrame(_ pixelBuffer: CVPixelBuffer, fromParticipant participantId: String) {
         cameraFrameCount += 1
+        lastParticipantId = participantId
     }
 
-    func didReceiveRemoteScreenShareFrame(_ pixelBuffer: CVPixelBuffer) {
+    func didReceiveRemoteScreenShareFrame(_ pixelBuffer: CVPixelBuffer, fromParticipant participantId: String) {
         screenShareFrameCount += 1
+        lastParticipantId = participantId
     }
 
-    func remoteTrackDidMute(_ kind: InterTrackKind) {
+    func remoteTrackDidMute(_ kind: InterTrackKind, forParticipant participantId: String) {
         mutedKinds.append(kind)
+        lastParticipantId = participantId
     }
 
-    func remoteTrackDidUnmute(_ kind: InterTrackKind) {
+    func remoteTrackDidUnmute(_ kind: InterTrackKind, forParticipant participantId: String) {
         unmutedKinds.append(kind)
+        lastParticipantId = participantId
     }
 
-    func remoteTrackDidEnd(_ kind: InterTrackKind) {
+    func remoteTrackDidEnd(_ kind: InterTrackKind, forParticipant participantId: String) {
         endedKinds.append(kind)
+        lastParticipantId = participantId
     }
 }
 

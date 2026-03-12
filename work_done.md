@@ -182,10 +182,150 @@
 
 ---
 
+## [11 March 2026] — Phase 2: Modifications to Existing ObjC Files
+
+**Phase**: 2.1–2.7 (all items)  
+**Files changed**:
+- `inter/Media/InterLocalMediaController.h` — Added 2 readonly properties: `captureSession` (AVCaptureSession *) and `sessionQueue` (dispatch_queue_t). Documented: callers MUST use sessionQueue, MUST NOT call startRunning/stopRunning.
+- `inter/Media/InterLocalMediaController.m` — Added getter implementations returning `_session` and `_sessionQueue` ivars.
+- `inter/Media/Sharing/InterShareTypes.h` — Added `networkPublishEnabled` BOOL property with `isNetworkPublishEnabled` getter.
+- `inter/Media/Sharing/InterShareTypes.m` — Updated `defaultConfiguration` (sets NO) and `copyWithZone:` (copies value).
+- `inter/Media/InterSurfaceShareController.h` — Added `#import "InterShareSink.h"`, added nullable `networkPublishSink` property (id<InterShareSink>).
+- `inter/Media/InterSurfaceShareController.m` — Added `#import <mach/mach_time.h>`. Updated `sinksForConfiguration:` to include networkPublishSink when non-nil. Added G5 debug timing assertion in `routeVideoFrame:` (asserts < 5ms via mach_absolute_time).
+- `inter/inter.entitlements` — Already had `com.apple.security.network.client` (no change needed).
+- `inter/App/AppDelegate.m` — Major additions:
+  - `#import "inter-Swift.h"` with `__has_include` guard
+  - `roomController` property (InterRoomController, strong) + `isObservingRoomController` flag
+  - Traditional ObjC KVO on `connectionState` and `participantPresenceState` with static void* contexts
+  - `wireNormalNetworkPublish` — publishes camera + mic when room connected
+  - `wireNetworkSinkOnSurfaceShareController:` — creates screen share sink from publisher
+  - `twoPhaseToggleNormalCamera` / `twoPhaseToggleNormalMicrophone` — G2 ordering (mute first → stop device; start device → unmute)
+  - `handleModeTransitionIfNeeded:` — G4 mode transition with completion
+  - `finalizeCurrentModeExit` calls `[self.roomController disconnect]`
+  - `applicationWillTerminate:` teardowns KVO and disconnects
+  - `applicationDidFinishLaunching:` creates roomController with @try/@catch (G8)
+  - KVO handlers map connection/presence states to UI label text
+- `inter/UI/Controllers/SecureWindowController.h` — Added `@class InterRoomController` forward declaration, weak `roomController` property.
+- `inter/UI/Controllers/SecureWindowController.m` — Major additions:
+  - `#import "inter-Swift.h"` with `__has_include` guard
+  - Traditional ObjC KVO (same pattern as AppDelegate, separate static contexts)
+  - `wireSecureNetworkPublish` / `wireNetworkSinkOnSurfaceShareController:`
+  - `twoPhaseToggleCamera` / `twoPhaseToggleMicrophone` — G2 two-phase toggles
+  - `destroySecureWindow` clears networkPublishSink, teardowns KVO, does NOT disconnect room (G4)
+  - Toggle handlers in control panel wired to two-phase methods
+- `inter/Rendering/MetalSurfaceView.m` — No modifications needed (2.7.1 confirmed).
+
+**Why**: Wire the Swift networking layer (Phase 1) into the existing ObjC app architecture. Room lifecycle owned by AppDelegate, mode-specific media wiring in each controller, two-phase toggles everywhere for G2 compliance.  
+**Notes**: All 93 tests still pass. BUILD SUCCEEDED. Key patterns: traditional KVO (not block-based), @try/@catch for G8 crash resilience, weak roomController reference from SecureWindowController (room outlives modes per G4).
+
+---
+
+## [11 March 2026] — Phase 3 Complete: UI Layer
+
+**Phase**: 3.1 (Connection UI), 3.2 (Remote Video Normal), 3.3 (Remote Video Secure), 3.4 (Call Controls)
+
+**Files created**:
+- `inter/UI/Views/InterConnectionSetupPanel.h/.m` — Self-contained connection setup form. Four fields (Server URL, Token Server URL, Display Name, Room Code) with NSUserDefaults persistence. Host Call / Host Interview / Join buttons with delegate pattern. G7 room code auto-uppercase with confusable-char filtering (0O1IL removed). Connection indicator dot (green/yellow/red/gray). Hosted room code display (monospaced bold green).
+- `inter/UI/Views/InterRemoteVideoLayoutManager.h/.m` — Owns two InterRemoteVideoView instances (camera + screen share) and participant overlay. Four layout modes (none/cameraOnly/screenShareOnly/cameraAndShare) with NSAnimationContext 200ms ease-in-out transitions. Camera+share mode: screen share 80% width + PiP 160×120 top-right.
+- `inter/UI/Views/InterParticipantOverlayView.h/.m` — Semi-transparent overlay for participant states. G6 "Waiting for participant…" state with pulsing green dot (CABasicAnimation). "Participant left." state with Wait / End Call buttons. Delegate-driven actions.
+- `inter/UI/Views/InterTrackRendererBridge.h/.m` — ObjC adapter conforming to Swift InterRemoteTrackRenderer protocol. Routes didReceiveRemoteCameraFrame/ScreenShareFrame and mute/unmute/end callbacks to InterRemoteVideoLayoutManager.
+- `inter/UI/Views/InterNetworkStatusView.h/.m` — Custom drawRect 4-bar signal indicator. InterNetworkQualityLevel enum (unknown/lost/poor/good/excellent). Progressive bar heights (4→16px), color-coded (green/yellow-green/orange/red/gray). Intrinsic size 40×16.
+
+**Files modified**:
+- `inter/App/AppDelegate.m` — Setup window expanded 660×560. Old 3-button panel replaced with InterConnectionSetupPanel. Connection setup delegate: host flow (create room → display code → connect), join flow (validate → connect with 404/410 mapping). Remote video layout wired in normal call window with TrackRendererBridge. Participant overlay driven by KVO on participantPresenceState. Network status bars + triple-click diagnostic gesture (G9 clipboard copy). Connection status text driven by KVO on connectionState.
+- `inter/UI/Views/InterLocalCallControlPanel.h/.m` — Added connectionStatusLabel, roomCodeLabel, networkStatusContainerView. New methods: setConnectionStatusText:, setRoomCodeText:.
+- `inter/UI/Controllers/SecureWindowController.m` — Remote video layout + TrackRendererBridge wired in secure window (inherits NSWindowSharingNone). Participant overlay driven by KVO. Network status bars + triple-click diagnostic. Connection status text driven by KVO.
+
+**Why**: Phase 3 builds the complete UI layer for LiveKit integration — connection management, remote video rendering with adaptive layouts, participant presence feedback, and network diagnostics. All UI views are self-contained with delegate patterns, matching the existing codebase conventions.
+
+**Build**: ✅ Clean build. 93 tests passing (unchanged from Phase 2).
+**Notes**: InterRoomConfiguration uses designated initializer with serverURL/tokenServerURL/roomCode/participantIdentity/participantName/isHost. UUID generated for participantIdentity at connect time. G8 isolation preserved — nil roomController gracefully falls through to local-only mode.
+
+---
+
 ## Log
 
-> Phase 0 complete. Phase 1 complete (all 11 files created + all unit tests). Phase 2 next (modify existing ObjC files).  
+> Phase 0 complete. Phase 1 complete. Phase 2 complete. Phase 3 complete.
+> Post-Phase 3 bug fixes complete. UI polish complete. Window picker implemented.
+> Phase 4 next (Production Hardening).
 > Stats JSON export 1.10.5 still pending.
+
+---
+
+## [12 March 2026] — Bug Fixes: Screen Share Publish, G5 Crash, Double-Publish Guard
+
+**Phase**: Post-Phase 3 bug fixes  
+**Files changed**:
+- `inter/App/AppDelegate.m` — Added `publishScreenShare` call inside the `statusHandler` block for `normalSurfaceShareController`, so network publishing actually starts when sharing is active and room is connected. Previously `publishScreenShare()` was never called.
+- `inter/UI/Controllers/SecureWindowController.m` — Same fix: added `publishScreenShare` call in the secure window `statusHandler`.
+- `inter/Networking/InterLiveKitScreenShareSource.swift` — Moved IOSurface retain off the router queue. Previously, `CVPixelBufferRetain` was called on the router queue before dispatch, which could block under kernel lock contention. Now the pixel buffer is retained inside the async dispatch block on the encoder queue.
+- `inter/Networking/InterLiveKitPublisher.swift` — Added double-publish guard to `publishScreenShare`: returns early with error if `screenShareSource` is already non-nil, preventing duplicate track publication.
+
+**Why**: Screen share was silently not publishing to the network. G5 crash occurred due to IOSurface kernel lock contention on the router queue. Double-publish caused track duplication.  
+**Notes**: All three bugs were independently discovered during testing. Build succeeded, all 93 tests pass.
+
+---
+
+## [12 March 2026] — Google Meet/Zoom-Style Remote Video Layout Rewrite
+
+**Phase**: Post-Phase 3 UI polish  
+**Files changed**:
+- `inter/UI/Views/InterRemoteVideoLayoutManager.h` — Complete API rewrite. New public API: `addRemoteCameraViewForParticipant:`, `removeRemoteCameraViewForParticipant:`, `setRemoteScreenShareView:forParticipant:`, spotlight support, filmstrip layout constants.
+- `inter/UI/Views/InterRemoteVideoLayoutManager.m` — Full rewrite (~600 lines). New components:
+  - `InterRemoteVideoTileView` (NSView wrapper): name label, hover highlight (tracking area), click-to-spotlight gesture, rounded corners, semi-transparent label bar.
+  - **Stage + Filmstrip layout**: When screen share is active, main stage takes 75% width with the shared screen, filmstrip sidebar takes 25% (min 160px, max 280px) with scrollable camera tiles.
+  - **Layout modes**: None, SingleCamera, MultiCamera (grid), ScreenShareOnly, ScreenShareWithCameras (stage+filmstrip).
+  - **Spotlight**: Click any tile to spotlight it to the main stage. Click again to unspotlight.
+  - **Animated transitions**: 300ms ease-in-out via `NSAnimationContext`.
+  - `NSScrollView` filmstrip with vertical scroller for many participants.
+  - Constants: `kFilmstripWidthFraction=0.25`, `kFilmstripMinWidth=160`, `kFilmstripMaxWidth=280`, `kAnimationDuration=0.3`.
+
+**Why**: Previous layout was basic PiP overlay. New layout matches Google Meet/Zoom experience — dedicated stage for primary content (screen share or spotlighted participant), scrollable filmstrip sidebar for other cameras.  
+**Notes**: Build succeeded, all tests pass.
+
+---
+
+## [12 March 2026] — Background Color Consistency Fix
+
+**Phase**: Post-Phase 3 UI polish  
+**Files changed**:
+- `inter/UI/Controllers/SecureWindowController.m` — Changed `grayColor` background to `blackColor` on secure window content view.
+- `inter/App/AppDelegate.m` — Added `blackColor` background on normal call window and its content view. Added `blackColor` on setup window content view.
+- `inter/UI/Views/InterRemoteVideoLayoutManager.m` — Changed `clearColor` to `blackColor` on layout manager view. Changed tile background from `colorWithWhite:0.12` to `blackColor`.
+- `inter/Rendering/MetalRenderEngine.m` — Changed Metal clear color from off-black `(0.03, 0.03, 0.03, 1.0)` to pure black `(0.0, 0.0, 0.0, 1.0)`.
+- `inter/Rendering/MetalSurfaceView.m` — Added `layer.backgroundColor = [NSColor blackColor].CGColor` on the CAMetalLayer.
+
+**Why**: 7 different sources produced inconsistent black/grey shades, causing visible seams between Metal render views, window backgrounds, and layout containers.  
+**Notes**: All backgrounds now uniform pure black. Build succeeded, all tests pass.
+
+---
+
+## [12 March 2026] — Window Picker UI (ScreenCaptureKit)
+
+**Phase**: Post-Phase 3 feature — Window-specific sharing  
+**Files created**:
+- `inter/UI/Views/InterWindowPickerPanel.h` — Public API: `+showPickerRelativeToWindow:completion:` presents modal sheet, calls `InterWindowPickerCompletion` with selected window identifier string or nil on cancel.
+- `inter/UI/Views/InterWindowPickerPanel.m` (~580 lines) — Full Google Meet/Zoom-style window picker:
+  - **ScreenCaptureKit** enumeration via `SCShareableContent getShareableContentExcludingDesktopWindows:onScreenWindowsOnly:` — no deprecated CG APIs.
+  - **Thumbnails**: `SCScreenshotManager captureImageWithFilter:configuration:` for each window (480×320 thumbnail). Parallel capture with `dispatch_group`.
+  - **Grid UI**: 3-column scrollable grid of `InterWindowTileView` tiles. Each tile shows: window thumbnail (NSImageView, aspect-fit), app icon (20×20), window title (truncated), app name subtitle.
+  - **Interaction**: Hover highlight (grey border via NSTrackingArea), click-to-select (blue border), click again to deselect. Cancel/Share buttons in bottom bar. Share enabled only when a tile is selected. Enter key shortcut.
+  - **Internal model**: `InterWindowInfo` (windowID, windowTitle, appName, thumbnail, appIcon). `InterWindowTileView` (custom NSView with tracking area).
+  - **Filtering**: Excludes own app windows (by PID and bundle ID), non-layer-0 windows (menus/tooltips), off-screen windows, windows smaller than 100×60.
+  - **Dark theme**: Matches app aesthetic — dark backgrounds (0.10/0.12), light text, rounded corners, semi-transparent bottom bar.
+  - **Loading state**: NSProgressIndicator spinner while SCShareableContent queries and thumbnails are captured.
+  - Presented as NSPanel sheet on the call window.
+
+**Files modified**:
+- `inter/Media/Sharing/InterShareTypes.h` — Added `selectedWindowIdentifier` (nullable NSString) to `InterShareSessionConfiguration`. Passes the user's chosen CGWindowID through the share pipeline.
+- `inter/Media/Sharing/InterShareTypes.m` — Updated `copyWithZone:` to copy `selectedWindowIdentifier`.
+- `inter/Media/InterSurfaceShareController.m` — In `startSharingFromSurfaceView:`, forwards `configuration.selectedWindowIdentifier` to `InterScreenCaptureVideoSource.selectedWindowIdentifier` before calling `startCaptureForSelectedWindow`.
+- `inter/App/AppDelegate.m` — Added `#import "InterWindowPickerPanel.h"`. Refactored `toggleNormalSurfaceShare`: for Window mode, presents the picker sheet first via `showPickerRelativeToWindow:completion:`. On selection, calls new helper `startNormalShareWithMode:windowIdentifier:` which sets the identifier on the configuration. Extracted common share-start logic into `startNormalShareWithMode:windowIdentifier:`.
+
+**Why**: Previously "Share Window" mode had no UI for the user to choose which window to share — it just picked the first available non-own window. Now matches the Google Meet/Zoom experience where users see a visual grid of all available windows with live thumbnails and can select one before sharing starts.  
+**Notes**: Build succeeded, all tests pass. Uses only ScreenCaptureKit APIs (macOS 13+), no deprecated CGWindowListCreateImage. Single SCShareableContent query reused for both window filtering and thumbnail capture (no N+1 query pattern).
+
+---
 
 <!-- 
 TEMPLATE — copy this for each new entry:

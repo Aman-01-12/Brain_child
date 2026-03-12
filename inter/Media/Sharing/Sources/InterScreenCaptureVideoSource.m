@@ -29,6 +29,12 @@ typedef NS_ENUM(NSUInteger, InterScreenCaptureSelectionMode) {
 
     NSArray<NSString *> *_cachedDisplayIdentifiers;
     NSArray<NSString *> *_cachedWindowIdentifiers;
+
+    /// State for waiting on permission grant after user is sent to System Settings.
+    BOOL _waitingForPermissionGrant;
+    InterScreenCaptureSelectionMode _pendingSelectionMode;
+    uint64_t _pendingGeneration;
+    id _appDidBecomeActiveObserver;
 }
 
 @synthesize frameHandler = _frameHandler;
@@ -53,7 +59,17 @@ typedef NS_ENUM(NSUInteger, InterScreenCaptureSelectionMode) {
     _hasLastEmittedPresentationTime = NO;
     _cachedDisplayIdentifiers = @[];
     _cachedWindowIdentifiers = @[];
+    _waitingForPermissionGrant = NO;
+    _pendingGeneration = 0;
+    _appDidBecomeActiveObserver = nil;
     return self;
+}
+
+- (void)dealloc {
+    if (_appDidBecomeActiveObserver) {
+        [[NSNotificationCenter defaultCenter] removeObserver:_appDidBecomeActiveObserver];
+        _appDidBecomeActiveObserver = nil;
+    }
 }
 
 + (BOOL)preflightScreenCaptureAccess {
@@ -113,21 +129,17 @@ typedef NS_ENUM(NSUInteger, InterScreenCaptureSelectionMode) {
         if (@available(macOS 13.0, *)) {
             BOOL hasScreenCaptureAccess = [InterScreenCaptureVideoSource preflightScreenCaptureAccess];
             if (!hasScreenCaptureAccess) {
-                BOOL requestResult = [InterScreenCaptureVideoSource requestScreenCaptureAccessIfNeeded];
-                if (!requestResult) {
-                    [self failStartForGeneration:generation
-                                            code:InterShareErrorCodeInvalidConfiguration
-                                     description:@"Screen recording permission is required. Enable it in System Settings > Privacy & Security."
-                                 underlyingError:nil];
-                    return;
-                }
+                // CGRequestScreenCaptureAccess() opens System Settings and returns NO
+                // immediately — it does NOT block until the user grants permission.
+                // Instead of failing right away, we observe app-became-active to
+                // re-check permission when the user returns from Settings.
+                (void)[InterScreenCaptureVideoSource requestScreenCaptureAccessIfNeeded];
 
+                // Re-check immediately in case permission was already cached
                 hasScreenCaptureAccess = [InterScreenCaptureVideoSource preflightScreenCaptureAccess];
                 if (!hasScreenCaptureAccess) {
-                    [self failStartForGeneration:generation
-                                            code:InterShareErrorCodeInvalidConfiguration
-                                     description:@"Screen recording was enabled, but macOS requires app relaunch before capture can start."
-                                 underlyingError:nil];
+                    // Permission not yet granted — wait for user to come back from Settings
+                    [self waitForPermissionGrantWithSelectionMode:selectionMode generation:generation];
                     return;
                 }
             }
@@ -155,6 +167,9 @@ typedef NS_ENUM(NSUInteger, InterScreenCaptureSelectionMode) {
 
 - (void)stop {
     dispatch_async(_controlQueue, ^{
+        // Cancel any pending permission wait
+        [self cancelPermissionWait];
+
         SCStream *streamToStop = nil;
 
         os_unfair_lock_lock(&self->_stateLock);
@@ -175,6 +190,81 @@ typedef NS_ENUM(NSUInteger, InterScreenCaptureSelectionMode) {
 
         [self stopStream:streamToStop];
     });
+}
+
+#pragma mark - Permission Wait
+
+/// When CGRequestScreenCaptureAccess() sends the user to System Settings, this
+/// method registers an observer for NSApplicationDidBecomeActiveNotification.
+/// When the user returns, we re-check permission and either proceed or fail.
+- (void)waitForPermissionGrantWithSelectionMode:(InterScreenCaptureSelectionMode)selectionMode
+                                     generation:(uint64_t)generation {
+    os_unfair_lock_lock(&_stateLock);
+    _waitingForPermissionGrant = YES;
+    _pendingSelectionMode = selectionMode;
+    _pendingGeneration = generation;
+    os_unfair_lock_unlock(&_stateLock);
+
+    __weak typeof(self) weakSelf = self;
+    _appDidBecomeActiveObserver =
+        [[NSNotificationCenter defaultCenter] addObserverForName:NSApplicationDidBecomeActiveNotification
+                                                          object:nil
+                                                           queue:[NSOperationQueue mainQueue]
+                                                      usingBlock:^(NSNotification * _Nonnull note) {
+#pragma unused(note)
+            __strong typeof(weakSelf) strongSelf = weakSelf;
+            if (!strongSelf) return;
+            dispatch_async(strongSelf->_controlQueue, ^{
+                [strongSelf handleReturnFromSettingsForGeneration:generation
+                                                   selectionMode:selectionMode];
+            });
+        }];
+}
+
+- (void)handleReturnFromSettingsForGeneration:(uint64_t)generation
+                                selectionMode:(InterScreenCaptureSelectionMode)selectionMode {
+    [self cancelPermissionWait];
+
+    // Check the generation is still current
+    os_unfair_lock_lock(&_stateLock);
+    BOOL isCurrent = (_starting && _generation == generation);
+    os_unfair_lock_unlock(&_stateLock);
+    if (!isCurrent) return;
+
+    BOOL hasAccess = [InterScreenCaptureVideoSource preflightScreenCaptureAccess];
+    if (!hasAccess) {
+        [self failStartForGeneration:generation
+                                code:InterShareErrorCodeInvalidConfiguration
+                         description:@"Screen recording permission is required. Enable it in System Settings > Privacy & Security."
+                     underlyingError:nil];
+        return;
+    }
+
+    // Permission granted — continue the normal capture start flow
+    if (@available(macOS 13.0, *)) {
+        [SCShareableContent getShareableContentExcludingDesktopWindows:YES
+                                                  onScreenWindowsOnly:YES
+                                                     completionHandler:^(SCShareableContent * _Nullable content,
+                                                                         NSError * _Nullable error) {
+            dispatch_async(self->_controlQueue, ^{
+                [self handleShareableContent:content
+                                       error:error
+                               selectionMode:selectionMode
+                                  generation:generation];
+            });
+        }];
+    }
+}
+
+- (void)cancelPermissionWait {
+    os_unfair_lock_lock(&_stateLock);
+    _waitingForPermissionGrant = NO;
+    os_unfair_lock_unlock(&_stateLock);
+
+    if (_appDidBecomeActiveObserver) {
+        [[NSNotificationCenter defaultCenter] removeObserver:_appDidBecomeActiveObserver];
+        _appDidBecomeActiveObserver = nil;
+    }
 }
 
 #pragma mark - Internal

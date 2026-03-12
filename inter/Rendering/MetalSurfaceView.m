@@ -22,6 +22,7 @@ static CVReturn InterDisplayLinkCallback(CVDisplayLinkRef displayLink,
     dispatch_queue_t _egressQueue;
 
     os_unfair_lock _surfaceLock;
+    BOOL _stopped;
     CGSize _drawableSize;
     id<MTLTexture> _captureTexture;
     NSUInteger _captureWidth;
@@ -79,6 +80,7 @@ static CVReturn InterDisplayLinkCallback(CVDisplayLinkRef displayLink,
     layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
     layer.framebufferOnly = YES;
     layer.opaque = YES;
+    layer.backgroundColor = [NSColor blackColor].CGColor;
     layer.contentsGravity = kCAGravityResizeAspect;
     self.metalLayer = layer;
 
@@ -120,6 +122,10 @@ static CVReturn InterDisplayLinkCallback(CVDisplayLinkRef displayLink,
         return;
     }
 
+    os_unfair_lock_lock(&_surfaceLock);
+    _stopped = NO;
+    os_unfair_lock_unlock(&_surfaceLock);
+
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
     CVReturn result = CVDisplayLinkCreateWithActiveCGDisplays(&_displayLink);
@@ -137,6 +143,11 @@ static CVReturn InterDisplayLinkCallback(CVDisplayLinkRef displayLink,
 }
 
 - (void)stopAndReleaseDisplayLink {
+    // Signal stopped first so any in-flight callback bails out.
+    os_unfair_lock_lock(&_surfaceLock);
+    _stopped = YES;
+    os_unfair_lock_unlock(&_surfaceLock);
+
     if (_displayLink == NULL) {
         return;
     }
@@ -147,6 +158,15 @@ static CVReturn InterDisplayLinkCallback(CVDisplayLinkRef displayLink,
     CVDisplayLinkRelease(_displayLink);
 #pragma clang diagnostic pop
     _displayLink = NULL;
+
+    // Drain the in-flight semaphore to wait for any callback that was
+    // already past the _stopped check when we set the flag.
+    for (int i = 0; i < 3; i++) {
+        dispatch_semaphore_wait(_inFlightSemaphore, DISPATCH_TIME_FOREVER);
+    }
+    for (int i = 0; i < 3; i++) {
+        dispatch_semaphore_signal(_inFlightSemaphore);
+    }
 }
 
 - (void)refreshDrawableSize {
@@ -172,7 +192,24 @@ static CVReturn InterDisplayLinkCallback(CVDisplayLinkRef displayLink,
 }
 
 - (void)renderFrameFromDisplayLink {
+    // Early-out if the view is being torn down.
+    os_unfair_lock_lock(&_surfaceLock);
+    BOOL stopped = _stopped;
+    os_unfair_lock_unlock(&_surfaceLock);
+    if (stopped) {
+        return;
+    }
+
     dispatch_semaphore_wait(_inFlightSemaphore, DISPATCH_TIME_FOREVER);
+
+    // Re-check after semaphore acquisition — teardown may have started while waiting.
+    os_unfair_lock_lock(&_surfaceLock);
+    stopped = _stopped;
+    os_unfair_lock_unlock(&_surfaceLock);
+    if (stopped) {
+        dispatch_semaphore_signal(_inFlightSemaphore);
+        return;
+    }
 
     CGSize drawableSize = CGSizeZero;
     os_unfair_lock_lock(&_surfaceLock);

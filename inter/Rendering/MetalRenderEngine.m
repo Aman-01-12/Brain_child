@@ -112,11 +112,7 @@ typedef struct InterCompositeUniforms {
     "fragment float4 interCompositeFragment(VertexOut in [[stage_in]],\n"
     "                                       constant CompositeUniforms &uniforms [[buffer(0)]]) {\n"
     "\n"
-    "    float pulse = 0.08 * sin(uniforms.timeSeconds * 1.4);\n"
-    "    float3 baseColor = float3(0.06 + in.uv.y * 0.14,\n"
-    "                              0.08 + in.uv.x * 0.20 + pulse,\n"
-    "                              0.13 + in.uv.y * 0.16);\n"
-    "    return float4(baseColor, 1.0);\n"
+    "    return float4(0.03, 0.03, 0.03, 1.0);\n"
     "}\n"
     "\n"
     "fragment float4 interPresentFragment(VertexOut in [[stage_in]],\n"
@@ -206,7 +202,7 @@ typedef struct InterCompositeUniforms {
     renderPassDescriptor.colorAttachments[0].texture = captureTexture;
     renderPassDescriptor.colorAttachments[0].loadAction = MTLLoadActionClear;
     renderPassDescriptor.colorAttachments[0].storeAction = MTLStoreActionStore;
-    renderPassDescriptor.colorAttachments[0].clearColor = MTLClearColorMake(0.03, 0.03, 0.03, 1.0);
+    renderPassDescriptor.colorAttachments[0].clearColor = MTLClearColorMake(0.0, 0.0, 0.0, 1.0);
 
     id<MTLRenderCommandEncoder> renderEncoder =
     [commandBuffer renderCommandEncoderWithDescriptor:renderPassDescriptor];

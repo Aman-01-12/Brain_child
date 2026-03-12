@@ -6,10 +6,21 @@
 #import "InterLocalCallControlPanel.h"
 #import "InterSurfaceShareController.h"
 #import "InterScreenCaptureVideoSource.h"
+#import "InterWindowPickerPanel.h"
 #import "MetalSurfaceView.h"
 #import "SecureWindowController.h"
+#import "InterConnectionSetupPanel.h"
+#import "InterRemoteVideoLayoutManager.h"
+#import "InterTrackRendererBridge.h"
+#import "InterParticipantOverlayView.h"
+#import "InterNetworkStatusView.h"
 
-@interface AppDelegate () <NSWindowDelegate>
+// [2.5.1] Swift module import for networking layer
+#if __has_include("inter-Swift.h")
+#import "inter-Swift.h"
+#endif
+
+@interface AppDelegate () <NSWindowDelegate, InterConnectionSetupPanelDelegate, InterParticipantOverlayDelegate>
 @property (nonatomic, strong) NSMutableArray<CapWindow *> *capWindows;
 @property (nonatomic, strong) SecureWindowController *secureController;
 @property (nonatomic, strong) NSWindow *setupWindow;
@@ -22,10 +33,23 @@
 @property (nonatomic, strong) InterSurfaceShareController *normalSurfaceShareController;
 @property (nonatomic, strong) InterLocalCallControlPanel *normalControlPanel;
 @property (nonatomic, strong) InterCallSessionCoordinator *sessionCoordinator;
+@property (nonatomic, strong, nullable) InterConnectionSetupPanel *connectionPanel;
+@property (nonatomic, strong, nullable) InterRemoteVideoLayoutManager *normalRemoteLayout;
+@property (nonatomic, strong, nullable) InterTrackRendererBridge *normalTrackRendererBridge;
+@property (nonatomic, strong, nullable) InterNetworkStatusView *normalNetworkStatusView;
 @property (nonatomic, assign) BOOL isScreenObserverRegistered;
 @property (nonatomic, assign) BOOL isShowingExternalDisplayAlert;
 @property (nonatomic, weak) NSWindow *fullScreenExitPendingWindow;
+
+// [2.5.2] Room controller — persists across mode transitions [G4]
+@property (nonatomic, strong, nullable) InterRoomController *roomController;
+
+// KVO observation tokens [2.5.8]
+@property (nonatomic, assign) BOOL isObservingRoomController;
 @end
+
+static void *InterConnectionStateContext = &InterConnectionStateContext;
+static void *InterPresenceStateContext = &InterPresenceStateContext;
 
 @implementation AppDelegate
 
@@ -33,6 +57,18 @@ static NSString *const InterScreenCaptureStartupPromptedKey = @"InterScreenCaptu
 
 - (void)applicationDidFinishLaunching:(NSNotification *)aNotification {
     self.sessionCoordinator = [[InterCallSessionCoordinator alloc] init];
+
+    // [2.5.2] Create room controller. [G8] If this fails, app continues as local-only
+    @try {
+        self.roomController = [[InterRoomController alloc] init];
+    } @catch (NSException *exception) {
+        NSLog(@"[G8] InterRoomController creation failed: %@. Continuing local-only.", exception.reason);
+        self.roomController = nil;
+    }
+
+    // [2.5.8] KVO: observe connection state + participant presence → update UI
+    [self setupRoomControllerKVO];
+
     [self launchSetupUI];
     [self preflightMediaPermissions];
 }
@@ -48,6 +84,13 @@ static NSString *const InterScreenCaptureStartupPromptedKey = @"InterScreenCaptu
 - (void)applicationWillTerminate:(NSNotification *)notification {
 #pragma unused(notification)
     [self stopScreenMonitoring];
+
+    // [2.5.7] Disconnect room on app terminate
+    [self teardownRoomControllerKVO];
+    if (self.roomController) {
+        [self.roomController disconnect];
+        self.roomController = nil;
+    }
 
     if (self.fullScreenExitPendingWindow) {
         [[NSNotificationCenter defaultCenter] removeObserver:self
@@ -184,6 +227,8 @@ static NSString *const InterScreenCaptureStartupPromptedKey = @"InterScreenCaptu
         [self applyKioskRestrictions];
         [self startScreenMonitoring];
         self.secureController = [[SecureWindowController alloc] init];
+        // [2.6.1] Pass room controller reference to secure window
+        self.secureController.roomController = self.roomController;
         __weak typeof(self) weakSelf = self;
         self.secureController.exitSessionHandler = ^{
             [weakSelf requestExitCurrentMode];
@@ -210,7 +255,7 @@ static NSString *const InterScreenCaptureStartupPromptedKey = @"InterScreenCaptu
     }
 
     self.setupWindow =
-    [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 620, 430)
+    [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 660, 560)
                                 styleMask:(NSWindowStyleMaskTitled |
                                            NSWindowStyleMaskClosable)
                                   backing:NSBackingStoreBuffered
@@ -220,8 +265,11 @@ static NSString *const InterScreenCaptureStartupPromptedKey = @"InterScreenCaptu
     [self.setupWindow setTitle:@"Secure Call Setup"];
     [self.setupWindow setSharingType:NSWindowSharingNone];
     [self.setupWindow setDelegate:self];
+    [self.setupWindow setBackgroundColor:[NSColor blackColor]];
 
     NSView *view = [[NSView alloc] initWithFrame:self.setupWindow.contentView.bounds];
+    [view setWantsLayer:YES];
+    view.layer.backgroundColor = [NSColor blackColor].CGColor;
     [self.setupWindow setContentView:view];
 
     self.setupRenderView = [[MetalSurfaceView alloc] initWithFrame:view.bounds];
@@ -241,46 +289,177 @@ static NSString *const InterScreenCaptureStartupPromptedKey = @"InterScreenCaptu
     overlayView.layer.backgroundColor = NSColor.clearColor.CGColor;
     [containerView addSubview:overlayView];
 
-    NSView *panelView = [[NSView alloc] initWithFrame:NSMakeRect(120, 106, 380, 250)];
-    panelView.autoresizingMask = NSViewMinXMargin | NSViewMaxXMargin | NSViewMinYMargin | NSViewMaxYMargin;
-    [panelView setWantsLayer:YES];
-    panelView.layer.backgroundColor = [[NSColor colorWithWhite:0.08 alpha:0.60] CGColor];
-    panelView.layer.cornerRadius = 16.0;
-    panelView.layer.borderWidth = 1.0;
-    panelView.layer.borderColor = [[NSColor colorWithWhite:1.0 alpha:0.12] CGColor];
-    [overlayView addSubview:panelView];
+    // [3.1.1] Connection setup panel — server URLs, display name, room code, action buttons
+    CGFloat panelW = 420.0;
+    CGFloat panelH = 480.0;
+    CGFloat panelX = (containerView.bounds.size.width - panelW) / 2.0;
+    CGFloat panelY = (containerView.bounds.size.height - panelH) / 2.0;
+    self.connectionPanel = [[InterConnectionSetupPanel alloc] initWithFrame:NSMakeRect(panelX, panelY, panelW, panelH)];
+    self.connectionPanel.autoresizingMask = NSViewMinXMargin | NSViewMaxXMargin | NSViewMinYMargin | NSViewMaxYMargin;
+    self.connectionPanel.delegate = self;
+    [overlayView addSubview:self.connectionPanel];
 
-    NSTextField *headline = [NSTextField labelWithString:@"Choose how you want to continue"];
-    headline.frame = NSMakeRect(20, 200, 340, 30);
-    headline.alignment = NSTextAlignmentCenter;
-    headline.font = [NSFont boldSystemFontOfSize:16];
-    headline.textColor = [NSColor colorWithWhite:0.95 alpha:1.0];
-    [panelView addSubview:headline];
-
-    NSButton *normalCallButton = [[NSButton alloc] initWithFrame:NSMakeRect(80, 132, 220, 44)];
-    [normalCallButton setTitle:@"Start Normal Call"];
-    [normalCallButton setTarget:self];
-    [normalCallButton setAction:@selector(startNormalCallMode)];
-    [panelView addSubview:normalCallButton];
-
-    NSButton *createInterviewButton = [[NSButton alloc] initWithFrame:NSMakeRect(80, 76, 220, 44)];
-    [createInterviewButton setTitle:@"Create Interview"];
-    [createInterviewButton setTarget:self];
-    [createInterviewButton setAction:@selector(createInterviewAsInterviewer)];
-    [panelView addSubview:createInterviewButton];
-
-    NSButton *joinInterviewButton = [[NSButton alloc] initWithFrame:NSMakeRect(80, 20, 220, 44)];
-    [joinInterviewButton setTitle:@"Join Interview"];
-    [joinInterviewButton setTarget:self];
-    [joinInterviewButton setAction:@selector(joinInterviewAsInterviewee)];
-    [panelView addSubview:joinInterviewButton];
-
-    NSButton *settingsButton = [[NSButton alloc] initWithFrame:NSMakeRect(250, 210, 112, 26)];
+    NSButton *settingsButton = [[NSButton alloc] initWithFrame:NSMakeRect(panelX + panelW - 112, panelY + panelH + 8, 112, 26)];
     settingsButton.autoresizingMask = NSViewMinXMargin | NSViewMinYMargin;
     [settingsButton setTitle:@"Settings"];
     [settingsButton setTarget:self];
     [settingsButton setAction:@selector(openSettingsWindow)];
-    [panelView addSubview:settingsButton];
+    [overlayView addSubview:settingsButton];
+}
+
+#pragma mark - InterConnectionSetupPanelDelegate [3.1]
+
+- (void)setupPanelDidRequestHostCall:(InterConnectionSetupPanel *)panel {
+    [self connectAndEnterMode:InterCallModeNormal role:InterInterviewRoleNone panel:panel];
+}
+
+- (void)setupPanelDidRequestHostInterview:(InterConnectionSetupPanel *)panel {
+    [self connectAndEnterMode:InterCallModeInterview role:InterInterviewRoleInterviewer panel:panel];
+}
+
+- (void)setupPanelDidRequestJoin:(InterConnectionSetupPanel *)panel {
+    NSString *code = panel.roomCode;
+    if (code.length == 0) {
+        [panel setStatusText:@"Enter a room code to join."];
+        return;
+    }
+
+    [self joinRoomWithCode:code panel:panel];
+}
+
+/// [3.1.2] Host flow: create room → get code → display it → connect → enter mode.
+- (void)connectAndEnterMode:(InterCallMode)mode
+                       role:(InterInterviewRole)role
+                      panel:(InterConnectionSetupPanel *)panel {
+    NSString *serverURL    = panel.serverURL;
+    NSString *tokenURL     = panel.tokenServerURL;
+    NSString *displayName  = panel.displayName;
+
+    if (displayName.length == 0) {
+        [panel setStatusText:@"Enter a display name."];
+        return;
+    }
+
+    InterRoomController *rc = self.roomController;
+    if (!rc) {
+        // [G8] No room controller — fall through to local-only mode
+        [panel setStatusText:@"Network unavailable — starting local-only."];
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            [self enterMode:mode role:role];
+        });
+        return;
+    }
+
+    [panel setActionsEnabled:NO];
+    [panel setIndicatorState:InterConnectionIndicatorStateConnecting];
+    [panel setStatusText:@"Creating room…"];
+
+    NSString *identity = [[NSUUID UUID] UUIDString];
+    InterRoomConfiguration *config =
+        [[InterRoomConfiguration alloc] initWithServerURL:serverURL
+                                          tokenServerURL:tokenURL
+                                                roomCode:@""
+                                     participantIdentity:identity
+                                         participantName:displayName
+                                                  isHost:YES];
+
+    __weak typeof(self) weakSelf = self;
+    [rc connectWithConfiguration:config completion:^(NSError * _Nullable error) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            __strong typeof(weakSelf) strongSelf = weakSelf;
+            if (!strongSelf) return;
+
+            if (error) {
+                [panel setActionsEnabled:YES];
+                [panel setIndicatorState:InterConnectionIndicatorStateError];
+                [panel setStatusText:[strongSelf userFacingMessageForError:error]];
+                return;
+            }
+
+            [panel setIndicatorState:InterConnectionIndicatorStateConnected];
+            [panel setStatusText:@"Connected"];
+
+            NSString *roomCode = rc.roomCode;
+            if (roomCode.length > 0) {
+                [panel showHostedRoomCode:roomCode];
+            }
+
+            // Brief delay so user can see the room code before window transitions
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                [panel setActionsEnabled:YES];
+                [strongSelf enterMode:mode role:role];
+            });
+        });
+    }];
+}
+
+/// [3.1.3] Join flow: validate code → connect → enter as guest (normal call).
+- (void)joinRoomWithCode:(NSString *)code panel:(InterConnectionSetupPanel *)panel {
+    NSString *serverURL    = panel.serverURL;
+    NSString *tokenURL     = panel.tokenServerURL;
+    NSString *displayName  = panel.displayName;
+
+    if (displayName.length == 0) {
+        [panel setStatusText:@"Enter a display name."];
+        return;
+    }
+
+    InterRoomController *rc = self.roomController;
+    if (!rc) {
+        [panel setStatusText:@"Network unavailable — cannot join."];
+        return;
+    }
+
+    [panel setActionsEnabled:NO];
+    [panel setIndicatorState:InterConnectionIndicatorStateConnecting];
+    [panel setStatusText:@"Joining room…"];
+
+    NSString *identity = [[NSUUID UUID] UUIDString];
+    InterRoomConfiguration *config =
+        [[InterRoomConfiguration alloc] initWithServerURL:serverURL
+                                          tokenServerURL:tokenURL
+                                                roomCode:code
+                                     participantIdentity:identity
+                                         participantName:displayName
+                                                  isHost:NO];
+
+    __weak typeof(self) weakSelf = self;
+    [rc connectWithConfiguration:config completion:^(NSError * _Nullable error) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            __strong typeof(weakSelf) strongSelf = weakSelf;
+            if (!strongSelf) return;
+
+            if (error) {
+                [panel setActionsEnabled:YES];
+                [panel setIndicatorState:InterConnectionIndicatorStateError];
+                [panel setStatusText:[strongSelf userFacingMessageForError:error]];
+                return;
+            }
+
+            [panel setIndicatorState:InterConnectionIndicatorStateConnected];
+            [panel setStatusText:@"Joined"];
+            [panel setActionsEnabled:YES];
+
+            // Joiner enters normal call mode
+            [strongSelf enterMode:InterCallModeNormal role:InterInterviewRoleNone];
+        });
+    }];
+}
+
+/// [3.1.3] Map NSError codes to user-facing messages.
+- (NSString *)userFacingMessageForError:(NSError *)error {
+    if (!error) return @"Unknown error";
+
+    NSInteger code = error.code;
+    // InterNetworkErrorCode values from InterNetworkTypes.swift
+    if (code == 2) return @"Invalid room code. Check and try again.";
+    if (code == 3) return @"Room has expired. Ask the host for a new code.";
+    if (code == 4) return @"Token fetch failed. Check token server URL.";
+    if (code == 5) return @"Connection failed. Check server URL and network.";
+
+    return error.localizedDescription ?: @"Connection failed.";
 }
 
 - (void)launchNormalCallWindow {
@@ -319,12 +498,21 @@ static NSString *const InterScreenCaptureStartupPromptedKey = @"InterScreenCaptu
             [subview removeFromSuperview];
         }
     }
+    [view setWantsLayer:YES];
+    view.layer.backgroundColor = [NSColor blackColor].CGColor;
+    [self.normalCallWindow setBackgroundColor:[NSColor blackColor]];
 
     self.normalRenderView = [[MetalSurfaceView alloc] initWithFrame:view.bounds];
     self.normalRenderView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
     [view addSubview:self.normalRenderView];
 
+    // [3.2.1] Remote video layout (camera + screen share views + participant overlay)
+    self.normalRemoteLayout = [[InterRemoteVideoLayoutManager alloc] initWithFrame:view.bounds];
+    self.normalRemoteLayout.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+    [view addSubview:self.normalRemoteLayout];
+
     [self attachNormalCallControlsInView:view];
+    [self wireNormalRemoteRendering];
     [self startNormalLocalMediaFlow];
 
     [self.normalControlPanel setCameraEnabled:self.normalMediaController.isCameraEnabled];
@@ -332,6 +520,9 @@ static NSString *const InterScreenCaptureStartupPromptedKey = @"InterScreenCaptu
     [self.normalControlPanel setSharingEnabled:self.normalSurfaceShareController.isSharing];
 
     [self.normalControlPanel setShareStatusText:@"Secure surface share is off. Select a source to begin."];
+
+    // [3.4.2] Carry over connection status + room code from the setup phase
+    [self updateNormalConnectionStatus];
 
     [self.normalCallWindow makeKeyAndOrderFront:nil];
 }
@@ -366,10 +557,12 @@ static NSString *const InterScreenCaptureStartupPromptedKey = @"InterScreenCaptu
 
     __weak typeof(self) weakSelf = self;
     self.normalControlPanel.cameraToggleHandler = ^{
-        [weakSelf toggleNormalCamera];
+        // [2.5.6] [G2] Two-phase camera toggle
+        [weakSelf twoPhaseToggleNormalCamera];
     };
     self.normalControlPanel.microphoneToggleHandler = ^{
-        [weakSelf toggleNormalMicrophone];
+        // [2.5.6] [G2] Two-phase microphone toggle
+        [weakSelf twoPhaseToggleNormalMicrophone];
     };
     self.normalControlPanel.shareToggleHandler = ^{
         [weakSelf toggleNormalSurfaceShare];
@@ -377,6 +570,16 @@ static NSString *const InterScreenCaptureStartupPromptedKey = @"InterScreenCaptu
     self.normalControlPanel.shareModeChangedHandler = ^(InterShareMode shareMode) {
         [weakSelf handleNormalShareModeChanged:shareMode];
     };
+
+    // [3.4.4] Network quality signal bars in the control panel
+    self.normalNetworkStatusView = [[InterNetworkStatusView alloc] initWithFrame:NSMakeRect(0, 0, 40, 16)];
+    [self.normalControlPanel.networkStatusContainerView addSubview:self.normalNetworkStatusView];
+
+    // [3.4.5] [G9] Triple-click diagnostic: copy snapshot to clipboard
+    NSClickGestureRecognizer *tripleClick = [[NSClickGestureRecognizer alloc] initWithTarget:self
+                                                                                      action:@selector(handleDiagnosticTripleClick:)];
+    tripleClick.numberOfClicksRequired = 3;
+    [self.normalControlPanel.networkStatusContainerView addGestureRecognizer:tripleClick];
 }
 
 - (void)startNormalLocalMediaFlow {
@@ -389,6 +592,16 @@ static NSString *const InterScreenCaptureStartupPromptedKey = @"InterScreenCaptu
     __weak typeof(self) weakSelf = self;
     self.normalSurfaceShareController.statusHandler = ^(NSString *statusText) {
         [weakSelf.normalControlPanel setShareStatusText:statusText];
+        BOOL sharing = weakSelf.normalSurfaceShareController.isSharing;
+        [weakSelf.normalControlPanel setSharingEnabled:sharing];
+        // Publish screen share track to LiveKit when sharing starts
+        if (sharing && weakSelf.roomController.connectionState == InterRoomConnectionStateConnected) {
+            [weakSelf.roomController.publisher publishScreenShareWithCompletion:^(NSError *error) {
+                if (error) {
+                    NSLog(@"[G8] Screen share publish error: %@", error.localizedDescription);
+                }
+            }];
+        }
     };
     self.normalSurfaceShareController.audioSampleObserverRegistrationBlock =
     ^(InterSurfaceShareAudioSampleHandler _Nullable sampleHandler) {
@@ -416,6 +629,9 @@ static NSString *const InterScreenCaptureStartupPromptedKey = @"InterScreenCaptu
             message = failureReason;
         }
         [weakSelf.normalControlPanel setMediaStatusText:message];
+
+        // [2.5.4] Wire network publishing if room is connected
+        [weakSelf wireNormalNetworkPublish];
     }];
 }
 
@@ -484,17 +700,420 @@ static NSString *const InterScreenCaptureStartupPromptedKey = @"InterScreenCaptu
         return;
     }
 
-    if (self.normalSurfaceShareController.isSharing) {
+    // Sync button state — an async error may have reset sharing behind our back
+    BOOL currentlySharing = self.normalSurfaceShareController.isSharing;
+    [self.normalControlPanel setSharingEnabled:currentlySharing];
+
+    if (currentlySharing) {
+        // Unpublish screen share track from LiveKit before stopping
+        [self.roomController.publisher unpublishScreenShareWithCompletion:nil];
         [self.normalSurfaceShareController stopSharingFromSurfaceView:self.normalRenderView];
+        // Clear network sink on stop
+        self.normalSurfaceShareController.networkPublishSink = nil;
         [self.normalControlPanel setSharingEnabled:self.normalSurfaceShareController.isSharing];
         return;
     }
 
+    InterShareMode selectedMode = self.normalControlPanel.selectedShareMode;
+
+    // For Window mode, show the picker first so the user can choose which window
+    if (selectedMode == InterShareModeWindow) {
+        NSWindow *parent = self.normalCallWindow;
+        if (!parent) { return; }
+
+        __weak typeof(self) weakSelf = self;
+        [InterWindowPickerPanel showPickerRelativeToWindow:parent completion:^(NSString * _Nullable selectedWindowIdentifier) {
+            if (!selectedWindowIdentifier) {
+                // User cancelled — do nothing
+                return;
+            }
+
+            [weakSelf startNormalWindowShareWithIdentifier:selectedWindowIdentifier];
+        }];
+        return;
+    }
+
+    [self startNormalShareWithMode:selectedMode windowIdentifier:nil];
+}
+
+/// Start window share after the user picked a specific window.
+- (void)startNormalWindowShareWithIdentifier:(NSString *)windowIdentifier {
+    [self startNormalShareWithMode:InterShareModeWindow windowIdentifier:windowIdentifier];
+}
+
+/// Common path for starting a normal surface share, optionally with a pre-selected
+/// window identifier (for Window mode).
+- (void)startNormalShareWithMode:(InterShareMode)shareMode
+                windowIdentifier:(NSString * _Nullable)windowIdentifier {
     [self.normalSurfaceShareController configureWithSessionKind:InterShareSessionKindNormal
-                                                      shareMode:self.normalControlPanel.selectedShareMode
+                                                      shareMode:shareMode
                                                recordingEnabled:YES];
+
+    if (windowIdentifier.length > 0) {
+        self.normalSurfaceShareController.configuration.selectedWindowIdentifier = windowIdentifier;
+    }
+
+    // [2.5.5] Wire network sink before starting share
+    [self wireNetworkSinkOnSurfaceShareController:self.normalSurfaceShareController];
+
     [self.normalSurfaceShareController startSharingFromSurfaceView:self.normalRenderView];
-    [self.normalControlPanel setSharingEnabled:self.normalSurfaceShareController.isSharing];
+    // Don't optimistically read isSharing here — it may be YES momentarily
+    // before an async permission error resets it. The statusHandler will
+    // sync the button state when the capture actually succeeds or fails.
+}
+
+#pragma mark - Network Wiring [2.5]
+
+// [2.5.8] KVO observation for room controller state
+- (void)setupRoomControllerKVO {
+    InterRoomController *rc = self.roomController;
+    if (!rc || self.isObservingRoomController) {
+        return;
+    }
+
+    [rc addObserver:self forKeyPath:@"connectionState"
+            options:NSKeyValueObservingOptionNew
+            context:InterConnectionStateContext];
+    [rc addObserver:self forKeyPath:@"participantPresenceState"
+            options:NSKeyValueObservingOptionNew
+            context:InterPresenceStateContext];
+    self.isObservingRoomController = YES;
+}
+
+- (void)teardownRoomControllerKVO {
+    if (!self.isObservingRoomController || !self.roomController) {
+        return;
+    }
+
+    [self.roomController removeObserver:self forKeyPath:@"connectionState"
+                                context:InterConnectionStateContext];
+    [self.roomController removeObserver:self forKeyPath:@"participantPresenceState"
+                                context:InterPresenceStateContext];
+    self.isObservingRoomController = NO;
+}
+
+- (void)observeValueForKeyPath:(NSString *)keyPath
+                      ofObject:(id)object
+                        change:(NSDictionary<NSKeyValueChangeKey,id> *)change
+                       context:(void *)context {
+    if (context == InterConnectionStateContext) {
+        InterRoomController *rc = (InterRoomController *)object;
+        [self handleConnectionStateChanged:rc.connectionState];
+    } else if (context == InterPresenceStateContext) {
+        InterRoomController *rc = (InterRoomController *)object;
+        [self handlePresenceStateChanged:rc.participantPresenceState];
+    } else {
+        [super observeValueForKeyPath:keyPath ofObject:object change:change context:context];
+    }
+}
+
+// [2.5.8] Handle connection state changes → update control panel UI
+- (void)handleConnectionStateChanged:(InterRoomConnectionState)state {
+    NSString *label = nil;
+    switch (state) {
+        case InterRoomConnectionStateDisconnected:
+            label = @"Disconnected";
+            break;
+        case InterRoomConnectionStateConnecting:
+            label = @"Connecting…";
+            break;
+        case InterRoomConnectionStateConnected:
+            label = @"Connected";
+            break;
+        case InterRoomConnectionStateReconnecting:
+            label = @"Reconnecting…";
+            break;
+        case InterRoomConnectionStateDisconnectedWithError:
+            label = @"Connection error — Continue offline or retry";
+            break;
+    }
+
+    if (label && self.normalControlPanel) {
+        [self.normalControlPanel setMediaStatusText:label];
+        [self.normalControlPanel setConnectionStatusText:label];
+    }
+
+    // [3.4.4] Update signal bars based on connection state
+    if (self.normalNetworkStatusView) {
+        InterNetworkQualityLevel quality = InterNetworkQualityLevelUnknown;
+        switch (state) {
+            case InterRoomConnectionStateConnected:
+                quality = InterNetworkQualityLevelExcellent;
+                break;
+            case InterRoomConnectionStateReconnecting:
+                quality = InterNetworkQualityLevelPoor;
+                break;
+            case InterRoomConnectionStateConnecting:
+                quality = InterNetworkQualityLevelGood;
+                break;
+            case InterRoomConnectionStateDisconnectedWithError:
+                quality = InterNetworkQualityLevelLost;
+                break;
+            case InterRoomConnectionStateDisconnected:
+                quality = InterNetworkQualityLevelUnknown;
+                break;
+        }
+        [self.normalNetworkStatusView setQualityLevel:quality];
+    }
+}
+
+// [2.5.8] [G6] Handle participant presence state → update UI + overlay
+- (void)handlePresenceStateChanged:(InterParticipantPresenceState)state {
+    switch (state) {
+        case InterParticipantPresenceStateAlone:
+            // [3.2.4] Show waiting overlay when connected and alone
+            if (self.roomController.connectionState == InterRoomConnectionStateConnected) {
+                [self.normalRemoteLayout.participantOverlay setOverlayState:InterParticipantOverlayStateWaiting];
+            }
+            break;
+        case InterParticipantPresenceStateParticipantJoined:
+            if (self.normalControlPanel) {
+                [self.normalControlPanel setMediaStatusText:@"Participant joined"];
+            }
+            // Hide overlay when someone joins
+            [self.normalRemoteLayout.participantOverlay setOverlayState:InterParticipantOverlayStateHidden];
+            break;
+        case InterParticipantPresenceStateParticipantLeft:
+            if (self.normalControlPanel) {
+                [self.normalControlPanel setMediaStatusText:@"Participant left"];
+            }
+            // [3.2.5] Show "Participant left." overlay with Wait / End Call
+            [self.normalRemoteLayout.participantOverlay setOverlayState:InterParticipantOverlayStateParticipantLeft];
+            break;
+    }
+}
+
+// [2.5.4] Publish camera and mic to network when connected
+- (void)wireNormalNetworkPublish {
+    InterRoomController *rc = self.roomController;
+    if (!rc || rc.connectionState != InterRoomConnectionStateConnected) {
+        return;
+    }
+
+    InterLocalMediaController *media = self.normalMediaController;
+    if (!media) {
+        return;
+    }
+
+    AVCaptureSession *session = media.captureSession;
+    dispatch_queue_t sessionQueue = media.sessionQueue;
+    if (!session || !sessionQueue) {
+        return;
+    }
+
+    // Publish camera
+    if (media.isCameraEnabled) {
+        [rc.publisher publishCameraWithCaptureSession:session
+                                         sessionQueue:sessionQueue
+                                           completion:^(NSError * _Nullable error) {
+            if (error) {
+                NSLog(@"[G8] Camera publish error: %@", error.localizedDescription);
+            }
+        }];
+    }
+
+    // Publish microphone
+    if (media.isMicrophoneEnabled) {
+        [rc.publisher publishMicrophoneWithCompletion:^(NSError * _Nullable error) {
+            if (error) {
+                NSLog(@"[G8] Microphone publish error: %@", error.localizedDescription);
+            }
+        }];
+    }
+}
+
+// [2.5.5] Wire network sink for screen share on surface share controller
+- (void)wireNetworkSinkOnSurfaceShareController:(InterSurfaceShareController *)surfaceShareController {
+    InterRoomController *rc = self.roomController;
+    if (!rc || rc.connectionState != InterRoomConnectionStateConnected) {
+        surfaceShareController.networkPublishSink = nil;
+        return;
+    }
+
+    // Create a screen share sink from the publisher
+    InterLiveKitScreenShareSource *source = [rc.publisher createScreenShareSink];
+    surfaceShareController.networkPublishSink = source;
+}
+
+/// [3.2.1] Wire remote video rendering — connect subscriber to layout manager
+- (void)wireNormalRemoteRendering {
+    InterRoomController *rc = self.roomController;
+    if (!rc || !self.normalRemoteLayout) {
+        return;
+    }
+
+    self.normalTrackRendererBridge = [[InterTrackRendererBridge alloc] initWithLayoutManager:self.normalRemoteLayout];
+    rc.subscriber.trackRenderer = self.normalTrackRendererBridge;
+
+    // [3.2.4] [G6] Show "Waiting for participant…" overlay when alone + connected
+    if (rc.connectionState == InterRoomConnectionStateConnected &&
+        rc.participantPresenceState == InterParticipantPresenceStateAlone) {
+        [self.normalRemoteLayout.participantOverlay setOverlayState:InterParticipantOverlayStateWaiting];
+    }
+
+    // Wire overlay delegate
+    __weak typeof(self) weakSelf = self;
+    self.normalRemoteLayout.participantOverlay.delegate = (id<InterParticipantOverlayDelegate>)weakSelf;
+}
+
+/// [3.4.1] Update connection status on the normal call control panel.
+- (void)updateNormalConnectionStatus {
+    InterRoomController *rc = self.roomController;
+    if (!rc || !self.normalControlPanel) return;
+
+    NSString *text = nil;
+    switch (rc.connectionState) {
+        case InterRoomConnectionStateDisconnected:     text = @"Disconnected";  break;
+        case InterRoomConnectionStateConnecting:       text = @"Connecting…";   break;
+        case InterRoomConnectionStateConnected:        text = @"Connected";     break;
+        case InterRoomConnectionStateReconnecting:     text = @"Reconnecting…"; break;
+        case InterRoomConnectionStateDisconnectedWithError: text = @"Connection error"; break;
+    }
+    [self.normalControlPanel setConnectionStatusText:text];
+
+    // [3.4.2] Room code
+    if (rc.roomCode.length > 0) {
+        [self.normalControlPanel setRoomCodeText:rc.roomCode];
+    }
+}
+
+// [2.5.6] [G2] Two-phase camera toggle — mute track FIRST, then stop device
+- (void)twoPhaseToggleNormalCamera {
+    InterLocalMediaController *media = self.normalMediaController;
+    InterRoomController *rc = self.roomController;
+    BOOL shouldEnable = !media.isCameraEnabled;
+
+    __weak typeof(self) weakSelf = self;
+
+    if (!shouldEnable) {
+        // DISABLE: [G2] Mute LiveKit track FIRST → then stop capture device
+        if (rc && rc.connectionState == InterRoomConnectionStateConnected) {
+            [rc.publisher muteCameraTrackWithCompletion:^{
+                [weakSelf performLocalCameraToggle:NO];
+            }];
+        } else {
+            // [G8] No network — just toggle locally
+            [self performLocalCameraToggle:NO];
+        }
+    } else {
+        // ENABLE: [G2] Start capture device FIRST → first frame → unmute LiveKit track
+        [self performLocalCameraToggle:YES];
+        if (rc && rc.connectionState == InterRoomConnectionStateConnected) {
+            [rc.publisher unmuteCameraTrack];
+        }
+    }
+}
+
+- (void)performLocalCameraToggle:(BOOL)enable {
+    __weak typeof(self) weakSelf = self;
+    [self.normalMediaController setCameraEnabled:enable completion:^(BOOL success) {
+        if (!success) {
+            [weakSelf.normalControlPanel setMediaStatusText:@"Unable to change camera state."];
+            return;
+        }
+        [weakSelf.normalControlPanel setCameraEnabled:weakSelf.normalMediaController.isCameraEnabled];
+        [weakSelf.normalControlPanel setMediaStatusText:[weakSelf normalMediaStateSummary]];
+    }];
+}
+
+// [2.5.6] [G2] Two-phase microphone toggle
+- (void)twoPhaseToggleNormalMicrophone {
+    InterLocalMediaController *media = self.normalMediaController;
+    InterRoomController *rc = self.roomController;
+    BOOL shouldEnable = !media.isMicrophoneEnabled;
+
+    __weak typeof(self) weakSelf = self;
+
+    if (!shouldEnable) {
+        // DISABLE: [G2] Mute LiveKit track FIRST → then stop capture
+        if (rc && rc.connectionState == InterRoomConnectionStateConnected) {
+            [rc.publisher muteMicrophoneTrackWithCompletion:^{
+                [weakSelf performLocalMicrophoneToggle:NO];
+            }];
+        } else {
+            [self performLocalMicrophoneToggle:NO];
+        }
+    } else {
+        // ENABLE: [G2] Start capture device FIRST → then unmute track
+        [self performLocalMicrophoneToggle:YES];
+        if (rc && rc.connectionState == InterRoomConnectionStateConnected) {
+            [rc.publisher unmuteMicrophoneTrack];
+        }
+    }
+}
+
+- (void)performLocalMicrophoneToggle:(BOOL)enable {
+    __weak typeof(self) weakSelf = self;
+    [self.normalMediaController setMicrophoneEnabled:enable completion:^(BOOL success) {
+        if (!success) {
+            [weakSelf.normalControlPanel setMediaStatusText:@"Unable to change microphone state."];
+            return;
+        }
+        [weakSelf.normalControlPanel setMicrophoneEnabled:weakSelf.normalMediaController.isMicrophoneEnabled];
+        [weakSelf.normalControlPanel setMediaStatusText:[weakSelf normalMediaStateSummary]];
+    }];
+}
+
+// [2.5.3] [G4] Mode transition support
+- (void)handleModeTransitionIfNeeded:(void (^)(void))exitWork {
+    InterRoomController *rc = self.roomController;
+    if (rc && (rc.connectionState == InterRoomConnectionStateConnected ||
+               rc.connectionState == InterRoomConnectionStateReconnecting)) {
+        // Room is live — transition mode [G4]: detach sources, keep room alive
+        [rc transitionModeWithCompletion:^{
+            // Network sinks detached. Now it's safe to tear down the old mode
+            if (exitWork) {
+                exitWork();
+            }
+        }];
+    } else {
+        // No active connection — proceed immediately
+        if (exitWork) {
+            exitWork();
+        }
+    }
+}
+
+#pragma mark - InterParticipantOverlayDelegate [3.2.5]
+
+- (void)overlayDidRequestWait:(InterParticipantOverlayView *)overlay {
+    // User chose to wait — hide overlay and stay in call
+    [overlay setOverlayState:InterParticipantOverlayStateWaiting];
+}
+
+- (void)overlayDidRequestEndCall:(InterParticipantOverlayView *)overlay {
+    [overlay setOverlayState:InterParticipantOverlayStateHidden];
+    [self requestExitCurrentMode];
+}
+
+#pragma mark - Diagnostics [3.4.5]
+
+/// [3.4.5] [G9] Triple-click network status → copy diagnostic snapshot to clipboard.
+- (void)handleDiagnosticTripleClick:(NSClickGestureRecognizer *)recognizer {
+#pragma unused(recognizer)
+    InterRoomController *rc = self.roomController;
+    if (!rc || !rc.statsCollector) {
+        return;
+    }
+
+    NSString *snapshot = [rc.statsCollector captureDiagnosticSnapshot];
+    if (snapshot.length == 0) {
+        return;
+    }
+
+    NSPasteboard *pb = [NSPasteboard generalPasteboard];
+    [pb clearContents];
+    [pb setString:snapshot forType:NSPasteboardTypeString];
+
+    // Brief visual confirmation on the status label
+    NSString *saved = self.normalControlPanel ? @"Copied!" : nil;
+    if (saved) {
+        [self.normalControlPanel setConnectionStatusText:@"Diagnostic copied!"];
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            [self updateNormalConnectionStatus];
+        });
+    }
 }
 
 #pragma mark - Settings
@@ -633,6 +1252,19 @@ static NSString *const InterScreenCaptureStartupPromptedKey = @"InterScreenCaptu
     self.normalMediaController = nil;
     self.normalControlPanel = nil;
 
+    // [3.2] Tear down remote video layout
+    if (self.normalRemoteLayout) {
+        [self.normalRemoteLayout teardown];
+        [self.normalRemoteLayout removeFromSuperview];
+        self.normalRemoteLayout = nil;
+    }
+    if (self.normalTrackRendererBridge) {
+        if (self.roomController) {
+            self.roomController.subscriber.trackRenderer = nil;
+        }
+        self.normalTrackRendererBridge = nil;
+    }
+
     [self.secureController destroySecureWindow];
     self.secureController = nil;
 
@@ -674,6 +1306,11 @@ static NSString *const InterScreenCaptureStartupPromptedKey = @"InterScreenCaptu
     [NSApp setPresentationOptions:NSApplicationPresentationDefault];
     [self stopScreenMonitoring];
     self.isShowingExternalDisplayAlert = NO;
+
+    // [2.5.7] [G8] Disconnect room on exit. Guarded: skip if nil
+    if (self.roomController) {
+        [self.roomController disconnect];
+    }
 
     [self teardownActiveWindows];
 

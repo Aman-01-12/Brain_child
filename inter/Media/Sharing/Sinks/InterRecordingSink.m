@@ -362,6 +362,12 @@
     Float64 sampleRate = _detectedAudioSampleRate > 0 ? _detectedAudioSampleRate : 48000.0;
     NSInteger channels = _detectedAudioChannels > 0 ? _detectedAudioChannels : 1;
 
+    // Clamp to mono or stereo — AVAssetWriterInput requires the AudioChannelLayout
+    // tag to match AVNumberOfChannelsKey exactly. Values >2 are not supported by AAC.
+    if (channels > 2) {
+        channels = 2;
+    }
+
     AudioChannelLayout channelLayout;
     memset(&channelLayout, 0, sizeof(channelLayout));
     channelLayout.mChannelLayoutTag = (channels == 1)

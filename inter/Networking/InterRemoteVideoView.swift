@@ -182,6 +182,15 @@ enum DetectedFormat {
         os_unfair_lock_unlock(&lock)
     }
 
+    /// Clear the current frame so the view renders black.
+    /// Called when the remote participant mutes their camera.
+    @objc public func clearFrame() {
+        os_unfair_lock_lock(&lock)
+        pendingPixelBuffer = nil
+        lastRenderedPixelBuffer = nil
+        os_unfair_lock_unlock(&lock)
+    }
+
     // MARK: - Layout
 
     public override func layout() {
@@ -327,7 +336,8 @@ enum DetectedFormat {
 
         let descriptor = MTLRenderPassDescriptor()
         descriptor.colorAttachments[0].texture = drawable.texture
-        descriptor.colorAttachments[0].loadAction = .dontCare
+        descriptor.colorAttachments[0].loadAction = .clear
+        descriptor.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
         descriptor.colorAttachments[0].storeAction = .store
 
         guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: descriptor) else { return }
@@ -351,8 +361,8 @@ enum DetectedFormat {
         )
         encoder.setVertexBytes(&aspectUniforms, length: MemoryLayout<AspectFitUniforms>.stride, index: 0)
 
-        // Fullscreen triangle (3 vertices, no vertex buffer) [1.11.5]
-        encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+        // Quad (4 vertices, triangle strip) [1.11.5]
+        encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
         encoder.endEncoding()
     }
 
@@ -384,7 +394,8 @@ enum DetectedFormat {
 
         let descriptor = MTLRenderPassDescriptor()
         descriptor.colorAttachments[0].texture = drawable.texture
-        descriptor.colorAttachments[0].loadAction = .dontCare
+        descriptor.colorAttachments[0].loadAction = .clear
+        descriptor.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
         descriptor.colorAttachments[0].storeAction = .store
 
         guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: descriptor) else { return }
@@ -401,7 +412,7 @@ enum DetectedFormat {
         )
         encoder.setVertexBytes(&aspectUniforms, length: MemoryLayout<AspectFitUniforms>.stride, index: 0)
 
-        encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+        encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
         encoder.endEncoding()
     }
 
@@ -522,7 +533,7 @@ enum DetectedFormat {
             viewWidth: Float(outputTexture.width), viewHeight: Float(outputTexture.height))
         encoder.setVertexBytes(&aspectUniforms, length: MemoryLayout<AspectFitUniforms>.stride, index: 0)
 
-        encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+        encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
         encoder.endEncoding()
     }
 
@@ -557,7 +568,7 @@ enum DetectedFormat {
             viewWidth: Float(outputTexture.width), viewHeight: Float(outputTexture.height))
         encoder.setVertexBytes(&aspectUniforms, length: MemoryLayout<AspectFitUniforms>.stride, index: 0)
 
-        encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+        encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
         encoder.endEncoding()
     }
 
@@ -683,23 +694,24 @@ enum DetectedFormat {
         float2 texCoord;
     };
 
-    // Fullscreen triangle: generates a triangle covering the entire screen
-    // from vertex_id 0, 1, 2 without a vertex buffer.
+    // Quad vertex shader: 4 vertices forming a triangle strip.
+    // Positions are scaled by aspect-fit uniforms; UVs map exactly [0,1].
     vertex VertexOut interRemoteVertexShader(
         uint vertexID [[vertex_id]],
         constant AspectFitUniforms &uniforms [[buffer(0)]]
     ) {
-        // Oversized triangle coords that cover [-1, 1] clip space
-        float2 positions[3] = {
+        float2 positions[4] = {
             float2(-1.0, -1.0),
-            float2( 3.0, -1.0),
-            float2(-1.0,  3.0)
+            float2( 1.0, -1.0),
+            float2(-1.0,  1.0),
+            float2( 1.0,  1.0)
         };
 
-        float2 texCoords[3] = {
+        float2 texCoords[4] = {
             float2(0.0, 1.0),
-            float2(2.0, 1.0),
-            float2(0.0, -1.0)
+            float2(1.0, 1.0),
+            float2(0.0, 0.0),
+            float2(1.0, 0.0)
         };
 
         VertexOut out;
@@ -719,7 +731,8 @@ enum DetectedFormat {
         texture2d<float> cbcrTexture [[texture(1)]],
         constant float4x4 &colorMatrix [[buffer(0)]]
     ) {
-        constexpr sampler textureSampler(mag_filter::linear, min_filter::linear);
+        constexpr sampler textureSampler(mag_filter::linear, min_filter::linear,
+                                         address::clamp_to_edge);
 
         float y = yTexture.sample(textureSampler, in.texCoord).r;
         float2 cbcr = cbcrTexture.sample(textureSampler, in.texCoord).rg;
@@ -735,7 +748,8 @@ enum DetectedFormat {
         VertexOut in [[stage_in]],
         texture2d<float> texture [[texture(0)]]
     ) {
-        constexpr sampler textureSampler(mag_filter::linear, min_filter::linear);
+        constexpr sampler textureSampler(mag_filter::linear, min_filter::linear,
+                                         address::clamp_to_edge);
         return texture.sample(textureSampler, in.texCoord);
     }
     """

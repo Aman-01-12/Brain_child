@@ -9,6 +9,7 @@ NSErrorDomain const InterShareErrorDomain = @"secure.inter.share";
     configuration.sessionKind = InterShareSessionKindNormal;
     configuration.shareMode = InterShareModeThisApp;
     configuration.recordingEnabled = YES;
+    configuration.networkPublishEnabled = NO;
     return configuration;
 }
 
@@ -18,6 +19,8 @@ NSErrorDomain const InterShareErrorDomain = @"secure.inter.share";
     copy.sessionKind = self.sessionKind;
     copy.shareMode = self.shareMode;
     copy.recordingEnabled = self.isRecordingEnabled;
+    copy.networkPublishEnabled = self.isNetworkPublishEnabled;
+    copy.selectedWindowIdentifier = self.selectedWindowIdentifier;
     return copy;
 }
 
