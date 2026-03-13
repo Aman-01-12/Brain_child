@@ -1,7 +1,6 @@
 #import "AppDelegate.h"
 #import "CapWindow.h"
 #import "InterCallSessionCoordinator.h"
-#import "InterAppSettings.h"
 #import "InterLocalMediaController.h"
 #import "InterLocalCallControlPanel.h"
 #import "InterSurfaceShareController.h"
@@ -26,7 +25,6 @@
 @property (nonatomic, strong) NSWindow *setupWindow;
 @property (nonatomic, strong) MetalSurfaceView *setupRenderView;
 @property (nonatomic, strong) NSWindow *settingsWindow;
-@property (nonatomic, strong) NSTextField *settingsRecordingPathValueLabel;
 @property (nonatomic, strong) NSWindow *normalCallWindow;
 @property (nonatomic, strong) MetalSurfaceView *normalRenderView;
 @property (nonatomic, strong) InterLocalMediaController *normalMediaController;
@@ -362,7 +360,8 @@ static NSString *const InterScreenCaptureStartupPromptedKey = @"InterScreenCaptu
                                                 roomCode:@""
                                      participantIdentity:identity
                                          participantName:displayName
-                                                  isHost:YES];
+                                                  isHost:YES
+                                                roomType:(mode == InterCallModeInterview) ? @"interview" : @"call"];
 
     __weak typeof(self) weakSelf = self;
     [rc connectWithConfiguration:config completion:^(NSError * _Nullable error) {
@@ -423,7 +422,8 @@ static NSString *const InterScreenCaptureStartupPromptedKey = @"InterScreenCaptu
                                                 roomCode:code
                                      participantIdentity:identity
                                          participantName:displayName
-                                                  isHost:NO];
+                                                  isHost:NO
+                                                roomType:@""];
 
     __weak typeof(self) weakSelf = self;
     [rc connectWithConfiguration:config completion:^(NSError * _Nullable error) {
@@ -442,10 +442,49 @@ static NSString *const InterScreenCaptureStartupPromptedKey = @"InterScreenCaptu
             [panel setStatusText:@"Joined"];
             [panel setActionsEnabled:YES];
 
-            // Joiner enters normal call mode
-            [strongSelf enterMode:InterCallModeNormal role:InterInterviewRoleNone];
+            // Determine mode from the server-reported room type
+            NSString *roomType = rc.roomType;
+            BOOL isInterviewRoom = [roomType isEqualToString:@"interview"];
+
+            if (isInterviewRoom) {
+                // Show confirmation before entering secure interviewee mode
+                [strongSelf showIntervieweeConfirmationWithCompletion:^(BOOL accepted) {
+                    if (accepted) {
+                        [strongSelf enterMode:InterCallModeInterview
+                                         role:InterInterviewRoleInterviewee];
+                    } else {
+                        // User declined — disconnect and return to setup
+                        [rc disconnect];
+                        [panel setIndicatorState:InterConnectionIndicatorStateIdle];
+                        [panel setStatusText:@"Disconnected — declined interview session."];
+                    }
+                }];
+            } else {
+                // Normal call
+                [strongSelf enterMode:InterCallModeNormal role:InterInterviewRoleNone];
+            }
         });
     }];
+}
+
+/// [3.1.4] Show confirmation dialog before entering secure interviewee mode.
+/// The joiner sees this when the server reports roomType == "interview".
+- (void)showIntervieweeConfirmationWithCompletion:(void (^)(BOOL accepted))completion {
+    NSAlert *alert = [[NSAlert alloc] init];
+    alert.messageText = @"You are joining an Interview Session";
+    alert.informativeText =
+        @"This room is an interview. You will enter secure interviewee mode:\n\n"
+        @"• Full-screen secure window\n"
+        @"• Screen sharing restricted\n"
+        @"• External displays blocked\n\n"
+        @"Click 'Continue' to proceed or 'Cancel' to disconnect.";
+    alert.alertStyle = NSAlertStyleInformational;
+    [alert addButtonWithTitle:@"Continue"];
+    [alert addButtonWithTitle:@"Cancel"];
+
+    NSModalResponse response = [alert runModal];
+    BOOL accepted = (response == NSAlertFirstButtonReturn);
+    completion(accepted);
 }
 
 /// [3.1.3] Map NSError codes to user-facing messages.
@@ -545,7 +584,7 @@ static NSString *const InterScreenCaptureStartupPromptedKey = @"InterScreenCaptu
     NSRect panelFrame = NSMakeRect(view.bounds.size.width - 300.0,
                                    22.0,
                                    278.0,
-                                   410.0);
+                                   470.0);
     self.normalControlPanel = [[InterLocalCallControlPanel alloc] initWithFrame:panelFrame];
     self.normalControlPanel.autoresizingMask = NSViewMinXMargin | NSViewMaxYMargin;
     [self.normalControlPanel setPanelTitleText:@"Normal Call Controls"];
@@ -570,6 +609,9 @@ static NSString *const InterScreenCaptureStartupPromptedKey = @"InterScreenCaptu
     self.normalControlPanel.shareModeChangedHandler = ^(InterShareMode shareMode) {
         [weakSelf handleNormalShareModeChanged:shareMode];
     };
+    self.normalControlPanel.audioInputSelectionChangedHandler = ^(NSString * _Nullable deviceID) {
+        [weakSelf handleNormalAudioInputSelection:deviceID];
+    };
 
     // [3.4.4] Network quality signal bars in the control panel
     self.normalNetworkStatusView = [[InterNetworkStatusView alloc] initWithFrame:NSMakeRect(0, 0, 40, 16)];
@@ -586,8 +628,8 @@ static NSString *const InterScreenCaptureStartupPromptedKey = @"InterScreenCaptu
     self.normalMediaController = [[InterLocalMediaController alloc] init];
     self.normalSurfaceShareController = [[InterSurfaceShareController alloc] init];
     [self.normalSurfaceShareController configureWithSessionKind:InterShareSessionKindNormal
-                                                      shareMode:self.normalControlPanel.selectedShareMode
-                                               recordingEnabled:YES];
+                                                      shareMode:self.normalControlPanel.selectedShareMode];
+    [self refreshNormalAudioInputOptions];
 
     __weak typeof(self) weakSelf = self;
     self.normalSurfaceShareController.statusHandler = ^(NSString *statusText) {
@@ -643,8 +685,7 @@ static NSString *const InterScreenCaptureStartupPromptedKey = @"InterScreenCaptu
     }
 
     [self.normalSurfaceShareController configureWithSessionKind:InterShareSessionKindNormal
-                                                      shareMode:shareMode
-                                               recordingEnabled:YES];
+                                                      shareMode:shareMode];
 
     if (shareMode == InterShareModeThisApp) {
         [self.normalControlPanel setShareStatusText:@"Share This App is ready."];
@@ -665,6 +706,33 @@ static NSString *const InterScreenCaptureStartupPromptedKey = @"InterScreenCaptu
     return [NSString stringWithFormat:@"Camera %@, Mic %@.",
             cameraOn ? @"on" : @"off",
             microphoneOn ? @"on" : @"off"];
+}
+
+- (void)refreshNormalAudioInputOptions {
+    if (!self.normalMediaController || !self.normalControlPanel) {
+        return;
+    }
+
+    NSArray<NSDictionary<NSString *, NSString *> *> *options = [self.normalMediaController availableAudioInputOptions];
+    NSString *selectedDeviceID = [self.normalMediaController selectedAudioInputDeviceID];
+    [self.normalControlPanel setAudioInputOptions:options selectedDeviceID:selectedDeviceID];
+}
+
+- (void)handleNormalAudioInputSelection:(NSString * _Nullable)deviceID {
+    if (!self.normalMediaController) {
+        return;
+    }
+
+    __weak typeof(self) weakSelf = self;
+    [self.normalMediaController selectAudioInputDeviceWithID:deviceID completion:^(BOOL success) {
+        [weakSelf refreshNormalAudioInputOptions];
+        if (!success) {
+            [weakSelf.normalControlPanel setMediaStatusText:@"Unable to switch microphone source."];
+            return;
+        }
+
+        [weakSelf.normalControlPanel setMediaStatusText:[weakSelf normalMediaStateSummary]];
+    }];
 }
 
 - (void)toggleNormalCamera {
@@ -746,8 +814,7 @@ static NSString *const InterScreenCaptureStartupPromptedKey = @"InterScreenCaptu
 - (void)startNormalShareWithMode:(InterShareMode)shareMode
                 windowIdentifier:(NSString * _Nullable)windowIdentifier {
     [self.normalSurfaceShareController configureWithSessionKind:InterShareSessionKindNormal
-                                                      shareMode:shareMode
-                                               recordingEnabled:YES];
+                                                      shareMode:shareMode];
 
     if (windowIdentifier.length > 0) {
         self.normalSurfaceShareController.configuration.selectedWindowIdentifier = windowIdentifier;
@@ -1121,7 +1188,7 @@ static NSString *const InterScreenCaptureStartupPromptedKey = @"InterScreenCaptu
 - (void)openSettingsWindow {
     if (!self.settingsWindow) {
         self.settingsWindow =
-        [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 620, 240)
+        [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 400, 140)
                                     styleMask:(NSWindowStyleMaskTitled |
                                                NSWindowStyleMaskClosable)
                                       backing:NSBackingStoreBuffered
@@ -1133,90 +1200,22 @@ static NSString *const InterScreenCaptureStartupPromptedKey = @"InterScreenCaptu
         contentView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
         [self.settingsWindow setContentView:contentView];
 
-        NSTextField *titleLabel = [NSTextField labelWithString:@"Recording Storage"];
-        titleLabel.frame = NSMakeRect(24, 188, 220, 24);
-        titleLabel.font = [NSFont boldSystemFontOfSize:16];
-        [contentView addSubview:titleLabel];
+        NSTextField *placeholderLabel = [NSTextField labelWithString:@"No configurable settings yet."];
+        placeholderLabel.frame = NSMakeRect(24, 72, 352, 24);
+        placeholderLabel.font = [NSFont systemFontOfSize:13];
+        placeholderLabel.textColor = [NSColor secondaryLabelColor];
+        [contentView addSubview:placeholderLabel];
 
-        NSTextField *subtitleLabel = [NSTextField labelWithString:@"Choose one folder for meeting recordings before joining calls."];
-        subtitleLabel.frame = NSMakeRect(24, 162, 560, 20);
-        subtitleLabel.font = [NSFont systemFontOfSize:12];
-        subtitleLabel.textColor = [NSColor secondaryLabelColor];
-        [contentView addSubview:subtitleLabel];
-
-        NSTextField *pathLabel = [NSTextField labelWithString:@"Recording Folder"];
-        pathLabel.frame = NSMakeRect(24, 128, 140, 18);
-        pathLabel.font = [NSFont systemFontOfSize:12];
-        [contentView addSubview:pathLabel];
-
-        self.settingsRecordingPathValueLabel = [NSTextField labelWithString:@"Not configured"];
-        self.settingsRecordingPathValueLabel.frame = NSMakeRect(24, 96, 572, 24);
-        self.settingsRecordingPathValueLabel.font = [NSFont monospacedSystemFontOfSize:12 weight:NSFontWeightRegular];
-        self.settingsRecordingPathValueLabel.lineBreakMode = NSLineBreakByTruncatingMiddle;
-        self.settingsRecordingPathValueLabel.textColor = [NSColor labelColor];
-        [contentView addSubview:self.settingsRecordingPathValueLabel];
-
-        NSButton *chooseFolderButton = [[NSButton alloc] initWithFrame:NSMakeRect(24, 44, 150, 34)];
-        [chooseFolderButton setTitle:@"Choose Folder..."];
-        [chooseFolderButton setTarget:self];
-        [chooseFolderButton setAction:@selector(selectRecordingFolderFromSettings)];
-        [contentView addSubview:chooseFolderButton];
-
-        NSButton *closeButton = [[NSButton alloc] initWithFrame:NSMakeRect(504, 44, 92, 34)];
+        NSButton *closeButton = [[NSButton alloc] initWithFrame:NSMakeRect(284, 24, 92, 34)];
         [closeButton setTitle:@"Close"];
         [closeButton setTarget:self];
         [closeButton setAction:@selector(closeSettingsWindow)];
         [contentView addSubview:closeButton];
     }
 
-    [self refreshSettingsRecordingPathLabel];
     [self.settingsWindow center];
     [self.settingsWindow makeKeyAndOrderFront:nil];
     [NSApp activateIgnoringOtherApps:YES];
-}
-
-- (void)refreshSettingsRecordingPathLabel {
-    NSString *recordingPath = [InterAppSettings configuredRecordingDirectoryDisplayPath];
-    if (recordingPath.length == 0) {
-        self.settingsRecordingPathValueLabel.stringValue = @"Not configured";
-        self.settingsRecordingPathValueLabel.textColor = [NSColor secondaryLabelColor];
-        return;
-    }
-
-    self.settingsRecordingPathValueLabel.stringValue = recordingPath;
-    self.settingsRecordingPathValueLabel.textColor = [NSColor labelColor];
-}
-
-- (void)selectRecordingFolderFromSettings {
-    if (!self.settingsWindow) {
-        return;
-    }
-
-    NSOpenPanel *openPanel = [NSOpenPanel openPanel];
-    openPanel.canChooseFiles = NO;
-    openPanel.canChooseDirectories = YES;
-    openPanel.allowsMultipleSelection = NO;
-    openPanel.canCreateDirectories = YES;
-    openPanel.prompt = @"Select";
-    openPanel.message = @"Meeting recordings will be saved to this folder.";
-
-    [openPanel beginSheetModalForWindow:self.settingsWindow completionHandler:^(NSModalResponse response) {
-        if (response != NSModalResponseOK || openPanel.URL == nil) {
-            return;
-        }
-
-        NSError *settingsError = nil;
-        BOOL saved = [InterAppSettings setRecordingDirectoryURL:openPanel.URL error:&settingsError];
-        if (!saved) {
-            NSAlert *alert = [[NSAlert alloc] init];
-            alert.messageText = @"Unable to save recording folder";
-            alert.informativeText = settingsError.localizedDescription ?: @"Please choose a different folder.";
-            [alert beginSheetModalForWindow:self.settingsWindow completionHandler:nil];
-            return;
-        }
-
-        [self refreshSettingsRecordingPathLabel];
-    }];
 }
 
 - (void)closeSettingsWindow {
@@ -1243,6 +1242,7 @@ static NSString *const InterScreenCaptureStartupPromptedKey = @"InterScreenCaptu
         self.normalControlPanel.microphoneToggleHandler = nil;
         self.normalControlPanel.shareToggleHandler = nil;
         self.normalControlPanel.shareModeChangedHandler = nil;
+        self.normalControlPanel.audioInputSelectionChangedHandler = nil;
     }
 
     [self.normalSurfaceShareController stopSharingFromSurfaceView:self.normalRenderView];
@@ -1306,6 +1306,14 @@ static NSString *const InterScreenCaptureStartupPromptedKey = @"InterScreenCaptu
     [NSApp setPresentationOptions:NSApplicationPresentationDefault];
     [self stopScreenMonitoring];
     self.isShowingExternalDisplayAlert = NO;
+
+    // Hide all call windows FIRST so the user sees instant visual feedback,
+    // then perform potentially-slow teardown (room disconnect, AVCaptureSession
+    // stop, etc.) without the user staring at a frozen window.
+    if (self.normalCallWindow != nil) {
+        [self.normalCallWindow orderOut:nil];
+    }
+    [self.secureController hideSecureWindow];
 
     // [2.5.7] [G8] Disconnect room on exit. Guarded: skip if nil
     if (self.roomController) {

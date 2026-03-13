@@ -23,8 +23,7 @@ typedef void (^InterSurfaceShareAudioSampleObserverRegistrationBlock)(InterSurfa
 @property (nonatomic, strong, nullable) id<InterShareSink> networkPublishSink;
 
 - (void)configureWithSessionKind:(InterShareSessionKind)sessionKind
-                       shareMode:(InterShareMode)shareMode
-                recordingEnabled:(BOOL)recordingEnabled;
+                       shareMode:(InterShareMode)shareMode;
 
 - (void)startSharingFromSurfaceView:(MetalSurfaceView *)surfaceView;
 - (void)stopSharingFromSurfaceView:(nullable MetalSurfaceView *)surfaceView;

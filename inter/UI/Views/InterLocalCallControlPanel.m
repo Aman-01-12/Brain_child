@@ -7,12 +7,15 @@
 @property (nonatomic, strong) NSTextField *mediaStatusLabel;
 @property (nonatomic, strong) NSTextField *shareStatusLabel;
 @property (nonatomic, strong) NSTextField *shareModeLabel;
+@property (nonatomic, strong) NSTextField *audioInputLabel;
 @property (nonatomic, strong) NSButton *cameraButton;
 @property (nonatomic, strong) NSButton *microphoneButton;
 @property (nonatomic, strong) NSButton *shareButton;
 @property (nonatomic, strong) NSPopUpButton *shareModePopUpButton;
+@property (nonatomic, strong) NSPopUpButton *audioInputPopUpButton;
 @property (nonatomic, strong, readwrite) NSView *previewContainerView;
 @property (nonatomic, strong, readwrite) NSView *networkStatusContainerView;
+@property (nonatomic, assign) BOOL suppressAudioInputCallback;
 @end
 
 @implementation InterLocalCallControlPanel
@@ -93,6 +96,20 @@
     self.shareStatusLabel.font = [NSFont systemFontOfSize:11];
     self.shareStatusLabel.textColor = [NSColor colorWithWhite:0.85 alpha:1.0];
     [self addSubview:self.shareStatusLabel];
+
+    self.audioInputLabel = [NSTextField labelWithString:@"Microphone Source"];
+    self.audioInputLabel.frame = NSMakeRect(16, 196, self.bounds.size.width - 32, 16);
+    self.audioInputLabel.autoresizingMask = NSViewWidthSizable | NSViewMaxYMargin;
+    self.audioInputLabel.font = [NSFont systemFontOfSize:11];
+    self.audioInputLabel.textColor = [NSColor colorWithWhite:0.85 alpha:1.0];
+    [self addSubview:self.audioInputLabel];
+
+    self.audioInputPopUpButton = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(16, 166, self.bounds.size.width - 32, 26)
+                                                             pullsDown:NO];
+    self.audioInputPopUpButton.autoresizingMask = NSViewWidthSizable | NSViewMaxYMargin;
+    [self.audioInputPopUpButton setTarget:self];
+    [self.audioInputPopUpButton setAction:@selector(handleAudioInputChange:)];
+    [self addSubview:self.audioInputPopUpButton];
 
     self.shareModeLabel = [NSTextField labelWithString:@"Share Source"];
     self.shareModeLabel.frame = NSMakeRect(16, 146, 120, 18);
@@ -210,6 +227,53 @@
     self.shareModePopUpButton.hidden = hidden;
 }
 
+- (void)setAudioInputOptions:(NSArray<NSDictionary<NSString *,NSString *> *> *)options
+            selectedDeviceID:(NSString *)selectedDeviceID {
+    self.suppressAudioInputCallback = YES;
+
+    [self.audioInputPopUpButton removeAllItems];
+    if (options.count == 0) {
+        [self.audioInputPopUpButton addItemWithTitle:@"No microphone detected"];
+        NSMenuItem *item = self.audioInputPopUpButton.itemArray.firstObject;
+        item.enabled = NO;
+        self.audioInputPopUpButton.enabled = NO;
+        self.suppressAudioInputCallback = NO;
+        return;
+    }
+
+    self.audioInputPopUpButton.enabled = YES;
+    NSInteger selectedIndex = NSNotFound;
+    NSInteger index = 0;
+    for (NSDictionary<NSString *, NSString *> *entry in options) {
+        NSString *name = entry[@"name"];
+        NSString *deviceID = entry[@"id"];
+        if (name.length == 0 || deviceID.length == 0) {
+            continue;
+        }
+
+        [self.audioInputPopUpButton addItemWithTitle:name];
+        NSMenuItem *item = self.audioInputPopUpButton.lastItem;
+        item.representedObject = deviceID;
+        if (selectedDeviceID.length > 0 && [selectedDeviceID isEqualToString:deviceID]) {
+            selectedIndex = index;
+        }
+        index += 1;
+    }
+
+    if (self.audioInputPopUpButton.numberOfItems == 0) {
+        [self.audioInputPopUpButton addItemWithTitle:@"No microphone detected"];
+        NSMenuItem *item = self.audioInputPopUpButton.itemArray.firstObject;
+        item.enabled = NO;
+        self.audioInputPopUpButton.enabled = NO;
+    } else if (selectedIndex != NSNotFound) {
+        [self.audioInputPopUpButton selectItemAtIndex:selectedIndex];
+    } else {
+        [self.audioInputPopUpButton selectItemAtIndex:0];
+    }
+
+    self.suppressAudioInputCallback = NO;
+}
+
 - (void)handleCameraToggle:(id)sender {
 #pragma unused(sender)
     dispatch_block_t handler = self.cameraToggleHandler;
@@ -242,6 +306,24 @@
     }
 
     handler([self selectedShareMode]);
+}
+
+- (void)handleAudioInputChange:(id)sender {
+#pragma unused(sender)
+    if (self.suppressAudioInputCallback) {
+        return;
+    }
+
+    void (^handler)(NSString * _Nullable) = self.audioInputSelectionChangedHandler;
+    if (!handler) {
+        return;
+    }
+
+    NSMenuItem *selectedItem = self.audioInputPopUpButton.selectedItem;
+    NSString *deviceID = [selectedItem.representedObject isKindOfClass:[NSString class]]
+    ? (NSString *)selectedItem.representedObject
+    : nil;
+    handler(deviceID);
 }
 
 - (NSMenuItem *)shareModeMenuItemForMode:(InterShareMode)shareMode {

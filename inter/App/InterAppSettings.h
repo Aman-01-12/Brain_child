@@ -2,13 +2,10 @@
 
 NS_ASSUME_NONNULL_BEGIN
 
+/// Centralised application settings.
+/// Currently a placeholder — recording directory management was removed
+/// pending a future composed-layout recording implementation.
 @interface InterAppSettings : NSObject
-
-+ (BOOL)hasConfiguredRecordingDirectory;
-+ (BOOL)setRecordingDirectoryURL:(NSURL *)directoryURL error:(NSError * _Nullable * _Nullable)error;
-+ (nullable NSString *)configuredRecordingDirectoryDisplayPath;
-+ (nullable NSURL *)resolvedRecordingDirectoryURLStartingSecurityScope:(BOOL *)didStartAccessing
-                                                                 error:(NSError * _Nullable * _Nullable)error;
 
 @end
 

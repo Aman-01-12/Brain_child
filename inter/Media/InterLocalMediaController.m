@@ -8,6 +8,8 @@
 @property (atomic, assign, getter=isShuttingDown) BOOL shuttingDown;
 + (void)resolveAuthorizationStatusForMediaType:(AVMediaType)mediaType
                                     completion:(void (^)(AVAuthorizationStatus status))completion;
+- (nullable AVCaptureDevice *)preferredAudioDevice;
+- (BOOL)isLikelyProblematicAudioDevice:(AVCaptureDevice *)device;
 @end
 
 static const void *InterLocalMediaSessionQueueKey = &InterLocalMediaSessionQueueKey;
@@ -17,6 +19,7 @@ static const void *InterLocalMediaSessionQueueKey = &InterLocalMediaSessionQueue
     AVCaptureSession *_session;
     dispatch_queue_t _audioSampleOutputQueue;
     dispatch_queue_t _audioSampleCallbackQueue;
+    NSString *_preferredAudioDeviceID;
 
     AVCaptureDeviceInput *_videoInput;
     AVCaptureDeviceInput *_audioInput;
@@ -238,13 +241,28 @@ static const void *InterLocalMediaSessionQueueKey = &InterLocalMediaSessionQueue
 
     self.shuttingDown = YES;
     [self detachPreviewSynchronously];
-    [self performSynchronouslyOnSessionQueue:^{
+
+    // Perform heavy AVCaptureSession teardown OFF the main thread so the UI
+    // can dismiss immediately. dispatch_async avoids the 200-500ms main-thread
+    // stall that [AVCaptureSession stopRunning] causes.
+    dispatch_queue_t queue = _sessionQueue;
+    if (!queue) {
+        // No session queue — nothing to tear down.
+        self.cameraEnabled = NO;
+        self.microphoneEnabled = NO;
+        self.configured = NO;
+        return;
+    }
+
+    dispatch_async(queue, ^{
         [self stopSessionLocked];
 
         if (!self->_session) {
-            self.cameraEnabled = NO;
-            self.microphoneEnabled = NO;
-            self.configured = NO;
+            dispatch_async(dispatch_get_main_queue(), ^{
+                self.cameraEnabled = NO;
+                self.microphoneEnabled = NO;
+                self.configured = NO;
+            });
             return;
         }
 
@@ -260,12 +278,15 @@ static const void *InterLocalMediaSessionQueueKey = &InterLocalMediaSessionQueue
         [self removeAudioDataOutputLocked];
         [self->_session commitConfiguration];
 
-        self.cameraEnabled = NO;
-        self.microphoneEnabled = NO;
-        self.configured = NO;
         self->_session = nil;
-        self.audioSampleBufferHandler = nil;
-    }];
+
+        dispatch_async(dispatch_get_main_queue(), ^{
+            self.cameraEnabled = NO;
+            self.microphoneEnabled = NO;
+            self.configured = NO;
+            self.audioSampleBufferHandler = nil;
+        });
+    });
 }
 
 - (void)setCameraEnabled:(BOOL)enabled completion:(void (^ _Nullable)(BOOL success))completion {
@@ -342,6 +363,120 @@ static const void *InterLocalMediaSessionQueueKey = &InterLocalMediaSessionQueue
         }
 
         BOOL success = [strongSelf setAudioInputEnabledLocked:enabled];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (completion) {
+                completion(success);
+            }
+        });
+    });
+}
+
+- (NSArray<NSDictionary<NSString *,NSString *> *> *)availableAudioInputOptions {
+    NSMutableArray<NSDictionary<NSString *, NSString *> *> *options = [NSMutableArray array];
+    AVCaptureDeviceDiscoverySession *discoverySession =
+    [AVCaptureDeviceDiscoverySession discoverySessionWithDeviceTypes:@[AVCaptureDeviceTypeMicrophone]
+                                                          mediaType:AVMediaTypeAudio
+                                                           position:AVCaptureDevicePositionUnspecified];
+
+    for (AVCaptureDevice *device in discoverySession.devices) {
+        if ([self isLikelyProblematicAudioDevice:device]) {
+            continue;
+        }
+
+        if (device.uniqueID.length == 0 || device.localizedName.length == 0) {
+            continue;
+        }
+        [options addObject:@{
+            @"id": device.uniqueID,
+            @"name": device.localizedName
+        }];
+    }
+    return [options copy];
+}
+
+- (nullable NSString *)selectedAudioInputDeviceID {
+    __block NSString *selectedDeviceID = nil;
+    [self performSynchronouslyOnSessionQueue:^{
+        if (self->_preferredAudioDeviceID.length > 0) {
+            AVCaptureDevice *preferredDevice = [AVCaptureDevice deviceWithUniqueID:self->_preferredAudioDeviceID];
+            if (preferredDevice && ![self isLikelyProblematicAudioDevice:preferredDevice]) {
+                selectedDeviceID = self->_preferredAudioDeviceID;
+                return;
+            }
+        }
+
+        if (self->_audioInput.device.uniqueID.length > 0 && ![self isLikelyProblematicAudioDevice:self->_audioInput.device]) {
+            selectedDeviceID = self->_audioInput.device.uniqueID;
+            return;
+        }
+
+        AVCaptureDevice *preferredDefault = [self preferredAudioDevice];
+        if (preferredDefault.uniqueID.length > 0) {
+            selectedDeviceID = preferredDefault.uniqueID;
+            return;
+        }
+
+        AVCaptureDevice *defaultDevice = [AVCaptureDevice defaultDeviceWithMediaType:AVMediaTypeAudio];
+        if (defaultDevice.uniqueID.length > 0 && ![self isLikelyProblematicAudioDevice:defaultDevice]) {
+            selectedDeviceID = defaultDevice.uniqueID;
+        }
+    }];
+    return selectedDeviceID;
+}
+
+- (void)selectAudioInputDeviceWithID:(nullable NSString *)deviceID
+                          completion:(void (^ _Nullable)(BOOL success))completion {
+    dispatch_queue_t queue = _sessionQueue;
+    if (!queue || self.isShuttingDown) {
+        if (completion) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                completion(NO);
+            });
+        }
+        return;
+    }
+
+    NSString *normalizedID = deviceID.length > 0 ? [deviceID copy] : nil;
+    if (normalizedID.length > 0) {
+        AVCaptureDevice *requestedDevice = [AVCaptureDevice deviceWithUniqueID:normalizedID];
+        if (!requestedDevice || [self isLikelyProblematicAudioDevice:requestedDevice]) {
+            if (completion) {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    completion(NO);
+                });
+            }
+            return;
+        }
+    }
+
+    __weak typeof(self) weakSelf = self;
+    dispatch_async(queue, ^{
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf || strongSelf.isShuttingDown || !strongSelf->_session) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                if (completion) {
+                    completion(NO);
+                }
+            });
+            return;
+        }
+
+        strongSelf->_preferredAudioDeviceID = normalizedID;
+        BOOL shouldKeepMicEnabled = strongSelf.isMicrophoneEnabled;
+
+        if (strongSelf->_audioInput) {
+            [strongSelf->_session beginConfiguration];
+            [strongSelf removeAudioDataOutputLocked];
+            [strongSelf->_session removeInput:strongSelf->_audioInput];
+            [strongSelf->_session commitConfiguration];
+            strongSelf->_audioInput = nil;
+        }
+
+        BOOL success = YES;
+        if (shouldKeepMicEnabled) {
+            success = [strongSelf setAudioInputEnabledLocked:YES];
+        }
+
         dispatch_async(dispatch_get_main_queue(), ^{
             if (completion) {
                 completion(success);
@@ -585,7 +720,16 @@ static const void *InterLocalMediaSessionQueueKey = &InterLocalMediaSessionQueue
             return YES;
         }
 
-        AVCaptureDevice *audioDevice = [AVCaptureDevice defaultDeviceWithMediaType:AVMediaTypeAudio];
+        AVCaptureDevice *audioDevice = nil;
+        if (_preferredAudioDeviceID.length > 0) {
+            AVCaptureDevice *candidate = [AVCaptureDevice deviceWithUniqueID:_preferredAudioDeviceID];
+            if (candidate && ![self isLikelyProblematicAudioDevice:candidate]) {
+                audioDevice = candidate;
+            }
+        }
+        if (!audioDevice) {
+            audioDevice = [self preferredAudioDevice];
+        }
         if (!audioDevice) {
             self.microphoneEnabled = NO;
             return NO;
@@ -725,6 +869,63 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
     }
 
     return [AVCaptureDevice defaultDeviceWithMediaType:AVMediaTypeVideo];
+}
+
+- (nullable AVCaptureDevice *)preferredAudioDevice {
+    AVCaptureDevice *defaultDevice = [AVCaptureDevice defaultDeviceWithMediaType:AVMediaTypeAudio];
+    if (defaultDevice && ![self isLikelyProblematicAudioDevice:defaultDevice]) {
+        return defaultDevice;
+    }
+
+    AVCaptureDeviceDiscoverySession *discoverySession =
+    [AVCaptureDeviceDiscoverySession discoverySessionWithDeviceTypes:@[AVCaptureDeviceTypeMicrophone]
+                                                          mediaType:AVMediaTypeAudio
+                                                           position:AVCaptureDevicePositionUnspecified];
+
+    for (AVCaptureDevice *device in discoverySession.devices) {
+        if (![self isLikelyProblematicAudioDevice:device]) {
+            if (defaultDevice) {
+                NSLog(@"[G8] Switching audio input from potentially unstable device '%@' to '%@'",
+                      defaultDevice.localizedName,
+                      device.localizedName);
+            }
+            return device;
+        }
+    }
+
+    return defaultDevice;
+}
+
+- (BOOL)isLikelyProblematicAudioDevice:(AVCaptureDevice *)device {
+    if (!device) {
+        return NO;
+    }
+
+    NSString *name = device.localizedName.lowercaseString;
+    NSString *uniqueID = device.uniqueID.lowercaseString;
+    static NSArray<NSString *> *problematicTokens;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        problematicTokens = @[
+            @"aggregate",
+            @"multi-output",
+            @"blackhole",
+            @"loopback",
+            @"soundflower",
+            @"zoom",
+            @"virtual",
+            @"vpau",
+            @"cadefaultdeviceaggregate"
+        ];
+    });
+
+    for (NSString *token in problematicTokens) {
+        if ([name containsString:token] || [uniqueID containsString:token]) {
+            return YES;
+        }
+    }
+
+    return NO;
 }
 
 @end

@@ -18,15 +18,13 @@ FOUNDATION_EXPORT NSErrorDomain const InterShareErrorDomain;
 typedef NS_ERROR_ENUM(InterShareErrorDomain, InterShareErrorCode) {
     InterShareErrorCodeInvalidConfiguration = 1001,
     InterShareErrorCodeUnsupportedMode = 1002,
-    InterShareErrorCodeNotImplemented = 1003,
-    InterShareErrorCodeRecordingUnavailable = 1004
+    InterShareErrorCodeNotImplemented = 1003
 };
 
 @interface InterShareSessionConfiguration : NSObject <NSCopying>
 
 @property (nonatomic, assign) InterShareSessionKind sessionKind;
 @property (nonatomic, assign) InterShareMode shareMode;
-@property (nonatomic, assign, getter=isRecordingEnabled) BOOL recordingEnabled;
 @property (nonatomic, assign, getter=isNetworkPublishEnabled) BOOL networkPublishEnabled;
 
 /// For InterShareModeWindow — the CGWindowID (as string) chosen by the user

@@ -95,12 +95,19 @@ static void *InterSecurePresenceStateContext = &InterSecurePresenceStateContext;
     }
 }
 
+- (void)hideSecureWindow {
+    if (self.secureWindow) {
+        [self.secureWindow orderOut:nil];
+    }
+}
+
 - (void)destroySecureWindow {
     if (self.controlPanel) {
         self.controlPanel.cameraToggleHandler = nil;
         self.controlPanel.microphoneToggleHandler = nil;
         self.controlPanel.shareToggleHandler = nil;
         self.controlPanel.shareModeChangedHandler = nil;
+        self.controlPanel.audioInputSelectionChangedHandler = nil;
     }
 
     [self.surfaceShareController stopSharingFromSurfaceView:self.renderView];
@@ -143,7 +150,7 @@ static void *InterSecurePresenceStateContext = &InterSecurePresenceStateContext;
     NSRect panelFrame = NSMakeRect(view.bounds.size.width - 312.0,
                                    26.0,
                                    278.0,
-                                   410.0);
+                                   470.0);
     self.controlPanel = [[InterLocalCallControlPanel alloc] initWithFrame:panelFrame];
     self.controlPanel.autoresizingMask = NSViewMinXMargin | NSViewMaxYMargin;
     [self.controlPanel setPanelTitleText:@"Interview Controls"];
@@ -164,6 +171,9 @@ static void *InterSecurePresenceStateContext = &InterSecurePresenceStateContext;
     self.controlPanel.shareToggleHandler = ^{
         [weakSelf toggleSurfaceShare];
     };
+    self.controlPanel.audioInputSelectionChangedHandler = ^(NSString * _Nullable deviceID) {
+        [weakSelf handleSecureAudioInputSelection:deviceID];
+    };
 
     // [3.4.4] Network quality signal bars
     self.networkStatusView = [[InterNetworkStatusView alloc] initWithFrame:NSMakeRect(0, 0, 40, 16)];
@@ -180,8 +190,8 @@ static void *InterSecurePresenceStateContext = &InterSecurePresenceStateContext;
     self.localMediaController = [[InterLocalMediaController alloc] init];
     self.surfaceShareController = [[InterSurfaceShareController alloc] init];
     [self.surfaceShareController configureWithSessionKind:InterShareSessionKindInterview
-                                                shareMode:InterShareModeThisApp
-                                         recordingEnabled:YES];
+                                                shareMode:InterShareModeThisApp];
+    [self refreshSecureAudioInputOptions];
 
     __weak typeof(self) weakSelf = self;
     self.surfaceShareController.statusHandler = ^(NSString *statusText) {
@@ -241,6 +251,33 @@ static void *InterSecurePresenceStateContext = &InterSecurePresenceStateContext;
     return [NSString stringWithFormat:@"Camera %@, Mic %@.",
             cameraOn ? @"on" : @"off",
             microphoneOn ? @"on" : @"off"];
+}
+
+- (void)refreshSecureAudioInputOptions {
+    if (!self.localMediaController || !self.controlPanel) {
+        return;
+    }
+
+    NSArray<NSDictionary<NSString *, NSString *> *> *options = [self.localMediaController availableAudioInputOptions];
+    NSString *selectedDeviceID = [self.localMediaController selectedAudioInputDeviceID];
+    [self.controlPanel setAudioInputOptions:options selectedDeviceID:selectedDeviceID];
+}
+
+- (void)handleSecureAudioInputSelection:(NSString * _Nullable)deviceID {
+    if (!self.localMediaController) {
+        return;
+    }
+
+    __weak typeof(self) weakSelf = self;
+    [self.localMediaController selectAudioInputDeviceWithID:deviceID completion:^(BOOL success) {
+        [weakSelf refreshSecureAudioInputOptions];
+        if (!success) {
+            [weakSelf.controlPanel setMediaStatusText:@"Unable to switch microphone source."];
+            return;
+        }
+
+        [weakSelf.controlPanel setMediaStatusText:[weakSelf secureMediaStateSummary]];
+    }];
 }
 
 - (void)toggleCamera {

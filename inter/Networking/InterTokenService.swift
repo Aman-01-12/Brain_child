@@ -30,12 +30,15 @@ import os.log
     @objc public let token: String
     /// LiveKit server WebSocket URL.
     @objc public let serverURL: String
+    /// Room type: "call" or "interview". Defaults to "call" for backward compatibility.
+    @objc public let roomType: String
 
-    @objc public init(roomCode: String, roomName: String, token: String, serverURL: String) {
+    @objc public init(roomCode: String, roomName: String, token: String, serverURL: String, roomType: String = "call") {
         self.roomCode = roomCode
         self.roomName = roomName
         self.token = token
         self.serverURL = serverURL
+        self.roomType = roomType
         super.init()
     }
 }
@@ -48,11 +51,14 @@ import os.log
     @objc public let token: String
     /// LiveKit server WebSocket URL.
     @objc public let serverURL: String
+    /// Room type: "call" or "interview". Determines the mode the joiner enters.
+    @objc public let roomType: String
 
-    @objc public init(roomName: String, token: String, serverURL: String) {
+    @objc public init(roomName: String, token: String, serverURL: String, roomType: String = "call") {
         self.roomName = roomName
         self.token = token
         self.serverURL = serverURL
+        self.roomType = roomType
         super.init()
     }
 }
@@ -128,15 +134,21 @@ private struct TokenCacheEntry {
     ///   - serverURL: Base URL of the token server (e.g. "http://localhost:3000").
     ///   - identity: Unique participant identity.
     ///   - displayName: Human-readable name shown to remote participants.
+    ///   - roomType: Room type string ("call" or "interview"). Defaults to "call".
     ///   - completion: Called on the main queue with either a response or an error.
     @objc public func createRoom(serverURL: String,
                                  identity: String,
                                  displayName: String,
+                                 roomType: String = "call",
                                  completion: @escaping (InterCreateRoomResponse?, NSError?) -> Void) {
-        let body: [String: Any] = [
+        var body: [String: Any] = [
             "identity": identity,
             "displayName": displayName
         ]
+        // Only send roomType when non-default to stay backward-compatible with older servers
+        if !roomType.isEmpty && roomType != "call" {
+            body["roomType"] = roomType
+        }
 
         interLogInfo(InterLog.networking, "Token: creating room (identity=%{private}@)", identity)
 
@@ -160,6 +172,9 @@ private struct TokenCacheEntry {
                     return
                 }
 
+                // roomType is optional in the response for backward compatibility
+                let responseRoomType = json["roomType"] as? String ?? "call"
+
                 // Cache the token
                 self?.cacheToken(token, forRoom: roomCode, identity: identity)
 
@@ -167,9 +182,10 @@ private struct TokenCacheEntry {
                     roomCode: roomCode,
                     roomName: roomName,
                     token: token,
-                    serverURL: wsURL
+                    serverURL: wsURL,
+                    roomType: responseRoomType
                 )
-                interLogInfo(InterLog.networking, "Token: room created (code=***)")
+                interLogInfo(InterLog.networking, "Token: room created (code=***, type=%{public}@)", responseRoomType)
                 self?.completeOnMain { completion(response, nil) }
 
             case .failure(let error):
@@ -223,14 +239,18 @@ private struct TokenCacheEntry {
                     return
                 }
 
+                // roomType is optional for backward compatibility with older servers
+                let responseRoomType = json["roomType"] as? String ?? "call"
+
                 self?.cacheToken(token, forRoom: roomCode, identity: identity)
 
                 let response = InterJoinRoomResponse(
                     roomName: roomName,
                     token: token,
-                    serverURL: wsURL
+                    serverURL: wsURL,
+                    roomType: responseRoomType
                 )
-                interLogInfo(InterLog.networking, "Token: room joined (code=***)")
+                interLogInfo(InterLog.networking, "Token: room joined (code=***, type=%{public}@)", responseRoomType)
                 self?.completeOnMain { completion(response, nil) }
 
             case .failure(let error):

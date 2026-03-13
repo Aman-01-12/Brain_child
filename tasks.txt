@@ -1,6 +1,6 @@
 # LiveKit Integration — Implementation Plan
 
-> **Status**: Phase 0 complete. Phase 1 complete. Phase 2 complete. Phase 3 complete. Post-Phase 3 (bug fixes + UI polish + window picker) complete. Phase 4 next.  
+> **Status**: Phase 0 complete. Phase 1 complete. Phase 2 complete. Phase 3 complete. Post-Phase 3 (bug fixes + UI polish + window picker + interview join fix) complete. Phase 4 next.  
 > **Last updated**: 12 March 2026  
 > **Tracking**: Changes logged in `work_done.md`
 
@@ -434,6 +434,26 @@ Networking/
 - [x] PF.4.7 — Added `selectedWindowIdentifier` to `InterShareSessionConfiguration` — passes chosen CGWindowID through share pipeline
 - [x] PF.4.8 — Wired in `InterSurfaceShareController.m`: forwards identifier to `InterScreenCaptureVideoSource` before capture start
 - [x] PF.4.9 — Wired in `AppDelegate.m`: Window mode presents picker sheet first, share starts only after user selects and confirms
+
+### PF.5 — Interview Mode: Server-Authoritative Room Type & Join Flow Fix
+
+Architecture: **Server-authoritative roles via `roomType`**. The token server is the single source of truth
+for whether a room is a "call" or "interview". Joiners never choose their own role — the server
+assigns it based on the room type. This is the Zoom/Meet/Teams pattern and is designed for:
+- Future multi-interviewer support (each participant has own role in JWT metadata)
+- Future dynamic role switching (host calls API → server updates participant metadata → LiveKit broadcasts)
+- Future URL-based join (inter://join/CODE, same POST /room/join backend)
+
+- [x] PF.5.1 — Token server: `POST /room/create` accepts `roomType` ("call" | "interview"), stores in room code map, returns in response. Host metadata stamped in JWT (`{"role":"interviewer"}` for interview rooms)
+- [x] PF.5.2 — Token server: `POST /room/join` returns `roomType` from stored data. Joiner metadata stamped in JWT (`{"role":"interviewee"}` for interview rooms). `createToken()` accepts optional `metadata` parameter for future extensibility
+- [x] PF.5.3 — `InterCreateRoomResponse` + `InterJoinRoomResponse`: added `roomType` property (defaults to "call" for backward compatibility with older servers)
+- [x] PF.5.4 — `InterRoomConfiguration`: added `roomType` property — set by host before create, populated from server on join
+- [x] PF.5.5 — `InterRoomController`: added `roomType` KVO-observable property — set from token response, cleared on disconnect. Piped `roomType` through `handleTokenResponse` and both create/join flows
+- [x] PF.5.6 — `InterTokenService.createRoom()`: accepts `roomType` parameter, sends to server for interview rooms
+- [x] PF.5.7 — `AppDelegate.connectAndEnterMode:`: sets `roomType` on config ("interview" for InterCallModeInterview, "call" for Normal)
+- [x] PF.5.8 — `AppDelegate.joinRoomWithCode:`: reads `rc.roomType` after connect; if "interview", shows confirmation dialog ("You are joining an Interview Session") → Continue enters SecureWindowController as interviewee, Cancel disconnects
+- [x] PF.5.9 — Added `showIntervieweeConfirmationWithCompletion:` — NSAlert-based confirmation with full-screen/restrictions disclosure
+- [x] PF.5.10 — Tests: updated `makeCreateRoomJSON`/`makeJoinRoomJSON` helpers with roomType field; `testCreateRoom_interviewType` + `testJoinRoom_interviewType` verify interview type flows; `testRoomConfiguration_copy` verifies roomType copy semantics. All 95 tests pass.
 
 ---
 

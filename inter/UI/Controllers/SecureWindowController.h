@@ -16,6 +16,11 @@ NS_ASSUME_NONNULL_BEGIN
 - (void)createSecureWindow;
 - (void)destroySecureWindow;
 
+/// Immediately hide the secure window without tearing down resources.
+/// Used by finalizeCurrentModeExit for instant visual feedback before
+/// the heavier destroySecureWindow cleanup runs.
+- (void)hideSecureWindow;
+
 @end
 
 NS_ASSUME_NONNULL_END

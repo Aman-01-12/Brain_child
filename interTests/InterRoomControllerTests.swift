@@ -195,7 +195,8 @@ final class InterRoomControllerTests: XCTestCase {
             roomCode: "ABC123",
             participantIdentity: "alice",
             participantName: "Alice",
-            isHost: true
+            isHost: true,
+            roomType: "interview"
         )
 
         guard let copy = config.copy() as? InterRoomConfiguration else {
@@ -209,10 +210,13 @@ final class InterRoomControllerTests: XCTestCase {
         XCTAssertEqual(copy.participantIdentity, config.participantIdentity)
         XCTAssertEqual(copy.participantName, config.participantName)
         XCTAssertEqual(copy.isHost, config.isHost)
+        XCTAssertEqual(copy.roomType, config.roomType)
 
         // Mutating copy should not affect original
         copy.roomCode = "XYZ789"
         XCTAssertEqual(config.roomCode, "ABC123")
+        copy.roomType = "call"
+        XCTAssertEqual(config.roomType, "interview")
     }
 
     func testRoomConfiguration_description_doesNotLeakSecrets() {

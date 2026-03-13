@@ -34,6 +34,16 @@ typedef void (^InterLocalMediaAudioSampleBufferHandler)(CMSampleBufferRef sample
 - (void)setCameraEnabled:(BOOL)enabled completion:(void (^ _Nullable)(BOOL success))completion;
 - (void)setMicrophoneEnabled:(BOOL)enabled completion:(void (^ _Nullable)(BOOL success))completion;
 
+/// Returns available audio input devices as dictionaries: { "id", "name" }.
+- (NSArray<NSDictionary<NSString *, NSString *> *> *)availableAudioInputOptions;
+
+/// Currently selected (or preferred) audio input device ID.
+- (nullable NSString *)selectedAudioInputDeviceID;
+
+/// Explicitly select an audio input device by unique ID.
+- (void)selectAudioInputDeviceWithID:(nullable NSString *)deviceID
+                          completion:(void (^ _Nullable)(BOOL success))completion;
+
 - (void)attachPreviewToView:(NSView *)view;
 - (void)detachPreview;
 

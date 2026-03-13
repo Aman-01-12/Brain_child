@@ -14,6 +14,5 @@
 #import "InterShareVideoFrame.h"
 #import "InterShareSink.h"
 #import "InterShareVideoSource.h"
-#import "InterRecordingSink.h"
 #import "MetalRenderEngine.h"
 #import "MetalSurfaceView.h"

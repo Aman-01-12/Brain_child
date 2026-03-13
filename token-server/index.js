@@ -31,7 +31,8 @@ const ROOM_CODE_EXPIRY_MS = 24 * 60 * 60 * 1000; // 24 hours
 
 // ---------------------------------------------------------------------------
 // In-memory room code store (Redis in production — see plan step 5.2.3)
-// Map: roomCode → { roomName, createdAt, hostIdentity }
+// Map: roomCode → { roomName, createdAt, hostIdentity, roomType }
+// roomType: "call" | "interview" (extensible for future types)
 // ---------------------------------------------------------------------------
 const roomCodes = new Map();
 
@@ -71,12 +72,20 @@ function generateRoomCode() {
 // ---------------------------------------------------------------------------
 // Token generation
 // ---------------------------------------------------------------------------
-async function createToken(identity, displayName, roomName, isHost) {
-  const token = new AccessToken(LIVEKIT_API_KEY, LIVEKIT_API_SECRET, {
+async function createToken(identity, displayName, roomName, isHost, metadata = null) {
+  const tokenOpts = {
     identity,
     name: displayName,
     ttl: TOKEN_TTL_SECONDS,
-  });
+  };
+
+  // Stamp participant metadata into the JWT (role, etc.) for future features.
+  // LiveKit delivers this to all participants via Participant.metadata.
+  if (metadata) {
+    tokenOpts.metadata = JSON.stringify(metadata);
+  }
+
+  const token = new AccessToken(LIVEKIT_API_KEY, LIVEKIT_API_SECRET, tokenOpts);
 
   token.addGrant({
     room: roomName,
@@ -106,15 +115,18 @@ setInterval(() => {
 
 // ---------------------------------------------------------------------------
 // POST /room/create
-// Body: { identity, displayName }
-// Returns: { roomCode, roomName, token, serverURL }
+// Body: { identity, displayName, roomType? }
+// Returns: { roomCode, roomName, token, serverURL, roomType }
 // ---------------------------------------------------------------------------
 app.post('/room/create', async (req, res) => {
-  const { identity, displayName } = req.body;
+  const { identity, displayName, roomType: rawRoomType } = req.body;
 
   if (!identity || !displayName) {
     return res.status(400).json({ error: 'identity and displayName are required' });
   }
+
+  // Normalize roomType — default to "call" for backward compatibility
+  const roomType = (rawRoomType === 'interview') ? 'interview' : 'call';
 
   if (!checkRateLimit(identity)) {
     return res.status(429).json({ error: 'Rate limit exceeded. Try again in 1 minute.' });
@@ -128,22 +140,27 @@ app.post('/room/create', async (req, res) => {
 
   const roomName = `inter-${roomCode}`;
 
-  // Store the room code mapping
+  // Store the room code mapping (roomType persisted for join-time lookup)
   roomCodes.set(roomCode, {
     roomName,
     createdAt: Date.now(),
     hostIdentity: identity,
+    roomType,
   });
 
   try {
-    const jwt = await createToken(identity, displayName, roomName, true);
-    console.log(`[audit] Room created: code=${roomCode} host=${identity}`);
+    // Host metadata includes role for future multi-interviewer support
+    const hostRole = (roomType === 'interview') ? 'interviewer' : null;
+    const metadata = hostRole ? { role: hostRole } : null;
+    const jwt = await createToken(identity, displayName, roomName, true, metadata);
+    console.log(`[audit] Room created: code=${roomCode} type=${roomType} host=${identity}`);
     // NEVER log the token
     res.json({
       roomCode,
       roomName,
       token: jwt,
       serverURL: process.env.LIVEKIT_SERVER_URL || 'ws://localhost:7880',
+      roomType,
     });
   } catch (err) {
     console.error(`[error] Token creation failed for ${identity}:`, err.message);
@@ -154,7 +171,7 @@ app.post('/room/create', async (req, res) => {
 // ---------------------------------------------------------------------------
 // POST /room/join
 // Body: { roomCode, identity, displayName }
-// Returns: { roomName, token, serverURL }
+// Returns: { roomName, token, serverURL, roomType }
 // ---------------------------------------------------------------------------
 app.post('/room/join', async (req, res) => {
   const { roomCode, identity, displayName } = req.body;
@@ -182,12 +199,16 @@ app.post('/room/join', async (req, res) => {
   }
 
   try {
-    const jwt = await createToken(identity, displayName, roomData.roomName, false);
-    console.log(`[audit] Room joined: code=${roomCode} participant=${identity}`);
+    // Assign role based on room type — joiners of interview rooms are interviewees
+    const joinerRole = (roomData.roomType === 'interview') ? 'interviewee' : null;
+    const metadata = joinerRole ? { role: joinerRole } : null;
+    const jwt = await createToken(identity, displayName, roomData.roomName, false, metadata);
+    console.log(`[audit] Room joined: code=${roomCode} type=${roomData.roomType} participant=${identity}`);
     res.json({
       roomName: roomData.roomName,
       token: jwt,
       serverURL: process.env.LIVEKIT_SERVER_URL || 'ws://localhost:7880',
+      roomType: roomData.roomType,
     });
   } catch (err) {
     console.error(`[error] Token creation failed for ${identity}:`, err.message);

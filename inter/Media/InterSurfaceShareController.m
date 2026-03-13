@@ -5,7 +5,6 @@
 
 #import "InterAppSurfaceVideoSource.h"
 #import "InterScreenCaptureVideoSource.h"
-#import "InterRecordingSink.h"
 #import "InterShareSink.h"
 #import "InterShareVideoSource.h"
 
@@ -20,6 +19,7 @@
     NSArray<id<InterShareSink>> *_sinks;
     uint64_t _routingGeneration;
     uint64_t _activeStatusGeneration;
+    NSUInteger _slowRouteStreak;
 }
 
 - (instancetype)init {
@@ -35,16 +35,15 @@
     _sinks = @[];
     _routingGeneration = 0;
     _activeStatusGeneration = 0;
+    _slowRouteStreak = 0;
     return self;
 }
 
 - (void)configureWithSessionKind:(InterShareSessionKind)sessionKind
-                       shareMode:(InterShareMode)shareMode
-                recordingEnabled:(BOOL)recordingEnabled {
+                       shareMode:(InterShareMode)shareMode {
     InterShareSessionConfiguration *updatedConfiguration = [self.configuration copy];
     updatedConfiguration.sessionKind = sessionKind;
     updatedConfiguration.shareMode = shareMode;
-    updatedConfiguration.recordingEnabled = recordingEnabled;
     self.configuration = updatedConfiguration;
 }
 
@@ -146,9 +145,6 @@
 
 - (NSArray<id<InterShareSink>> *)sinksForConfiguration:(InterShareSessionConfiguration *)configuration {
     NSMutableArray<id<InterShareSink>> *sinks = [NSMutableArray array];
-    if (configuration.isRecordingEnabled) {
-        [sinks addObject:[[InterRecordingSink alloc] init]];
-    }
     // [G8] Network publish sink — added when non-nil
     id<InterShareSink> networkSink = self.networkPublishSink;
     if (networkSink) {
@@ -200,8 +196,8 @@
         BOOL shouldEmitActiveStatus = NO;
         InterShareSessionConfiguration *configurationSnapshot = nil;
         @synchronized(self) {
-            if (_activeStatusGeneration != generation) {
-                _activeStatusGeneration = generation;
+            if (self->_activeStatusGeneration != generation) {
+                self->_activeStatusGeneration = generation;
                 shouldEmitActiveStatus = YES;
                 configurationSnapshot = [self.configuration copy];
             }
@@ -228,10 +224,23 @@
         mach_timebase_info(&info);
         double elapsedMs = (double)(routeEnd - routeStart) * (double)info.numer / (double)info.denom / 1e6;
         if (elapsedMs > 5.0) {
-            os_log_fault(OS_LOG_DEFAULT,
-                         "[G5] Router queue frame routing took %.2fms (>5ms limit) — "
-                         "check sink appendVideoFrame: implementations for blocking work",
-                         elapsedMs);
+            self->_slowRouteStreak += 1;
+            BOOL isSevereSpike = elapsedMs > 20.0;
+            BOOL isSustained = self->_slowRouteStreak >= 3;
+            if (isSevereSpike || isSustained) {
+                os_log_fault(OS_LOG_DEFAULT,
+                             "[G5] Router queue frame routing took %.2fms (>5ms), streak=%lu — "
+                             "check sink appendVideoFrame: implementations for blocking work",
+                             elapsedMs,
+                             (unsigned long)self->_slowRouteStreak);
+            } else {
+                os_log_debug(OS_LOG_DEFAULT,
+                             "[G5] Transient slow router frame: %.2fms (streak=%lu)",
+                             elapsedMs,
+                             (unsigned long)self->_slowRouteStreak);
+            }
+        } else {
+            self->_slowRouteStreak = 0;
         }
 #endif
     });
@@ -300,21 +309,11 @@
 
 - (NSString *)activeStatusTextForConfiguration:(InterShareSessionConfiguration *)configuration {
     NSString *sourceLabel = [self sourceLabelForShareMode:configuration.shareMode];
-    if (configuration.isRecordingEnabled) {
-        return [NSString stringWithFormat:@"%@ share is active. Recording destination is ready.",
-                                          sourceLabel];
-    }
-
     return [NSString stringWithFormat:@"%@ share is active.", sourceLabel];
 }
 
 - (NSString *)startingStatusTextForConfiguration:(InterShareSessionConfiguration *)configuration {
     NSString *sourceLabel = [self sourceLabelForShareMode:configuration.shareMode];
-    if (configuration.isRecordingEnabled) {
-        return [NSString stringWithFormat:@"Starting %@ share. Recording destination is being prepared.",
-                                          sourceLabel.lowercaseString];
-    }
-
     return [NSString stringWithFormat:@"Starting %@ share.", sourceLabel.lowercaseString];
 }
 

@@ -50,6 +50,10 @@ import LiveKit
     /// Room code (6-char alphanumeric). Set after create or join. [G7]
     @objc public private(set) dynamic var roomCode: String = ""
 
+    /// Room type: "call" or "interview". Set from the token server response.
+    /// Used by AppDelegate to determine which mode/role to enter on join.
+    @objc public private(set) dynamic var roomType: String = ""
+
     // MARK: - Owned Components
 
     /// Publisher: manages local track publishing.
@@ -128,12 +132,14 @@ import LiveKit
             tokenService.createRoom(
                 serverURL: configuration.tokenServerURL,
                 identity: configuration.participantIdentity,
-                displayName: configuration.participantName
+                displayName: configuration.participantName,
+                roomType: configuration.roomType.isEmpty ? "call" : configuration.roomType
             ) { [weak self] response, error in
                 self?.handleTokenResponse(
                     token: response?.token,
                     serverURL: response?.serverURL ?? configuration.serverURL,
                     roomCode: response?.roomCode,
+                    roomType: response?.roomType ?? "call",
                     error: error,
                     completion: completion
                 )
@@ -149,6 +155,7 @@ import LiveKit
                     token: response?.token,
                     serverURL: response?.serverURL ?? configuration.serverURL,
                     roomCode: configuration.roomCode,
+                    roomType: response?.roomType ?? "call",
                     error: error,
                     completion: completion
                 )
@@ -161,6 +168,7 @@ import LiveKit
         token: String?,
         serverURL: String,
         roomCode: String?,
+        roomType: String,
         error: NSError?,
         completion: @escaping (NSError?) -> Void
     ) {
@@ -181,10 +189,20 @@ import LiveKit
             return
         }
 
-        // Store room code
+        // Store room code and room type on main queue (synchronous if already on main,
+        // otherwise dispatched before the async connect begins).
         if let code = roomCode, !code.isEmpty {
             DispatchQueue.main.async {
                 self.roomCode = code
+            }
+        }
+        // roomType must be set before the connect completion fires so AppDelegate
+        // can read it — use sync dispatch if off main, direct assignment if on main.
+        if Thread.isMainThread {
+            self.roomType = roomType
+        } else {
+            DispatchQueue.main.sync {
+                self.roomType = roomType
             }
         }
 
@@ -318,6 +336,7 @@ import LiveKit
             self.remoteParticipantCount = 0
             self.participantPresenceState = .alone
             self.roomCode = ""
+            self.roomType = ""
         }
     }
 

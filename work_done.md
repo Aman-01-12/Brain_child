@@ -327,6 +327,53 @@
 
 ---
 
+## [12 March 2026] — PF.5: Interview Mode Join Flow Fix (Server-Authoritative Room Type)
+
+**Phase**: PF.5.1–PF.5.10  
+**Files changed**:
+- `token-server/index.js` — `/room/create` accepts + stores `roomType` ("call"|"interview"), returns it. `/room/join` returns stored `roomType`. `createToken()` accepts optional `metadata` param to stamp role in JWT (`{"role":"interviewer"}` or `{"role":"interviewee"}`)
+- `inter/Networking/InterTokenService.swift` — `InterCreateRoomResponse` + `InterJoinRoomResponse` gained `roomType` property (defaults "call"). `createRoom()` sends `roomType` to server. Both parsers extract `roomType` from JSON.
+- `inter/Networking/InterNetworkTypes.swift` — `InterRoomConfiguration` gained `roomType` property. `init` + `copy(with:)` updated.
+- `inter/Networking/InterRoomController.swift` — Added `roomType` KVO property. Passed through `handleTokenResponse`. Cleared on disconnect.
+- `inter/App/AppDelegate.m` — `connectAndEnterMode:` sets config.roomType based on InterCallMode. `joinRoomWithCode:` reads rc.roomType after connect: if "interview" → shows confirmation dialog → enters SecureWindowController as interviewee (or disconnects on cancel). Added `showIntervieweeConfirmationWithCompletion:` method.
+- `interTests/InterTokenServiceTests.swift` — Updated helpers with roomType field. Added `testCreateRoom_interviewType` + `testJoinRoom_interviewType`.
+- `interTests/InterRoomControllerTests.swift` — `testRoomConfiguration_copy` verifies roomType copy semantics.
+
+**Why**: Critical bug fix — joiners always entered normal mode regardless of room type. The token server now stores the room type, and the join response tells the client whether to enter interview (secure) mode. Architecture designed for future extensibility: URL-based joins, multi-interviewer rooms, and dynamic role switching all use the same `roomType` + JWT metadata pattern.  
+**Notes**: BUILD SUCCEEDED, 95 tests pass (0 failures). 2 new tests added. Server backward-compatible (missing roomType defaults to "call"). JWT metadata stamping future-proofs for LiveKit participant metadata broadcasting.
+
+---
+
+## [2026-03-XX] — PF.6: Recording Logic Removal
+
+**Phase**: Post-Phase 3 (PF.6)  
+**Files changed**:
+- `inter/Media/Sharing/Sinks/InterRecordingSink.h` — DELETED. Full AVAssetWriter recording pipeline (452 lines → 0).
+- `inter/Media/Sharing/Sinks/InterRecordingSink.m` — DELETED.
+- `inter/Media/Sharing/InterShareTypes.h` — Removed `InterShareErrorCodeRecordingUnavailable` error code and `recordingEnabled` property from `InterShareSessionConfiguration`.
+- `inter/Media/Sharing/InterShareTypes.m` — Removed `recordingEnabled = YES` from default configuration and `copyWithZone:`.
+- `inter/Media/InterSurfaceShareController.h` — Removed `recordingEnabled:` parameter from `configureWithSessionKind:shareMode:` method.
+- `inter/Media/InterSurfaceShareController.m` — Removed `InterRecordingSink.h` import, recording sink creation in `sinksForConfiguration:`, recording-related status text in `activeStatusTextForConfiguration:` and `startingStatusTextForConfiguration:`.
+- `inter/App/AppDelegate.m` — Removed `settingsRecordingPathValueLabel` property, `recordingEnabled:YES` from 3 configure calls, entire recording storage Settings UI (folder chooser, path display, NSOpenPanel), `refreshSettingsRecordingPathLabel` and `selectRecordingFolderFromSettings` methods, `InterAppSettings.h` import.
+- `inter/UI/Controllers/SecureWindowController.m` — Removed `recordingEnabled:YES` from configure call.
+- `inter/inter-Bridging-Header.h` — Removed `#import "InterRecordingSink.h"`.
+- `inter/App/InterAppSettings.h` — Gutted to empty class shell (placeholder for future settings).
+- `inter/App/InterAppSettings.m` — Gutted to empty implementation (placeholder).
+- `inter/Networking/InterLiveKitAudioBridge.swift` — Updated architecture comments to remove InterRecordingSink references.
+
+**What was kept (for future recording)**:
+- `InterShareSink` protocol — needed by network publish sink and future composed-layout recording.
+- `InterSurfaceShareController` frame/audio routing infrastructure — the sink fan-out architecture supports adding a recording sink back later.
+- `InterShareVideoSource` protocol — capture source abstraction.
+- `InterShareVideoFrame` — frame container type.
+- `InterAppSettings` class shell — ready for future settings (recording directory, preferences).
+- `files.user-selected.read-write` entitlement — needed for future file saving.
+
+**Why**: The existing recording pipeline captured raw screen content and auto-triggered on every screen share — this is not how production apps record. Zoom, Google Meet, and Microsoft Teams use **composed server-side recording**: a headless compositor on the SFU (or a dedicated media server) receives all participant tracks, composites them into a single layout (grid/speaker view), and encodes to a single MP4/MKV. The raw-screen approach was removed to avoid shipping incorrect behavior. The InterShareSink protocol and frame routing architecture are retained as the foundation for a future proper recording implementation (either server-side composed or client-side composed using multiple remote tracks).  
+**Notes**: BUILD SUCCEEDED, 95 tests pass (0 failures). ~570 lines of recording code removed. Settings window now shows "No configurable settings yet." placeholder.
+
+---
+
 <!-- 
 TEMPLATE — copy this for each new entry:
 

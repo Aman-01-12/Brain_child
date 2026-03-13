@@ -10,6 +10,7 @@ NS_ASSUME_NONNULL_BEGIN
 @property (nonatomic, copy, nullable) dispatch_block_t microphoneToggleHandler;
 @property (nonatomic, copy, nullable) dispatch_block_t shareToggleHandler;
 @property (nonatomic, copy, nullable) void (^shareModeChangedHandler)(InterShareMode shareMode);
+@property (nonatomic, copy, nullable) void (^audioInputSelectionChangedHandler)(NSString * _Nullable deviceID);
 
 @property (nonatomic, strong, readonly) NSView *previewContainerView;
 
@@ -32,6 +33,11 @@ NS_ASSUME_NONNULL_BEGIN
 - (InterShareMode)selectedShareMode;
 - (void)setShareModeOptionEnabled:(BOOL)enabled forMode:(InterShareMode)shareMode;
 - (void)setShareModeSelectorHidden:(BOOL)hidden;
+
+/// Populate the microphone source selector.
+/// Expected dictionary keys in `options`: @"id", @"name".
+- (void)setAudioInputOptions:(NSArray<NSDictionary<NSString *, NSString *> *> *)options
+			selectedDeviceID:(nullable NSString *)selectedDeviceID;
 
 @end
 

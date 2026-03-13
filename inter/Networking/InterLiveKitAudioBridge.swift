@@ -6,9 +6,8 @@
 //
 // ARCHITECTURE (Decision 1 — Single-Source Fan-Out):
 // The app captures mic audio ONCE via AVCaptureAudioDataOutput. Raw
-// CMSampleBuffers are fanned out to:
-//   1. InterRecordingSink (existing — disk recording)
-//   2. InterLiveKitAudioBridge (this file — network)
+// CMSampleBuffers are fanned out to registered InterShareSink instances
+// (e.g. InterLiveKitAudioBridge for network publish).
 //
 // HOW IT WORKS:
 // The LiveKit Swift SDK does not expose a direct audio buffer injection API
@@ -27,7 +26,7 @@
 //
 // ISOLATION INVARIANT [G8]:
 // All errors are swallowed with logging. This class never affects local
-// capture, recording, or UI. If it fails, the app continues in local-only mode.
+// capture or UI. If it fails, the app continues in local-only mode.
 //
 // THREADING:
 // - appendAudioSampleBuffer: returns in <500ns [G5] via CFRetain + dispatch

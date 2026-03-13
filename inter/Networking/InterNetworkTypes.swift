@@ -149,18 +149,24 @@ enum InterMicrophoneNetworkAction {
     /// Whether this participant is the room host (creator).
     @objc public var isHost: Bool
 
+    /// Room type: "call" or "interview". Set by host before creating; populated from
+    /// server response on join. Empty string means unspecified (defaults to "call").
+    @objc public var roomType: String
+
     @objc public init(serverURL: String,
                       tokenServerURL: String,
                       roomCode: String = "",
                       participantIdentity: String,
                       participantName: String,
-                      isHost: Bool = false) {
+                      isHost: Bool = false,
+                      roomType: String = "") {
         self.serverURL = serverURL
         self.tokenServerURL = tokenServerURL
         self.roomCode = roomCode
         self.participantIdentity = participantIdentity
         self.participantName = participantName
         self.isHost = isHost
+        self.roomType = roomType
         super.init()
     }
 
@@ -171,7 +177,8 @@ enum InterMicrophoneNetworkAction {
             roomCode: roomCode,
             participantIdentity: participantIdentity,
             participantName: participantName,
-            isHost: isHost
+            isHost: isHost,
+            roomType: roomType
         )
         return copy
     }

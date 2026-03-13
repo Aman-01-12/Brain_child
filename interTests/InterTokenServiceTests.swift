@@ -44,23 +44,25 @@ private func makeJWT(exp: TimeInterval) -> String {
     return "\(header).\(payload).\(signature)"
 }
 
-private func makeCreateRoomJSON(roomCode: String = "ABC123", token: String? = nil) -> Data {
+private func makeCreateRoomJSON(roomCode: String = "ABC123", roomType: String = "call", token: String? = nil) -> Data {
     let jwt = token ?? makeJWT(exp: Date().timeIntervalSince1970 + 3600)
     let dict: [String: Any] = [
         "roomCode": roomCode,
         "roomName": "inter-\(roomCode)",
         "token": jwt,
-        "serverURL": "ws://localhost:7880"
+        "serverURL": "ws://localhost:7880",
+        "roomType": roomType
     ]
     return try! JSONSerialization.data(withJSONObject: dict)
 }
 
-private func makeJoinRoomJSON(token: String? = nil) -> Data {
+private func makeJoinRoomJSON(roomType: String = "call", token: String? = nil) -> Data {
     let jwt = token ?? makeJWT(exp: Date().timeIntervalSince1970 + 3600)
     let dict: [String: Any] = [
         "roomName": "inter-ABC123",
         "token": jwt,
-        "serverURL": "ws://localhost:7880"
+        "serverURL": "ws://localhost:7880",
+        "roomType": roomType
     ]
     return try! JSONSerialization.data(withJSONObject: dict)
 }
@@ -124,7 +126,35 @@ final class InterTokenServiceTests: XCTestCase {
             XCTAssertEqual(response?.roomCode, "ABC123")
             XCTAssertEqual(response?.roomName, "inter-ABC123")
             XCTAssertEqual(response?.serverURL, "ws://localhost:7880")
+            XCTAssertEqual(response?.roomType, "call")
             XCTAssertFalse(response?.token.isEmpty ?? true)
+            exp.fulfill()
+        }
+
+        waitForExpectations(timeout: 5)
+    }
+
+    func testCreateRoom_interviewType() {
+        let exp = expectation(description: "createRoom interview")
+
+        MockURLProtocol.requestHandler = { request in
+            // Verify roomType is sent in the request body
+            if let body = request.httpBody,
+               let json = try? JSONSerialization.jsonObject(with: body) as? [String: Any] {
+                XCTAssertEqual(json["roomType"] as? String, "interview")
+            }
+            return (httpResponse(url: request.url!.absoluteString, statusCode: 200),
+                    makeCreateRoomJSON(roomType: "interview"))
+        }
+
+        service.createRoom(
+            serverURL: "http://localhost:3000",
+            identity: "host-alice",
+            displayName: "Alice",
+            roomType: "interview"
+        ) { response, error in
+            XCTAssertNil(error)
+            XCTAssertEqual(response?.roomType, "interview")
             exp.fulfill()
         }
 
@@ -150,6 +180,29 @@ final class InterTokenServiceTests: XCTestCase {
             XCTAssertNotNil(response)
             XCTAssertEqual(response?.roomName, "inter-ABC123")
             XCTAssertEqual(response?.serverURL, "ws://localhost:7880")
+            XCTAssertEqual(response?.roomType, "call")
+            exp.fulfill()
+        }
+
+        waitForExpectations(timeout: 5)
+    }
+
+    func testJoinRoom_interviewType() {
+        let exp = expectation(description: "joinRoom interview")
+
+        MockURLProtocol.requestHandler = { request in
+            return (httpResponse(url: request.url!.absoluteString, statusCode: 200),
+                    makeJoinRoomJSON(roomType: "interview"))
+        }
+
+        service.joinRoom(
+            serverURL: "http://localhost:3000",
+            roomCode: "ABC123",
+            identity: "joiner-bob",
+            displayName: "Bob"
+        ) { response, error in
+            XCTAssertNil(error)
+            XCTAssertEqual(response?.roomType, "interview")
             exp.fulfill()
         }
 

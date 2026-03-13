@@ -67,6 +67,30 @@ import LiveKit
     /// Microphone two-phase mute/unmute state.
     private var micNetworkState: InterMicrophoneNetworkState = .active
 
+    /// Guards concurrent publish attempts for screen share.
+    private var isScreenSharePublishInFlight: Bool = false
+
+    /// Monotonic token used to invalidate stale in-flight publish completions.
+    private var screenSharePublishGeneration: UInt64 = 0
+
+    /// Coalesced completions while a publish attempt is in-flight.
+    private var pendingScreenSharePublishCompletions: [((NSError?) -> Void)] = []
+
+    private func enqueueScreenSharePublishCompletion(_ completion: ((NSError?) -> Void)?) {
+        guard let completion else {
+            return
+        }
+        pendingScreenSharePublishCompletions.append(completion)
+    }
+
+    private func flushScreenSharePublishCompletions(error: NSError?) {
+        let completions = pendingScreenSharePublishCompletions
+        pendingScreenSharePublishCompletions.removeAll()
+        for completion in completions {
+            completion(error)
+        }
+    }
+
     // MARK: - Camera Publishing
 
     /// Publish the camera video track.
@@ -260,9 +284,15 @@ import LiveKit
 
     /// Publish the screen share track (after the source has received at least one frame).
     @objc public func publishScreenShare(completion: ((NSError?) -> Void)? = nil) {
-        // Guard against double-publish
+        // Guard against already-published state.
         guard screenSharePublication == nil else {
             completion?(nil)
+            return
+        }
+
+        // Coalesce duplicate triggers while publish is in flight.
+        if isScreenSharePublishInFlight {
+            enqueueScreenSharePublishCompletion(completion)
             return
         }
 
@@ -280,6 +310,11 @@ import LiveKit
 
         interLogInfo(InterLog.media, "Publisher: publishing screen share")
 
+        isScreenSharePublishInFlight = true
+        screenSharePublishGeneration &+= 1
+        let publishGeneration = screenSharePublishGeneration
+        enqueueScreenSharePublishCompletion(completion)
+
         let options = VideoPublishOptions(
             screenShareEncoding: VideoEncoding(maxBitrate: 2_500_000, maxFps: 15),
             simulcast: false,
@@ -289,9 +324,19 @@ import LiveKit
         Task {
             do {
                 let pub = try await participant.publish(videoTrack: track, options: options)
-                self.screenSharePublication = pub
-                interLogInfo(InterLog.media, "Publisher: screen share published")
-                DispatchQueue.main.async { completion?(nil) }
+                DispatchQueue.main.async {
+                    if publishGeneration != self.screenSharePublishGeneration {
+                        Task {
+                            try? await participant.unpublish(publication: pub)
+                        }
+                        return
+                    }
+
+                    self.screenSharePublication = pub
+                    self.isScreenSharePublishInFlight = false
+                    interLogInfo(InterLog.media, "Publisher: screen share published")
+                    self.flushScreenSharePublishCompletions(error: nil)
+                }
             } catch {
                 interLogError(InterLog.media, "Publisher: screen share publish failed: %{public}@",
                               error.localizedDescription)
@@ -299,7 +344,14 @@ import LiveKit
                     message: "Screen share publish failed",
                     underlyingError: error
                 )
-                DispatchQueue.main.async { completion?(nsError) }
+                DispatchQueue.main.async {
+                    if publishGeneration != self.screenSharePublishGeneration {
+                        return
+                    }
+
+                    self.isScreenSharePublishInFlight = false
+                    self.flushScreenSharePublishCompletions(error: nsError)
+                }
             }
         }
     }
@@ -307,6 +359,13 @@ import LiveKit
     /// Unpublish screen share.
     @objc public func unpublishScreenShare(completion: (() -> Void)? = nil) {
         interLogInfo(InterLog.media, "Publisher: unpublishing screen share")
+
+        // Invalidate any in-flight publish attempt and unblock queued callers.
+        screenSharePublishGeneration &+= 1
+        if isScreenSharePublishInFlight {
+            isScreenSharePublishInFlight = false
+            flushScreenSharePublishCompletions(error: nil)
+        }
 
         if let pub = screenSharePublication, let participant = localParticipant {
             Task {
