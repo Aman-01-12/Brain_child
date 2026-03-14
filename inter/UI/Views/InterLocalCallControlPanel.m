@@ -7,12 +7,15 @@
 @property (nonatomic, strong) NSTextField *mediaStatusLabel;
 @property (nonatomic, strong) NSTextField *shareStatusLabel;
 @property (nonatomic, strong) NSTextField *shareModeLabel;
+@property (nonatomic, strong) NSTextField *interviewToolLabel;
 @property (nonatomic, strong) NSTextField *audioInputLabel;
 @property (nonatomic, strong) NSButton *cameraButton;
 @property (nonatomic, strong) NSButton *microphoneButton;
 @property (nonatomic, strong) NSButton *shareButton;
 @property (nonatomic, strong) NSPopUpButton *shareModePopUpButton;
+@property (nonatomic, strong) NSSegmentedControl *interviewToolSegmentedControl;
 @property (nonatomic, strong) NSPopUpButton *audioInputPopUpButton;
+@property (nonatomic, strong) NSButton *shareSystemAudioButton;
 @property (nonatomic, strong, readwrite) NSView *previewContainerView;
 @property (nonatomic, strong, readwrite) NSView *networkStatusContainerView;
 @property (nonatomic, assign) BOOL suppressAudioInputCallback;
@@ -133,21 +136,48 @@
 
     [self addSubview:self.shareModePopUpButton];
 
-    self.cameraButton = [[NSButton alloc] initWithFrame:NSMakeRect(16, 88, self.bounds.size.width - 32, 30)];
+    self.interviewToolLabel = [NSTextField labelWithString:@"Interview Tool"];
+    self.interviewToolLabel.frame = NSMakeRect(16, 146, 140, 18);
+    self.interviewToolLabel.autoresizingMask = NSViewMaxXMargin | NSViewMaxYMargin;
+    self.interviewToolLabel.font = [NSFont systemFontOfSize:11];
+    self.interviewToolLabel.textColor = [NSColor colorWithWhite:0.85 alpha:1.0];
+    [self addSubview:self.interviewToolLabel];
+
+    self.interviewToolSegmentedControl = [[NSSegmentedControl alloc] initWithFrame:NSMakeRect(16, 118, self.bounds.size.width - 32, 26)];
+    self.interviewToolSegmentedControl.autoresizingMask = NSViewWidthSizable | NSViewMaxYMargin;
+    self.interviewToolSegmentedControl.segmentCount = 3;
+    [self.interviewToolSegmentedControl setLabel:@"Off" forSegment:0];
+    [self.interviewToolSegmentedControl setLabel:@"Code" forSegment:1];
+    [self.interviewToolSegmentedControl setLabel:@"Board" forSegment:2];
+    self.interviewToolSegmentedControl.trackingMode = NSSegmentSwitchTrackingSelectOne;
+    [self.interviewToolSegmentedControl setTarget:self];
+    [self.interviewToolSegmentedControl setAction:@selector(handleInterviewToolSelection:)];
+    [self addSubview:self.interviewToolSegmentedControl];
+
+    self.shareSystemAudioButton = [[NSButton alloc] initWithFrame:NSMakeRect(16, 4, self.bounds.size.width - 32, 18)];
+    self.shareSystemAudioButton.autoresizingMask = NSViewWidthSizable | NSViewMaxYMargin;
+    self.shareSystemAudioButton.buttonType = NSButtonTypeSwitch;
+    self.shareSystemAudioButton.title = @"Share System Audio";
+    self.shareSystemAudioButton.state = NSControlStateValueOff;
+    [self.shareSystemAudioButton setTarget:self];
+    [self.shareSystemAudioButton setAction:@selector(handleShareSystemAudioToggle:)];
+    [self addSubview:self.shareSystemAudioButton];
+
+    self.cameraButton = [[NSButton alloc] initWithFrame:NSMakeRect(16, 86, self.bounds.size.width - 32, 30)];
     self.cameraButton.autoresizingMask = NSViewWidthSizable | NSViewMaxYMargin;
     [self.cameraButton setTitle:@"Turn Camera On"];
     [self.cameraButton setTarget:self];
     [self.cameraButton setAction:@selector(handleCameraToggle:)];
     [self addSubview:self.cameraButton];
 
-    self.microphoneButton = [[NSButton alloc] initWithFrame:NSMakeRect(16, 56, self.bounds.size.width - 32, 30)];
+    self.microphoneButton = [[NSButton alloc] initWithFrame:NSMakeRect(16, 54, self.bounds.size.width - 32, 30)];
     self.microphoneButton.autoresizingMask = NSViewWidthSizable | NSViewMaxYMargin;
     [self.microphoneButton setTitle:@"Turn Mic On"];
     [self.microphoneButton setTarget:self];
     [self.microphoneButton setAction:@selector(handleMicrophoneToggle:)];
     [self addSubview:self.microphoneButton];
 
-    self.shareButton = [[NSButton alloc] initWithFrame:NSMakeRect(16, 20, self.bounds.size.width - 32, 30)];
+    self.shareButton = [[NSButton alloc] initWithFrame:NSMakeRect(16, 22, self.bounds.size.width - 32, 30)];
     self.shareButton.autoresizingMask = NSViewWidthSizable | NSViewMaxYMargin;
     [self.shareButton setTitle:@"Start Surface Share"];
     [self.shareButton setTarget:self];
@@ -155,6 +185,8 @@
     [self addSubview:self.shareButton];
 
     [self setShareMode:InterShareModeThisApp];
+    [self setSelectedInterviewToolKind:InterInterviewToolKindNone];
+    [self setInterviewToolSelectorHidden:YES];
 }
 
 - (void)setPanelTitleText:(NSString *)title {
@@ -225,6 +257,49 @@
 - (void)setShareModeSelectorHidden:(BOOL)hidden {
     self.shareModeLabel.hidden = hidden;
     self.shareModePopUpButton.hidden = hidden;
+}
+
+- (void)setShareSystemAudioEnabled:(BOOL)enabled {
+    self.shareSystemAudioButton.state = enabled ? NSControlStateValueOn : NSControlStateValueOff;
+}
+
+- (void)setShareSystemAudioToggleHidden:(BOOL)hidden {
+    self.shareSystemAudioButton.hidden = hidden;
+}
+
+- (void)setInterviewToolSelectorHidden:(BOOL)hidden {
+    self.interviewToolLabel.hidden = hidden;
+    self.interviewToolSegmentedControl.hidden = hidden;
+}
+
+- (void)setSelectedInterviewToolKind:(InterInterviewToolKind)toolKind {
+    NSInteger segment = 0;
+    switch (toolKind) {
+        case InterInterviewToolKindCodeEditor:
+            segment = 1;
+            break;
+        case InterInterviewToolKindWhiteboard:
+            segment = 2;
+            break;
+        case InterInterviewToolKindNone:
+        default:
+            segment = 0;
+            break;
+    }
+
+    self.interviewToolSegmentedControl.selectedSegment = segment;
+}
+
+- (InterInterviewToolKind)selectedInterviewToolKind {
+    switch (self.interviewToolSegmentedControl.selectedSegment) {
+        case 1:
+            return InterInterviewToolKindCodeEditor;
+        case 2:
+            return InterInterviewToolKindWhiteboard;
+        case 0:
+        default:
+            return InterInterviewToolKindNone;
+    }
 }
 
 - (void)setAudioInputOptions:(NSArray<NSDictionary<NSString *,NSString *> *> *)options
@@ -324,6 +399,27 @@
     ? (NSString *)selectedItem.representedObject
     : nil;
     handler(deviceID);
+}
+
+- (void)handleShareSystemAudioToggle:(id)sender {
+#pragma unused(sender)
+    void (^handler)(BOOL) = self.shareSystemAudioChangedHandler;
+    if (!handler) {
+        return;
+    }
+
+    BOOL enabled = self.shareSystemAudioButton.state == NSControlStateValueOn;
+    handler(enabled);
+}
+
+- (void)handleInterviewToolSelection:(id)sender {
+#pragma unused(sender)
+    void (^handler)(InterInterviewToolKind) = self.interviewToolChangedHandler;
+    if (!handler) {
+        return;
+    }
+
+    handler([self selectedInterviewToolKind]);
 }
 
 - (NSMenuItem *)shareModeMenuItemForMode:(InterShareMode)shareMode {

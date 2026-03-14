@@ -35,6 +35,7 @@
 @property (nonatomic, strong, nullable) InterRemoteVideoLayoutManager *normalRemoteLayout;
 @property (nonatomic, strong, nullable) InterTrackRendererBridge *normalTrackRendererBridge;
 @property (nonatomic, strong, nullable) InterNetworkStatusView *normalNetworkStatusView;
+@property (nonatomic, assign) BOOL normalShareSystemAudioEnabled;
 @property (nonatomic, assign) BOOL isScreenObserverRegistered;
 @property (nonatomic, assign) BOOL isShowingExternalDisplayAlert;
 @property (nonatomic, weak) NSWindow *fullScreenExitPendingWindow;
@@ -52,6 +53,15 @@ static void *InterPresenceStateContext = &InterPresenceStateContext;
 @implementation AppDelegate
 
 static NSString *const InterScreenCaptureStartupPromptedKey = @"InterScreenCaptureStartupPrompted";
+
+static BOOL InterShouldEnforceInterviewExternalDisplayPolicy(void) {
+    // Temporary testing bypass:
+    // Secure interview mode normally blocks multiple displays for the interviewee path.
+    // We are intentionally disabling only that enforcement while validating the new
+    // secure tool-surface workflow. Re-enable this by returning YES once the refined
+    // policy is ready.
+    return NO;
+}
 
 - (void)applicationDidFinishLaunching:(NSNotification *)aNotification {
     self.sessionCoordinator = [[InterCallSessionCoordinator alloc] init];
@@ -205,7 +215,9 @@ static NSString *const InterScreenCaptureStartupPromptedKey = @"InterScreenCaptu
 
 - (void)enterMode:(InterCallMode)mode role:(InterInterviewRole)role {
     BOOL isIntervieweeMode = (mode == InterCallModeInterview && role == InterInterviewRoleInterviewee);
-    if (isIntervieweeMode && [NSScreen screens].count > 1) {
+    if (isIntervieweeMode &&
+        InterShouldEnforceInterviewExternalDisplayPolicy() &&
+        [NSScreen screens].count > 1) {
         [self showExternalDisplayAlert];
         return;
     }
@@ -217,6 +229,7 @@ static NSString *const InterScreenCaptureStartupPromptedKey = @"InterScreenCaptu
     [self teardownActiveWindows];
     [self.settingsWindow orderOut:nil];
     [self.setupWindow orderOut:nil];
+    [self.setupRenderView shutdownRenderingSynchronously];
     [self.setupRenderView removeFromSuperview];
     self.setupRenderView = nil;
     self.setupWindow = nil;
@@ -247,6 +260,7 @@ static NSString *const InterScreenCaptureStartupPromptedKey = @"InterScreenCaptu
 - (void)launchSetupUI {
     if (self.setupWindow != nil) {
         [self.setupWindow orderOut:nil];
+        [self.setupRenderView shutdownRenderingSynchronously];
         [self.setupRenderView removeFromSuperview];
         self.setupRenderView = nil;
         self.setupWindow = nil;
@@ -472,12 +486,16 @@ static NSString *const InterScreenCaptureStartupPromptedKey = @"InterScreenCaptu
 - (void)showIntervieweeConfirmationWithCompletion:(void (^)(BOOL accepted))completion {
     NSAlert *alert = [[NSAlert alloc] init];
     alert.messageText = @"You are joining an Interview Session";
-    alert.informativeText =
-        @"This room is an interview. You will enter secure interviewee mode:\n\n"
-        @"• Full-screen secure window\n"
-        @"• Screen sharing restricted\n"
-        @"• External displays blocked\n\n"
-        @"Click 'Continue' to proceed or 'Cancel' to disconnect.";
+    NSMutableString *informativeText =
+        [NSMutableString stringWithString:
+            @"This room is an interview. You will enter secure interviewee mode:\n\n"
+             @"• Full-screen secure window\n"
+             @"• Screen sharing restricted\n"];
+    if (InterShouldEnforceInterviewExternalDisplayPolicy()) {
+        [informativeText appendString:@"• External displays blocked\n"];
+    }
+    [informativeText appendString:@"\nClick 'Continue' to proceed or 'Cancel' to disconnect."];
+    alert.informativeText = informativeText;
     alert.alertStyle = NSAlertStyleInformational;
     [alert addButtonWithTitle:@"Continue"];
     [alert addButtonWithTitle:@"Cancel"];
@@ -590,6 +608,8 @@ static NSString *const InterScreenCaptureStartupPromptedKey = @"InterScreenCaptu
     [self.normalControlPanel setPanelTitleText:@"Normal Call Controls"];
     [self.normalControlPanel setShareModeSelectorHidden:NO];
     [self.normalControlPanel setShareMode:InterShareModeThisApp];
+    [self.normalControlPanel setShareSystemAudioEnabled:NO];
+    [self.normalControlPanel setShareSystemAudioToggleHidden:YES];
     [self.normalControlPanel setShareModeOptionEnabled:YES forMode:InterShareModeWindow];
     [self.normalControlPanel setShareModeOptionEnabled:YES forMode:InterShareModeEntireScreen];
     [view addSubview:self.normalControlPanel];
@@ -612,6 +632,9 @@ static NSString *const InterScreenCaptureStartupPromptedKey = @"InterScreenCaptu
     self.normalControlPanel.audioInputSelectionChangedHandler = ^(NSString * _Nullable deviceID) {
         [weakSelf handleNormalAudioInputSelection:deviceID];
     };
+    self.normalControlPanel.shareSystemAudioChangedHandler = ^(BOOL enabled) {
+        [weakSelf handleNormalShareSystemAudioChanged:enabled];
+    };
 
     // [3.4.4] Network quality signal bars in the control panel
     self.normalNetworkStatusView = [[InterNetworkStatusView alloc] initWithFrame:NSMakeRect(0, 0, 40, 16)];
@@ -625,10 +648,12 @@ static NSString *const InterScreenCaptureStartupPromptedKey = @"InterScreenCaptu
 }
 
 - (void)startNormalLocalMediaFlow {
+    self.normalShareSystemAudioEnabled = NO;
     self.normalMediaController = [[InterLocalMediaController alloc] init];
     self.normalSurfaceShareController = [[InterSurfaceShareController alloc] init];
     [self.normalSurfaceShareController configureWithSessionKind:InterShareSessionKindNormal
                                                       shareMode:self.normalControlPanel.selectedShareMode];
+    [self.normalSurfaceShareController setShareSystemAudioEnabled:self.normalShareSystemAudioEnabled];
     [self refreshNormalAudioInputOptions];
 
     __weak typeof(self) weakSelf = self;
@@ -684,8 +709,16 @@ static NSString *const InterScreenCaptureStartupPromptedKey = @"InterScreenCaptu
         return;
     }
 
+    BOOL supportsSystemAudio = shareMode != InterShareModeThisApp;
+    [self.normalControlPanel setShareSystemAudioToggleHidden:!supportsSystemAudio];
+    if (!supportsSystemAudio) {
+        self.normalShareSystemAudioEnabled = NO;
+        [self.normalControlPanel setShareSystemAudioEnabled:NO];
+    }
+
     [self.normalSurfaceShareController configureWithSessionKind:InterShareSessionKindNormal
                                                       shareMode:shareMode];
+    [self.normalSurfaceShareController setShareSystemAudioEnabled:self.normalShareSystemAudioEnabled];
 
     if (shareMode == InterShareModeThisApp) {
         [self.normalControlPanel setShareStatusText:@"Share This App is ready."];
@@ -693,11 +726,26 @@ static NSString *const InterScreenCaptureStartupPromptedKey = @"InterScreenCaptu
     }
 
     if (shareMode == InterShareModeWindow) {
-        [self.normalControlPanel setShareStatusText:@"Share Window is ready."];
+        NSString *status = self.normalShareSystemAudioEnabled ? @"Share Window + system audio is ready." : @"Share Window is ready.";
+        [self.normalControlPanel setShareStatusText:status];
         return;
     }
 
-    [self.normalControlPanel setShareStatusText:@"Share Entire Screen is ready."];
+    NSString *status = self.normalShareSystemAudioEnabled ? @"Share Entire Screen + system audio is ready." : @"Share Entire Screen is ready.";
+    [self.normalControlPanel setShareStatusText:status];
+}
+
+- (void)handleNormalShareSystemAudioChanged:(BOOL)enabled {
+    self.normalShareSystemAudioEnabled = enabled;
+    [self.normalSurfaceShareController setShareSystemAudioEnabled:enabled];
+
+    if (self.normalControlPanel.selectedShareMode == InterShareModeWindow) {
+        NSString *status = enabled ? @"Share Window + system audio is ready." : @"Share Window is ready.";
+        [self.normalControlPanel setShareStatusText:status];
+    } else if (self.normalControlPanel.selectedShareMode == InterShareModeEntireScreen) {
+        NSString *status = enabled ? @"Share Entire Screen + system audio is ready." : @"Share Entire Screen is ready.";
+        [self.normalControlPanel setShareStatusText:status];
+    }
 }
 
 - (NSString *)normalMediaStateSummary {
@@ -784,6 +832,15 @@ static NSString *const InterScreenCaptureStartupPromptedKey = @"InterScreenCaptu
 
     InterShareMode selectedMode = self.normalControlPanel.selectedShareMode;
 
+    BOOL requiresScreenRecordingPermission = (selectedMode == InterShareModeWindow ||
+                                              selectedMode == InterShareModeEntireScreen);
+    if (requiresScreenRecordingPermission && ![InterScreenCaptureVideoSource preflightScreenCaptureAccess]) {
+        (void)[InterScreenCaptureVideoSource requestScreenCaptureAccessIfNeeded];
+        [self.normalControlPanel setShareStatusText:@"Screen recording permission is required. Enable it in System Settings, then click Start Surface Share again."];
+        [self.normalControlPanel setSharingEnabled:NO];
+        return;
+    }
+
     // For Window mode, show the picker first so the user can choose which window
     if (selectedMode == InterShareModeWindow) {
         NSWindow *parent = self.normalCallWindow;
@@ -815,6 +872,7 @@ static NSString *const InterScreenCaptureStartupPromptedKey = @"InterScreenCaptu
                 windowIdentifier:(NSString * _Nullable)windowIdentifier {
     [self.normalSurfaceShareController configureWithSessionKind:InterShareSessionKindNormal
                                                       shareMode:shareMode];
+    [self.normalSurfaceShareController setShareSystemAudioEnabled:self.normalShareSystemAudioEnabled];
 
     if (windowIdentifier.length > 0) {
         self.normalSurfaceShareController.configuration.selectedWindowIdentifier = windowIdentifier;
@@ -1243,6 +1301,7 @@ static NSString *const InterScreenCaptureStartupPromptedKey = @"InterScreenCaptu
         self.normalControlPanel.shareToggleHandler = nil;
         self.normalControlPanel.shareModeChangedHandler = nil;
         self.normalControlPanel.audioInputSelectionChangedHandler = nil;
+        self.normalControlPanel.shareSystemAudioChangedHandler = nil;
     }
 
     [self.normalSurfaceShareController stopSharingFromSurfaceView:self.normalRenderView];
@@ -1276,11 +1335,13 @@ static NSString *const InterScreenCaptureStartupPromptedKey = @"InterScreenCaptu
     }
 
     if (self.setupRenderView != nil) {
+        [self.setupRenderView shutdownRenderingSynchronously];
         [self.setupRenderView removeFromSuperview];
         self.setupRenderView = nil;
     }
 
     if (self.normalRenderView != nil) {
+        [self.normalRenderView shutdownRenderingSynchronously];
         [self.normalRenderView removeFromSuperview];
         self.normalRenderView = nil;
     }
@@ -1329,6 +1390,10 @@ static NSString *const InterScreenCaptureStartupPromptedKey = @"InterScreenCaptu
 #pragma mark - Screen Monitoring
 
 - (void)startScreenMonitoring {
+    if (!InterShouldEnforceInterviewExternalDisplayPolicy()) {
+        return;
+    }
+
     if (self.isScreenObserverRegistered) {
         return;
     }
@@ -1353,6 +1418,10 @@ static NSString *const InterScreenCaptureStartupPromptedKey = @"InterScreenCaptu
 
 - (void)handleScreenChange:(NSNotification *)notification {
 #pragma unused(notification)
+    if (!InterShouldEnforceInterviewExternalDisplayPolicy()) {
+        return;
+    }
+
     BOOL isIntervieweeMode = (self.currentCallMode == InterCallModeInterview &&
                               self.currentInterviewRole == InterInterviewRoleInterviewee);
     if (!isIntervieweeMode) {

@@ -105,6 +105,8 @@ enum DetectedFormat {
 
     private var displayLink: CVDisplayLink?
     private var renderSemaphore = DispatchSemaphore(value: 2)
+    private let lifecycleLock = NSLock()
+    private var isShuttingDown = false
 
     // MARK: - Init
 
@@ -158,7 +160,7 @@ enum DetectedFormat {
     }
 
     deinit {
-        stopDisplayLink()
+        shutdownRenderingSynchronously()
     }
 
     // MARK: - Frame Input [1.11.10]
@@ -207,6 +209,10 @@ enum DetectedFormat {
     private func startDisplayLink() {
         guard displayLink == nil else { return }
 
+        lifecycleLock.lock()
+        isShuttingDown = false
+        lifecycleLock.unlock()
+
         var link: CVDisplayLink?
         CVDisplayLinkCreateWithActiveCGDisplays(&link)
         guard let link = link else {
@@ -233,10 +239,55 @@ enum DetectedFormat {
         }
     }
 
+    /// Synchronously stops rendering and drains any in-flight callback before
+    /// callers remove the view or its layer from the hierarchy.
+    ///
+    /// Why this exists:
+    /// - Remote preview views own their own CVDisplayLink callbacks.
+    /// - Window teardown can otherwise release the backing CAMetalLayer while a
+    ///   callback is already in flight on a non-main thread.
+    /// - Draining the render semaphore gives teardown a hard synchronization
+    ///   point instead of relying on deinit timing.
+    @objc public func shutdownRenderingSynchronously() {
+        lifecycleLock.lock()
+        isShuttingDown = true
+        lifecycleLock.unlock()
+
+        stopDisplayLink()
+
+        for _ in 0..<2 {
+            renderSemaphore.wait()
+        }
+        for _ in 0..<2 {
+            renderSemaphore.signal()
+        }
+
+        os_unfair_lock_lock(&lock)
+        pendingPixelBuffer = nil
+        lastRenderedPixelBuffer = nil
+        os_unfair_lock_unlock(&lock)
+    }
+
+    private func renderingIsShuttingDown() -> Bool {
+        lifecycleLock.lock()
+        let shuttingDown = isShuttingDown
+        lifecycleLock.unlock()
+        return shuttingDown
+    }
+
     /// Called on the display link thread at screen refresh rate.
     private func displayLinkCallback() {
+        if renderingIsShuttingDown() {
+            return
+        }
+
         // Semaphore limits in-flight frames to 2 [1.11.4]
         guard renderSemaphore.wait(timeout: .now()) == .success else { return }
+
+        if renderingIsShuttingDown() {
+            renderSemaphore.signal()
+            return
+        }
 
         // Grab the latest frame (or re-present the last one) [1.11.11]
         os_unfair_lock_lock(&lock)

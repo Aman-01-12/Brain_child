@@ -1,7 +1,7 @@
 # LiveKit Integration — Implementation Plan
 
 > **Status**: Phase 0 complete. Phase 1 complete. Phase 2 complete. Phase 3 complete. Post-Phase 3 (bug fixes + UI polish + window picker + interview join fix) complete. Phase 4 next.  
-> **Last updated**: 12 March 2026  
+> **Last updated**: 13 March 2026  
 > **Tracking**: Changes logged in `work_done.md`
 
 ---
@@ -454,6 +454,25 @@ assigns it based on the room type. This is the Zoom/Meet/Teams pattern and is de
 - [x] PF.5.8 — `AppDelegate.joinRoomWithCode:`: reads `rc.roomType` after connect; if "interview", shows confirmation dialog ("You are joining an Interview Session") → Continue enters SecureWindowController as interviewee, Cancel disconnects
 - [x] PF.5.9 — Added `showIntervieweeConfirmationWithCompletion:` — NSAlert-based confirmation with full-screen/restrictions disclosure
 - [x] PF.5.10 — Tests: updated `makeCreateRoomJSON`/`makeJoinRoomJSON` helpers with roomType field; `testCreateRoom_interviewType` + `testJoinRoom_interviewType` verify interview type flows; `testRoomConfiguration_copy` verifies roomType copy semantics. All 95 tests pass.
+
+### PF.6 — Recording Logic Removal Sync
+
+- [x] PF.6.1 — Removed legacy local recording sink pipeline (`InterRecordingSink`) from the active share graph
+- [x] PF.6.2 — Removed `recordingEnabled` configuration and related recording-only status branches from share configuration/controller
+- [x] PF.6.3 — Removed recording settings UI wiring from `AppDelegate` and kept settings placeholder path for future work
+- [x] PF.6.4 — Build/tests remained stable after removal (95 tests passing in recorded run)
+
+### PF.7 — System Audio Share + Permission UX Fixes
+
+- [x] PF.7.1 — Added system-audio share configuration flag + control-panel toggle wiring for normal mode
+- [x] PF.7.2 — Added ScreenCaptureKit audio-output capture path in `InterScreenCaptureVideoSource` and forwarding via `audioSampleBufferHandler`
+- [x] PF.7.3 — Updated `InterSurfaceShareController` routing to use source-provided audio sample buffers when system-audio sharing is enabled
+- [x] PF.7.4 — Extended `InterLiveKitScreenShareSource` to ingest app/system audio samples and feed LiveKit mixer capture path
+- [x] PF.7.5 — Stabilized audio path with dedicated audio queue, deterministic PCM normalization, and unsupported-format drop protection
+- [x] PF.7.6 — Corrected control layout: "Share System Audio" toggle positioned below existing controls in local call panel
+- [x] PF.7.7 — Fixed permission UX: preflight Screen Recording permission before opening picker/start flow, and redirect user to System Settings with immediate in-app flow exit
+- [x] PF.7.8 — Removed forced modal-panel window level from window picker to prevent lingering panel behavior during Settings handoff
+- [x] PF.7.9 — Validation: clean focused screen-share source tests passed; subsequent app builds succeeded after UI/permission fixes
 
 ---
 

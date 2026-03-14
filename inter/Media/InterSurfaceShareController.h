@@ -3,6 +3,7 @@
 
 #import "InterShareTypes.h"
 #import "InterShareSink.h"
+#import "InterShareVideoSource.h"
 #import "MetalSurfaceView.h"
 
 NS_ASSUME_NONNULL_BEGIN
@@ -21,9 +22,12 @@ typedef void (^InterSurfaceShareAudioSampleObserverRegistrationBlock)(InterSurfa
 /// [G8] Optional network publish sink. When non-nil, frames are routed to it
 /// alongside local sinks. Setting this to nil removes it from routing.
 @property (nonatomic, strong, nullable) id<InterShareSink> networkPublishSink;
+@property (nonatomic, strong, nullable) id<InterShareVideoSource> customVideoSource;
 
 - (void)configureWithSessionKind:(InterShareSessionKind)sessionKind
                        shareMode:(InterShareMode)shareMode;
+
+- (void)setShareSystemAudioEnabled:(BOOL)enabled;
 
 - (void)startSharingFromSurfaceView:(MetalSurfaceView *)surfaceView;
 - (void)stopSharingFromSurfaceView:(nullable MetalSurfaceView *)surfaceView;

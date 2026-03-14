@@ -51,6 +51,12 @@ import LiveKit
         qos: .userInitiated
     )
 
+    /// Dedicated queue for audio sample conversion/injection.
+    private let audioQueue = DispatchQueue(
+        label: "inter.screenshare.livekit.audio",
+        qos: .userInitiated
+    )
+
     /// Minimum interval between frames (66ms = 15 FPS).
     private let minFrameInterval: TimeInterval = 1.0 / 15.0
 
@@ -65,6 +71,7 @@ import LiveKit
     private(set) var framesSent: UInt64 = 0
     private(set) var framesDropped: UInt64 = 0
     private(set) var framesThrottled: UInt64 = 0
+    private(set) var audioBuffersDropped: UInt64 = 0
 
     // MARK: - InterShareSink: Start
 
@@ -99,6 +106,7 @@ import LiveKit
         framesSent = 0
         framesDropped = 0
         framesThrottled = 0
+        audioBuffersDropped = 0
         lastFrameTime = 0
 
         interLogInfo(InterLog.media, "ScreenShareSource: started, track created")
@@ -157,10 +165,28 @@ import LiveKit
         }
     }
 
-    // MARK: - InterShareSink: Append Audio (no-op)
+    // MARK: - InterShareSink: Append Audio
 
     @objc public func appendAudioSampleBuffer(_ sampleBuffer: CMSampleBuffer) {
-        // Screen share source ignores audio (future: system audio capture).
+        guard isActive else { return }
+
+        // Keep router queue fast: retain and process on encoder queue.
+        let retained = Unmanaged.passRetained(sampleBuffer)
+        audioQueue.async { [weak self] in
+            guard let self = self, self.isActive else {
+                _ = retained.takeRetainedValue()
+                return
+            }
+
+            let buffer = retained.takeRetainedValue()
+            guard AudioManager.shared.isEngineRunning,
+                                    let pcmBuffer = self.makePCMBuffer(from: buffer) else {
+                self.audioBuffersDropped += 1
+                return
+            }
+
+            AudioManager.shared.mixer.capture(appAudio: pcmBuffer)
+        }
     }
 
     // MARK: - InterShareSink: Stop
@@ -190,6 +216,72 @@ import LiveKit
     }
 
     // MARK: - Private: Downscaling
+
+    private func makePCMBuffer(from sampleBuffer: CMSampleBuffer) -> AVAudioPCMBuffer? {
+        guard CMSampleBufferIsValid(sampleBuffer),
+              CMSampleBufferDataIsReady(sampleBuffer) else {
+            return nil
+        }
+
+        guard let formatDescription = CMSampleBufferGetFormatDescription(sampleBuffer),
+              CMFormatDescriptionGetMediaType(formatDescription) == kCMMediaType_Audio,
+              let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(formatDescription) else {
+            return nil
+        }
+
+        guard asbd.pointee.mFormatID == kAudioFormatLinearPCM,
+              asbd.pointee.mChannelsPerFrame > 0,
+              asbd.pointee.mSampleRate > 0 else {
+            return nil
+        }
+
+        let bitsPerChannel = asbd.pointee.mBitsPerChannel
+        let formatFlags = asbd.pointee.mFormatFlags
+        let isNonInterleaved = (formatFlags & kAudioFormatFlagIsNonInterleaved) != 0
+        let isFloat = (formatFlags & kAudioFormatFlagIsFloat) != 0
+        let isSignedInt = (formatFlags & kAudioFormatFlagIsSignedInteger) != 0
+
+        let commonFormat: AVAudioCommonFormat
+        if isFloat && bitsPerChannel == 32 {
+            commonFormat = .pcmFormatFloat32
+        } else if isFloat && bitsPerChannel == 64 {
+            commonFormat = .pcmFormatFloat64
+        } else if isSignedInt && bitsPerChannel == 16 {
+            commonFormat = .pcmFormatInt16
+        } else if isSignedInt && bitsPerChannel == 32 {
+            commonFormat = .pcmFormatInt32
+        } else {
+            return nil
+        }
+
+        let sampleCount = CMSampleBufferGetNumSamples(sampleBuffer)
+        guard sampleCount > 0 else {
+            return nil
+        }
+
+        guard let format = AVAudioFormat(commonFormat: commonFormat,
+                                         sampleRate: asbd.pointee.mSampleRate,
+                                         channels: AVAudioChannelCount(asbd.pointee.mChannelsPerFrame),
+                                         interleaved: !isNonInterleaved) else {
+            return nil
+        }
+
+        guard let pcmBuffer = AVAudioPCMBuffer(pcmFormat: format,
+                                               frameCapacity: AVAudioFrameCount(sampleCount)) else {
+            return nil
+        }
+
+        pcmBuffer.frameLength = AVAudioFrameCount(sampleCount)
+        let status = CMSampleBufferCopyPCMDataIntoAudioBufferList(sampleBuffer,
+                                                                   at: 0,
+                                                                   frameCount: Int32(sampleCount),
+                                                                   into: pcmBuffer.mutableAudioBufferList)
+        guard status == noErr else {
+            return nil
+        }
+
+        return pcmBuffer
+    }
 
     /// Downscale a CVPixelBuffer to fit within maxWidth × maxHeight, preserving aspect ratio.
     /// Uses vImage for efficient BGRA scaling.

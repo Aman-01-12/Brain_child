@@ -8,6 +8,7 @@ NS_ASSUME_NONNULL_BEGIN
 
 @property (nonatomic, copy, nullable) NSString *selectedDisplayIdentifier;
 @property (nonatomic, copy, nullable) NSString *selectedWindowIdentifier;
+@property (nonatomic, assign, getter=isCaptureSystemAudioEnabled) BOOL captureSystemAudioEnabled;
 
 + (BOOL)preflightScreenCaptureAccess;
 + (BOOL)requestScreenCaptureAccessIfNeeded;

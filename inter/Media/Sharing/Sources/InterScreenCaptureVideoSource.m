@@ -35,10 +35,15 @@ typedef NS_ENUM(NSUInteger, InterScreenCaptureSelectionMode) {
     InterScreenCaptureSelectionMode _pendingSelectionMode;
     uint64_t _pendingGeneration;
     id _appDidBecomeActiveObserver;
+
+    InterShareVideoSourceAudioSampleBufferHandler _audioSampleBufferHandler;
+    BOOL _captureSystemAudioEnabled;
 }
 
 @synthesize frameHandler = _frameHandler;
 @synthesize errorHandler = _errorHandler;
+@synthesize audioSampleBufferHandler = _audioSampleBufferHandler;
+@synthesize captureSystemAudioEnabled = _captureSystemAudioEnabled;
 
 - (instancetype)init {
     self = [super init];
@@ -62,6 +67,7 @@ typedef NS_ENUM(NSUInteger, InterScreenCaptureSelectionMode) {
     _waitingForPermissionGrant = NO;
     _pendingGeneration = 0;
     _appDidBecomeActiveObserver = nil;
+    _captureSystemAudioEnabled = NO;
     return self;
 }
 
@@ -326,6 +332,21 @@ typedef NS_ENUM(NSUInteger, InterScreenCaptureSelectionMode) {
         return;
     }
 
+    if (configuration.capturesAudio) {
+        NSError *audioOutputError = nil;
+        BOOL audioOutputAdded = [stream addStreamOutput:self
+                                                   type:SCStreamOutputTypeAudio
+                                      sampleHandlerQueue:_sampleQueue
+                                                   error:&audioOutputError];
+        if (!audioOutputAdded) {
+            [self failStartForGeneration:generation
+                                    code:InterShareErrorCodeInvalidConfiguration
+                             description:@"Unable to add system audio output to the capture stream."
+                         underlyingError:audioOutputError];
+            return;
+        }
+    }
+
     os_unfair_lock_lock(&_stateLock);
     BOOL generationStillActive = (_starting && _generation == generation);
     if (generationStillActive) {
@@ -416,7 +437,7 @@ typedef NS_ENUM(NSUInteger, InterScreenCaptureSelectionMode) {
     configuration.minimumFrameInterval = CMTimeMake(1, 30);
     configuration.queueDepth = 3;
     configuration.showsCursor = YES;
-    configuration.capturesAudio = NO;
+    configuration.capturesAudio = self.isCaptureSystemAudioEnabled;
 
     size_t width = 0;
     size_t height = 0;
@@ -605,6 +626,9 @@ typedef NS_ENUM(NSUInteger, InterScreenCaptureSelectionMode) {
     NSError *removeError = nil;
     [stream removeStreamOutput:self type:SCStreamOutputTypeScreen error:&removeError];
 #pragma unused(removeError)
+    NSError *removeAudioError = nil;
+    [stream removeStreamOutput:self type:SCStreamOutputTypeAudio error:&removeAudioError];
+#pragma unused(removeAudioError)
     [stream stopCaptureWithCompletionHandler:^(__unused NSError * _Nullable stopError) {
     }];
 }
@@ -667,7 +691,7 @@ typedef NS_ENUM(NSUInteger, InterScreenCaptureSelectionMode) {
 - (void)stream:(SCStream *)stream
 didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
         ofType:(SCStreamOutputType)type API_AVAILABLE(macos(13.0)) {
-    if (type != SCStreamOutputTypeScreen || !sampleBuffer) {
+    if (!sampleBuffer) {
         return;
     }
 
@@ -675,6 +699,22 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
     BOOL shouldProcess = (self.running && _stream == stream);
     os_unfair_lock_unlock(&_stateLock);
     if (!shouldProcess) {
+        return;
+    }
+
+    if (type == SCStreamOutputTypeAudio) {
+        if (!CMSampleBufferIsValid(sampleBuffer) ||
+            !CMSampleBufferDataIsReady(sampleBuffer)) {
+            return;
+        }
+        InterShareVideoSourceAudioSampleBufferHandler audioHandler = self.audioSampleBufferHandler;
+        if (audioHandler) {
+            audioHandler(sampleBuffer);
+        }
+        return;
+    }
+
+    if (type != SCStreamOutputTypeScreen) {
         return;
     }
 

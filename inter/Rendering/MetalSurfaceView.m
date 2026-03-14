@@ -58,7 +58,7 @@ static CVReturn InterDisplayLinkCallback(CVDisplayLinkRef displayLink,
 
 - (void)dealloc {
     // Defensive cleanup in case lifecycle teardown did not run.
-    [self stopAndReleaseDisplayLink];
+    [self shutdownRenderingSynchronously];
 
     if (_pixelBufferPool != NULL) {
         CVPixelBufferPoolRelease(_pixelBufferPool);
@@ -167,6 +167,15 @@ static CVReturn InterDisplayLinkCallback(CVDisplayLinkRef displayLink,
     for (int i = 0; i < 3; i++) {
         dispatch_semaphore_signal(_inFlightSemaphore);
     }
+}
+
+- (void)shutdownRenderingSynchronously {
+    // Teardown can remove the view hierarchy while the display-link callback is
+    // still racing on its own thread. Clearing the egress handler first and
+    // then synchronously draining the display link ensures no callback can
+    // reach engine-backed resources after callers start dismantling the window.
+    self.frameEgressHandler = nil;
+    [self stopAndReleaseDisplayLink];
 }
 
 - (void)refreshDrawableSize {

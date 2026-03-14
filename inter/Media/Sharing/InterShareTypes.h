@@ -26,6 +26,7 @@ typedef NS_ERROR_ENUM(InterShareErrorDomain, InterShareErrorCode) {
 @property (nonatomic, assign) InterShareSessionKind sessionKind;
 @property (nonatomic, assign) InterShareMode shareMode;
 @property (nonatomic, assign, getter=isNetworkPublishEnabled) BOOL networkPublishEnabled;
+@property (nonatomic, assign, getter=isShareSystemAudioEnabled) BOOL shareSystemAudioEnabled;
 
 /// For InterShareModeWindow — the CGWindowID (as string) chosen by the user
 /// in the window picker. When nil, the capture source picks the first

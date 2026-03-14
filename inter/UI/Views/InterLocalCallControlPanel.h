@@ -1,5 +1,6 @@
 #import <Cocoa/Cocoa.h>
 
+#import "InterInterviewToolTypes.h"
 #import "InterShareTypes.h"
 
 NS_ASSUME_NONNULL_BEGIN
@@ -11,6 +12,8 @@ NS_ASSUME_NONNULL_BEGIN
 @property (nonatomic, copy, nullable) dispatch_block_t shareToggleHandler;
 @property (nonatomic, copy, nullable) void (^shareModeChangedHandler)(InterShareMode shareMode);
 @property (nonatomic, copy, nullable) void (^audioInputSelectionChangedHandler)(NSString * _Nullable deviceID);
+@property (nonatomic, copy, nullable) void (^shareSystemAudioChangedHandler)(BOOL enabled);
+@property (nonatomic, copy, nullable) void (^interviewToolChangedHandler)(InterInterviewToolKind toolKind);
 
 @property (nonatomic, strong, readonly) NSView *previewContainerView;
 
@@ -33,6 +36,11 @@ NS_ASSUME_NONNULL_BEGIN
 - (InterShareMode)selectedShareMode;
 - (void)setShareModeOptionEnabled:(BOOL)enabled forMode:(InterShareMode)shareMode;
 - (void)setShareModeSelectorHidden:(BOOL)hidden;
+- (void)setShareSystemAudioEnabled:(BOOL)enabled;
+- (void)setShareSystemAudioToggleHidden:(BOOL)hidden;
+- (void)setInterviewToolSelectorHidden:(BOOL)hidden;
+- (void)setSelectedInterviewToolKind:(InterInterviewToolKind)toolKind;
+- (InterInterviewToolKind)selectedInterviewToolKind;
 
 /// Populate the microphone source selector.
 /// Expected dictionary keys in `options`: @"id", @"name".

@@ -8,6 +8,8 @@
 #import "InterTrackRendererBridge.h"
 #import "InterParticipantOverlayView.h"
 #import "InterNetworkStatusView.h"
+#import "InterSecureToolHostView.h"
+#import "InterViewSnapshotVideoSource.h"
 
 // [2.6] Swift module import for networking layer
 #if __has_include("inter-Swift.h")
@@ -16,9 +18,18 @@
 
 static void *InterSecureConnectionStateContext = &InterSecureConnectionStateContext;
 static void *InterSecurePresenceStateContext = &InterSecurePresenceStateContext;
+static const CGFloat InterSecureSidebarWidth = 278.0;
+static const CGFloat InterSecureSidebarTrailingMargin = 34.0;
+static const CGFloat InterSecureSidebarBottomMargin = 26.0;
+static const CGFloat InterSecurePanelHeight = 470.0;
+static const CGFloat InterSecureRemotePreviewHeight = 190.0;
+static const CGFloat InterSecureTopMargin = 40.0;
+static const CGFloat InterSecureLeftMargin = 40.0;
+static const CGFloat InterSecureBottomWorkspaceMargin = 100.0;
 
 @interface SecureWindowController () <InterParticipantOverlayDelegate>
 @property (nonatomic, strong) MetalSurfaceView *renderView;
+@property (nonatomic, strong) InterSecureToolHostView *toolHostView;
 @property (nonatomic, strong) InterLocalCallControlPanel *controlPanel;
 @property (nonatomic, strong) InterLocalMediaController *localMediaController;
 @property (nonatomic, strong) InterSurfaceShareController *surfaceShareController;
@@ -61,20 +72,31 @@ static void *InterSecurePresenceStateContext = &InterSecurePresenceStateContext;
     self.renderView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
     [view addSubview:self.renderView];
 
-    // [3.3.1] Remote video layout — inherits NSWindowSharingNone from SecureWindow [3.3.2]
-    self.remoteLayout = [[InterRemoteVideoLayoutManager alloc] initWithFrame:view.bounds];
-    self.remoteLayout.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+    self.toolHostView = [[InterSecureToolHostView alloc] initWithFrame:[self secureToolHostFrameInView:view]];
+    self.toolHostView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+    [view addSubview:self.toolHostView];
+
+    // [3.3.1] Remote video layout — remains local-only and stays outside the
+    // captured tool host hierarchy so incoming media never leaks into the
+    // outgoing secure share.
+    self.remoteLayout = [[InterRemoteVideoLayoutManager alloc] initWithFrame:[self secureRemoteLayoutFrameInView:view]];
+    self.remoteLayout.allowsManualSpotlightSelection = NO;
+    self.remoteLayout.autoresizingMask = NSViewMinXMargin | NSViewMinYMargin;
     [view addSubview:self.remoteLayout];
 
     NSTextField *headline = [NSTextField labelWithString:@"Interview secure surface (Metal)"];
-    headline.frame = NSMakeRect(40, view.bounds.size.height - 52, 460, 24);
+    headline.frame = NSMakeRect(InterSecureLeftMargin,
+                                view.bounds.size.height - 52.0,
+                                NSMaxX(self.toolHostView.frame) - InterSecureLeftMargin,
+                                24.0);
     headline.font = [NSFont boldSystemFontOfSize:15];
     headline.textColor = [NSColor colorWithWhite:0.92 alpha:1.0];
-    headline.autoresizingMask = NSViewMaxXMargin | NSViewMinYMargin;
+    headline.autoresizingMask = NSViewWidthSizable | NSViewMinYMargin;
     [view addSubview:headline];
 
     [self attachControlPanelInView:view];
     [self startLocalMediaFlow];
+    [self updateSecureWorkspacePresentationAnimated:NO];
 
     NSButton *exitButton =
     [[NSButton alloc] initWithFrame:NSMakeRect(40, 40, 140, 45)];
@@ -97,6 +119,11 @@ static void *InterSecurePresenceStateContext = &InterSecurePresenceStateContext;
 
 - (void)hideSecureWindow {
     if (self.secureWindow) {
+        // Ordering the borderless secure window out before the Metal view is
+        // quiesced leaves a window where the CAMetalLayer can lose its drawable
+        // while the display-link thread is still issuing work. Stop rendering
+        // first so exit never races layer teardown.
+        [self.renderView shutdownRenderingSynchronously];
         [self.secureWindow orderOut:nil];
     }
 }
@@ -108,8 +135,11 @@ static void *InterSecurePresenceStateContext = &InterSecurePresenceStateContext;
         self.controlPanel.shareToggleHandler = nil;
         self.controlPanel.shareModeChangedHandler = nil;
         self.controlPanel.audioInputSelectionChangedHandler = nil;
+        self.controlPanel.shareSystemAudioChangedHandler = nil;
+        self.controlPanel.interviewToolChangedHandler = nil;
     }
 
+    [self.renderView shutdownRenderingSynchronously];
     [self.surfaceShareController stopSharingFromSurfaceView:self.renderView];
     // [2.6.5] Clear network sink but do NOT disconnect room
     self.surfaceShareController.networkPublishSink = nil;
@@ -136,6 +166,9 @@ static void *InterSecurePresenceStateContext = &InterSecurePresenceStateContext;
 
     self.controlPanel = nil;
 
+    [self.toolHostView removeFromSuperview];
+    self.toolHostView = nil;
+
     [self.renderView removeFromSuperview];
     self.renderView = nil;
 
@@ -147,16 +180,17 @@ static void *InterSecurePresenceStateContext = &InterSecurePresenceStateContext;
 #pragma mark - Controls
 
 - (void)attachControlPanelInView:(NSView *)view {
-    NSRect panelFrame = NSMakeRect(view.bounds.size.width - 312.0,
-                                   26.0,
-                                   278.0,
-                                   470.0);
+    NSRect panelFrame = [self secureControlPanelFrameInView:view];
     self.controlPanel = [[InterLocalCallControlPanel alloc] initWithFrame:panelFrame];
     self.controlPanel.autoresizingMask = NSViewMinXMargin | NSViewMaxYMargin;
     [self.controlPanel setPanelTitleText:@"Interview Controls"];
     [self.controlPanel setShareModeSelectorHidden:YES];
+    [self.controlPanel setInterviewToolSelectorHidden:NO];
+    [self.controlPanel setSelectedInterviewToolKind:InterInterviewToolKindNone];
     [self.controlPanel setShareMode:InterShareModeThisApp];
-    [self.controlPanel setShareStatusText:@"Secure surface share is off."];
+    [self.controlPanel setShareSystemAudioEnabled:NO];
+    [self.controlPanel setShareSystemAudioToggleHidden:YES];
+    [self.controlPanel setShareStatusText:@"Secure tool share is off."];
     [view addSubview:self.controlPanel];
 
     __weak typeof(self) weakSelf = self;
@@ -173,6 +207,9 @@ static void *InterSecurePresenceStateContext = &InterSecurePresenceStateContext;
     };
     self.controlPanel.audioInputSelectionChangedHandler = ^(NSString * _Nullable deviceID) {
         [weakSelf handleSecureAudioInputSelection:deviceID];
+    };
+    self.controlPanel.interviewToolChangedHandler = ^(InterInterviewToolKind toolKind) {
+        [weakSelf handleInterviewToolSelection:toolKind];
     };
 
     // [3.4.4] Network quality signal bars
@@ -191,6 +228,11 @@ static void *InterSecurePresenceStateContext = &InterSecurePresenceStateContext;
     self.surfaceShareController = [[InterSurfaceShareController alloc] init];
     [self.surfaceShareController configureWithSessionKind:InterShareSessionKindInterview
                                                 shareMode:InterShareModeThisApp];
+    [self.surfaceShareController setShareSystemAudioEnabled:NO];
+    if (self.toolHostView) {
+        self.surfaceShareController.customVideoSource =
+        [[InterViewSnapshotVideoSource alloc] initWithCapturedView:self.toolHostView];
+    }
     [self refreshSecureAudioInputOptions];
 
     __weak typeof(self) weakSelf = self;
@@ -198,6 +240,7 @@ static void *InterSecurePresenceStateContext = &InterSecurePresenceStateContext;
         [weakSelf.controlPanel setShareStatusText:statusText];
         BOOL sharing = weakSelf.surfaceShareController.isSharing;
         [weakSelf.controlPanel setSharingEnabled:sharing];
+        [weakSelf updateSecureWorkspacePresentationAnimated:YES];
         // Publish screen share track to LiveKit when sharing starts
         if (sharing && weakSelf.roomController.connectionState == InterRoomConnectionStateConnected) {
             [weakSelf.roomController.publisher publishScreenShareWithCompletion:^(NSError *error) {
@@ -253,6 +296,45 @@ static void *InterSecurePresenceStateContext = &InterSecurePresenceStateContext;
             microphoneOn ? @"on" : @"off"];
 }
 
+- (NSRect)secureControlPanelFrameInView:(NSView *)view {
+    CGFloat originX = view.bounds.size.width - InterSecureSidebarTrailingMargin - InterSecureSidebarWidth;
+    return NSMakeRect(originX,
+                      InterSecureSidebarBottomMargin,
+                      InterSecureSidebarWidth,
+                      InterSecurePanelHeight);
+}
+
+- (NSRect)secureRemoteLayoutFrameInView:(NSView *)view {
+    CGFloat originX = view.bounds.size.width - InterSecureSidebarTrailingMargin - InterSecureSidebarWidth;
+    CGFloat originY = view.bounds.size.height - InterSecureTopMargin - InterSecureRemotePreviewHeight;
+    return NSMakeRect(originX,
+                      originY,
+                      InterSecureSidebarWidth,
+                      InterSecureRemotePreviewHeight);
+}
+
+- (NSRect)secureToolHostFrameInView:(NSView *)view {
+    CGFloat sidebarOriginX = NSMinX([self secureControlPanelFrameInView:view]);
+    CGFloat width = MAX(320.0, sidebarOriginX - (InterSecureLeftMargin + 24.0));
+    CGFloat height = MAX(320.0, view.bounds.size.height - (InterSecureBottomWorkspaceMargin + InterSecureTopMargin + 30.0));
+    return NSMakeRect(InterSecureLeftMargin,
+                      InterSecureBottomWorkspaceMargin,
+                      width,
+                      height);
+}
+
+- (NSString *)secureToolDescriptionForKind:(InterInterviewToolKind)toolKind {
+    switch (toolKind) {
+        case InterInterviewToolKindCodeEditor:
+            return @"Code editor";
+        case InterInterviewToolKindWhiteboard:
+            return @"Whiteboard";
+        case InterInterviewToolKindNone:
+        default:
+            return @"No secure tool";
+    }
+}
+
 - (void)refreshSecureAudioInputOptions {
     if (!self.localMediaController || !self.controlPanel) {
         return;
@@ -261,6 +343,92 @@ static void *InterSecurePresenceStateContext = &InterSecurePresenceStateContext;
     NSArray<NSDictionary<NSString *, NSString *> *> *options = [self.localMediaController availableAudioInputOptions];
     NSString *selectedDeviceID = [self.localMediaController selectedAudioInputDeviceID];
     [self.controlPanel setAudioInputOptions:options selectedDeviceID:selectedDeviceID];
+}
+
+- (void)handleInterviewToolSelection:(InterInterviewToolKind)toolKind {
+    if (!self.toolHostView || !self.controlPanel) {
+        return;
+    }
+
+    [self.toolHostView setActiveToolKind:toolKind];
+    [self.controlPanel setSelectedInterviewToolKind:toolKind];
+
+    if (self.surfaceShareController.isSharing && toolKind == InterInterviewToolKindNone) {
+        // Interview sharing should never keep streaming a placeholder once the
+        // user explicitly turns tools off. Stop the share so the main stage can
+        // return to remote video immediately.
+        [self.roomController.publisher unpublishScreenShareWithCompletion:nil];
+        [self.surfaceShareController stopSharingFromSurfaceView:self.renderView];
+        self.surfaceShareController.networkPublishSink = nil;
+        [self.controlPanel setSharingEnabled:self.surfaceShareController.isSharing];
+        [self updateSecureWorkspacePresentationAnimated:YES];
+        return;
+    }
+
+    if (self.surfaceShareController.isSharing) {
+        NSString *toolDescription = [self secureToolDescriptionForKind:toolKind];
+        [self.controlPanel setShareStatusText:[NSString stringWithFormat:@"Secure tool share is active. %@ visible to the other participant.", toolDescription]];
+    } else {
+        if (toolKind == InterInterviewToolKindNone) {
+            [self.controlPanel setShareStatusText:@"Secure tool share is off. Choose a tool before you begin sharing."];
+        } else {
+            NSString *toolDescription = [self secureToolDescriptionForKind:toolKind];
+            [self.controlPanel setShareStatusText:[NSString stringWithFormat:@"Secure tool share is off. %@ selected. Press Share to start publishing it.", toolDescription]];
+        }
+    }
+
+    [self updateSecureWorkspacePresentationAnimated:YES];
+}
+
+- (void)applyRemoteLayoutFrameAnimated:(BOOL)animated {
+#pragma unused(animated)
+    NSView *contentView = self.secureWindow.contentView;
+    if (!self.remoteLayout || !contentView) {
+        return;
+    }
+
+    NSRect targetFrame = [self targetRemoteLayoutFrameInView:contentView];
+
+    // Keep the remote panel as a sibling overlay so expanding it locally never
+    // changes the secure-tool subtree that is captured and sent to the other side.
+    [contentView addSubview:self.remoteLayout positioned:NSWindowAbove relativeTo:self.toolHostView];
+    // Secure-mode transitions are intentionally immediate. The previous animated
+    // resize path could leave the remote renderer visually out of sync with its
+    // container until another event forced a fresh layout.
+    self.remoteLayout.frame = targetFrame;
+    [self.remoteLayout layoutSubtreeIfNeeded];
+}
+
+- (BOOL)shouldDisplaySecureToolSurface {
+    if (!self.toolHostView || !self.surfaceShareController) {
+        return NO;
+    }
+
+    return self.surfaceShareController.isSharing &&
+           self.toolHostView.activeToolKind != InterInterviewToolKindNone;
+}
+
+- (NSRect)targetRemoteLayoutFrameInView:(NSView *)view {
+    if (![self shouldDisplaySecureToolSurface]) {
+        // Mirror the normal-call behavior: when there is no active secure tool
+        // share, remote media owns the main workspace region instead of leaving
+        // an empty reserved surface on screen.
+        return [self secureToolHostFrameInView:view];
+    }
+
+    return [self secureRemoteLayoutFrameInView:view];
+}
+
+- (void)updateSecureWorkspacePresentationAnimated:(BOOL)animated {
+    NSView *contentView = self.secureWindow.contentView;
+    if (!self.toolHostView || !contentView) {
+        return;
+    }
+
+    BOOL shouldShowToolSurface = [self shouldDisplaySecureToolSurface];
+    self.toolHostView.hidden = !shouldShowToolSurface;
+
+    [self applyRemoteLayoutFrameAnimated:animated];
 }
 
 - (void)handleSecureAudioInputSelection:(NSString * _Nullable)deviceID {
@@ -309,7 +477,7 @@ static void *InterSecurePresenceStateContext = &InterSecurePresenceStateContext;
 }
 
 - (void)toggleSurfaceShare {
-    if (!self.renderView) {
+    if (!self.renderView || !self.toolHostView) {
         return;
     }
 
@@ -319,6 +487,13 @@ static void *InterSecurePresenceStateContext = &InterSecurePresenceStateContext;
         [self.surfaceShareController stopSharingFromSurfaceView:self.renderView];
         self.surfaceShareController.networkPublishSink = nil;
         [self.controlPanel setSharingEnabled:self.surfaceShareController.isSharing];
+        [self updateSecureWorkspacePresentationAnimated:YES];
+        return;
+    }
+
+    if (self.toolHostView.activeToolKind == InterInterviewToolKindNone) {
+        [self.controlPanel setShareStatusText:@"Select Code or Whiteboard before starting secure tool share."];
+        [self updateSecureWorkspacePresentationAnimated:YES];
         return;
     }
 

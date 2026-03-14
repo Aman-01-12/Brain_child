@@ -15,10 +15,12 @@
     uint64_t _generation;
     InterShareVideoSourceFrameHandler _frameHandler;
     InterShareVideoSourceErrorHandler _errorHandler;
+    InterShareVideoSourceAudioSampleBufferHandler _audioSampleBufferHandler;
 }
 
 @synthesize frameHandler = _frameHandler;
 @synthesize errorHandler = _errorHandler;
+@synthesize audioSampleBufferHandler = _audioSampleBufferHandler;
 
 - (instancetype)initWithSurfaceView:(MetalSurfaceView *)surfaceView {
     self = [super init];

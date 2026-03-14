@@ -7,6 +7,7 @@
 #import "InterScreenCaptureVideoSource.h"
 #import "InterShareSink.h"
 #import "InterShareVideoSource.h"
+#import "InterViewSnapshotVideoSource.h"
 
 @interface InterSurfaceShareController ()
 @property (atomic, assign, readwrite, getter=isSharing) BOOL sharing;
@@ -47,6 +48,12 @@
     self.configuration = updatedConfiguration;
 }
 
+- (void)setShareSystemAudioEnabled:(BOOL)enabled {
+    InterShareSessionConfiguration *updatedConfiguration = [self.configuration copy];
+    updatedConfiguration.shareSystemAudioEnabled = enabled;
+    self.configuration = updatedConfiguration;
+}
+
 - (void)startSharingFromSurfaceView:(MetalSurfaceView *)surfaceView {
     if (self.isSharing) {
         return;
@@ -66,6 +73,13 @@
     if (!videoSource) {
         [self emitStatusText:@"Unable to start sharing source."];
         return;
+    }
+
+    if ([videoSource isKindOfClass:[InterScreenCaptureVideoSource class]]) {
+        InterScreenCaptureVideoSource *screenSource = (InterScreenCaptureVideoSource *)videoSource;
+        BOOL shouldCaptureSystemAudio = configuration.isShareSystemAudioEnabled &&
+        configuration.shareMode != InterShareModeThisApp;
+        screenSource.captureSystemAudioEnabled = shouldCaptureSystemAudio;
     }
 
     NSArray<id<InterShareSink>> *sinks = [self sinksForConfiguration:configuration];
@@ -99,7 +113,13 @@
         [weakSelf emitStatusText:status];
     };
 
-    [self registerAudioObserverForGeneration:generation];
+    BOOL shouldUseSystemAudioPath = configuration.isShareSystemAudioEnabled &&
+    [videoSource isKindOfClass:[InterScreenCaptureVideoSource class]];
+    if (shouldUseSystemAudioPath) {
+        [self registerVideoSourceAudioObserverForGeneration:generation source:videoSource];
+    } else {
+        [self registerAudioObserverForGeneration:generation];
+    }
 
     for (id<InterShareSink> sink in sinks) {
         [sink startWithConfiguration:configuration completion:^(BOOL active, NSString * _Nullable statusText) {
@@ -134,6 +154,11 @@
 
 - (id<InterShareVideoSource>)videoSourceForConfiguration:(InterShareSessionConfiguration *)configuration
                                               surfaceView:(MetalSurfaceView *)surfaceView {
+    id<InterShareVideoSource> injectedSource = self.customVideoSource;
+    if (injectedSource && configuration.shareMode == InterShareModeThisApp) {
+        return injectedSource;
+    }
+
     switch (configuration.shareMode) {
         case InterShareModeThisApp:
             return [[InterAppSurfaceVideoSource alloc] initWithSurfaceView:surfaceView];
@@ -181,6 +206,32 @@
             CFRelease(sampleBuffer);
         });
     });
+}
+
+- (void)registerVideoSourceAudioObserverForGeneration:(uint64_t)generation
+                                               source:(id<InterShareVideoSource>)videoSource {
+    dispatch_queue_t routerQueue = _routerQueue;
+    __weak typeof(self) weakSelf = self;
+    videoSource.audioSampleBufferHandler = ^(CMSampleBufferRef sampleBuffer) {
+        if (!sampleBuffer) {
+            return;
+        }
+
+        CFRetain(sampleBuffer);
+        dispatch_async(routerQueue, ^{
+            __strong typeof(weakSelf) strongSelf = weakSelf;
+            if (!strongSelf || ![strongSelf isGenerationActive:generation]) {
+                CFRelease(sampleBuffer);
+                return;
+            }
+
+            NSArray<id<InterShareSink>> *sinks = [strongSelf currentSinksSnapshot];
+            for (id<InterShareSink> sink in sinks) {
+                [sink appendAudioSampleBuffer:sampleBuffer];
+            }
+            CFRelease(sampleBuffer);
+        });
+    };
 }
 
 - (void)routeVideoFrame:(InterShareVideoFrame *)frame generation:(uint64_t)generation {
@@ -262,6 +313,8 @@
     id<InterShareVideoSource> videoSource = nil;
     NSArray<id<InterShareSink>> *sinks = nil;
     InterSurfaceShareAudioSampleObserverRegistrationBlock registrationBlock = nil;
+    InterShareSessionConfiguration *configurationSnapshot = nil;
+    BOOL usedCustomVideoSource = NO;
 
     @synchronized(self) {
         if (!self.sharing && _videoSource == nil && _sinks.count == 0) {
@@ -275,6 +328,8 @@
         videoSource = _videoSource;
         sinks = [_sinks copy];
         registrationBlock = self.audioSampleObserverRegistrationBlock;
+        configurationSnapshot = [self.configuration copy];
+        usedCustomVideoSource = (_videoSource != nil && _videoSource == self.customVideoSource);
 
         _videoSource = nil;
         _sinks = @[];
@@ -284,6 +339,7 @@
         [videoSource stop];
         videoSource.frameHandler = nil;
         videoSource.errorHandler = nil;
+        videoSource.audioSampleBufferHandler = nil;
     }
 
     if (registrationBlock) {
@@ -303,16 +359,29 @@
     }
 
     dispatch_group_notify(stopGroup, dispatch_get_main_queue(), ^{
+        if (usedCustomVideoSource && configurationSnapshot.sessionKind == InterShareSessionKindInterview) {
+            [self emitStatusText:@"Secure tool share is off."];
+            return;
+        }
+
         [self emitStatusText:@"Secure surface share is off."];
     });
 }
 
 - (NSString *)activeStatusTextForConfiguration:(InterShareSessionConfiguration *)configuration {
+    if (configuration.sessionKind == InterShareSessionKindInterview && self.customVideoSource) {
+        return @"Secure tool share is active.";
+    }
+
     NSString *sourceLabel = [self sourceLabelForShareMode:configuration.shareMode];
     return [NSString stringWithFormat:@"%@ share is active.", sourceLabel];
 }
 
 - (NSString *)startingStatusTextForConfiguration:(InterShareSessionConfiguration *)configuration {
+    if (configuration.sessionKind == InterShareSessionKindInterview && self.customVideoSource) {
+        return @"Starting secure tool share.";
+    }
+
     NSString *sourceLabel = [self sourceLabelForShareMode:configuration.shareMode];
     return [NSString stringWithFormat:@"Starting %@ share.", sourceLabel.lowercaseString];
 }

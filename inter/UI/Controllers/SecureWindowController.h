@@ -16,9 +16,10 @@ NS_ASSUME_NONNULL_BEGIN
 - (void)createSecureWindow;
 - (void)destroySecureWindow;
 
-/// Immediately hide the secure window without tearing down resources.
-/// Used by finalizeCurrentModeExit for instant visual feedback before
-/// the heavier destroySecureWindow cleanup runs.
+/// Immediately hide the secure window without tearing down room/media objects.
+/// This also quiesces the secure renderer first so exit cannot race the
+/// CAMetalLayer/drawable lifecycle while the heavier destroySecureWindow
+/// cleanup runs.
 - (void)hideSecureWindow;
 
 @end

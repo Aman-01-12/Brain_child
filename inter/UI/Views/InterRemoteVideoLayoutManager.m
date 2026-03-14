@@ -191,6 +191,7 @@ static const CGFloat kAnimationDuration      = 0.3;
     [self addSubview:self.participantOverlay];
 
     self.layoutMode = InterRemoteVideoLayoutModeNone;
+    self.allowsManualSpotlightSelection = YES;
     return self;
 }
 
@@ -266,6 +267,10 @@ static const CGFloat kAnimationDuration      = 0.3;
 - (void)removeCameraViewForParticipant:(NSString *)participantId {
     InterRemoteVideoView *view = self.remoteCameraViews[participantId];
     if (view) {
+        // Remote preview tiles run their own display-link renderer. Stop that
+        // renderer before releasing the final strong reference so view teardown
+        // cannot race CAMetalLayer access on a background callback.
+        [view shutdownRenderingSynchronously];
         [self removeTileForKey:participantId];
         [self.remoteCameraViews removeObjectForKey:participantId];
         [self.cameraParticipantOrder removeObject:participantId];
@@ -273,7 +278,7 @@ static const CGFloat kAnimationDuration      = 0.3;
 
     // If the removed camera was spotlighted, reset to auto
     if ([self.spotlightedTileKey isEqualToString:participantId]) {
-        self.spotlightedTileKey = nil;
+        [self updateManualSpotlightTileKey:nil];
     }
 }
 
@@ -309,11 +314,6 @@ static const CGFloat kAnimationDuration      = 0.3;
         InterRemoteVideoView *v = [self screenShareView];
         [v updateFrame:pixelBuffer];
         CVPixelBufferRelease(pixelBuffer);
-
-        // Auto-spotlight screen share when it first appears
-        if (!self.spotlightedTileKey) {
-            self.spotlightedTileKey = kScreenShareTileKey;
-        }
         [self updateLayoutAnimated:YES];
     });
 }
@@ -338,6 +338,7 @@ static const CGFloat kAnimationDuration      = 0.3;
         [self removeCameraViewForParticipant:participantId];
     } else if (trackKind == InterTrackKindScreenShare) {
         if ([self.screenShareParticipantId isEqualToString:participantId]) {
+            [self.remoteScreenShareView shutdownRenderingSynchronously];
             [self removeTileForKey:kScreenShareTileKey];
             [self.remoteScreenShareView removeFromSuperview];
             self.remoteScreenShareView = nil;
@@ -345,7 +346,7 @@ static const CGFloat kAnimationDuration      = 0.3;
 
             // If screen share was spotlighted, reset to auto
             if ([self.spotlightedTileKey isEqualToString:kScreenShareTileKey]) {
-                self.spotlightedTileKey = nil;
+                [self updateManualSpotlightTileKey:nil];
             }
         }
     }
@@ -360,16 +361,15 @@ static const CGFloat kAnimationDuration      = 0.3;
 
 /// Called by tile click or programmatic spotlight.
 - (void)handleTileClicked:(NSString *)tileKey {
+    if (!self.allowsManualSpotlightSelection) {
+        return;
+    }
+
     // If already spotlighted, un-spotlight (back to auto)
     if ([self.spotlightedTileKey isEqualToString:tileKey]) {
-        // Reset to auto (screen share if present, else nil)
-        if (self.screenShareParticipantId) {
-            self.spotlightedTileKey = kScreenShareTileKey;
-        } else {
-            self.spotlightedTileKey = nil;
-        }
+        [self updateManualSpotlightTileKey:nil];
     } else {
-        self.spotlightedTileKey = tileKey;
+        [self updateManualSpotlightTileKey:tileKey];
     }
     [self updateLayoutAnimated:YES];
 }
@@ -677,16 +677,18 @@ static const CGFloat kAnimationDuration      = 0.3;
 
     // Clean camera state
     for (InterRemoteVideoView *view in self.remoteCameraViews.allValues) {
+        [view shutdownRenderingSynchronously];
         [view removeFromSuperview];
     }
     [self.remoteCameraViews removeAllObjects];
     [self.cameraParticipantOrder removeAllObjects];
 
     // Clean screen share state
+    [self.remoteScreenShareView shutdownRenderingSynchronously];
     [self.remoteScreenShareView removeFromSuperview];
     self.remoteScreenShareView = nil;
     self.screenShareParticipantId = nil;
-    self.spotlightedTileKey = nil;
+    [self updateManualSpotlightTileKey:nil];
 
     // Clean filmstrip
     for (NSView *sub in [self.filmstripContentView.subviews copy]) {
@@ -696,6 +698,37 @@ static const CGFloat kAnimationDuration      = 0.3;
 
     self.participantOverlay.hidden = YES;
     self.layoutMode = InterRemoteVideoLayoutModeNone;
+}
+
+#pragma mark - Spotlight State
+
+- (void)updateManualSpotlightTileKey:(NSString * _Nullable)tileKey {
+    BOOL unchanged = ((self.spotlightedTileKey == nil && tileKey == nil) ||
+                      [self.spotlightedTileKey isEqualToString:tileKey]);
+    if (unchanged) {
+        return;
+    }
+
+    self.spotlightedTileKey = [tileKey copy];
+
+    void (^handler)(NSString * _Nullable) = self.spotlightSelectionChangedHandler;
+    if (handler) {
+        handler(self.spotlightedTileKey);
+    }
+}
+
+- (void)setAllowsManualSpotlightSelection:(BOOL)allowsManualSpotlightSelection {
+    if (_allowsManualSpotlightSelection == allowsManualSpotlightSelection) {
+        return;
+    }
+
+    _allowsManualSpotlightSelection = allowsManualSpotlightSelection;
+    if (!allowsManualSpotlightSelection && self.spotlightedTileKey != nil) {
+        // Disabling manual spotlight should also clear any previously selected
+        // tile so future layout is purely automatic.
+        [self updateManualSpotlightTileKey:nil];
+        [self updateLayoutAnimated:NO];
+    }
 }
 
 @end

@@ -50,6 +50,17 @@ typedef NS_ENUM(NSUInteger, InterRemoteVideoLayoutMode) {
 /// Number of remote camera feeds currently displayed.
 @property (nonatomic, readonly) NSUInteger remoteCameraCount;
 
+/// Optional callback fired when the user manually selects or clears a spotlight tile.
+/// This is intended for container-level UI reactions outside the layout manager itself,
+/// such as secure-mode expansion of the local-only remote preview area.
+/// A nil tile key means the layout manager returned to automatic spotlight behavior.
+@property (nonatomic, copy, nullable) void (^spotlightSelectionChangedHandler)(NSString * _Nullable tileKey);
+
+/// Enables click-to-spotlight behavior for tiles. Normal call layouts can keep
+/// this on; secure interview mode turns it off so remote feeds are positioned
+/// only by secure share state, never by local tile clicks.
+@property (nonatomic, assign) BOOL allowsManualSpotlightSelection;
+
 /// Call when a remote camera frame arrives from a participant.
 - (void)handleRemoteCameraFrame:(CVPixelBufferRef)pixelBuffer fromParticipant:(NSString *)participantId;
 

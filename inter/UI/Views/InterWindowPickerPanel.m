@@ -222,7 +222,6 @@ static const CGFloat kBottomBarHeight       = 56.0;
     picker.backgroundColor = [NSColor colorWithWhite:0.10 alpha:1.0];
     picker.opaque = NO;
     picker.movableByWindowBackground = YES;
-    picker.level = NSModalPanelWindowLevel;
     picker.releasedWhenClosed = NO;
 
     [picker buildUI];

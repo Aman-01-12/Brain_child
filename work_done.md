@@ -247,6 +247,8 @@
 
 > Phase 0 complete. Phase 1 complete. Phase 2 complete. Phase 3 complete.
 > Post-Phase 3 bug fixes complete. UI polish complete. Window picker implemented.
+> PF.6 recording logic removal complete.
+> PF.7 system-audio share + audio-path hardening + permission handoff UX fixes complete.
 > Phase 4 next (Production Hardening).
 > Stats JSON export 1.10.5 still pending.
 
@@ -344,7 +346,7 @@
 
 ---
 
-## [2026-03-XX] — PF.6: Recording Logic Removal
+## [13 March 2026] — PF.6: Recording Logic Removal
 
 **Phase**: Post-Phase 3 (PF.6)  
 **Files changed**:
@@ -371,6 +373,50 @@
 
 **Why**: The existing recording pipeline captured raw screen content and auto-triggered on every screen share — this is not how production apps record. Zoom, Google Meet, and Microsoft Teams use **composed server-side recording**: a headless compositor on the SFU (or a dedicated media server) receives all participant tracks, composites them into a single layout (grid/speaker view), and encodes to a single MP4/MKV. The raw-screen approach was removed to avoid shipping incorrect behavior. The InterShareSink protocol and frame routing architecture are retained as the foundation for a future proper recording implementation (either server-side composed or client-side composed using multiple remote tracks).  
 **Notes**: BUILD SUCCEEDED, 95 tests pass (0 failures). ~570 lines of recording code removed. Settings window now shows "No configurable settings yet." placeholder.
+
+---
+
+## [13 March 2026] — PF.7: System Audio Screen Share (End-to-End)
+
+**Phase**: Post-Phase 3 (PF.7.1–PF.7.6)  
+**Files changed**:
+- `inter/Media/Sharing/InterShareTypes.h` + `inter/Media/Sharing/InterShareTypes.m` — Added `shareSystemAudioEnabled` to `InterShareSessionConfiguration` with default/copy support.
+- `inter/Media/Sharing/Protocols/InterShareVideoSource.h` — Added audio sample callback contract for source-driven audio (`audioSampleBufferHandler`).
+- `inter/Media/Sharing/Sources/InterAppSurfaceVideoSource.m` — Adopted new audio callback property to satisfy updated video source protocol.
+- `inter/Media/Sharing/Sources/InterScreenCaptureVideoSource.h` + `inter/Media/Sharing/Sources/InterScreenCaptureVideoSource.m` — Added optional SCStream audio output capture path, wired sample forwarding for app/system audio, and guarded sample forwarding validity checks.
+- `inter/Media/InterSurfaceShareController.h` + `inter/Media/InterSurfaceShareController.m` — Added `setShareSystemAudioEnabled:` and conditional routing: source-audio observer for screen share vs mic observer for regular share path.
+- `inter/Networking/InterLiveKitScreenShareSource.swift` — Added app/system audio ingestion path and LiveKit mixer capture integration.
+- `inter/UI/Views/InterLocalCallControlPanel.h` + `inter/UI/Views/InterLocalCallControlPanel.m` — Added Share System Audio toggle API + callback wiring.
+- `inter/App/AppDelegate.m` — Wired toggle state/handlers in normal mode and status sync behavior.
+- `inter/UI/Controllers/SecureWindowController.m` — Hid/forced-off system audio toggle in secure interview mode.
+
+**Why**: Add production-ready system audio sharing for screen/window sharing, while preserving existing microphone path and mode-specific behavior.  
+**Notes**: End-to-end path now routes SCStream audio samples from source → share controller → screen-share sink → LiveKit mixer.
+
+---
+
+## [13 March 2026] — PF.7 Stability: Screen-Share Audio Crash Hardening
+
+**Phase**: Post-Phase 3 (PF.7.5)  
+**Files changed**:
+- `inter/Networking/InterLiveKitScreenShareSource.swift` — Replaced fragile conversion with deterministic PCM normalization and strict format validation (Float32/Float64/Int16/Int32). Added dedicated audio queue, safe-drop behavior for unsupported formats, and drop diagnostics counter.
+- `inter/Media/Sharing/Sources/InterScreenCaptureVideoSource.m` — Added source-side guards to avoid forwarding invalid audio sample buffers into conversion path.
+
+**Why**: Resolve EXC_BAD_ACCESS and conversion instability during active screen-share audio capture under variable ScreenCaptureKit audio formats.  
+**Notes**: Clean focused test run for screen-share source passed after cleanup/rebuild; subsequent project builds succeeded.
+
+---
+
+## [13 March 2026] — PF.7 UX: Share Audio Toggle Placement + Permission Handoff Fix
+
+**Phase**: Post-Phase 3 (PF.7.6–PF.7.8)  
+**Files changed**:
+- `inter/UI/Views/InterLocalCallControlPanel.m` — Repositioned Share System Audio toggle below the existing control stack.
+- `inter/App/AppDelegate.m` — Added preflight permission gate in `toggleNormalSurfaceShare` for window/screen modes; if missing permission, request/open Settings flow and exit local share-start flow immediately with user-facing status text.
+- `inter/UI/Views/InterWindowPickerPanel.m` — Removed forced `NSModalPanelWindowLevel` to prevent persistent floating panel behavior during System Settings redirection.
+
+**Why**: Fix UX bug where permission handoff to System Settings left an in-app panel lingering onscreen, and align toggle placement with expected control order.  
+**Notes**: BUILD SUCCEEDED after permission-flow and panel-level changes.
 
 ---
 
