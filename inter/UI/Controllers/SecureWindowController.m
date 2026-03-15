@@ -9,6 +9,7 @@
 #import "InterParticipantOverlayView.h"
 #import "InterNetworkStatusView.h"
 #import "InterSecureToolHostView.h"
+#import "InterSecureInterviewStageView.h"
 #import "InterViewSnapshotVideoSource.h"
 
 // [2.6] Swift module import for networking layer
@@ -29,6 +30,7 @@ static const CGFloat InterSecureBottomWorkspaceMargin = 100.0;
 
 @interface SecureWindowController () <InterParticipantOverlayDelegate>
 @property (nonatomic, strong) MetalSurfaceView *renderView;
+@property (nonatomic, strong) InterSecureInterviewStageView *stageView;
 @property (nonatomic, strong) InterSecureToolHostView *toolHostView;
 @property (nonatomic, strong) InterLocalCallControlPanel *controlPanel;
 @property (nonatomic, strong) InterLocalMediaController *localMediaController;
@@ -72,22 +74,20 @@ static const CGFloat InterSecureBottomWorkspaceMargin = 100.0;
     self.renderView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
     [view addSubview:self.renderView];
 
-    self.toolHostView = [[InterSecureToolHostView alloc] initWithFrame:[self secureToolHostFrameInView:view]];
-    self.toolHostView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
-    [view addSubview:self.toolHostView];
+    self.stageView = [[InterSecureInterviewStageView alloc] initWithFrame:view.bounds];
+    self.stageView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+    [view addSubview:self.stageView];
 
-    // [3.3.1] Remote video layout — remains local-only and stays outside the
-    // captured tool host hierarchy so incoming media never leaks into the
-    // outgoing secure share.
-    self.remoteLayout = [[InterRemoteVideoLayoutManager alloc] initWithFrame:[self secureRemoteLayoutFrameInView:view]];
-    self.remoteLayout.allowsManualSpotlightSelection = NO;
-    self.remoteLayout.autoresizingMask = NSViewMinXMargin | NSViewMinYMargin;
-    [view addSubview:self.remoteLayout];
+    // The secure stage owns both the authoritative tool capture host and the
+    // local-only remote media presentation. Keep controller-level references so
+    // existing networking and overlay wiring can remain explicit.
+    self.toolHostView = self.stageView.toolCaptureHostView;
+    self.remoteLayout = self.stageView.remoteLayoutManager;
 
     NSTextField *headline = [NSTextField labelWithString:@"Interview secure surface (Metal)"];
     headline.frame = NSMakeRect(InterSecureLeftMargin,
                                 view.bounds.size.height - 52.0,
-                                NSMaxX(self.toolHostView.frame) - InterSecureLeftMargin,
+                                NSMaxX([self secureToolHostFrameInView:view]) - InterSecureLeftMargin,
                                 24.0);
     headline.font = [NSFont boldSystemFontOfSize:15];
     headline.textColor = [NSColor colorWithWhite:0.92 alpha:1.0];
@@ -97,6 +97,7 @@ static const CGFloat InterSecureBottomWorkspaceMargin = 100.0;
     [self attachControlPanelInView:view];
     [self startLocalMediaFlow];
     [self updateSecureWorkspacePresentationAnimated:NO];
+    [self.stageView layoutSubtreeIfNeeded];
 
     NSButton *exitButton =
     [[NSButton alloc] initWithFrame:NSMakeRect(40, 40, 140, 45)];
@@ -145,6 +146,7 @@ static const CGFloat InterSecureBottomWorkspaceMargin = 100.0;
     self.surfaceShareController.networkPublishSink = nil;
     self.surfaceShareController = nil;
 
+    self.localMediaController.audioInputOptionsChangedHandler = nil;
     [self.localMediaController shutdown];
     self.localMediaController = nil;
 
@@ -166,8 +168,10 @@ static const CGFloat InterSecureBottomWorkspaceMargin = 100.0;
 
     self.controlPanel = nil;
 
-    [self.toolHostView removeFromSuperview];
+    [self.stageView removeFromSuperview];
+    self.stageView = nil;
     self.toolHostView = nil;
+    self.remoteLayout = nil;
 
     [self.renderView removeFromSuperview];
     self.renderView = nil;
@@ -190,6 +194,7 @@ static const CGFloat InterSecureBottomWorkspaceMargin = 100.0;
     [self.controlPanel setShareMode:InterShareModeThisApp];
     [self.controlPanel setShareSystemAudioEnabled:NO];
     [self.controlPanel setShareSystemAudioToggleHidden:YES];
+    [self.controlPanel setShareStartPending:NO];
     [self.controlPanel setShareStatusText:@"Secure tool share is off."];
     [view addSubview:self.controlPanel];
 
@@ -229,18 +234,25 @@ static const CGFloat InterSecureBottomWorkspaceMargin = 100.0;
     [self.surfaceShareController configureWithSessionKind:InterShareSessionKindInterview
                                                 shareMode:InterShareModeThisApp];
     [self.surfaceShareController setShareSystemAudioEnabled:NO];
-    if (self.toolHostView) {
+    __weak typeof(self) weakSelf = self;
+    self.localMediaController.audioInputOptionsChangedHandler = ^{
+        [weakSelf refreshSecureAudioInputOptions];
+    };
+    if (self.stageView.toolCaptureHostView) {
         self.surfaceShareController.customVideoSource =
-        [[InterViewSnapshotVideoSource alloc] initWithCapturedView:self.toolHostView];
+        [[InterViewSnapshotVideoSource alloc] initWithCapturedView:self.stageView.toolCaptureHostView];
     }
     [self refreshSecureAudioInputOptions];
 
-    __weak typeof(self) weakSelf = self;
     self.surfaceShareController.statusHandler = ^(NSString *statusText) {
         [weakSelf.controlPanel setShareStatusText:statusText];
+        BOOL startPending = weakSelf.surfaceShareController.isStartPending;
         BOOL sharing = weakSelf.surfaceShareController.isSharing;
+        [weakSelf.controlPanel setShareStartPending:startPending];
         [weakSelf.controlPanel setSharingEnabled:sharing];
+        weakSelf.stageView.secureShareActive = sharing;
         [weakSelf updateSecureWorkspacePresentationAnimated:YES];
+        [weakSelf.stageView focusActiveToolIfVisible];
         // Publish screen share track to LiveKit when sharing starts
         if (sharing && weakSelf.roomController.connectionState == InterRoomConnectionStateConnected) {
             [weakSelf.roomController.publisher publishScreenShareWithCompletion:^(NSError *error) {
@@ -346,11 +358,11 @@ static const CGFloat InterSecureBottomWorkspaceMargin = 100.0;
 }
 
 - (void)handleInterviewToolSelection:(InterInterviewToolKind)toolKind {
-    if (!self.toolHostView || !self.controlPanel) {
+    if (!self.stageView || !self.controlPanel) {
         return;
     }
 
-    [self.toolHostView setActiveToolKind:toolKind];
+    [self.stageView setActiveToolKind:toolKind];
     [self.controlPanel setSelectedInterviewToolKind:toolKind];
 
     if (self.surfaceShareController.isSharing && toolKind == InterInterviewToolKindNone) {
@@ -360,6 +372,7 @@ static const CGFloat InterSecureBottomWorkspaceMargin = 100.0;
         [self.roomController.publisher unpublishScreenShareWithCompletion:nil];
         [self.surfaceShareController stopSharingFromSurfaceView:self.renderView];
         self.surfaceShareController.networkPublishSink = nil;
+        [self.controlPanel setShareStartPending:self.surfaceShareController.isStartPending];
         [self.controlPanel setSharingEnabled:self.surfaceShareController.isSharing];
         [self updateSecureWorkspacePresentationAnimated:YES];
         return;
@@ -378,34 +391,21 @@ static const CGFloat InterSecureBottomWorkspaceMargin = 100.0;
     }
 
     [self updateSecureWorkspacePresentationAnimated:YES];
+    [self.stageView focusActiveToolIfVisible];
 }
 
 - (void)applyRemoteLayoutFrameAnimated:(BOOL)animated {
 #pragma unused(animated)
-    NSView *contentView = self.secureWindow.contentView;
-    if (!self.remoteLayout || !contentView) {
-        return;
-    }
-
-    NSRect targetFrame = [self targetRemoteLayoutFrameInView:contentView];
-
-    // Keep the remote panel as a sibling overlay so expanding it locally never
-    // changes the secure-tool subtree that is captured and sent to the other side.
-    [contentView addSubview:self.remoteLayout positioned:NSWindowAbove relativeTo:self.toolHostView];
-    // Secure-mode transitions are intentionally immediate. The previous animated
-    // resize path could leave the remote renderer visually out of sync with its
-    // container until another event forced a fresh layout.
-    self.remoteLayout.frame = targetFrame;
-    [self.remoteLayout layoutSubtreeIfNeeded];
+    // Secure interview stage layout is now owned entirely by InterSecureInterviewStageView.
 }
 
 - (BOOL)shouldDisplaySecureToolSurface {
-    if (!self.toolHostView || !self.surfaceShareController) {
+    if (!self.stageView || !self.surfaceShareController) {
         return NO;
     }
 
     return self.surfaceShareController.isSharing &&
-           self.toolHostView.activeToolKind != InterInterviewToolKindNone;
+           self.stageView.activeToolKind != InterInterviewToolKindNone;
 }
 
 - (NSRect)targetRemoteLayoutFrameInView:(NSView *)view {
@@ -420,15 +420,13 @@ static const CGFloat InterSecureBottomWorkspaceMargin = 100.0;
 }
 
 - (void)updateSecureWorkspacePresentationAnimated:(BOOL)animated {
-    NSView *contentView = self.secureWindow.contentView;
-    if (!self.toolHostView || !contentView) {
+#pragma unused(animated)
+    if (!self.stageView) {
         return;
     }
 
-    BOOL shouldShowToolSurface = [self shouldDisplaySecureToolSurface];
-    self.toolHostView.hidden = !shouldShowToolSurface;
-
-    [self applyRemoteLayoutFrameAnimated:animated];
+    self.stageView.secureShareActive = [self shouldDisplaySecureToolSurface];
+    [self.stageView setNeedsLayout:YES];
 }
 
 - (void)handleSecureAudioInputSelection:(NSString * _Nullable)deviceID {
@@ -477,21 +475,27 @@ static const CGFloat InterSecureBottomWorkspaceMargin = 100.0;
 }
 
 - (void)toggleSurfaceShare {
-    if (!self.renderView || !self.toolHostView) {
+    if (!self.renderView || !self.stageView) {
         return;
     }
 
-    if (self.surfaceShareController.isSharing) {
+    BOOL sharing = self.surfaceShareController.isSharing;
+    BOOL startPending = self.surfaceShareController.isStartPending;
+    [self.controlPanel setShareStartPending:startPending];
+    [self.controlPanel setSharingEnabled:sharing];
+
+    if (sharing || startPending) {
         // Unpublish screen share track from LiveKit before stopping
         [self.roomController.publisher unpublishScreenShareWithCompletion:nil];
         [self.surfaceShareController stopSharingFromSurfaceView:self.renderView];
         self.surfaceShareController.networkPublishSink = nil;
+        [self.controlPanel setShareStartPending:self.surfaceShareController.isStartPending];
         [self.controlPanel setSharingEnabled:self.surfaceShareController.isSharing];
         [self updateSecureWorkspacePresentationAnimated:YES];
         return;
     }
 
-    if (self.toolHostView.activeToolKind == InterInterviewToolKindNone) {
+    if (self.stageView.activeToolKind == InterInterviewToolKindNone) {
         [self.controlPanel setShareStatusText:@"Select Code or Whiteboard before starting secure tool share."];
         [self updateSecureWorkspacePresentationAnimated:YES];
         return;
@@ -501,6 +505,8 @@ static const CGFloat InterSecureBottomWorkspaceMargin = 100.0;
     [self wireNetworkSinkOnSurfaceShareController:self.surfaceShareController];
 
     [self.surfaceShareController startSharingFromSurfaceView:self.renderView];
+    [self.controlPanel setShareStartPending:self.surfaceShareController.isStartPending];
+    [self.controlPanel setSharingEnabled:self.surfaceShareController.isSharing];
     // Don't optimistically read isSharing here — it may be YES momentarily
     // before an async permission error resets it. The statusHandler will
     // sync the button state when the capture actually succeeds or fails.
@@ -614,8 +620,9 @@ static const CGFloat InterSecureBottomWorkspaceMargin = 100.0;
         return;
     }
 
-    self.trackRendererBridge = [[InterTrackRendererBridge alloc] initWithLayoutManager:self.remoteLayout];
-    rc.subscriber.trackRenderer = self.trackRendererBridge;
+    self.trackRendererBridge = [[InterTrackRendererBridge alloc] initWithLayoutManager:self.remoteLayout
+                                                                      previewObserver:self.stageView];
+    rc.subscriber.trackRenderer = (id<InterRemoteTrackRenderer>)self.trackRendererBridge;
 
     // [3.3.3] [G6] Show waiting overlay when alone + connected
     if (rc.connectionState == InterRoomConnectionStateConnected &&

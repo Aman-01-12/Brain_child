@@ -19,6 +19,8 @@
 @property (nonatomic, strong, readwrite) NSView *previewContainerView;
 @property (nonatomic, strong, readwrite) NSView *networkStatusContainerView;
 @property (nonatomic, assign) BOOL suppressAudioInputCallback;
+@property (nonatomic, assign) BOOL shareButtonActive;
+@property (nonatomic, assign) BOOL shareButtonStartPending;
 @end
 
 @implementation InterLocalCallControlPanel
@@ -187,6 +189,7 @@
     [self setShareMode:InterShareModeThisApp];
     [self setSelectedInterviewToolKind:InterInterviewToolKindNone];
     [self setInterviewToolSelectorHidden:YES];
+    [self updateShareButtonPresentation];
 }
 
 - (void)setPanelTitleText:(NSString *)title {
@@ -218,7 +221,23 @@
 }
 
 - (void)setSharingEnabled:(BOOL)enabled {
-    self.shareButton.title = enabled ? @"Stop Surface Share" : @"Start Surface Share";
+    if (self.shareButtonActive == enabled) {
+        return;
+    }
+
+    self.shareButtonActive = enabled;
+    [self updateShareButtonPresentation];
+}
+
+- (void)setShareStartPending:(BOOL)pending {
+    if (self.shareButtonStartPending == pending) {
+        return;
+    }
+
+    // Keep the public API separate from the private storage to avoid
+    // accidentally recursing back into this setter.
+    self.shareButtonStartPending = pending;
+    [self updateShareButtonPresentation];
 }
 
 - (void)setMediaStatusText:(NSString *)text {
@@ -429,6 +448,15 @@
         }
     }
     return nil;
+}
+
+- (void)updateShareButtonPresentation {
+    self.shareButton.title = self.shareButtonActive ? @"Stop Surface Share" : @"Start Surface Share";
+
+    // Keep the button label stable across short start-up transitions. The
+    // controller still exposes pending state, but the button only uses it to
+    // suppress extra clicks until the share either becomes active or fails.
+    self.shareButton.enabled = !self.shareButtonStartPending;
 }
 
 @end

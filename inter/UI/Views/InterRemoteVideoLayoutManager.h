@@ -61,6 +61,29 @@ typedef NS_ENUM(NSUInteger, InterRemoteVideoLayoutMode) {
 /// only by secure share state, never by local tile clicks.
 @property (nonatomic, assign) BOOL allowsManualSpotlightSelection;
 
+/// Forces multi-camera remote feeds into the stage + filmstrip presentation
+/// instead of the equal-sized grid. Secure interview mode uses this so remote
+/// feeds keep a stable "selected feed in center" model even without a remote
+/// screen-share track.
+@property (nonatomic, assign) BOOL preferStageLayoutForMultipleCameras;
+
+/// Collapses the layout into a single spotlighted remote tile that fills the
+/// available bounds, hiding the internal filmstrip. Secure interview mode uses
+/// this when the local secure tool already owns the primary center stage and
+/// remote media is shown only as a compact side preview.
+@property (nonatomic, assign) BOOL compactPreviewMode;
+
+/// Optional external preview view inserted into the filmstrip column when the
+/// container wants to treat a non-remote candidate as part of the same stage
+/// system. Secure interview mode uses this for the local tool preview so it
+/// shares the same rail as remote camera/screen-share candidates.
+@property (nonatomic, strong, nullable) NSView *supplementalFilmstripView;
+
+/// Callback fired after the layout manager re-evaluates its layout state.
+/// Secure interview mode uses this to react when remote content changes from a
+/// single tile to stage+filmstrip or back.
+@property (nonatomic, copy, nullable) dispatch_block_t layoutStateChangedHandler;
+
 /// Call when a remote camera frame arrives from a participant.
 - (void)handleRemoteCameraFrame:(CVPixelBufferRef)pixelBuffer fromParticipant:(NSString *)participantId;
 
@@ -80,6 +103,10 @@ typedef NS_ENUM(NSUInteger, InterRemoteVideoLayoutMode) {
 /// @param tileKey The tile key to spotlight. Screen share tile key is @"__screenshare__".
 ///                Camera tile keys are the participant identity string.
 - (void)spotlightTile:(NSString *)tileKey;
+
+/// Set the spotlight selection directly without toggle semantics.
+/// Passing nil returns the layout manager to automatic spotlight behavior.
+- (void)setManualSpotlightTileKey:(NSString * _Nullable)tileKey animated:(BOOL)animated;
 
 /// Tear down and remove all remote views. Call on mode exit.
 - (void)teardown;

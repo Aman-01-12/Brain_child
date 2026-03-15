@@ -192,6 +192,8 @@ static const CGFloat kAnimationDuration      = 0.3;
 
     self.layoutMode = InterRemoteVideoLayoutModeNone;
     self.allowsManualSpotlightSelection = YES;
+    self.preferStageLayoutForMultipleCameras = NO;
+    self.compactPreviewMode = NO;
     return self;
 }
 
@@ -359,6 +361,11 @@ static const CGFloat kAnimationDuration      = 0.3;
     [self handleTileClicked:tileKey];
 }
 
+- (void)setManualSpotlightTileKey:(NSString * _Nullable)tileKey animated:(BOOL)animated {
+    [self updateManualSpotlightTileKey:tileKey];
+    [self updateLayoutAnimated:animated];
+}
+
 /// Called by tile click or programmatic spotlight.
 - (void)handleTileClicked:(NSString *)tileKey {
     if (!self.allowsManualSpotlightSelection) {
@@ -389,6 +396,11 @@ static const CGFloat kAnimationDuration      = 0.3;
     } else {
         [self applyCurrentLayoutAnimated:NO];
     }
+
+    dispatch_block_t handler = self.layoutStateChangedHandler;
+    if (handler) {
+        handler();
+    }
 }
 
 - (InterRemoteVideoLayoutMode)computeLayoutMode {
@@ -402,6 +414,9 @@ static const CGFloat kAnimationDuration      = 0.3;
         return InterRemoteVideoLayoutModeScreenShareOnly;
     }
     if (camCount > 1) {
+        if (self.preferStageLayoutForMultipleCameras) {
+            return InterRemoteVideoLayoutModeScreenShareWithCameras;
+        }
         return InterRemoteVideoLayoutModeMultiCamera;
     }
     if (camCount == 1) {
@@ -426,6 +441,9 @@ static const CGFloat kAnimationDuration      = 0.3;
     if (self.screenShareParticipantId) {
         return kScreenShareTileKey;
     }
+    if (self.preferStageLayoutForMultipleCameras && self.cameraParticipantOrder.firstObject != nil) {
+        return self.cameraParticipantOrder.firstObject;
+    }
     return nil;
 }
 
@@ -438,6 +456,12 @@ static const CGFloat kAnimationDuration      = 0.3;
     // Detach all tiles from superview first — we'll re-parent as needed
     [self detachAllTilesFromHierarchy];
     self.filmstripScrollView.hidden = YES;
+    [self.supplementalFilmstripView removeFromSuperview];
+
+    if (self.compactPreviewMode) {
+        [self applyCompactSpotlightLayoutAnimated:animated];
+        return;
+    }
 
     switch (mode) {
         case InterRemoteVideoLayoutModeNone:
@@ -490,6 +514,39 @@ static const CGFloat kAnimationDuration      = 0.3;
 }
 
 #pragma mark - Stage + Filmstrip Layout
+
+- (void)applyCompactSpotlightLayoutAnimated:(BOOL)animated {
+    CGFloat W = self.bounds.size.width;
+    CGFloat H = self.bounds.size.height;
+
+    NSString *spotlightKey = [self effectiveSpotlightKey];
+    if (spotlightKey.length == 0) {
+        if (self.screenShareParticipantId) {
+            spotlightKey = kScreenShareTileKey;
+        } else {
+            spotlightKey = self.cameraParticipantOrder.firstObject;
+        }
+    }
+
+    InterRemoteVideoView *spotlightVideoView = nil;
+    if ([spotlightKey isEqualToString:kScreenShareTileKey]) {
+        spotlightVideoView = self.remoteScreenShareView;
+    } else if (spotlightKey.length > 0) {
+        spotlightVideoView = self.remoteCameraViews[spotlightKey];
+    }
+
+    if (!spotlightVideoView) {
+        return;
+    }
+
+    InterRemoteVideoTileView *tile = [self tileForKey:spotlightKey videoView:spotlightVideoView];
+    tile.nameLabel.hidden = YES;
+    tile.layer.cornerRadius = 8.0;
+    [self addSubview:tile positioned:NSWindowBelow relativeTo:self.participantOverlay];
+    tile.hidden = NO;
+    spotlightVideoView.hidden = NO;
+    [self setTile:tile frame:NSMakeRect(0, 0, W, H) animated:animated];
+}
 
 - (void)applyStageAndFilmstripLayoutAnimated:(BOOL)animated {
     CGFloat W = self.bounds.size.width;
@@ -560,12 +617,29 @@ static const CGFloat kAnimationDuration      = 0.3;
         [sub removeFromSuperview];
     }
 
+    BOOL hasSupplementalFilmstripView = (self.supplementalFilmstripView != nil);
     CGFloat tileW = filmstripW - 2 * kFilmstripPadding;
     CGFloat tileH = tileW * 9.0 / 16.0;  // 16:9 aspect
-    CGFloat totalH = filmstripKeys.count * tileH + (filmstripKeys.count - 1) * kFilmstripTileGap + 2 * kFilmstripPadding;
+    NSUInteger itemCount = filmstripKeys.count + (hasSupplementalFilmstripView ? 1 : 0);
+    CGFloat totalH = itemCount * tileH + (MAX(itemCount, 1) - 1) * kFilmstripTileGap + 2 * kFilmstripPadding;
     totalH = MAX(totalH, H);
 
     self.filmstripContentView.frame = NSMakeRect(0, 0, filmstripW, totalH);
+
+    NSUInteger itemIndex = 0;
+    if (hasSupplementalFilmstripView) {
+        NSView *supplementalView = self.supplementalFilmstripView;
+        CGFloat y = totalH - kFilmstripPadding - (itemIndex + 1) * tileH - itemIndex * kFilmstripTileGap;
+        NSRect supplementalFrame = NSMakeRect(kFilmstripPadding, y, tileW, tileH);
+        supplementalView.hidden = NO;
+        [self.filmstripContentView addSubview:supplementalView];
+        if (animated) {
+            supplementalView.animator.frame = supplementalFrame;
+        } else {
+            supplementalView.frame = supplementalFrame;
+        }
+        itemIndex += 1;
+    }
 
     // Stack tiles top-to-bottom. NSView y=0 is bottom, so we invert.
     for (NSUInteger i = 0; i < filmstripKeys.count; i++) {
@@ -585,7 +659,8 @@ static const CGFloat kAnimationDuration      = 0.3;
         tile.hidden = NO;
         videoView.hidden = NO;
 
-        CGFloat y = totalH - kFilmstripPadding - (i + 1) * tileH - i * kFilmstripTileGap;
+        NSUInteger visualIndex = itemIndex + i;
+        CGFloat y = totalH - kFilmstripPadding - (visualIndex + 1) * tileH - visualIndex * kFilmstripTileGap;
         NSRect tileFrame = NSMakeRect(kFilmstripPadding, y, tileW, tileH);
 
         [self.filmstripContentView addSubview:tile];
@@ -729,6 +804,30 @@ static const CGFloat kAnimationDuration      = 0.3;
         [self updateManualSpotlightTileKey:nil];
         [self updateLayoutAnimated:NO];
     }
+}
+
+- (void)setCompactPreviewMode:(BOOL)compactPreviewMode {
+    if (_compactPreviewMode == compactPreviewMode) {
+        return;
+    }
+
+    _compactPreviewMode = compactPreviewMode;
+
+    // Compact preview mode is a presentation-only concern. As soon as the
+    // container changes between full remote stage and secure-tool-owned stage,
+    // the layout manager must rebuild its hierarchy immediately so stale nested
+    // filmstrip geometry never remains visible.
+    [self updateLayoutAnimated:NO];
+}
+
+- (void)setSupplementalFilmstripView:(NSView *)supplementalFilmstripView {
+    if (_supplementalFilmstripView == supplementalFilmstripView) {
+        return;
+    }
+
+    [_supplementalFilmstripView removeFromSuperview];
+    _supplementalFilmstripView = supplementalFilmstripView;
+    [self updateLayoutAnimated:NO];
 }
 
 @end

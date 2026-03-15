@@ -11,6 +11,7 @@
 
 @interface InterSurfaceShareController ()
 @property (atomic, assign, readwrite, getter=isSharing) BOOL sharing;
+@property (atomic, assign, readwrite, getter=isStartPending) BOOL startPending;
 @property (nonatomic, strong, readwrite) InterShareSessionConfiguration *configuration;
 @end
 
@@ -32,6 +33,7 @@
     _routerQueue = dispatch_queue_create("secure.inter.media.surface.share.router",
                                          DISPATCH_QUEUE_SERIAL);
     _sharing = NO;
+    _startPending = NO;
     _configuration = [InterShareSessionConfiguration defaultConfiguration];
     _sinks = @[];
     _routingGeneration = 0;
@@ -55,7 +57,7 @@
 }
 
 - (void)startSharingFromSurfaceView:(MetalSurfaceView *)surfaceView {
-    if (self.isSharing) {
+    if (self.isSharing || self.isStartPending) {
         return;
     }
 
@@ -86,11 +88,12 @@
 
     __block uint64_t generation = 0;
     @synchronized(self) {
-        if (self.sharing) {
+        if (self.sharing || self.startPending) {
             return;
         }
 
-        self.sharing = YES;
+        self.startPending = YES;
+        self.sharing = NO;
         _routingGeneration += 1;
         generation = _routingGeneration;
         _activeStatusGeneration = 0;
@@ -98,13 +101,15 @@
         _sinks = sinks;
     }
 
+    [self emitStatusText:[self startingStatusTextForConfiguration:configuration]];
+
     __weak typeof(self) weakSelf = self;
     videoSource.frameHandler = ^(InterShareVideoFrame *frame) {
         [weakSelf routeVideoFrame:frame generation:generation];
     };
 
     videoSource.errorHandler = ^(NSError *error) {
-        if (!weakSelf || ![weakSelf isGenerationActive:generation]) {
+        if (!weakSelf || ![weakSelf isGenerationCurrent:generation includePending:YES]) {
             return;
         }
 
@@ -141,8 +146,6 @@
     } else {
         [videoSource start];
     }
-
-    [self emitStatusText:[self startingStatusTextForConfiguration:configuration]];
 }
 
 - (void)stopSharingFromSurfaceView:(MetalSurfaceView *)surfaceView {
@@ -194,7 +197,7 @@
         CFRetain(sampleBuffer);
         dispatch_async(routerQueue, ^{
             __strong typeof(weakSelf) strongSelf = weakSelf;
-            if (!strongSelf || ![strongSelf isGenerationActive:generation]) {
+            if (!strongSelf || ![strongSelf isGenerationCurrent:generation includePending:YES]) {
                 CFRelease(sampleBuffer);
                 return;
             }
@@ -220,7 +223,7 @@
         CFRetain(sampleBuffer);
         dispatch_async(routerQueue, ^{
             __strong typeof(weakSelf) strongSelf = weakSelf;
-            if (!strongSelf || ![strongSelf isGenerationActive:generation]) {
+            if (!strongSelf || ![strongSelf isGenerationCurrent:generation includePending:YES]) {
                 CFRelease(sampleBuffer);
                 return;
             }
@@ -240,18 +243,29 @@
     }
 
     dispatch_async(_routerQueue, ^{
-        if (![self isGenerationActive:generation]) {
-            return;
-        }
-
+        BOOL generationCurrent = NO;
         BOOL shouldEmitActiveStatus = NO;
         InterShareSessionConfiguration *configurationSnapshot = nil;
         @synchronized(self) {
+            generationCurrent = ((self.sharing || self.startPending) && _routingGeneration == generation);
+            if (!generationCurrent) {
+                return;
+            }
+
+            if (self.startPending) {
+                self.startPending = NO;
+                self.sharing = YES;
+            }
+
             if (self->_activeStatusGeneration != generation) {
                 self->_activeStatusGeneration = generation;
                 shouldEmitActiveStatus = YES;
                 configurationSnapshot = [self.configuration copy];
             }
+        }
+
+        if (!generationCurrent) {
+            return;
         }
         if (shouldEmitActiveStatus && configurationSnapshot) {
             [self emitStatusText:[self activeStatusTextForConfiguration:configurationSnapshot]];
@@ -303,9 +317,18 @@
     }
 }
 
-- (BOOL)isGenerationActive:(uint64_t)generation {
+- (BOOL)isGenerationCurrent:(uint64_t)generation includePending:(BOOL)includePending {
     @synchronized(self) {
-        return self.sharing && _routingGeneration == generation;
+        BOOL isCurrentGeneration = (_routingGeneration == generation);
+        if (!isCurrentGeneration) {
+            return NO;
+        }
+
+        if (self.sharing) {
+            return YES;
+        }
+
+        return includePending && self.startPending;
     }
 }
 
@@ -317,11 +340,12 @@
     BOOL usedCustomVideoSource = NO;
 
     @synchronized(self) {
-        if (!self.sharing && _videoSource == nil && _sinks.count == 0) {
+        if (!self.sharing && !self.startPending && _videoSource == nil && _sinks.count == 0) {
             return;
         }
 
         self.sharing = NO;
+        self.startPending = NO;
         _routingGeneration += 1;
         _activeStatusGeneration = 0;
 

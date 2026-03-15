@@ -575,6 +575,7 @@ static BOOL InterShouldEnforceInterviewExternalDisplayPolicy(void) {
     [self.normalControlPanel setCameraEnabled:self.normalMediaController.isCameraEnabled];
     [self.normalControlPanel setMicrophoneEnabled:self.normalMediaController.isMicrophoneEnabled];
     [self.normalControlPanel setSharingEnabled:self.normalSurfaceShareController.isSharing];
+    [self.normalControlPanel setShareStartPending:self.normalSurfaceShareController.isStartPending];
 
     [self.normalControlPanel setShareStatusText:@"Secure surface share is off. Select a source to begin."];
 
@@ -654,12 +655,17 @@ static BOOL InterShouldEnforceInterviewExternalDisplayPolicy(void) {
     [self.normalSurfaceShareController configureWithSessionKind:InterShareSessionKindNormal
                                                       shareMode:self.normalControlPanel.selectedShareMode];
     [self.normalSurfaceShareController setShareSystemAudioEnabled:self.normalShareSystemAudioEnabled];
+    __weak typeof(self) weakSelf = self;
+    self.normalMediaController.audioInputOptionsChangedHandler = ^{
+        [weakSelf refreshNormalAudioInputOptions];
+    };
     [self refreshNormalAudioInputOptions];
 
-    __weak typeof(self) weakSelf = self;
     self.normalSurfaceShareController.statusHandler = ^(NSString *statusText) {
         [weakSelf.normalControlPanel setShareStatusText:statusText];
+        BOOL startPending = weakSelf.normalSurfaceShareController.isStartPending;
         BOOL sharing = weakSelf.normalSurfaceShareController.isSharing;
+        [weakSelf.normalControlPanel setShareStartPending:startPending];
         [weakSelf.normalControlPanel setSharingEnabled:sharing];
         // Publish screen share track to LiveKit when sharing starts
         if (sharing && weakSelf.roomController.connectionState == InterRoomConnectionStateConnected) {
@@ -818,14 +824,17 @@ static BOOL InterShouldEnforceInterviewExternalDisplayPolicy(void) {
 
     // Sync button state — an async error may have reset sharing behind our back
     BOOL currentlySharing = self.normalSurfaceShareController.isSharing;
+    BOOL startPending = self.normalSurfaceShareController.isStartPending;
+    [self.normalControlPanel setShareStartPending:startPending];
     [self.normalControlPanel setSharingEnabled:currentlySharing];
 
-    if (currentlySharing) {
+    if (currentlySharing || startPending) {
         // Unpublish screen share track from LiveKit before stopping
         [self.roomController.publisher unpublishScreenShareWithCompletion:nil];
         [self.normalSurfaceShareController stopSharingFromSurfaceView:self.normalRenderView];
         // Clear network sink on stop
         self.normalSurfaceShareController.networkPublishSink = nil;
+        [self.normalControlPanel setShareStartPending:self.normalSurfaceShareController.isStartPending];
         [self.normalControlPanel setSharingEnabled:self.normalSurfaceShareController.isSharing];
         return;
     }
@@ -837,6 +846,7 @@ static BOOL InterShouldEnforceInterviewExternalDisplayPolicy(void) {
     if (requiresScreenRecordingPermission && ![InterScreenCaptureVideoSource preflightScreenCaptureAccess]) {
         (void)[InterScreenCaptureVideoSource requestScreenCaptureAccessIfNeeded];
         [self.normalControlPanel setShareStatusText:@"Screen recording permission is required. Enable it in System Settings, then click Start Surface Share again."];
+        [self.normalControlPanel setShareStartPending:NO];
         [self.normalControlPanel setSharingEnabled:NO];
         return;
     }
@@ -882,6 +892,8 @@ static BOOL InterShouldEnforceInterviewExternalDisplayPolicy(void) {
     [self wireNetworkSinkOnSurfaceShareController:self.normalSurfaceShareController];
 
     [self.normalSurfaceShareController startSharingFromSurfaceView:self.normalRenderView];
+    [self.normalControlPanel setShareStartPending:self.normalSurfaceShareController.isStartPending];
+    [self.normalControlPanel setSharingEnabled:self.normalSurfaceShareController.isSharing];
     // Don't optimistically read isSharing here — it may be YES momentarily
     // before an async permission error resets it. The statusHandler will
     // sync the button state when the capture actually succeeds or fails.
@@ -1068,7 +1080,7 @@ static BOOL InterShouldEnforceInterviewExternalDisplayPolicy(void) {
     }
 
     self.normalTrackRendererBridge = [[InterTrackRendererBridge alloc] initWithLayoutManager:self.normalRemoteLayout];
-    rc.subscriber.trackRenderer = self.normalTrackRendererBridge;
+    rc.subscriber.trackRenderer = (id<InterRemoteTrackRenderer>)self.normalTrackRendererBridge;
 
     // [3.2.4] [G6] Show "Waiting for participant…" overlay when alone + connected
     if (rc.connectionState == InterRoomConnectionStateConnected &&
@@ -1307,6 +1319,7 @@ static BOOL InterShouldEnforceInterviewExternalDisplayPolicy(void) {
     [self.normalSurfaceShareController stopSharingFromSurfaceView:self.normalRenderView];
     self.normalSurfaceShareController = nil;
 
+    self.normalMediaController.audioInputOptionsChangedHandler = nil;
     [self.normalMediaController shutdown];
     self.normalMediaController = nil;
     self.normalControlPanel = nil;

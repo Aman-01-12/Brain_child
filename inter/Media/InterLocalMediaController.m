@@ -10,6 +10,10 @@
                                     completion:(void (^)(AVAuthorizationStatus status))completion;
 - (nullable AVCaptureDevice *)preferredAudioDevice;
 - (BOOL)isLikelyProblematicAudioDevice:(AVCaptureDevice *)device;
+- (void)registerDeviceAvailabilityObservers;
+- (void)unregisterDeviceAvailabilityObservers;
+- (void)handleCaptureDeviceAvailabilityNotification:(NSNotification *)notification;
+- (void)notifyAudioInputOptionsChanged;
 @end
 
 static const void *InterLocalMediaSessionQueueKey = &InterLocalMediaSessionQueueKey;
@@ -27,6 +31,7 @@ static const void *InterLocalMediaSessionQueueKey = &InterLocalMediaSessionQueue
 
     __weak NSView *_previewHostView;
     AVCaptureVideoPreviewLayer *_previewLayer;
+    BOOL _deviceAvailabilityObserversRegistered;
 }
 
 + (void)preflightCapturePermissionsWithCompletion:(void (^ _Nullable)(AVAuthorizationStatus videoStatus,
@@ -76,6 +81,7 @@ static const void *InterLocalMediaSessionQueueKey = &InterLocalMediaSessionQueue
     _cameraEnabled = NO;
     _microphoneEnabled = NO;
     _shuttingDown = NO;
+    [self registerDeviceAvailabilityObservers];
     return self;
 }
 
@@ -240,6 +246,7 @@ static const void *InterLocalMediaSessionQueueKey = &InterLocalMediaSessionQueue
     }
 
     self.shuttingDown = YES;
+    [self unregisterDeviceAvailabilityObservers];
     [self detachPreviewSynchronously];
 
     // Perform heavy AVCaptureSession teardown OFF the main thread so the UI
@@ -926,6 +933,76 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
     }
 
     return NO;
+}
+
+- (void)registerDeviceAvailabilityObservers {
+    if (_deviceAvailabilityObserversRegistered) {
+        return;
+    }
+
+    NSNotificationCenter *notificationCenter = [NSNotificationCenter defaultCenter];
+    [notificationCenter addObserver:self
+                           selector:@selector(handleCaptureDeviceAvailabilityNotification:)
+                               name:AVCaptureDeviceWasConnectedNotification
+                             object:nil];
+    [notificationCenter addObserver:self
+                           selector:@selector(handleCaptureDeviceAvailabilityNotification:)
+                               name:AVCaptureDeviceWasDisconnectedNotification
+                             object:nil];
+    _deviceAvailabilityObserversRegistered = YES;
+}
+
+- (void)unregisterDeviceAvailabilityObservers {
+    if (!_deviceAvailabilityObserversRegistered) {
+        return;
+    }
+
+    NSNotificationCenter *notificationCenter = [NSNotificationCenter defaultCenter];
+    [notificationCenter removeObserver:self
+                                  name:AVCaptureDeviceWasConnectedNotification
+                                object:nil];
+    [notificationCenter removeObserver:self
+                                  name:AVCaptureDeviceWasDisconnectedNotification
+                                object:nil];
+    _deviceAvailabilityObserversRegistered = NO;
+}
+
+- (void)handleCaptureDeviceAvailabilityNotification:(NSNotification *)notification {
+    if (self.isShuttingDown) {
+        return;
+    }
+
+    id object = notification.object;
+    if (object && ![object isKindOfClass:[AVCaptureDevice class]]) {
+        return;
+    }
+
+    AVCaptureDevice *device = (AVCaptureDevice *)object;
+    if (device && ![device hasMediaType:AVMediaTypeAudio]) {
+        return;
+    }
+
+    // Hardware discovery should update the picker even when the microphone is
+    // currently off. Callers re-enumerate through the public options API.
+    [self notifyAudioInputOptionsChanged];
+}
+
+- (void)notifyAudioInputOptionsChanged {
+    dispatch_block_t handler = self.audioInputOptionsChangedHandler;
+    if (!handler) {
+        return;
+    }
+
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (self.isShuttingDown) {
+            return;
+        }
+
+        dispatch_block_t currentHandler = self.audioInputOptionsChangedHandler;
+        if (currentHandler) {
+            currentHandler();
+        }
+    });
 }
 
 @end

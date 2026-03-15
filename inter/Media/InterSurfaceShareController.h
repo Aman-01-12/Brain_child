@@ -15,6 +15,7 @@ typedef void (^InterSurfaceShareAudioSampleObserverRegistrationBlock)(InterSurfa
 @interface InterSurfaceShareController : NSObject
 
 @property (atomic, readonly, getter=isSharing) BOOL sharing;
+@property (atomic, readonly, getter=isStartPending) BOOL startPending;
 @property (nonatomic, copy, nullable) InterSurfaceShareStatusHandler statusHandler;
 @property (nonatomic, copy, nullable) InterSurfaceShareAudioSampleObserverRegistrationBlock audioSampleObserverRegistrationBlock;
 @property (nonatomic, readonly) InterShareSessionConfiguration *configuration;

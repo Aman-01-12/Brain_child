@@ -14,6 +14,7 @@ typedef void (^InterLocalMediaAudioSampleBufferHandler)(CMSampleBufferRef sample
 @property (atomic, readonly, getter=isCameraEnabled) BOOL cameraEnabled;
 @property (atomic, readonly, getter=isMicrophoneEnabled) BOOL microphoneEnabled;
 @property (nonatomic, copy, nullable) InterLocalMediaAudioSampleBufferHandler audioSampleBufferHandler;
+@property (nonatomic, copy, nullable) dispatch_block_t audioInputOptionsChangedHandler;
 
 /// The underlying AVCaptureSession. Callers MUST use sessionQueue for all
 /// session-related work. Callers MUST NOT call startRunning/stopRunning.

@@ -30,6 +30,7 @@ NS_ASSUME_NONNULL_BEGIN
 - (void)setCameraEnabled:(BOOL)enabled;
 - (void)setMicrophoneEnabled:(BOOL)enabled;
 - (void)setSharingEnabled:(BOOL)enabled;
+- (void)setShareStartPending:(BOOL)pending;
 - (void)setMediaStatusText:(NSString *)text;
 - (void)setShareStatusText:(NSString *)text;
 - (void)setShareMode:(InterShareMode)shareMode;
