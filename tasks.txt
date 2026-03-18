@@ -1,7 +1,7 @@
 # LiveKit Integration — Implementation Plan
 
-> **Status**: Phase 0 complete. Phase 1 complete. Phase 2 complete. Phase 3 complete. Post-Phase 3 (bug fixes + UI polish + window picker + interview join fix) complete. Phase 4 next.  
-> **Last updated**: 13 March 2026  
+> **Status**: Phase 0 complete. Phase 1 complete. Phase 2 complete. Phase 3 complete. Post-Phase 3 (bug fixes + UI polish + window picker + interview join fix + secure interview tool surface + secure stage system + share-start UX hardening + mic hot-plug refresh) complete. Phase 4 next.  
+> **Last updated**: 15 March 2026  
 > **Tracking**: Changes logged in `work_done.md`
 
 ---
@@ -691,3 +691,32 @@ Reach first real end-to-end online call capability quickly, then layer full prod
 - Reduces first-value time and integration uncertainty.
 - Prevents large-batch failures from 2.7k+ lines of new networking/media code landing at once.
 - Preserves the original production-grade architecture while improving execution efficiency.
+
+---
+
+## Post-Phase 3 Completion Notes (14–15 March 2026)
+
+These items are complete and are now part of the current codebase baseline.
+
+- [x] PF.8.1 — Secure interview tool surface foundation
+  - Added dedicated app-owned secure tool surfaces for interview mode.
+  - Code editor and whiteboard now exist as local secure tools.
+  - Secure tool capture is separated from local-only chrome and remote video.
+
+- [x] PF.8.2 — Dedicated secure interview stage system
+  - Added a secure-specific stage owner and right-rail model for interview mode.
+  - Remote feeds and the active secure tool can swap locally without reusing the normal-mode internal filmstrip as the interview rail.
+  - Published secure tool capture remains stable even when local center-stage presentation changes.
+
+- [x] PF.8.3 — Secure-mode stability and teardown hardening
+  - Added synchronous renderer shutdown on teardown paths to avoid display-link and view-lifetime races during mode exit.
+  - Kept secure share boundaries intact: only the secure tool surface is published.
+
+- [x] PF.9.1 — Share-start UX hardening
+  - Added explicit `startPending` handling in the share pipeline.
+  - Share buttons now wait for live-share confirmation before presenting the active stop state.
+  - Removed transient pending text churn from the button label; pending state now disables interaction without visual jitter.
+
+- [x] PF.9.2 — Microphone device hot-plug refresh
+  - Added audio-device availability observation in `InterLocalMediaController`.
+  - Normal-mode and secure-mode microphone source dropdowns now refresh when microphones are connected or disconnected, even while the mic is off.

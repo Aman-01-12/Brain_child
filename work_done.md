@@ -1,6 +1,6 @@
 # Work Done — LiveKit Integration Changelog
 
-> **Reference**: See `tasks.md` for the full implementation plan.  
+> **Reference**: See `tasks.txt` for the full implementation plan.  
 > **Convention**: Each entry includes the date, what changed, which files, and why.
 
 ---
@@ -10,7 +10,7 @@
 ```
 ## [DATE] — Brief Title
 
-**Phase**: X.Y.Z from tasks.md  
+**Phase**: X.Y.Z from tasks.txt  
 **Files changed**:
 - `path/to/file` — what was done
 
@@ -432,3 +432,36 @@ TEMPLATE — copy this for each new entry:
 **Why**: ...  
 **Notes**: ...
 -->
+
+## [14 March 2026] — PF.8: Secure Interview Tool Surface + Dedicated Stage System
+
+**Phase**: Post-Phase 3 (PF.8)  
+**Files changed**:
+- `inter/UI/Views/InterSecureToolHostView.h` / `inter/UI/Views/InterSecureToolHostView.m` — CREATED. Dedicated secure tool container used only for interview-mode tools.
+- `inter/UI/Views/InterSecureCodeEditorView.h` / `inter/UI/Views/InterSecureCodeEditorView.m` — CREATED. Local secure code editor surface for interview mode.
+- `inter/UI/Views/InterSecureWhiteboardView.h` / `inter/UI/Views/InterSecureWhiteboardView.m` — CREATED. Local secure whiteboard surface for interview mode.
+- `inter/UI/Views/InterSecureInterviewStageView.h` / `inter/UI/Views/InterSecureInterviewStageView.m` — CREATED. Secure-specific stage system owning center-stage selection and the dedicated right rail for interview mode.
+- `inter/Media/Sharing/Sources/InterViewSnapshotVideoSource.h` / `inter/Media/Sharing/Sources/InterViewSnapshotVideoSource.m` — CREATED. App-owned snapshot share source for the authoritative secure tool surface only.
+- `inter/Media/InterSurfaceShareController.h` / `inter/Media/InterSurfaceShareController.m` — MODIFIED. Added support for injected/custom secure video sources and stabilized pending-share state flow.
+- `inter/UI/Controllers/SecureWindowController.m` — MODIFIED. Rewired interview mode around the secure stage system, secure tool selection, secure share lifecycle, and teardown safety.
+- `inter/UI/Views/InterLocalCallControlPanel.h` / `inter/UI/Views/InterLocalCallControlPanel.m` — MODIFIED. Added interview-tool selection UI and shared-button state presentation improvements.
+- `inter/UI/Views/InterRemoteVideoLayoutManager.h` / `inter/UI/Views/InterRemoteVideoLayoutManager.m` — MODIFIED. Adjusted secure-mode remote presentation so interview mode no longer depends on the normal-mode internal filmstrip for its final stage layout.
+- `inter/UI/Views/InterTrackRendererBridge.h` / `inter/UI/Views/InterTrackRendererBridge.m` — MODIFIED. Supported secure interview-stage preview sourcing and renderer wiring.
+- `inter/Networking/InterRemoteVideoView.swift` — MODIFIED. Added stricter synchronous shutdown handling for remote renderer teardown.
+- `inter/Rendering/MetalSurfaceView.h` / `inter/Rendering/MetalSurfaceView.m` — MODIFIED. Added synchronous render shutdown to avoid exit races with display-link driven rendering.
+
+**Why**: Interview mode needed a secure tool-share architecture that does not leak local UI, remote feeds, or private chrome into the outgoing stream. The normal call layout model was not a safe or coherent abstraction for secure interview tools, so a separate secure interview stage system was introduced.
+**Notes**: The final architecture keeps remote feeds local-only, secure tool capture authoritative, and interview staging independent from the normal-mode filmstrip implementation. Build and test validation succeeded after the stage-system and teardown hardening work.
+
+## [15 March 2026] — PF.9: Share Start UX + Microphone Hot-Plug Refresh
+
+**Phase**: Post-Phase 3 (PF.9)  
+**Files changed**:
+- `inter/Media/InterSurfaceShareController.h` / `inter/Media/InterSurfaceShareController.m` — MODIFIED. Added explicit `startPending` state so share activation only becomes true after the first live frame arrives.
+- `inter/UI/Views/InterLocalCallControlPanel.h` / `inter/UI/Views/InterLocalCallControlPanel.m` — MODIFIED. Added pending-share presentation logic, fixed the recursive `setShareStartPending:` crash, and stabilized the button label so startup disables the button without flashing transient text.
+- `inter/App/AppDelegate.m` — MODIFIED. Synced normal-mode control panel with pending-share state and subscribed normal-mode media UI to audio-input option changes.
+- `inter/UI/Controllers/SecureWindowController.m` — MODIFIED. Synced secure-mode control panel with pending-share state and subscribed secure-mode media UI to audio-input option changes.
+- `inter/Media/InterLocalMediaController.h` / `inter/Media/InterLocalMediaController.m` — MODIFIED. Added audio-device availability observation via `AVCaptureDeviceWasConnectedNotification` / `AVCaptureDeviceWasDisconnectedNotification` and exposed a callback for dropdown refresh.
+
+**Why**: Two user-facing UX issues were addressed together: share buttons felt jittery because they exposed transient start-state text, and microphone dropdowns only refreshed when the mic was enabled because no device-availability observer existed.
+**Notes**: The host-interview crash reported on 15 March 2026 was caused by a recursive control-panel setter (`setShareStartPending:` self-assignment) and is fixed in this entry. The microphone source dropdown now refreshes when mics are connected or disconnected even while capture is off. Full project tests passed after these changes.

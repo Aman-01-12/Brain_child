@@ -63,6 +63,27 @@ static BOOL InterShouldEnforceInterviewExternalDisplayPolicy(void) {
     return NO;
 }
 
+static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
+                                     MetalSurfaceView *__strong *renderViewRef,
+                                     InterConnectionSetupPanel *__strong *connectionPanelRef) {
+    MetalSurfaceView *renderView = *renderViewRef;
+    if (renderView != nil) {
+        [renderView shutdownRenderingSynchronously];
+        [renderView removeFromSuperview];
+        *renderViewRef = nil;
+    }
+
+    NSWindow *window = *windowRef;
+    if (window != nil) {
+        [window orderOut:nil];
+        *windowRef = nil;
+    }
+
+    if (connectionPanelRef != NULL) {
+        *connectionPanelRef = nil;
+    }
+}
+
 - (void)applicationDidFinishLaunching:(NSNotification *)aNotification {
     self.sessionCoordinator = [[InterCallSessionCoordinator alloc] init];
 
@@ -92,6 +113,12 @@ static BOOL InterShouldEnforceInterviewExternalDisplayPolicy(void) {
 - (void)applicationWillTerminate:(NSNotification *)notification {
 #pragma unused(notification)
     [self stopScreenMonitoring];
+
+    InterTeardownSetupWindow(&_setupWindow, &_setupRenderView, &_connectionPanel);
+    if (self.settingsWindow != nil) {
+        [self.settingsWindow orderOut:nil];
+    }
+    [self teardownActiveWindows];
 
     // [2.5.7] Disconnect room on app terminate
     [self teardownRoomControllerKVO];
@@ -228,11 +255,7 @@ static BOOL InterShouldEnforceInterviewExternalDisplayPolicy(void) {
 
     [self teardownActiveWindows];
     [self.settingsWindow orderOut:nil];
-    [self.setupWindow orderOut:nil];
-    [self.setupRenderView shutdownRenderingSynchronously];
-    [self.setupRenderView removeFromSuperview];
-    self.setupRenderView = nil;
-    self.setupWindow = nil;
+    InterTeardownSetupWindow(&_setupWindow, &_setupRenderView, &_connectionPanel);
 
     if (isIntervieweeMode) {
         [self applyKioskRestrictions];
@@ -258,18 +281,14 @@ static BOOL InterShouldEnforceInterviewExternalDisplayPolicy(void) {
 #pragma mark - UI
 
 - (void)launchSetupUI {
-    if (self.setupWindow != nil) {
-        [self.setupWindow orderOut:nil];
-        [self.setupRenderView shutdownRenderingSynchronously];
-        [self.setupRenderView removeFromSuperview];
-        self.setupRenderView = nil;
-        self.setupWindow = nil;
-    }
+    InterTeardownSetupWindow(&_setupWindow, &_setupRenderView, &_connectionPanel);
 
     self.setupWindow =
     [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 660, 560)
                                 styleMask:(NSWindowStyleMaskTitled |
-                                           NSWindowStyleMaskClosable)
+                                           NSWindowStyleMaskClosable |
+                                           NSWindowStyleMaskMiniaturizable |
+                                           NSWindowStyleMaskResizable)
                                   backing:NSBackingStoreBuffered
                                     defer:NO];
 
@@ -278,6 +297,8 @@ static BOOL InterShouldEnforceInterviewExternalDisplayPolicy(void) {
     [self.setupWindow setSharingType:NSWindowSharingNone];
     [self.setupWindow setDelegate:self];
     [self.setupWindow setBackgroundColor:[NSColor blackColor]];
+    [self.setupWindow setMinSize:NSMakeSize(660.0, 560.0)];
+    [self.setupWindow setCollectionBehavior:NSWindowCollectionBehaviorFullScreenPrimary];
 
     NSView *view = [[NSView alloc] initWithFrame:self.setupWindow.contentView.bounds];
     [view setWantsLayer:YES];
@@ -1294,6 +1315,7 @@ static BOOL InterShouldEnforceInterviewExternalDisplayPolicy(void) {
 
 - (BOOL)windowShouldClose:(NSWindow *)sender {
     if (sender == self.setupWindow && self.currentCallMode == InterCallModeNone) {
+        InterTeardownSetupWindow(&_setupWindow, &_setupRenderView, &_connectionPanel);
         [NSApp terminate:nil];
         return NO;
     }
