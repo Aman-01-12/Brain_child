@@ -5,8 +5,8 @@ NS_ASSUME_NONNULL_BEGIN
 /// Overlay state for participant presence in the call.
 typedef NS_ENUM(NSUInteger, InterParticipantOverlayState) {
     InterParticipantOverlayStateHidden = 0,     // No overlay
-    InterParticipantOverlayStateWaiting,         // "Waiting for participant..." (pulsing dot)
-    InterParticipantOverlayStateParticipantLeft  // "Participant left." with Wait/End buttons
+    InterParticipantOverlayStateWaiting,         // "Waiting for participants..." (pulsing dot)
+    InterParticipantOverlayStateParticipantLeft  // "All participants left." with Wait/End buttons
 };
 
 @class InterParticipantOverlayView;

@@ -189,6 +189,13 @@ enum InterMicrophoneNetworkAction {
     }
 }
 
+// MARK: - Multi-Participant Constants
+
+/// Maximum number of participants allowed per room.
+/// Designed for N; shipping with a soft cap of 4 (Phase A).
+/// The token server enforces this on /room/join.
+public let InterMaxParticipantsPerRoom: Int = 4
+
 // MARK: - Error Domain [G7]
 
 /// Error domain for all networking-layer errors.
@@ -213,6 +220,8 @@ public let InterNetworkErrorDomain = "com.secure.inter.network"
     case roomCodeInvalid = 1006
     /// Room code has expired (410 from token server).
     case roomCodeExpired = 1007
+    /// Room is full — participant cap reached (403 from token server).
+    case roomFull = 1008
 }
 
 // MARK: - Error Helpers

@@ -24,6 +24,7 @@ static NSString *const kScreenShareTileKey = @"__screenshare__";
 @property (nonatomic, weak) id spotlightTarget;
 @property (nonatomic, assign) SEL spotlightAction;
 @property (nonatomic, assign) BOOL isHovered;
+@property (nonatomic, assign) BOOL isSpeaking;
 @property (nonatomic, strong) NSTrackingArea *hoverTrackingArea;
 @end
 
@@ -84,14 +85,32 @@ static NSString *const kScreenShareTileKey = @"__screenshare__";
 
 - (void)mouseEntered:(NSEvent *)event {
     self.isHovered = YES;
-    self.layer.borderColor = [NSColor colorWithWhite:1.0 alpha:0.5].CGColor;
-    self.layer.borderWidth = 2.0;
+    if (!self.isSpeaking) {
+        self.layer.borderColor = [NSColor colorWithWhite:1.0 alpha:0.5].CGColor;
+        self.layer.borderWidth = 2.0;
+    }
 }
 
 - (void)mouseExited:(NSEvent *)event {
     self.isHovered = NO;
-    self.layer.borderColor = nil;
-    self.layer.borderWidth = 0.0;
+    if (!self.isSpeaking) {
+        self.layer.borderColor = nil;
+        self.layer.borderWidth = 0.0;
+    }
+}
+
+- (void)setIsSpeaking:(BOOL)isSpeaking {
+    _isSpeaking = isSpeaking;
+    if (isSpeaking) {
+        self.layer.borderColor = [NSColor systemGreenColor].CGColor;
+        self.layer.borderWidth = 3.0;
+    } else if (self.isHovered) {
+        self.layer.borderColor = [NSColor colorWithWhite:1.0 alpha:0.5].CGColor;
+        self.layer.borderWidth = 2.0;
+    } else {
+        self.layer.borderColor = nil;
+        self.layer.borderWidth = 0.0;
+    }
 }
 
 - (void)mouseDown:(NSEvent *)event {
@@ -145,6 +164,11 @@ static NSString *const kScreenShareTileKey = @"__screenshare__";
 /// Content view inside scroll view that holds filmstrip tiles.
 @property (nonatomic, strong) NSView *filmstripContentView;
 
+// -- Participant count badge --
+
+/// Small label showing participant count (top-right corner).
+@property (nonatomic, strong) NSTextField *participantCountBadge;
+
 @end
 
 // ---------------------------------------------------------------------------
@@ -189,6 +213,19 @@ static const CGFloat kAnimationDuration      = 0.3;
     self.participantOverlay.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
     self.participantOverlay.hidden = YES;
     [self addSubview:self.participantOverlay];
+
+    // Participant count badge — top-right corner
+    self.participantCountBadge = [NSTextField labelWithString:@""];
+    self.participantCountBadge.font = [NSFont systemFontOfSize:11 weight:NSFontWeightSemibold];
+    self.participantCountBadge.textColor = [NSColor whiteColor];
+    self.participantCountBadge.backgroundColor = [NSColor colorWithWhite:0.0 alpha:0.6];
+    self.participantCountBadge.drawsBackground = YES;
+    self.participantCountBadge.alignment = NSTextAlignmentCenter;
+    self.participantCountBadge.wantsLayer = YES;
+    self.participantCountBadge.layer.cornerRadius = 10.0;
+    self.participantCountBadge.layer.masksToBounds = YES;
+    self.participantCountBadge.hidden = YES;
+    [self addSubview:self.participantCountBadge];
 
     self.layoutMode = InterRemoteVideoLayoutModeNone;
     self.allowsManualSpotlightSelection = YES;
@@ -252,6 +289,7 @@ static const CGFloat kAnimationDuration      = 0.3;
     if (!view) {
         view = [[InterRemoteVideoView alloc] initWithFrame:self.bounds];
         view.hidden = YES;
+        view.isMirrored = YES;  // Mirror camera feeds for natural appearance
         self.remoteCameraViews[participantId] = view;
         [self.cameraParticipantOrder addObject:participantId];
     }
@@ -372,12 +410,14 @@ static const CGFloat kAnimationDuration      = 0.3;
         return;
     }
 
-    // If already spotlighted, un-spotlight (back to auto)
-    if ([self.spotlightedTileKey isEqualToString:tileKey]) {
-        [self updateManualSpotlightTileKey:nil];
-    } else {
-        [self updateManualSpotlightTileKey:tileKey];
+    // If the clicked tile is already in the spotlight, do nothing — the user
+    // can bring a different tile to spotlight by clicking it in the filmstrip.
+    NSString *effectiveKey = [self effectiveSpotlightKey];
+    if ([effectiveKey isEqualToString:tileKey]) {
+        return;
     }
+
+    [self updateManualSpotlightTileKey:tileKey];
     [self updateLayoutAnimated:YES];
 }
 
@@ -679,6 +719,11 @@ static const CGFloat kAnimationDuration      = 0.3;
     NSUInteger count = participants.count;
     if (count == 0) return;
 
+    // Grid dimensions:
+    //   1 → 1×1 (fill)
+    //   2 → 2×1 (side-by-side)
+    //   3 → 2×2 (bottom row centered)
+    //   4 → 2×2 (full grid)
     NSUInteger cols, rows;
     if (count <= 2) {
         cols = count;
@@ -694,6 +739,11 @@ static const CGFloat kAnimationDuration      = 0.3;
     CGFloat cellW = (rect.size.width - totalGapW) / cols;
     CGFloat cellH = (rect.size.height - totalGapH) / rows;
 
+    // Check if the last row is incomplete (odd count with 2 cols)
+    BOOL lastRowIncomplete = (count > 2) && (count % cols != 0);
+    NSUInteger lastRowCount = lastRowIncomplete ? (count % cols) : cols;
+    NSUInteger lastRow = rows - 1;
+
     for (NSUInteger i = 0; i < count; i++) {
         NSString *pid = participants[i];
         InterRemoteVideoView *view = self.remoteCameraViews[pid];
@@ -706,12 +756,25 @@ static const CGFloat kAnimationDuration      = 0.3;
         tile.hidden = NO;
         view.hidden = NO;
 
+        // Apply active speaker highlight
+        tile.isSpeaking = [pid isEqualToString:self.activeSpeakerIdentity];
+
         NSUInteger col = i % cols;
         NSUInteger row = i / cols;
-        CGFloat x = rect.origin.x + col * (cellW + gap);
-        CGFloat y = rect.origin.y + (rows - 1 - row) * (cellH + gap);
-        NSRect frame = NSMakeRect(x, y, cellW, cellH);
 
+        CGFloat x, y;
+        y = rect.origin.y + (rows - 1 - row) * (cellH + gap);
+
+        // Center the last row if it has fewer tiles than cols
+        if (row == lastRow && lastRowIncomplete) {
+            CGFloat lastRowTotalW = lastRowCount * cellW + (lastRowCount - 1) * gap;
+            CGFloat offsetX = (rect.size.width - lastRowTotalW) / 2.0;
+            x = rect.origin.x + offsetX + col * (cellW + gap);
+        } else {
+            x = rect.origin.x + col * (cellW + gap);
+        }
+
+        NSRect frame = NSMakeRect(x, y, cellW, cellH);
         [self setTile:tile frame:frame animated:animated];
     }
 }
@@ -739,6 +802,7 @@ static const CGFloat kAnimationDuration      = 0.3;
 - (void)setFrame:(NSRect)frame {
     [super setFrame:frame];
     [self applyCurrentLayoutAnimated:NO];
+    [self updateParticipantCountBadge];
 }
 
 #pragma mark - Teardown
@@ -773,6 +837,63 @@ static const CGFloat kAnimationDuration      = 0.3;
 
     self.participantOverlay.hidden = YES;
     self.layoutMode = InterRemoteVideoLayoutModeNone;
+}
+
+#pragma mark - Active Speaker Highlight
+
+- (void)setActiveSpeakerIdentity:(NSString *)activeSpeakerIdentity {
+    if ([_activeSpeakerIdentity isEqualToString:activeSpeakerIdentity]) {
+        return;
+    }
+
+    NSString *previousSpeaker = _activeSpeakerIdentity;
+    _activeSpeakerIdentity = [activeSpeakerIdentity copy];
+
+    // Remove highlight from previous speaker's tile
+    if (previousSpeaker.length > 0) {
+        InterRemoteVideoTileView *oldTile = self.tileViews[previousSpeaker];
+        if (oldTile) {
+            oldTile.isSpeaking = NO;
+        }
+    }
+
+    // Add highlight to new speaker's tile
+    if (_activeSpeakerIdentity.length > 0) {
+        InterRemoteVideoTileView *newTile = self.tileViews[_activeSpeakerIdentity];
+        if (newTile) {
+            newTile.isSpeaking = YES;
+        }
+    }
+}
+
+#pragma mark - Participant Count Badge
+
+- (void)setRemoteParticipantCount:(NSUInteger)remoteParticipantCount {
+    _remoteParticipantCount = remoteParticipantCount;
+    [self updateParticipantCountBadge];
+}
+
+- (void)updateParticipantCountBadge {
+    // Show badge when 2+ remote participants (i.e. 3+ total in call)
+    NSUInteger count = self.remoteParticipantCount;
+    if (count <= 1) {
+        self.participantCountBadge.hidden = YES;
+        return;
+    }
+
+    // +1 for local participant
+    NSUInteger totalCount = count + 1;
+    self.participantCountBadge.stringValue = [NSString stringWithFormat:@" 👥 %lu ", (unsigned long)totalCount];
+    self.participantCountBadge.hidden = NO;
+
+    // Position top-right
+    [self.participantCountBadge sizeToFit];
+    NSSize badgeSize = self.participantCountBadge.frame.size;
+    badgeSize.width = MAX(badgeSize.width + 8, 44);
+    badgeSize.height = MAX(badgeSize.height, 22);
+    CGFloat x = self.bounds.size.width - badgeSize.width - 12;
+    CGFloat y = self.bounds.size.height - badgeSize.height - 12;
+    self.participantCountBadge.frame = NSMakeRect(x, y, badgeSize.width, badgeSize.height);
 }
 
 #pragma mark - Spotlight State

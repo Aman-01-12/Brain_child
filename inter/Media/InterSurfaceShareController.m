@@ -1,6 +1,7 @@
 #import "InterSurfaceShareController.h"
 
 #import <mach/mach_time.h>
+#import <os/lock.h>
 #import <os/log.h>
 
 #import "InterAppSurfaceVideoSource.h"
@@ -15,8 +16,20 @@
 @property (nonatomic, strong, readwrite) InterShareSessionConfiguration *configuration;
 @end
 
+// ---------------------------------------------------------------------------
+// Locking strategy:
+//   _stateLock (os_unfair_lock) guards all mutable ivars that are accessed from
+//   multiple queues: _videoSource, _sinks, _routingGeneration,
+//   _activeStatusGeneration, sharing, and startPending. Critical sections are
+//   kept minimal — only reads/writes of these ivars under the lock, never
+//   blocking calls or callbacks.
+//   _routerQueue (serial dispatch queue) serializes frame routing and sink
+//   callbacks.  The lock is acquired briefly inside _routerQueue blocks to
+//   snapshot state, but no dispatch or I/O occurs inside the lock.
+// ---------------------------------------------------------------------------
 @implementation InterSurfaceShareController {
     dispatch_queue_t _routerQueue;
+    os_unfair_lock _stateLock;
     id<InterShareVideoSource> _videoSource;
     NSArray<id<InterShareSink>> *_sinks;
     uint64_t _routingGeneration;
@@ -32,6 +45,7 @@
 
     _routerQueue = dispatch_queue_create("secure.inter.media.surface.share.router",
                                          DISPATCH_QUEUE_SERIAL);
+    _stateLock = OS_UNFAIR_LOCK_INIT;
     _sharing = NO;
     _startPending = NO;
     _configuration = [InterShareSessionConfiguration defaultConfiguration];
@@ -87,19 +101,19 @@
     NSArray<id<InterShareSink>> *sinks = [self sinksForConfiguration:configuration];
 
     __block uint64_t generation = 0;
-    @synchronized(self) {
-        if (self.sharing || self.startPending) {
-            return;
-        }
-
-        self.startPending = YES;
-        self.sharing = NO;
-        _routingGeneration += 1;
-        generation = _routingGeneration;
-        _activeStatusGeneration = 0;
-        _videoSource = videoSource;
-        _sinks = sinks;
+    os_unfair_lock_lock(&_stateLock);
+    if (self.sharing || self.startPending) {
+        os_unfair_lock_unlock(&_stateLock);
+        return;
     }
+    self.startPending = YES;
+    self.sharing = NO;
+    _routingGeneration += 1;
+    generation = _routingGeneration;
+    _activeStatusGeneration = 0;
+    _videoSource = videoSource;
+    _sinks = sinks;
+    os_unfair_lock_unlock(&_stateLock);
 
     [self emitStatusText:[self startingStatusTextForConfiguration:configuration]];
 
@@ -246,23 +260,22 @@
         BOOL generationCurrent = NO;
         BOOL shouldEmitActiveStatus = NO;
         InterShareSessionConfiguration *configurationSnapshot = nil;
-        @synchronized(self) {
-            generationCurrent = ((self.sharing || self.startPending) && _routingGeneration == generation);
-            if (!generationCurrent) {
-                return;
-            }
-
-            if (self.startPending) {
-                self.startPending = NO;
-                self.sharing = YES;
-            }
-
-            if (self->_activeStatusGeneration != generation) {
-                self->_activeStatusGeneration = generation;
-                shouldEmitActiveStatus = YES;
-                configurationSnapshot = [self.configuration copy];
-            }
+        os_unfair_lock_lock(&self->_stateLock);
+        generationCurrent = ((self.sharing || self.startPending) && self->_routingGeneration == generation);
+        if (!generationCurrent) {
+            os_unfair_lock_unlock(&self->_stateLock);
+            return;
         }
+        if (self.startPending) {
+            self.startPending = NO;
+            self.sharing = YES;
+        }
+        if (self->_activeStatusGeneration != generation) {
+            self->_activeStatusGeneration = generation;
+            shouldEmitActiveStatus = YES;
+            configurationSnapshot = [self.configuration copy];
+        }
+        os_unfair_lock_unlock(&self->_stateLock);
 
         if (!generationCurrent) {
             return;
@@ -312,24 +325,21 @@
 }
 
 - (NSArray<id<InterShareSink>> *)currentSinksSnapshot {
-    @synchronized(self) {
-        return [_sinks copy];
-    }
+    os_unfair_lock_lock(&_stateLock);
+    NSArray<id<InterShareSink>> *snapshot = [_sinks copy];
+    os_unfair_lock_unlock(&_stateLock);
+    return snapshot;
 }
 
 - (BOOL)isGenerationCurrent:(uint64_t)generation includePending:(BOOL)includePending {
-    @synchronized(self) {
-        BOOL isCurrentGeneration = (_routingGeneration == generation);
-        if (!isCurrentGeneration) {
-            return NO;
-        }
-
-        if (self.sharing) {
-            return YES;
-        }
-
-        return includePending && self.startPending;
-    }
+    os_unfair_lock_lock(&_stateLock);
+    BOOL isCurrentGeneration = (_routingGeneration == generation);
+    BOOL sharing = self.sharing;
+    BOOL pending = self.startPending;
+    os_unfair_lock_unlock(&_stateLock);
+    if (!isCurrentGeneration) { return NO; }
+    if (sharing) { return YES; }
+    return includePending && pending;
 }
 
 - (void)teardownSharingResourcesEmitStatus:(BOOL)emitStatus {
@@ -339,25 +349,23 @@
     InterShareSessionConfiguration *configurationSnapshot = nil;
     BOOL usedCustomVideoSource = NO;
 
-    @synchronized(self) {
-        if (!self.sharing && !self.startPending && _videoSource == nil && _sinks.count == 0) {
-            return;
-        }
-
-        self.sharing = NO;
-        self.startPending = NO;
-        _routingGeneration += 1;
-        _activeStatusGeneration = 0;
-
-        videoSource = _videoSource;
-        sinks = [_sinks copy];
-        registrationBlock = self.audioSampleObserverRegistrationBlock;
-        configurationSnapshot = [self.configuration copy];
-        usedCustomVideoSource = (_videoSource != nil && _videoSource == self.customVideoSource);
-
-        _videoSource = nil;
-        _sinks = @[];
+    os_unfair_lock_lock(&_stateLock);
+    if (!self.sharing && !self.startPending && _videoSource == nil && _sinks.count == 0) {
+        os_unfair_lock_unlock(&_stateLock);
+        return;
     }
+    self.sharing = NO;
+    self.startPending = NO;
+    _routingGeneration += 1;
+    _activeStatusGeneration = 0;
+    videoSource = _videoSource;
+    sinks = [_sinks copy];
+    registrationBlock = self.audioSampleObserverRegistrationBlock;
+    configurationSnapshot = [self.configuration copy];
+    usedCustomVideoSource = (_videoSource != nil && _videoSource == self.customVideoSource);
+    _videoSource = nil;
+    _sinks = @[];
+    os_unfair_lock_unlock(&_stateLock);
 
     if (videoSource) {
         [videoSource stop];

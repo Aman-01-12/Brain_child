@@ -1,6 +1,7 @@
 #import "SecureWindowController.h"
 #import "InterLocalCallControlPanel.h"
 #import "InterLocalMediaController.h"
+#import "InterMediaWiringController.h"
 #import "InterSurfaceShareController.h"
 #import "MetalSurfaceView.h"
 #import "SecureWindow.h"
@@ -17,8 +18,6 @@
 #import "inter-Swift.h"
 #endif
 
-static void *InterSecureConnectionStateContext = &InterSecureConnectionStateContext;
-static void *InterSecurePresenceStateContext = &InterSecurePresenceStateContext;
 static const CGFloat InterSecureSidebarWidth = 278.0;
 static const CGFloat InterSecureSidebarTrailingMargin = 34.0;
 static const CGFloat InterSecureSidebarBottomMargin = 26.0;
@@ -38,7 +37,7 @@ static const CGFloat InterSecureBottomWorkspaceMargin = 100.0;
 @property (nonatomic, strong, nullable) InterRemoteVideoLayoutManager *remoteLayout;
 @property (nonatomic, strong, nullable) InterTrackRendererBridge *trackRendererBridge;
 @property (nonatomic, strong, nullable) InterNetworkStatusView *networkStatusView;
-@property (nonatomic, assign) BOOL isObservingRoomController;
+@property (nonatomic, strong, nullable) InterMediaWiringController *mediaWiring;
 @end
 
 @implementation SecureWindowController
@@ -151,7 +150,8 @@ static const CGFloat InterSecureBottomWorkspaceMargin = 100.0;
     self.localMediaController = nil;
 
     // [2.6] Tear down KVO before releasing
-    [self teardownRoomControllerKVO];
+    [self.mediaWiring teardownRoomControllerKVO];
+    self.mediaWiring = nil;
 
     // [3.3] Tear down remote video layout
     if (self.remoteLayout) {
@@ -200,12 +200,12 @@ static const CGFloat InterSecureBottomWorkspaceMargin = 100.0;
 
     __weak typeof(self) weakSelf = self;
     self.controlPanel.cameraToggleHandler = ^{
-        // [2.6.3] [G2] Two-phase camera toggle
-        [weakSelf twoPhaseToggleCamera];
+        // [2.6.3] [G2] Two-phase camera toggle via shared wiring controller
+        [weakSelf.mediaWiring twoPhaseToggleCamera];
     };
     self.controlPanel.microphoneToggleHandler = ^{
-        // [2.6.3] [G2] Two-phase mic toggle
-        [weakSelf twoPhaseToggleMicrophone];
+        // [2.6.3] [G2] Two-phase mic toggle via shared wiring controller
+        [weakSelf.mediaWiring twoPhaseToggleMicrophone];
     };
     self.controlPanel.shareToggleHandler = ^{
         [weakSelf toggleSurfaceShare];
@@ -221,9 +221,9 @@ static const CGFloat InterSecureBottomWorkspaceMargin = 100.0;
     self.networkStatusView = [[InterNetworkStatusView alloc] initWithFrame:NSMakeRect(0, 0, 40, 16)];
     [self.controlPanel.networkStatusContainerView addSubview:self.networkStatusView];
 
-    // [3.4.5] Triple-click diagnostic
+    // [3.4.5] Triple-click diagnostic via wiring controller
     NSClickGestureRecognizer *tripleClick = [[NSClickGestureRecognizer alloc] initWithTarget:self
-                                                                                      action:@selector(handleDiagnosticTripleClick:)];
+                                                                                      action:@selector(forwardDiagnosticTripleClick:)];
     tripleClick.numberOfClicksRequired = 3;
     [self.controlPanel.networkStatusContainerView addGestureRecognizer:tripleClick];
 }
@@ -290,11 +290,22 @@ static const CGFloat InterSecureBottomWorkspaceMargin = 100.0;
         [weakSelf.controlPanel setMediaStatusText:message];
 
         // [2.6.2] Wire network publishing if room is connected
-        [weakSelf wireSecureNetworkPublish];
+        [weakSelf.mediaWiring wireNetworkPublish];
     }];
 
-    // [2.6.3] Set up KVO for room controller
-    [self setupRoomControllerKVO];
+    // [B1] Create and wire shared media wiring controller
+    self.mediaWiring = [[InterMediaWiringController alloc] init];
+    self.mediaWiring.roomController = self.roomController;
+    self.mediaWiring.mediaController = self.localMediaController;
+    self.mediaWiring.controlPanel = self.controlPanel;
+    self.mediaWiring.remoteLayout = self.remoteLayout;
+    self.mediaWiring.networkStatusView = self.networkStatusView;
+    self.mediaWiring.surfaceShareController = self.surfaceShareController;
+    self.mediaWiring.renderView = self.renderView;
+    self.mediaWiring.mediaStateSummaryBlock = ^NSString *{
+        return [weakSelf secureMediaStateSummary];
+    };
+    [self.mediaWiring setupRoomControllerKVO];
 
     // [3.3.1] Wire remote rendering
     [self wireSecureRemoteRendering];
@@ -446,33 +457,7 @@ static const CGFloat InterSecureBottomWorkspaceMargin = 100.0;
     }];
 }
 
-- (void)toggleCamera {
-    BOOL shouldEnable = !self.localMediaController.isCameraEnabled;
-    __weak typeof(self) weakSelf = self;
-    [self.localMediaController setCameraEnabled:shouldEnable completion:^(BOOL success) {
-        if (!success) {
-            [weakSelf.controlPanel setMediaStatusText:@"Unable to change camera state."];
-            return;
-        }
-
-        [weakSelf.controlPanel setCameraEnabled:weakSelf.localMediaController.isCameraEnabled];
-        [weakSelf.controlPanel setMediaStatusText:[weakSelf secureMediaStateSummary]];
-    }];
-}
-
-- (void)toggleMicrophone {
-    BOOL shouldEnable = !self.localMediaController.isMicrophoneEnabled;
-    __weak typeof(self) weakSelf = self;
-    [self.localMediaController setMicrophoneEnabled:shouldEnable completion:^(BOOL success) {
-        if (!success) {
-            [weakSelf.controlPanel setMediaStatusText:@"Unable to change microphone state."];
-            return;
-        }
-
-        [weakSelf.controlPanel setMicrophoneEnabled:weakSelf.localMediaController.isMicrophoneEnabled];
-        [weakSelf.controlPanel setMediaStatusText:[weakSelf secureMediaStateSummary]];
-    }];
-}
+// [B1] toggleCamera + toggleMicrophone removed — now in InterMediaWiringController.
 
 - (void)toggleSurfaceShare {
     if (!self.renderView || !self.stageView) {
@@ -502,7 +487,7 @@ static const CGFloat InterSecureBottomWorkspaceMargin = 100.0;
     }
 
     // [2.6.4] Wire network sink before starting (interview: always ThisApp)
-    [self wireNetworkSinkOnSurfaceShareController:self.surfaceShareController];
+    [self.mediaWiring wireNetworkSinkOnSurfaceShareController:self.surfaceShareController];
 
     [self.surfaceShareController startSharingFromSurfaceView:self.renderView];
     [self.controlPanel setShareStartPending:self.surfaceShareController.isStartPending];
@@ -514,104 +499,11 @@ static const CGFloat InterSecureBottomWorkspaceMargin = 100.0;
 
 #pragma mark - Network Wiring [2.6]
 
-// [2.6.3] [G2] Two-phase camera toggle
-- (void)twoPhaseToggleCamera {
-    InterLocalMediaController *media = self.localMediaController;
-    InterRoomController *rc = self.roomController;
-    BOOL shouldEnable = !media.isCameraEnabled;
-
-    __weak typeof(self) weakSelf = self;
-
-    if (!shouldEnable) {
-        // DISABLE: [G2] Mute LiveKit track FIRST → then stop capture device
-        if (rc && rc.connectionState == InterRoomConnectionStateConnected) {
-            [rc.publisher muteCameraTrackWithCompletion:^{
-                [weakSelf toggleCamera];
-            }];
-        } else {
-            [self toggleCamera];
-        }
-    } else {
-        // ENABLE: [G2] Start capture device FIRST → then unmute track
-        [self toggleCamera];
-        if (rc && rc.connectionState == InterRoomConnectionStateConnected) {
-            [rc.publisher unmuteCameraTrack];
-        }
-    }
-}
-
-// [2.6.3] [G2] Two-phase mic toggle
-- (void)twoPhaseToggleMicrophone {
-    InterLocalMediaController *media = self.localMediaController;
-    InterRoomController *rc = self.roomController;
-    BOOL shouldEnable = !media.isMicrophoneEnabled;
-
-    __weak typeof(self) weakSelf = self;
-
-    if (!shouldEnable) {
-        if (rc && rc.connectionState == InterRoomConnectionStateConnected) {
-            [rc.publisher muteMicrophoneTrackWithCompletion:^{
-                [weakSelf toggleMicrophone];
-            }];
-        } else {
-            [self toggleMicrophone];
-        }
-    } else {
-        [self toggleMicrophone];
-        if (rc && rc.connectionState == InterRoomConnectionStateConnected) {
-            [rc.publisher unmuteMicrophoneTrack];
-        }
-    }
-}
-
-// [2.6.2] Publish camera and mic if room is connected
-- (void)wireSecureNetworkPublish {
-    InterRoomController *rc = self.roomController;
-    if (!rc || rc.connectionState != InterRoomConnectionStateConnected) {
-        return;
-    }
-
-    InterLocalMediaController *media = self.localMediaController;
-    if (!media) {
-        return;
-    }
-
-    AVCaptureSession *session = media.captureSession;
-    dispatch_queue_t sessionQueue = media.sessionQueue;
-    if (!session || !sessionQueue) {
-        return;
-    }
-
-    if (media.isCameraEnabled) {
-        [rc.publisher publishCameraWithCaptureSession:session
-                                         sessionQueue:sessionQueue
-                                           completion:^(NSError * _Nullable error) {
-            if (error) {
-                NSLog(@"[G8] Secure camera publish error: %@", error.localizedDescription);
-            }
-        }];
-    }
-
-    if (media.isMicrophoneEnabled) {
-        [rc.publisher publishMicrophoneWithCompletion:^(NSError * _Nullable error) {
-            if (error) {
-                NSLog(@"[G8] Secure mic publish error: %@", error.localizedDescription);
-            }
-        }];
-    }
-}
-
-// [2.6.4] Wire network sink on surface share
-- (void)wireNetworkSinkOnSurfaceShareController:(InterSurfaceShareController *)controller {
-    InterRoomController *rc = self.roomController;
-    if (!rc || rc.connectionState != InterRoomConnectionStateConnected) {
-        controller.networkPublishSink = nil;
-        return;
-    }
-
-    InterLiveKitScreenShareSource *source = [rc.publisher createScreenShareSink];
-    controller.networkPublishSink = source;
-}
+// [B1] twoPhaseToggleCamera, twoPhaseToggleMicrophone, wireSecureNetworkPublish,
+// wireNetworkSinkOnSurfaceShareController:, handleDiagnosticTripleClick:,
+// setupRoomControllerKVO, teardownRoomControllerKVO, observeValueForKeyPath:,
+// handleConnectionStateChanged:, handlePresenceStateChanged:
+// are now in InterMediaWiringController (self.mediaWiring).
 
 /// [3.3.1] Wire remote video rendering in secure mode.
 - (void)wireSecureRemoteRendering {
@@ -646,120 +538,10 @@ static const CGFloat InterSecureBottomWorkspaceMargin = 100.0;
 
 #pragma mark - Diagnostics [3.4.5]
 
-- (void)handleDiagnosticTripleClick:(NSClickGestureRecognizer *)recognizer {
+/// [B1] Trampoline: gesture recognizer target must be self; forward to wiring controller.
+- (void)forwardDiagnosticTripleClick:(NSClickGestureRecognizer *)recognizer {
 #pragma unused(recognizer)
-    InterRoomController *rc = self.roomController;
-    if (!rc || !rc.statsCollector) return;
-
-    NSString *snapshot = [rc.statsCollector captureDiagnosticSnapshot];
-    if (snapshot.length == 0) return;
-
-    NSPasteboard *pb = [NSPasteboard generalPasteboard];
-    [pb clearContents];
-    [pb setString:snapshot forType:NSPasteboardTypeString];
-
-    if (self.controlPanel) {
-        [self.controlPanel setConnectionStatusText:@"Diagnostic copied!"];
-        __weak typeof(self) weakSelf = self;
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            InterRoomController *r = weakSelf.roomController;
-            if (r) {
-                NSString *label = nil;
-                switch (r.connectionState) {
-                    case InterRoomConnectionStateDisconnected: label = @"Disconnected"; break;
-                    case InterRoomConnectionStateConnecting: label = @"Connecting…"; break;
-                    case InterRoomConnectionStateConnected: label = @"Connected"; break;
-                    case InterRoomConnectionStateReconnecting: label = @"Reconnecting…"; break;
-                    case InterRoomConnectionStateDisconnectedWithError: label = @"Connection error"; break;
-                }
-                [weakSelf.controlPanel setConnectionStatusText:label];
-            }
-        });
-    }
-}
-
-// [2.6.3] KVO setup/teardown
-- (void)setupRoomControllerKVO {
-    InterRoomController *rc = self.roomController;
-    if (!rc || self.isObservingRoomController) {
-        return;
-    }
-
-    [rc addObserver:self forKeyPath:@"connectionState"
-            options:NSKeyValueObservingOptionNew
-            context:InterSecureConnectionStateContext];
-    [rc addObserver:self forKeyPath:@"participantPresenceState"
-            options:NSKeyValueObservingOptionNew
-            context:InterSecurePresenceStateContext];
-    self.isObservingRoomController = YES;
-}
-
-- (void)teardownRoomControllerKVO {
-    InterRoomController *rc = self.roomController;
-    if (!self.isObservingRoomController || !rc) {
-        self.isObservingRoomController = NO;
-        return;
-    }
-
-    [rc removeObserver:self forKeyPath:@"connectionState"
-               context:InterSecureConnectionStateContext];
-    [rc removeObserver:self forKeyPath:@"participantPresenceState"
-               context:InterSecurePresenceStateContext];
-    self.isObservingRoomController = NO;
-}
-
-- (void)observeValueForKeyPath:(NSString *)keyPath
-                      ofObject:(id)object
-                        change:(NSDictionary<NSKeyValueChangeKey,id> *)change
-                       context:(void *)context {
-    if (context == InterSecureConnectionStateContext) {
-        InterRoomController *rc = (InterRoomController *)object;
-        NSString *label = nil;
-        InterNetworkQualityLevel quality = InterNetworkQualityLevelUnknown;
-        switch (rc.connectionState) {
-            case InterRoomConnectionStateDisconnected:
-                label = @"Disconnected"; quality = InterNetworkQualityLevelUnknown; break;
-            case InterRoomConnectionStateConnecting:
-                label = @"Connecting…"; quality = InterNetworkQualityLevelGood; break;
-            case InterRoomConnectionStateConnected:
-                label = @"Connected"; quality = InterNetworkQualityLevelExcellent; break;
-            case InterRoomConnectionStateReconnecting:
-                label = @"Reconnecting…"; quality = InterNetworkQualityLevelPoor; break;
-            case InterRoomConnectionStateDisconnectedWithError:
-                label = @"Connection error"; quality = InterNetworkQualityLevelLost; break;
-        }
-        if (label && self.controlPanel) {
-            [self.controlPanel setMediaStatusText:label];
-            [self.controlPanel setConnectionStatusText:label];
-        }
-        [self.networkStatusView setQualityLevel:quality];
-    } else if (context == InterSecurePresenceStateContext) {
-        InterRoomController *rc = (InterRoomController *)object;
-        switch (rc.participantPresenceState) {
-            case InterParticipantPresenceStateAlone:
-                // [3.3.3] Show waiting overlay when alone
-                if (rc.connectionState == InterRoomConnectionStateConnected) {
-                    [self.remoteLayout.participantOverlay setOverlayState:InterParticipantOverlayStateWaiting];
-                }
-                break;
-            case InterParticipantPresenceStateParticipantJoined:
-                if (self.controlPanel) {
-                    [self.controlPanel setMediaStatusText:@"Participant joined"];
-                }
-                [self.remoteLayout.participantOverlay setOverlayState:InterParticipantOverlayStateHidden];
-                break;
-            case InterParticipantPresenceStateParticipantLeft:
-                if (self.controlPanel) {
-                    [self.controlPanel setMediaStatusText:@"Participant left"];
-                }
-                // [3.3.3] Show "Participant left." with Wait / End Call
-                [self.remoteLayout.participantOverlay setOverlayState:InterParticipantOverlayStateParticipantLeft];
-                break;
-        }
-    } else {
-        [super observeValueForKeyPath:keyPath ofObject:object change:change context:context];
-    }
+    [self.mediaWiring handleDiagnosticTripleClick];
 }
 
 @end

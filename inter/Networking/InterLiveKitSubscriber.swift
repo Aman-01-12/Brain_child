@@ -51,6 +51,9 @@ import LiveKit
 
     /// A remote track ended (participant unpublished or left).
     @objc func remoteTrackDidEnd(_ kind: InterTrackKind, forParticipant participantId: String)
+
+    /// The active/dominant speaker changed. Identity is empty string when no remote speaker is active.
+    @objc optional func activeSpeakerDidChange(_ participantId: String)
 }
 
 // MARK: - InterLiveKitSubscriber

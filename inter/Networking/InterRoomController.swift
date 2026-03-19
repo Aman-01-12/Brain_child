@@ -47,6 +47,11 @@ import LiveKit
     /// Number of remote participants currently in the room.
     @objc public private(set) dynamic var remoteParticipantCount: Int = 0
 
+    /// Identity of the current dominant/active speaker (nil if none or local).
+    /// Updated by LiveKit's activeSpeakersChanged delegate. Used by the layout
+    /// manager for speaker highlight effects.
+    @objc public private(set) dynamic var activeSpeakerIdentity: String = ""
+
     /// Room code (6-char alphanumeric). Set after create or join. [G7]
     @objc public private(set) dynamic var roomCode: String = ""
 
@@ -81,6 +86,15 @@ import LiveKit
 
     /// Grace timer for participant-left delay. [G6]
     private var participantGraceTimer: DispatchSourceTimer?
+
+    /// Token auto-refresh timer. Fires at ~80% of TTL to keep the session alive.
+    private var tokenRefreshTimer: DispatchSourceTimer?
+
+    /// Memory pressure source for graceful degradation under low-memory conditions.
+    private var memoryPressureSource: DispatchSourceMemoryPressure?
+
+    /// Whether screen share was unpublished due to memory pressure (for auto-restore).
+    private var screenShareSuspendedForMemory = false
 
     /// Flag to prevent double-connect.
     private(set) var isConnecting = false
@@ -247,6 +261,12 @@ import LiveKit
                 collector.start(room: newRoom)
                 self.statsCollector = collector
 
+                // Schedule token auto-refresh [4.5.4]
+                self.scheduleTokenRefresh()
+
+                // Start memory pressure monitor
+                self.startMemoryPressureMonitor()
+
                 // Update participant count
                 self.updateParticipantPresence()
 
@@ -296,8 +316,28 @@ import LiveKit
 
         interLogInfo(InterLog.networking, "RoomController: disconnecting (reason=%{public}@)", reason)
 
-        // Stop stats collector
-        statsCollector?.stop()
+        // Stop stats collector and export data
+        if let collector = statsCollector {
+            if let jsonData = collector.exportToJSON() {
+                let byteCount = jsonData.count
+                interLogInfo(InterLog.networking, "RoomController: exported %d bytes of call stats JSON", byteCount)
+                // Store in a well-known location for later retrieval / debugging
+                if let cachesDir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first {
+                    let formatter = DateFormatter()
+                    formatter.dateFormat = "yyyyMMdd_HHmmss"
+                    let filename = "inter_call_stats_\(formatter.string(from: Date())).json"
+                    let fileURL = cachesDir.appendingPathComponent(filename)
+                    do {
+                        try jsonData.write(to: fileURL)
+                        interLogInfo(InterLog.networking, "RoomController: stats saved to %{public}@", fileURL.path)
+                    } catch {
+                        interLogError(InterLog.networking, "RoomController: failed to write stats: %{public}@",
+                                      error.localizedDescription)
+                    }
+                }
+            }
+            collector.stop()
+        }
         statsCollector = nil
 
         // Unpublish all tracks (fire-and-forget)
@@ -309,6 +349,12 @@ import LiveKit
 
         // Cancel grace timer
         cancelGraceTimer()
+
+        // Cancel token refresh timer
+        cancelTokenRefreshTimer()
+
+        // Stop memory pressure monitor
+        stopMemoryPressureMonitor()
 
         // Disconnect room
         if let room = room {
@@ -335,6 +381,7 @@ import LiveKit
         DispatchQueue.main.async {
             self.remoteParticipantCount = 0
             self.participantPresenceState = .alone
+            self.activeSpeakerIdentity = ""
             self.roomCode = ""
             self.roomType = ""
         }
@@ -366,6 +413,45 @@ import LiveKit
 
     // MARK: - Token Refresh
 
+    /// Schedule a timer to refresh the token at ~80% of its TTL.
+    /// Called after connect and after each successful refresh.
+    private func scheduleTokenRefresh() {
+        cancelTokenRefreshTimer()
+
+        guard let config = configuration else { return }
+        let code = roomCode.isEmpty ? config.roomCode : roomCode
+        let ttl = tokenService.cachedTokenTTL(forRoom: code, identity: config.participantIdentity)
+
+        // If TTL is unknown or already expired, try refreshing in 60 seconds
+        let interval: TimeInterval
+        if ttl > 60 {
+            // Fire at 80% of remaining TTL (e.g. 5-minute token → refresh at 4 minutes)
+            interval = ttl * 0.8
+        } else if ttl > 0 {
+            // Less than 60s — refresh immediately
+            interval = 1.0
+        } else {
+            // Unknown TTL — default to 4 minutes (typical LiveKit token is 5-10 min)
+            interval = 240.0
+        }
+
+        interLogInfo(InterLog.networking, "RoomController: scheduling token refresh in %ds (TTL=%.0fs)",
+                     Int(interval), ttl)
+
+        let timer = DispatchSource.makeTimerSource(queue: .main)
+        timer.schedule(deadline: .now() + interval)
+        timer.setEventHandler { [weak self] in
+            self?.refreshToken()
+        }
+        timer.resume()
+        tokenRefreshTimer = timer
+    }
+
+    private func cancelTokenRefreshTimer() {
+        tokenRefreshTimer?.cancel()
+        tokenRefreshTimer = nil
+    }
+
     /// Refresh the authentication token. Called when token is about to expire.
     private func refreshToken() {
         guard let config = configuration, connectionState == .connected else { return }
@@ -383,6 +469,8 @@ import LiveKit
                 interLogError(InterLog.networking, "RoomController: token refresh failed: %{public}@",
                               error.localizedDescription)
                 // Don't disconnect — the SDK will handle token expiry via reconnection.
+                // Schedule a retry in 30 seconds
+                self?.scheduleTokenRefreshRetry()
                 return
             }
 
@@ -394,6 +482,72 @@ import LiveKit
             // on an existing room connection. The token will be used on the next reconnect.
             // For now, we store it in the token service cache.
             _ = token
+
+            // Reschedule refresh based on the new token's TTL
+            self?.scheduleTokenRefresh()
+        }
+    }
+
+    /// Schedule a short retry after a failed refresh attempt.
+    private func scheduleTokenRefreshRetry() {
+        cancelTokenRefreshTimer()
+
+        let timer = DispatchSource.makeTimerSource(queue: .main)
+        timer.schedule(deadline: .now() + 30.0)
+        timer.setEventHandler { [weak self] in
+            self?.refreshToken()
+        }
+        timer.resume()
+        tokenRefreshTimer = timer
+
+        interLogInfo(InterLog.networking, "RoomController: token refresh retry scheduled in 30s")
+    }
+
+    // MARK: - Memory Pressure Response
+
+    /// Start monitoring system memory pressure.
+    /// On `.warning`: log but keep going (screen share stays up).
+    /// On `.critical`: unpublish screen share to free memory.
+    private func startMemoryPressureMonitor() {
+        stopMemoryPressureMonitor()
+
+        let source = DispatchSource.makeMemoryPressureSource(
+            eventMask: [.warning, .critical],
+            queue: .main
+        )
+        source.setEventHandler { [weak self] in
+            guard let self = self else { return }
+            let event = source.data
+            if event.contains(.critical) {
+                self.handleMemoryPressureCritical()
+            } else if event.contains(.warning) {
+                self.handleMemoryPressureWarning()
+            }
+        }
+        source.resume()
+        memoryPressureSource = source
+        interLogInfo(InterLog.networking, "RoomController: memory pressure monitor started")
+    }
+
+    private func stopMemoryPressureMonitor() {
+        memoryPressureSource?.cancel()
+        memoryPressureSource = nil
+        screenShareSuspendedForMemory = false
+    }
+
+    private func handleMemoryPressureWarning() {
+        interLogInfo(InterLog.networking, "RoomController: memory pressure WARNING — monitoring")
+        // Log a diagnostic note; screen share stays active.
+        // The system may reclaim memory from other processes first.
+    }
+
+    private func handleMemoryPressureCritical() {
+        interLogError(InterLog.networking, "RoomController: memory pressure CRITICAL — unpublishing screen share")
+
+        guard publisher.screenSharePublication != nil else { return }
+        screenShareSuspendedForMemory = true
+        publisher.unpublishScreenShare {
+            interLogInfo(InterLog.networking, "RoomController: screen share unpublished (memory pressure)")
         }
     }
 
@@ -495,6 +649,10 @@ extension InterRoomController: RoomDelegate {
         interLogInfo(InterLog.networking, "RoomController: roomDidReconnect")
         self.setConnectionState(.connected)
         self.updateParticipantPresence()
+        // Re-schedule token refresh after reconnect (the old token may have been used)
+        DispatchQueue.main.async {
+            self.scheduleTokenRefresh()
+        }
     }
 
     public nonisolated func room(_ room: Room, didDisconnectWithError error: LiveKitError?) {
@@ -520,5 +678,21 @@ extension InterRoomController: RoomDelegate {
         interLogInfo(InterLog.networking, "RoomController: participant disconnected: %{public}@",
                      participant.identity?.stringValue ?? "(unknown)")
         self.updateParticipantPresence()
+    }
+
+    // MARK: Active Speakers
+
+    public nonisolated func room(_ room: Room, didUpdateSpeakingParticipants participants: [Participant]) {
+        // Find the loudest remote participant (first in the sorted list that isn't local)
+        let remoteSpeaker = participants.first { $0 is RemoteParticipant }
+        let identity = remoteSpeaker?.identity?.stringValue ?? ""
+
+        DispatchQueue.main.async {
+            if self.activeSpeakerIdentity != identity {
+                self.activeSpeakerIdentity = identity
+                interLogInfo(InterLog.networking, "RoomController: active speaker → %{public}@",
+                             identity.isEmpty ? "(none)" : identity)
+            }
+        }
     }
 }

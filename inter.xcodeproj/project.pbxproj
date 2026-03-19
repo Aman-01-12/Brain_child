@@ -8,6 +8,7 @@
 
 /* Begin PBXBuildFile section */
 		041DDB122F56B32C009968CE /* LiveKit in Frameworks */ = {isa = PBXBuildFile; productRef = 041DDB112F56B32C009968CE /* LiveKit */; };
+		04C0290D2F6BC7E6007A9D76 /* Atomics in Frameworks */ = {isa = PBXBuildFile; productRef = 04C8E1A12F79B00C009968CE /* Atomics */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -43,6 +44,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				04C0290D2F6BC7E6007A9D76 /* Atomics in Frameworks */,
 				041DDB122F56B32C009968CE /* LiveKit in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -96,6 +98,7 @@
 			name = inter;
 			packageProductDependencies = (
 				041DDB112F56B32C009968CE /* LiveKit */,
+				04C8E1A12F79B00C009968CE /* Atomics */,
 			);
 			productName = inter;
 			productReference = 042FD4022F1A72D60031193C /* inter.app */;
@@ -151,6 +154,7 @@
 			minimizedProjectReferenceProxies = 1;
 			packageReferences = (
 				041DDB102F56B32C009968CE /* XCRemoteSwiftPackageReference "client-sdk-swift" */,
+				04C8E1A02F79B00C009968CE /* XCRemoteSwiftPackageReference "swift-atomics" */,
 			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = 042FD4032F1A72D60031193C /* Products */;
@@ -452,6 +456,14 @@
 				version = 2.12.1;
 			};
 		};
+		04C8E1A02F79B00C009968CE /* XCRemoteSwiftPackageReference "swift-atomics" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/apple/swift-atomics.git";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 1.2.0;
+			};
+		};
 /* End XCRemoteSwiftPackageReference section */
 
 /* Begin XCSwiftPackageProductDependency section */
@@ -459,6 +471,11 @@
 			isa = XCSwiftPackageProductDependency;
 			package = 041DDB102F56B32C009968CE /* XCRemoteSwiftPackageReference "client-sdk-swift" */;
 			productName = LiveKit;
+		};
+		04C8E1A12F79B00C009968CE /* Atomics */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 04C8E1A02F79B00C009968CE /* XCRemoteSwiftPackageReference "swift-atomics" */;
+			productName = Atomics;
 		};
 /* End XCSwiftPackageProductDependency section */
 	};

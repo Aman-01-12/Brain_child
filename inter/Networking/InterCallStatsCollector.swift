@@ -197,4 +197,73 @@ import LiveKit
         let idx = (writeIndex - 1 + maxEntries) % maxEntries
         return entries[idx]
     }
+
+    // MARK: - JSON Export [1.10.5]
+
+    /// Export all collected stats entries as a JSON Data blob.
+    /// Returns nil if there are no entries. Thread-safe.
+    ///
+    /// JSON structure:
+    /// ```json
+    /// {
+    ///   "exportedAt": "2024-01-15T10:30:00Z",
+    ///   "entryCount": 42,
+    ///   "entries": [
+    ///     {
+    ///       "timestamp": 1705312200.0,
+    ///       "audioBitrateIn": 32000,
+    ///       "audioBitrateOut": 32000,
+    ///       "videoBitrateIn": 1500000,
+    ///       "videoBitrateOut": 1500000,
+    ///       "videoFpsIn": 30,
+    ///       "videoFpsOut": 30,
+    ///       "roundTripTimeMs": 15.0,
+    ///       "packetLossPercent": 0.1,
+    ///       "jitterMs": 2.5,
+    ///       "connectionQuality": 4
+    ///     }
+    ///   ]
+    /// }
+    /// ```
+    @objc public func exportToJSON() -> Data? {
+        os_unfair_lock_lock(&lock)
+        let count = entryCount
+        var exportEntries: [InterCallStatsEntry] = []
+        if count > 0 {
+            // Read entries in chronological order
+            let startIdx = count < maxEntries ? 0 : writeIndex
+            for i in 0..<count {
+                let idx = (startIdx + i) % maxEntries
+                exportEntries.append(entries[idx])
+            }
+        }
+        os_unfair_lock_unlock(&lock)
+
+        guard !exportEntries.isEmpty else { return nil }
+
+        let formatter = ISO8601DateFormatter()
+        let entriesArray: [[String: Any]] = exportEntries.map { entry in
+            return [
+                "timestamp": entry.timestamp,
+                "outboundAudioBitrate": entry.outboundAudioBitrate,
+                "outboundVideoBitrate": entry.outboundVideoBitrate,
+                "outboundVideoFPS": entry.outboundVideoFPS,
+                "inboundAudioBitrate": entry.inboundAudioBitrate,
+                "inboundVideoBitrate": entry.inboundVideoBitrate,
+                "inboundVideoFPS": entry.inboundVideoFPS,
+                "roundTripTimeMs": entry.roundTripTimeMs,
+                "packetLossPercent": entry.packetLossPercent,
+                "jitterMs": entry.jitterMs,
+                "connectionQuality": entry.connectionQuality
+            ]
+        }
+
+        let root: [String: Any] = [
+            "exportedAt": formatter.string(from: Date()),
+            "entryCount": exportEntries.count,
+            "entries": entriesArray
+        ]
+
+        return try? JSONSerialization.data(withJSONObject: root, options: [.prettyPrinted, .sortedKeys])
+    }
 }

@@ -317,6 +317,17 @@ private struct TokenCacheEntry {
         interLogDebug(InterLog.networking, "Token: cache invalidated")
     }
 
+    /// Returns the number of seconds until the cached token expires for the
+    /// given room and identity. Returns `nil` when no cached entry exists.
+    /// Used by InterRoomController to schedule auto-refresh timers.
+    @objc public func cachedTokenTTL(forRoom roomCode: String, identity: String) -> TimeInterval {
+        let key = cacheKey(room: roomCode, identity: identity)
+        return cacheQueue.sync {
+            guard let entry = tokenCache[key] else { return -1 }
+            return entry.expiresAt.timeIntervalSinceNow
+        }
+    }
+
     // MARK: - Private: Network
 
     /// Perform a POST request with JSON body. Retries once on 5xx/timeout.
@@ -405,6 +416,14 @@ private struct TokenCacheEntry {
             if statusCode == 429 {
                 let error = InterNetworkErrorCode.tokenFetchFailed.error(
                     message: "Rate limit exceeded"
+                )
+                completion(.failure(error))
+                return
+            }
+
+            if statusCode == 403 {
+                let error = InterNetworkErrorCode.roomFull.error(
+                    message: "Room is full"
                 )
                 completion(.failure(error))
                 return

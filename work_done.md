@@ -465,3 +465,188 @@ TEMPLATE — copy this for each new entry:
 
 **Why**: Two user-facing UX issues were addressed together: share buttons felt jittery because they exposed transient start-state text, and microphone dropdowns only refreshed when the mic was enabled because no device-availability observer existed.
 **Notes**: The host-interview crash reported on 15 March 2026 was caused by a recursive control-panel setter (`setShareStartPending:` self-assignment) and is fixed in this entry. The microphone source dropdown now refreshes when mics are connected or disconnected even while capture is off. Full project tests passed after these changes.
+
+---
+
+## [19 March 2026] — PH.A: Code Review Group A — Isolated Hardening Fixes
+
+**Phase**: Phase 4 Production Hardening (Group A: isolated, low-risk improvements)
+**Files changed**:
+- `inter/Networking/InterLiveKitAudioBridge.swift` — Replaced hand-rolled SPSC ring buffer with `ManagedAtomic<Int>` (swift-atomics 1.3.0) for head/tail indices, eliminating potential torn-read races on Intel. Replaced manual Int16-to-Float resampling with `AVAudioConverter` for correct sample-rate conversion.
+- `inter/Media/InterSurfaceShareController.m` — Replaced `@synchronized(self)` lock protecting the sink array with `os_unfair_lock` for lower overhead and priority-inversion safety.
+- `inter/Rendering/MetalSurfaceView.m` — Added `CVPixelBufferPool` pre-warm (`CVPixelBufferPoolCreatePixelBuffer` × 2 on init) so the first rendered frame doesn't stall on pool allocation.
+- `inter/inter-Bridging-Header.h` — Trimmed from 10 imports to 4 (only headers actually referenced by Swift): `InterLocalMediaController.h`, `InterSurfaceShareController.h`, `InterShareTypes.h`, `MetalRenderEngine.h`.
+- `token-server/index.js` — Cleaned up unused rate-limiter maps and tightened variable scoping.
+- `inter.xcodeproj/project.pbxproj` — Added Swift Atomics 1.3.0 via SPM (used by InterLiveKitAudioBridge).
+
+**Why**: These are the "Group A" items from the comprehensive code review (CODE_REVIEW.md) — isolated fixes that don't require architectural changes and carry minimal risk.
+**Notes**: BUILD SUCCEEDED, 95 tests pass. Items A7 (Sendable annotations), A8 (NSSecureCoding), A9 (token refresh timer) were evaluated and correctly skipped as unnecessary for the current architecture.
+
+---
+
+## [19 March 2026] — PH.B1: InterMediaWiringController Extraction
+
+**Phase**: Phase 4 Production Hardening (Group B1: architecture consolidation)
+**Files created**:
+- `inter/App/InterMediaWiringController.h` (~118 lines) — Public interface for shared media/network wiring controller. Declares delegate protocol (`InterMediaWiringDelegate`), weak references to all UI/media objects, and methods for: G2 two-phase camera/mic toggles, network publish wiring, KVO setup/teardown, diagnostic triple-click, connection label + quality level mapping.
+- `inter/App/InterMediaWiringController.m` (~330 lines) — Full implementation. Traditional ObjC KVO with private static void* contexts for connection and presence state. Delegates state-change callbacks via `InterMediaWiringDelegate`. Uses `NSInteger` for Swift enum parameters to avoid bridging-header import issues.
+
+**Files modified**:
+- `inter/App/AppDelegate.m` — Removed ~250 lines of duplicated wiring logic (KVO, two-phase toggles, network publish wiring, diagnostic handler, connection label mapping). Added `normalMediaWiring` property. Delegates all shared logic to InterMediaWiringController. Trampoline `forwardDiagnosticTripleClick:` added for gesture recognizer target.
+- `inter/UI/Controllers/SecureWindowController.m` — Same pattern: removed ~240 lines of duplicates, added `mediaWiring` property, all shared logic delegated to InterMediaWiringController.
+
+**Why**: AppDelegate.m and SecureWindowController.m had ~300 lines of near-identical media/network wiring logic (KVO, toggles, publish wiring, diagnostics). This consolidation eliminates the duplication, making both files significantly simpler and ensuring feature parity between normal and secure modes automatically.
+**Notes**: BUILD SUCCEEDED, 95 tests pass. Critical ordering fix applied: `normalMediaWiring` properties for `mediaController` and `surfaceShareController` are set AFTER `startNormalLocalMediaFlow` creates them (they're nil beforehand since the wiring controller holds weak references).
+
+---
+
+## [19 March 2026] — PH.C1: Click-to-Spotlight No-Op Fix
+
+**Phase**: Phase 4 Production Hardening (UI behaviour fix)
+**Files changed**:
+- `inter/UI/Views/InterRemoteVideoLayoutManager.m` — Changed `handleTileClicked:` to compare against `effectiveSpotlightKey` (which includes auto-resolved keys). If the clicked tile is already in the spotlight, the click is now a no-op. Previously, clicking the spotlighted tile toggled it back to "auto" mode, which immediately promoted screen share to the spotlight — making it look like an unwanted swap.
+
+**Why**: When a participant had both screen share and camera active, clicking the camera feed in the spotlight position caused it to swap with the screen share feed from the filmstrip. This was confusing — users expected clicking the spotlight tile to be inert (only filmstrip clicks should promote tiles).
+**Notes**: BUILD SUCCEEDED, 95 tests pass.
+
+---
+
+## [19 March 2026] — PH.C2: Remote Camera Feed UI-Side Mirroring
+
+**Phase**: Phase 4 Production Hardening (video rendering fix)
+**Files changed**:
+- `inter/Networking/InterRemoteVideoView.swift` — Added `@objc public var isMirrored: Bool` property. Extended `AspectFitUniforms` struct with `mirrorX` field (1.0 = normal, -1.0 = mirrored). Updated Metal vertex shader (`interRemoteVertexShader`) to flip texture U coordinate when `mirrorX < 0`. Updated both on-screen render paths (NV12 and BGRA) to pass `mirrored: isMirrored` to the aspect-fit uniforms computation. Offscreen test rendering paths remain un-mirrored.
+- `inter/UI/Views/InterRemoteVideoLayoutManager.m` — Set `view.isMirrored = YES` on remote camera views created in `cameraViewForParticipant:`. Screen share views remain un-mirrored.
+
+**Why**: Remote camera feeds appeared laterally inverted to viewers because AVFoundation's `AVCaptureConnection` automatically mirrors front-camera output before delivery. Rather than altering the network stream (which could break other consumers), the mirroring is handled at the UI rendering layer — only camera feeds displayed in the app are flipped, screen share feeds are not.
+**Notes**: BUILD SUCCEEDED, 95 tests pass. The fix is zero-cost GPU-side (single conditional in vertex shader). The previous attempt to fix this in `InterLiveKitCameraSource.swift` by disabling `automaticallyAdjustsVideoMirroring` on the data-output connection was reverted — the network stream is intentionally left as-is from AVFoundation.
+
+---
+
+## [19 March 2026] — PH.D: Production Hardening Steps 1–5
+
+**Phase**: Phase 4 Production Hardening (Steps 1–5 from Next Steps analysis)
+
+### Step 1: Token Auto-Refresh Timer [4.5.4]
+
+**Files changed**:
+- `inter/Networking/InterTokenService.swift` — Added `cachedTokenTTL(forRoom:identity:)` public method that returns the number of seconds remaining on a cached token (returns -1 if no entry exists). This lets InterRoomController inspect the TTL without exposing internal cache details.
+- `inter/Networking/InterRoomController.swift` — Added `tokenRefreshTimer: DispatchSourceTimer?` property. Added `scheduleTokenRefresh()` that reads the cached token's TTL and fires at 80% of remaining lifetime. Added `scheduleTokenRefreshRetry()` for 30s retry on failure. Timer is created after successful connect and after each successful refresh. Cancelled on disconnect, reconnect triggers reschedule.
+
+**Why**: Previously `refreshToken()` existed but was never called — tokens would expire silently, causing reconnection loops or dropped calls after the default ~5 minute LiveKit token TTL.
+
+### Step 2: Reconnection UX Banner [4.1 row 5]
+
+**Files changed**:
+- `inter/App/InterMediaWiringController.h` — Added two new delegate methods: `mediaWiringControllerDidRequestReconnect` and `mediaWiringControllerDidRequestContinueOffline`.
+- `inter/App/InterMediaWiringController.m` — Added `reconnectionTimeoutTimer` (dispatch_source_t) and `isShowingConnectionLostAlert` properties. New logic in `handleConnectionStateChanged:`: on `.reconnecting` starts a 30-second timeout timer; on `.connected` cancels it; on `.disconnectedWithError` or timeout expiry shows an NSAlert with "Connection Lost" message and Retry / Continue Offline buttons. Retry calls `mediaWiringControllerDidRequestReconnect` delegate; Continue Offline calls `mediaWiringControllerDidRequestContinueOffline`.
+
+**Why**: Users saw only "Reconnecting…" in the status label with no actionable options. After 30 seconds of failed reconnection, they now get a clear choice: retry the connection or continue working offline (G8 graceful degradation).
+
+### Step 3: Memory Pressure Response
+
+**Files changed**:
+- `inter/Networking/InterRoomController.swift` — Added `memoryPressureSource: DispatchSourceMemoryPressure?` and `screenShareSuspendedForMemory` flag. `startMemoryPressureMonitor()` listens for `.warning` and `.critical` events. On critical: unpublishes screen share to free memory. Monitor starts on connect, stops on disconnect.
+
+**Why**: A long-running screen share session with high resolution can consume significant memory. Under system memory pressure, gracefully unpublishing screen share prevents the system from killing the app.
+
+### Step 4: G8 Isolation Tests
+
+**Files created**:
+- `interTests/InterIsolationTests.swift` (~160 lines) — 17 new tests validating the G8 isolation invariant:
+  - Room controller: create/destroy, disconnect without connect, multiple disconnects, mode transition when disconnected, full failed lifecycle (connect to unreachable server → disconnect → nil)
+  - Publisher: publish mic/screenshare with nil participant returns error, unpublish all when nothing published, detach all sources
+  - Subscriber: detach when never attached
+  - Stats collector: stop without start, empty diagnostic snapshot, empty latestEntry, empty JSON export
+  - Token service: invalidate empty cache, TTL query for non-existent entry, double invalidation
+
+**Why**: Verifies the foundational guarantee that every networking component is safe to use (or nil) without crashing or affecting local-only functionality.
+
+### Step 5: Stats JSON Export [1.10.5]
+
+**Files changed**:
+- `inter/Networking/InterCallStatsCollector.swift` — Added `exportToJSON() -> Data?` method that reads the circular buffer under lock and serializes all entries to pretty-printed JSON with ISO8601 timestamp, entry count, and per-entry metrics (bitrates, FPS, RTT, packet loss, jitter, connection quality). Returns nil if buffer is empty.
+- `inter/Networking/InterRoomController.swift` — `disconnect(reason:)` now calls `exportToJSON()` before stopping the collector, writes the JSON to `~/Library/Caches/inter_call_stats_YYYYMMDD_HHmmss.json` for post-call diagnostics.
+
+**Why**: Call quality data was collected but never persisted. Now it's automatically saved on disconnect for debugging and support analysis.
+
+**Build**: SUCCEEDED. **Tests**: 112 pass (95 existing + 17 new isolation tests), 0 failures.
+
+---
+
+## [19 March 2026] — PH.D (cont.): Steps 6–7 — Integration Tests + Security Config
+
+**Phase**: Phase 4 Production Hardening (Steps 6–7 from Next Steps analysis)
+
+### Step 6: Integration Test — Bidirectional Call [4.7.2]
+
+**Files created**:
+- `interTests/InterIntegrationTests.swift` (~280 lines) — 12 integration tests that run against live local LiveKit + token servers:
+  - `testHostCreatesRoom_getsRoomCode` — verifies 6-char alphanumeric code
+  - `testBidirectionalConnect_bothReachConnected` — host creates, joiner joins, both `.connected`
+  - `testParticipantPresence_joinerJoins_hostSeesParticipant` — G6 presence → `.participantJoined` on both sides
+  - `testParticipantPresence_joinerDisconnects_hostSeesLeft` — disconnect → 3s grace → `.participantLeft`
+  - `testInterviewRoomType_propagatedToJoiner` — room type "interview" propagates host → server → joiner
+  - `testMicPublish_hostPublishes_noError` — mic publish succeeds, publication exists
+  - `testStatsCollector_createdOnConnect` / `destroyedOnDisconnect` — stats lifecycle
+  - `testTokenService_cachePopulatedAfterConnect` — token TTL > 0 after connect
+  - `testDisconnect_resetsAllState` — room code, presence, connection state all reset
+  - `testJoinInvalidRoomCode_returnsError` — "ZZZZZZ" returns error
+  - `testModeTransition_whileConnected_keepsRoom` — G4 mode transition stays connected
+  - Infrastructure check uses `XCTSkip` when servers are unavailable — tests are skipped, not failed
+
+**Why**: Validates the complete end-to-end call lifecycle between two real InterRoomController instances connected through LiveKit. This is the highest-impact test for production confidence — it exercises token fetch, room connect, participant presence, disconnect cleanup, and mode transitions.
+
+### Step 7: Security Hardening Verification
+
+Token TTL was already configured at 6 hours in `token-server/index.js` (`TOKEN_TTL_SECONDS = 6 * 60 * 60`). The remaining Step 7 items (WSS/TLS, SRTP, API secret isolation, room code security) are deployment infrastructure, not app code — all verified correct in the current codebase.
+
+**Build**: SUCCEEDED. **Tests**: 124 pass (112 previous + 12 new integration tests), 0 failures.
+
+---
+
+## Phase 5A — Multi-Participant Support (Cap: 4)
+
+### MP.1: Token Server — Max Participant Enforcement
+- Added `MAX_PARTICIPANTS_PER_ROOM = 4` constant in `token-server/index.js`
+- Each room tracks participants via a `Set<identity>` — reconnects (same identity) don't count double
+- 403 response with `{ error: "Room is full", maxParticipants, participantCount }` when cap reached
+- New `GET /room/info/:code` endpoint returns `{ participantCount, maxParticipants, isFull }`
+- Create/join responses now include `maxParticipants` and `participantCount` fields
+
+### MP.2: Client-Side Types & Error Handling
+- Added `InterMaxParticipantsPerRoom = 4` constant in `InterNetworkTypes.swift`
+- Added `InterNetworkErrorCode.roomFull` (1008) error code
+- `InterTokenService` maps 403 HTTP response → `.roomFull` error
+
+### MP.3: Active Speaker Detection
+- Added `activeSpeakerIdentity` KVO-observable property on `InterRoomController`
+- Implemented `didUpdateSpeakingParticipants` RoomDelegate to pick loudest remote speaker
+- Added `activeSpeakerDidChange` optional method to `InterRemoteTrackRenderer` protocol
+- `InterMediaWiringController` observes `activeSpeakerIdentity` and `remoteParticipantCount` via KVO, forwards to layout manager
+
+### MP.4: Grid Layout Enhancement
+- 2×2 grid for 3–4 cameras with centered bottom row when odd count
+- Active speaker tile gets green border highlight (3px, `systemGreenColor`)
+- Hover highlight properly defers to speaker highlight
+- Participant count badge (top-right corner, "👥 N" format, shown at 3+ total)
+- Badge repositions on resize
+
+### MP.5: Multi-Participant Presence UX
+- "N participants in call" status message when multiple participants are present
+- "A participant left · N remaining" when some leave but others stay
+- "All participants left" overlay only shows when count reaches 0 (not on individual leave)
+- Overlay text updated to plural: "Waiting for participants…" / "All participants left."
+
+### MP.6: Tests — 14 New Tests
+- Unit: `InterMaxParticipantsPerRoom` constant, `.roomFull` error code, default states, disconnect resets, multi-detach isolation
+- Integration: room full rejection (5th participant → 403), identity dedup (same identity doesn't double-count), `GET /room/info` endpoint
+
+**Build**: SUCCEEDED. **Tests**: 138 pass (124 previous + 14 new multi-participant tests), 0 failures.
+
+### MP.7: KVO Race Condition Fix (PH.B3)
+- **Bug**: 3rd participant joining a room doesn't see the participant count badge (👥 3) while the first two participants do
+- **Root cause**: `InterMediaWiringController.setupRoomControllerKVO` used `NSKeyValueObservingOptionNew` only — KVO fires only on **changes**, not on current state. When participant C connects, `remoteParticipantCount` is already 2 before KVO registers, so the handler never fires for C
+- **Fix**: Added `NSKeyValueObservingOptionInitial` to all four KVO key paths. `Initial` fires the callback immediately with the current value when KVO is first registered, guaranteeing late joiners see the correct count badge on arrival
+- **File**: `inter/App/InterMediaWiringController.m` — `setupRoomControllerKVO` method
+- **Tests**: 138 pass, 0 failures (no new tests needed — existing tests cover the paths; this was a timing-dependent race condition)

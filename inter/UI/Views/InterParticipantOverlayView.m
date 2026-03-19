@@ -36,7 +36,7 @@
 
         case InterParticipantOverlayStateWaiting:
             self.hidden = NO;
-            self.messageLabel.stringValue = @"Waiting for participant…";
+            self.messageLabel.stringValue = @"Waiting for participants…";
             self.pulsingDot.hidden = NO;
             self.waitButton.hidden = YES;
             self.endCallButton.hidden = YES;
@@ -45,7 +45,7 @@
 
         case InterParticipantOverlayStateParticipantLeft:
             self.hidden = NO;
-            self.messageLabel.stringValue = @"Participant left.";
+            self.messageLabel.stringValue = @"All participants left.";
             self.pulsingDot.hidden = YES;
             self.waitButton.hidden = NO;
             self.endCallButton.hidden = NO;

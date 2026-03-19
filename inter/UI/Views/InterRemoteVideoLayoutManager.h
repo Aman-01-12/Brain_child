@@ -50,6 +50,15 @@ typedef NS_ENUM(NSUInteger, InterRemoteVideoLayoutMode) {
 /// Number of remote camera feeds currently displayed.
 @property (nonatomic, readonly) NSUInteger remoteCameraCount;
 
+/// Identity of the current dominant/active speaker. Empty string means none.
+/// Set by InterMediaWiringController via KVO on InterRoomController.
+/// Tiles for the active speaker get a green highlight border.
+@property (nonatomic, copy) NSString *activeSpeakerIdentity;
+
+/// Total remote participant count (including those who may not have published video yet).
+/// Used for participant count badge and overlay messaging.
+@property (nonatomic, assign) NSUInteger remoteParticipantCount;
+
 /// Optional callback fired when the user manually selects or clears a spotlight tile.
 /// This is intended for container-level UI reactions outside the layout manager itself,
 /// such as secure-mode expansion of the local-only remote preview area.

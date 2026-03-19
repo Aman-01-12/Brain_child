@@ -40,6 +40,7 @@ import AVFoundation
 import CoreMedia
 import os.log
 import LiveKit
+import Atomics
 
 // MARK: - SPSC Ring Buffer
 
@@ -47,15 +48,25 @@ import LiveKit
 /// Supports mono or stereo by interleaving: [L0, R0, L1, R1, ...].
 ///
 /// The writer (appendAudioSampleBuffer queue) and reader (WebRTC audio thread)
-/// never need to synchronize — they use atomic load/store on head/tail indices.
+/// never need to synchronize — they use atomic load/store on head/tail indices
+/// with acquire/release memory ordering to guarantee visibility of buffer writes.
+///
+/// Memory ordering contract:
+///   - Writer stores head with `.releasing` → buffer data is flushed before head advances.
+///   - Reader loads head with `.acquiring` → sees all buffer writes before acting on them.
+///   - Reader stores tail with `.releasing` → writer sees consumed range (for overwrite safety).
+///   - Writer loads tail with `.acquiring` → not currently used (write always overwrites).
 private final class AudioRingBuffer: @unchecked Sendable {
     private let capacity: Int
     private let channelCount: Int
     private let buffer: UnsafeMutablePointer<Float>
 
-    // Atomic indices (UInt64 to avoid wrapping concerns for ~12,000 years at 48kHz)
-    private var _head: UInt64 = 0  // next write position (writer-owned)
-    private var _tail: UInt64 = 0  // next read position (reader-owned)
+    /// Atomic write cursor (UInt64 to avoid wrapping concerns for ~12,000 years at 48kHz).
+    /// Writer-owned: only the producer (conversion queue) stores to this.
+    private let _head = ManagedAtomic<UInt64>(0)
+
+    /// Atomic read cursor. Reader-owned: only the consumer (WebRTC audio thread) stores to this.
+    private let _tail = ManagedAtomic<UInt64>(0)
 
     /// Create a ring buffer.
     /// - Parameters:
@@ -74,33 +85,31 @@ private final class AudioRingBuffer: @unchecked Sendable {
         buffer.deallocate()
     }
 
-    /// Number of interleaved samples available to read.
-    var availableSamples: Int {
-        let h = atomicLoadHead()
-        let t = atomicLoadTail()
-        return Int(h &- t)
-    }
-
     /// Write interleaved Float32 samples. Called by the producer (conversion queue).
     /// Overwrites oldest data if the buffer is full (acceptable for real-time audio).
     func write(_ samples: UnsafePointer<Float>, count: Int) {
-        let h = _head
+        // Relaxed load: writer owns head — no cross-thread ordering needed for the read.
+        let h = _head.load(ordering: .relaxed)
         for i in 0..<count {
             let idx = Int((h &+ UInt64(i)) % UInt64(capacity))
             buffer[idx] = samples[i]
         }
-        // Store with release semantics so reader sees the data
-        atomicStoreHead(h &+ UInt64(count))
+        // Release store: ensures all buffer writes above are visible before head advances.
+        _head.store(h &+ UInt64(count), ordering: .releasing)
     }
 
     /// Read interleaved Float32 samples into the destination buffer.
     /// Called by the consumer (WebRTC audio thread).
     /// Returns the number of samples actually read. If not enough data, fills remainder with silence.
     func read(into destination: UnsafeMutablePointer<Float>, count: Int) -> Int {
-        let available = availableSamples
+        // Acquire load: reader must see all buffer writes completed before this head value.
+        let h = _head.load(ordering: .acquiring)
+        // Relaxed load: reader owns tail.
+        let t = _tail.load(ordering: .relaxed)
+
+        let available = Int(h &- t)
         let toRead = min(count, available)
 
-        let t = _tail
         for i in 0..<toRead {
             let idx = Int((t &+ UInt64(i)) % UInt64(capacity))
             destination[i] = buffer[idx]
@@ -111,42 +120,16 @@ private final class AudioRingBuffer: @unchecked Sendable {
                 destination[i] = 0
             }
         }
-        atomicStoreTail(t &+ UInt64(toRead))
+        // Release store: marks consumed range (not strictly needed since writer doesn't
+        // check space, but correct for potential future full-check).
+        _tail.store(t &+ UInt64(toRead), ordering: .releasing)
         return toRead
     }
 
-    /// Reset the buffer (called when stopping).
+    /// Reset the buffer (called when both threads are quiescent).
     func reset() {
-        _head = 0
-        _tail = 0
-    }
-
-    // MARK: - Atomics (using OSAtomic-free approach via volatile-like access)
-    // On arm64, aligned 64-bit loads/stores are naturally atomic.
-    // For additional safety, we use Swift's withUnsafeMutablePointer.
-
-    private func atomicLoadHead() -> UInt64 {
-        return withUnsafeMutablePointer(to: &_head) { ptr in
-            ptr.withMemoryRebound(to: UInt64.self, capacity: 1) { $0.pointee }
-        }
-    }
-
-    private func atomicStoreHead(_ value: UInt64) {
-        withUnsafeMutablePointer(to: &_head) { ptr in
-            ptr.withMemoryRebound(to: UInt64.self, capacity: 1) { $0.pointee = value }
-        }
-    }
-
-    private func atomicLoadTail() -> UInt64 {
-        return withUnsafeMutablePointer(to: &_tail) { ptr in
-            ptr.withMemoryRebound(to: UInt64.self, capacity: 1) { $0.pointee }
-        }
-    }
-
-    private func atomicStoreTail(_ value: UInt64) {
-        withUnsafeMutablePointer(to: &_tail) { ptr in
-            ptr.withMemoryRebound(to: UInt64.self, capacity: 1) { $0.pointee = value }
-        }
+        _head.store(0, ordering: .relaxed)
+        _tail.store(0, ordering: .relaxed)
     }
 }
 
@@ -192,6 +175,12 @@ private final class AudioRingBuffer: @unchecked Sendable {
     /// Scratch buffer for format conversion (reused to avoid allocation).
     /// Protected by conversionQueue.
     private var conversionScratch: [Float] = []
+
+    /// AVAudioConverter for sample rate conversion (reused across calls).
+    /// Protected by conversionQueue.
+    private var sampleRateConverter: AVAudioConverter?
+    /// Source format of the current converter (invalidated on format change).
+    private var converterSourceRate: Double = 0
 
     // MARK: - InterShareSink: Start
 
@@ -288,6 +277,8 @@ private final class AudioRingBuffer: @unchecked Sendable {
         audioTrack = nil
         ringBuffer?.reset()
         ringBuffer = nil
+        sampleRateConverter = nil
+        converterSourceRate = 0
 
         interLogInfo(InterLog.media, "AudioBridge: stopped")
         completion?()
@@ -527,26 +518,140 @@ private final class AudioRingBuffer: @unchecked Sendable {
         }
 
         // Handle sample rate mismatch: if source rate differs from WebRTC's expected rate,
-        // we do a simple nearest-neighbor resample. A proper resampler (vDSP_desamp)
-        // would be better but this handles the common case.
+        // use AVAudioConverter for proper sinc-interpolated resampling (replaces the
+        // nearest-neighbor approximation that caused audible aliasing with non-standard devices).
         if Int(sampleRate) != webrtcSampleRate && webrtcSampleRate > 0 {
-            let ratio = sampleRate / Double(webrtcSampleRate)
-            let outputFrames = Int(Double(frameLength) / ratio)
-            let outputTotal = outputFrames * channels
-            var resampledScratch = [Float](repeating: 0, count: outputTotal)
-            for i in 0..<outputFrames {
-                let srcIdx = min(Int(Double(i) * ratio), frameLength - 1)
-                for ch in 0..<channels {
-                    resampledScratch[i * channels + ch] = conversionScratch[srcIdx * channels + ch]
+            guard let resampled = resampleConversionScratch(
+                frameCount: frameLength,
+                channels: channels,
+                sourceRate: sampleRate
+            ) else {
+                // Fallback: write unresampled data (better than silence)
+                conversionScratch.withUnsafeBufferPointer { ptr in
+                    ringBuffer.write(ptr.baseAddress!, count: totalSamples)
                 }
+                return
             }
-            resampledScratch.withUnsafeBufferPointer { ptr in
-                ringBuffer.write(ptr.baseAddress!, count: outputTotal)
+            resampled.withUnsafeBufferPointer { ptr in
+                ringBuffer.write(ptr.baseAddress!, count: ptr.count)
             }
         } else {
             conversionScratch.withUnsafeBufferPointer { ptr in
                 ringBuffer.write(ptr.baseAddress!, count: totalSamples)
             }
         }
+    }
+
+    // MARK: - Private: Sample Rate Conversion
+
+    /// Resample interleaved Int16-scaled Float32 data from `conversionScratch` to WebRTC's
+    /// expected sample rate using AVAudioConverter (sinc interpolation, anti-aliased).
+    /// Runs on conversionQueue only.
+    ///
+    /// - Parameters:
+    ///   - frameCount: Number of audio frames in conversionScratch
+    ///   - channels: Number of audio channels
+    ///   - sourceRate: Source sample rate
+    /// - Returns: Interleaved resampled data, or nil on failure
+    private func resampleConversionScratch(
+        frameCount: Int,
+        channels: Int,
+        sourceRate: Double
+    ) -> [Float]? {
+        let destRate = Double(webrtcSampleRate)
+
+        // Create or reuse converter (invalidate on source rate change)
+        if sampleRateConverter == nil || converterSourceRate != sourceRate {
+            let srcFormat = AVAudioFormat(
+                commonFormat: .pcmFormatFloat32,
+                sampleRate: sourceRate,
+                channels: AVAudioChannelCount(channels),
+                interleaved: false
+            )
+            let dstFormat = AVAudioFormat(
+                commonFormat: .pcmFormatFloat32,
+                sampleRate: destRate,
+                channels: AVAudioChannelCount(channels),
+                interleaved: false
+            )
+            guard let srcFmt = srcFormat, let dstFmt = dstFormat,
+                  let converter = AVAudioConverter(from: srcFmt, to: dstFmt) else {
+                interLogError(InterLog.media,
+                              "AudioBridge: failed to create AVAudioConverter (%{public}.0f → %{public}.0f Hz)",
+                              sourceRate, destRate)
+                return nil
+            }
+            converter.sampleRateConverterQuality = .max  // highest quality sinc interpolation
+            sampleRateConverter = converter
+            converterSourceRate = sourceRate
+        }
+
+        guard let converter = sampleRateConverter else { return nil }
+
+        // Build source PCM buffer (non-interleaved) from conversionScratch (interleaved)
+        guard let srcFormat = converter.inputFormat as AVAudioFormat?,
+              let srcBuffer = AVAudioPCMBuffer(
+                  pcmFormat: srcFormat,
+                  frameCapacity: AVAudioFrameCount(frameCount)
+              ) else { return nil }
+
+        srcBuffer.frameLength = AVAudioFrameCount(frameCount)
+        if let channelData = srcBuffer.floatChannelData {
+            for ch in 0..<channels {
+                let dst = channelData[ch]
+                if channels == 1 {
+                    for i in 0..<frameCount { dst[i] = conversionScratch[i] }
+                } else {
+                    for i in 0..<frameCount {
+                        dst[i] = conversionScratch[i * channels + ch]
+                    }
+                }
+            }
+        }
+
+        // Allocate output buffer
+        let ratio = destRate / sourceRate
+        let outputFrames = AVAudioFrameCount(ceil(Double(frameCount) * ratio))
+        guard let dstBuffer = AVAudioPCMBuffer(
+            pcmFormat: converter.outputFormat,
+            frameCapacity: outputFrames
+        ) else { return nil }
+
+        // Convert
+        var error: NSError?
+        var inputProvided = false
+        let status = converter.convert(to: dstBuffer, error: &error) { _, outStatus in
+            if inputProvided {
+                outStatus.pointee = .noDataNow
+                return nil
+            }
+            outStatus.pointee = .haveData
+            inputProvided = true
+            return srcBuffer
+        }
+
+        guard status != .error else {
+            interLogError(InterLog.media, "AudioBridge: AVAudioConverter failed: %{public}@",
+                          error?.localizedDescription ?? "unknown")
+            return nil
+        }
+
+        // Re-interleave output into [Float]
+        let outFrames = Int(dstBuffer.frameLength)
+        let outTotal = outFrames * channels
+        var result = [Float](repeating: 0, count: outTotal)
+        if let channelData = dstBuffer.floatChannelData {
+            if channels == 1 {
+                let src = channelData[0]
+                for i in 0..<outFrames { result[i] = src[i] }
+            } else {
+                for i in 0..<outFrames {
+                    for ch in 0..<channels {
+                        result[i * channels + ch] = channelData[ch][i]
+                    }
+                }
+            }
+        }
+        return result
     }
 }

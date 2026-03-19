@@ -368,6 +368,18 @@ static CVReturn InterDisplayLinkCallback(CVDisplayLinkRef displayLink,
     }
     _pixelBufferPool = [self createPixelBufferPoolForWidth:width height:height];
 
+    // Pre-warm the pool: allocate and immediately release one buffer so the first
+    // real readback on the display-link thread doesn't trigger a pool expansion.
+    if (_pixelBufferPool != NULL) {
+        CVPixelBufferRef warmupBuffer = NULL;
+        CVReturn warmupResult = CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault,
+                                                                   _pixelBufferPool,
+                                                                   &warmupBuffer);
+        if (warmupResult == kCVReturnSuccess && warmupBuffer != NULL) {
+            CVPixelBufferRelease(warmupBuffer);
+        }
+    }
+
     _readbackBytesPerRow = [self alignedBytesPerRowForWidth:width];
     _readbackBufferLength = _readbackBytesPerRow * height;
     for (NSUInteger i = 0; i < 3; i++) {

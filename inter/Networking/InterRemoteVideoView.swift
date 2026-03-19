@@ -80,6 +80,10 @@ enum DetectedFormat {
     /// Whether the view has ever received a frame.
     @objc public private(set) var hasReceivedFrame: Bool = false
 
+    /// When YES, the rendered image is flipped horizontally (mirror).
+    /// Used for remote camera feeds so they appear natural to the viewer.
+    @objc public var isMirrored: Bool = false
+
     // MARK: - Metal State
 
     private var device: MTLDevice!
@@ -408,7 +412,8 @@ enum DetectedFormat {
             videoWidth: Float(width),
             videoHeight: Float(height),
             viewWidth: Float(drawable.texture.width),
-            viewHeight: Float(drawable.texture.height)
+            viewHeight: Float(drawable.texture.height),
+            mirrored: isMirrored
         )
         encoder.setVertexBytes(&aspectUniforms, length: MemoryLayout<AspectFitUniforms>.stride, index: 0)
 
@@ -459,7 +464,8 @@ enum DetectedFormat {
             videoWidth: Float(width),
             videoHeight: Float(height),
             viewWidth: Float(drawable.texture.width),
-            viewHeight: Float(drawable.texture.height)
+            viewHeight: Float(drawable.texture.height),
+            mirrored: isMirrored
         )
         encoder.setVertexBytes(&aspectUniforms, length: MemoryLayout<AspectFitUniforms>.stride, index: 0)
 
@@ -667,16 +673,20 @@ enum DetectedFormat {
         var scaleY: Float
         var offsetX: Float
         var offsetY: Float
+        var mirrorX: Float   // 1.0 = normal, -1.0 = horizontally mirrored
+        var _pad1: Float = 0 // padding to 24 bytes (6 floats)
     }
 
     func computeAspectFitUniforms(
         videoWidth: Float,
         videoHeight: Float,
         viewWidth: Float,
-        viewHeight: Float
+        viewHeight: Float,
+        mirrored: Bool = false
     ) -> AspectFitUniforms {
         guard videoWidth > 0, videoHeight > 0, viewWidth > 0, viewHeight > 0 else {
-            return AspectFitUniforms(scaleX: 1, scaleY: 1, offsetX: 0, offsetY: 0)
+            return AspectFitUniforms(scaleX: 1, scaleY: 1, offsetX: 0, offsetY: 0,
+                                     mirrorX: mirrored ? -1.0 : 1.0)
         }
 
         let videoAspect = videoWidth / videoHeight
@@ -693,7 +703,8 @@ enum DetectedFormat {
             scaleX = videoAspect / viewAspect
         }
 
-        return AspectFitUniforms(scaleX: scaleX, scaleY: scaleY, offsetX: 0, offsetY: 0)
+        return AspectFitUniforms(scaleX: scaleX, scaleY: scaleY, offsetX: 0, offsetY: 0,
+                                 mirrorX: mirrored ? -1.0 : 1.0)
     }
 
     // MARK: - Format Detection [G3 / 1.11.8]
@@ -738,6 +749,8 @@ enum DetectedFormat {
         float scaleY;
         float offsetX;
         float offsetY;
+        float mirrorX;   // 1.0 = normal, -1.0 = mirrored
+        float _pad1;
     };
 
     struct VertexOut {
@@ -747,6 +760,7 @@ enum DetectedFormat {
 
     // Quad vertex shader: 4 vertices forming a triangle strip.
     // Positions are scaled by aspect-fit uniforms; UVs map exactly [0,1].
+    // mirrorX flips the texture horizontally for mirrored camera feeds.
     vertex VertexOut interRemoteVertexShader(
         uint vertexID [[vertex_id]],
         constant AspectFitUniforms &uniforms [[buffer(0)]]
@@ -770,7 +784,12 @@ enum DetectedFormat {
         pos.x *= uniforms.scaleX;
         pos.y *= uniforms.scaleY;
         out.position = float4(pos, 0.0, 1.0);
-        out.texCoord = texCoords[vertexID];
+        float2 tc = texCoords[vertexID];
+        // Mirror: flip U coordinate around 0.5 center
+        if (uniforms.mirrorX < 0.0) {
+            tc.x = 1.0 - tc.x;
+        }
+        out.texCoord = tc;
         return out;
     }
 

@@ -3,16 +3,11 @@
 //  inter
 //
 //  Bridging header for Swift ↔ Objective-C interop.
-//  Import ObjC headers here that Swift files need access to.
+//  Import ONLY ObjC headers whose types are referenced from Swift code.
+//  Adding unused headers slows incremental compilation.
 //
 
-#import "InterAppSettings.h"
-#import "InterCallSessionCoordinator.h"
-#import "InterLocalMediaController.h"
-#import "InterSurfaceShareController.h"
 #import "InterShareTypes.h"
 #import "InterShareVideoFrame.h"
 #import "InterShareSink.h"
-#import "InterShareVideoSource.h"
 #import "MetalRenderEngine.h"
-#import "MetalSurfaceView.h"

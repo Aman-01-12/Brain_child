@@ -28,11 +28,13 @@ const LIVEKIT_API_SECRET = process.env.LIVEKIT_API_SECRET || 'secret';
 const PORT = process.env.PORT || 3000;
 const TOKEN_TTL_SECONDS = 6 * 60 * 60; // 6 hours
 const ROOM_CODE_EXPIRY_MS = 24 * 60 * 60 * 1000; // 24 hours
+const MAX_PARTICIPANTS_PER_ROOM = 4; // Soft cap — designed for N, shipping at 4
 
 // ---------------------------------------------------------------------------
 // In-memory room code store (Redis in production — see plan step 5.2.3)
-// Map: roomCode → { roomName, createdAt, hostIdentity, roomType }
+// Map: roomCode → { roomName, createdAt, hostIdentity, roomType, participants }
 // roomType: "call" | "interview" (extensible for future types)
+// participants: Set<string> of identity strings currently in the room
 // ---------------------------------------------------------------------------
 const roomCodes = new Map();
 
@@ -101,7 +103,7 @@ async function createToken(identity, displayName, roomName, isHost, metadata = n
 }
 
 // ---------------------------------------------------------------------------
-// Cleanup expired room codes (runs every hour)
+// Cleanup expired room codes and stale rate-limit entries (runs every hour)
 // ---------------------------------------------------------------------------
 setInterval(() => {
   const now = Date.now();
@@ -109,6 +111,12 @@ setInterval(() => {
     if (now - data.createdAt > ROOM_CODE_EXPIRY_MS) {
       roomCodes.delete(code);
       console.log(`[audit] Room code expired and removed: ${code}`);
+    }
+  }
+  // Purge stale rate-limit entries to prevent unbounded memory growth
+  for (const [identity, entry] of rateLimitMap) {
+    if (now - entry.windowStart > RATE_LIMIT_WINDOW_MS) {
+      rateLimitMap.delete(identity);
     }
   }
 }, 60 * 60 * 1000);
@@ -146,6 +154,7 @@ app.post('/room/create', async (req, res) => {
     createdAt: Date.now(),
     hostIdentity: identity,
     roomType,
+    participants: new Set([identity]),
   });
 
   try {
@@ -161,6 +170,8 @@ app.post('/room/create', async (req, res) => {
       token: jwt,
       serverURL: process.env.LIVEKIT_SERVER_URL || 'ws://localhost:7880',
       roomType,
+      maxParticipants: MAX_PARTICIPANTS_PER_ROOM,
+      participantCount: 1,
     });
   } catch (err) {
     console.error(`[error] Token creation failed for ${identity}:`, err.message);
@@ -198,17 +209,30 @@ app.post('/room/join', async (req, res) => {
     return res.status(410).json({ error: 'Room code has expired' });
   }
 
+  // Enforce participant cap (soft — identity dedup means reconnects don't count double)
+  if (!roomData.participants.has(identity) && roomData.participants.size >= MAX_PARTICIPANTS_PER_ROOM) {
+    console.log(`[audit] Room full: code=${roomCode} rejected=${identity} (${roomData.participants.size}/${MAX_PARTICIPANTS_PER_ROOM})`);
+    return res.status(403).json({
+      error: 'Room is full',
+      maxParticipants: MAX_PARTICIPANTS_PER_ROOM,
+      participantCount: roomData.participants.size,
+    });
+  }
+
   try {
     // Assign role based on room type — joiners of interview rooms are interviewees
     const joinerRole = (roomData.roomType === 'interview') ? 'interviewee' : null;
     const metadata = joinerRole ? { role: joinerRole } : null;
     const jwt = await createToken(identity, displayName, roomData.roomName, false, metadata);
-    console.log(`[audit] Room joined: code=${roomCode} type=${roomData.roomType} participant=${identity}`);
+    roomData.participants.add(identity);
+    console.log(`[audit] Room joined: code=${roomCode} type=${roomData.roomType} participant=${identity} (${roomData.participants.size}/${MAX_PARTICIPANTS_PER_ROOM})`);
     res.json({
       roomName: roomData.roomName,
       token: jwt,
       serverURL: process.env.LIVEKIT_SERVER_URL || 'ws://localhost:7880',
       roomType: roomData.roomType,
+      maxParticipants: MAX_PARTICIPANTS_PER_ROOM,
+      participantCount: roomData.participants.size,
     });
   } catch (err) {
     console.error(`[error] Token creation failed for ${identity}:`, err.message);
@@ -253,6 +277,32 @@ app.post('/token/refresh', async (req, res) => {
     console.error(`[error] Token refresh failed for ${identity}:`, err.message);
     res.status(500).json({ error: 'Failed to refresh token' });
   }
+});
+
+// ---------------------------------------------------------------------------
+// GET /room/info/:code — check room status without joining
+// Returns: { roomCode, roomType, participantCount, maxParticipants, isFull }
+// ---------------------------------------------------------------------------
+app.get('/room/info/:code', (req, res) => {
+  const roomCode = req.params.code.toUpperCase();
+  const roomData = roomCodes.get(roomCode);
+
+  if (!roomData) {
+    return res.status(404).json({ error: 'Invalid room code' });
+  }
+
+  if (Date.now() - roomData.createdAt > ROOM_CODE_EXPIRY_MS) {
+    roomCodes.delete(roomCode);
+    return res.status(410).json({ error: 'Room code has expired' });
+  }
+
+  res.json({
+    roomCode,
+    roomType: roomData.roomType,
+    participantCount: roomData.participants.size,
+    maxParticipants: MAX_PARTICIPANTS_PER_ROOM,
+    isFull: roomData.participants.size >= MAX_PARTICIPANTS_PER_ROOM,
+  });
 });
 
 // ---------------------------------------------------------------------------
