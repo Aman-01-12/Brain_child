@@ -650,3 +650,91 @@ Token TTL was already configured at 6 hours in `token-server/index.js` (`TOKEN_T
 - **Fix**: Added `NSKeyValueObservingOptionInitial` to all four KVO key paths. `Initial` fires the callback immediately with the current value when KVO is first registered, guaranteeing late joiners see the correct count badge on arrival
 - **File**: `inter/App/InterMediaWiringController.m` — `setupRoomControllerKVO` method
 - **Tests**: 138 pass, 0 failures (no new tests needed — existing tests cover the paths; this was a timing-dependent race condition)
+---
+
+## [26 March 2026] — Phase 6.1: Redis Migration (Token Server)
+
+**Phase**: 6.1 from `implementation_plan.md`
+**Files changed**:
+- `token-server/redis.js` — CREATED. Redis client module using `ioredis`. Connects to `REDIS_URL` env var (default `redis://localhost:6379`). Graceful reconnection with exponential backoff (max 10 retries). Event logging for connect/error/close.
+- `token-server/index.js` — REWRITTEN. Migrated from in-memory `Map` objects to Redis:
+  - Room data → Redis Hash `room:{CODE}` with fields: `roomName`, `createdAt`, `hostIdentity`, `roomType`. Auto-expires via `EXPIRE 86400` (24h TTL).
+  - Participants → Redis Set `room:{CODE}:participants`. Auto-expires via same TTL.
+  - Rate limiting → Redis key `ratelimit:{identity}` with `INCR` + `EXPIRE 60`. Atomic, no cleanup needed.
+  - Removed `setInterval` cleanup block — Redis TTL handles all expiry automatically.
+  - Added `dotenv` config loading (`require('dotenv').config()`).
+  - All endpoints now async (Redis commands return promises).
+  - `/health` endpoint now returns Redis connection status (`redis.ping()`), returns 503 if Redis is down.
+  - Room key helpers: `roomKey()`, `roomParticipantsKey()`, `getRoomData()`, `getParticipantCount()`, `isParticipant()`, `addParticipant()`.
+  - Uses `redis.pipeline()` for atomic multi-key writes in `/room/create`.
+- `token-server/.env.example` — CREATED. Documents all env vars: `REDIS_URL`, `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET`, `LIVEKIT_SERVER_URL`, `PORT`.
+- `token-server/package.json` — MODIFIED. Added `ioredis` and `dotenv` dependencies.
+
+**Why**: In-memory Maps don't survive server restarts (all rooms lost). Redis provides persistent ephemeral storage with automatic TTL-based cleanup, eliminates the hourly `setInterval` cleanup, and is the foundation for multi-instance deployment (horizontal scaling).
+
+**Verification**:
+- All 5 endpoints tested via curl: `/room/create`, `/room/join`, `/token/refresh`, `/room/info/:code`, `/health`
+- Redis-cli confirms: room hash stored correctly, participant set populated, TTL = ~86400s, rate limit keys auto-expire
+- Edge cases verified: invalid room code (404), missing fields (400), interview room type (metadata stamped), reconnect dedup (same identity doesn't double-count)
+- **138/138 Xcode tests pass** (0 failures) — client integration fully compatible with Redis-backed server
+
+---
+
+## [26 March 2026] — Phase 6.2: PostgreSQL Schema + Migrations
+
+**Phase**: 6.2 from `implementation_plan.md`
+**Files changed**:
+- `token-server/db.js` — CREATED. PostgreSQL connection pool using `pg`. Connects to `DATABASE_URL` env var (default `postgresql://localhost:5432/inter_dev`). Pool: max 10 connections, 30s idle timeout, 5s connection timeout. Exports `query()`, `getClient()`, `pool`.
+- `token-server/migrate.js` — CREATED. Sequential SQL migration runner. Tracks applied migrations in `schema_migrations` table. Reads `.sql` files from `./migrations/` sorted lexicographically. Each migration runs in a transaction (BEGIN/COMMIT/ROLLBACK). Idempotent — skips already-applied migrations.
+- `token-server/migrations/001_initial_schema.sql` — CREATED. Foundation schema:
+  - `users` table: UUID PK, email (unique), display_name, password_hash, tier (free|pro|hiring), created_at, updated_at. `updated_at` trigger auto-updates on row change.
+  - `meetings` table: UUID PK, host_user_id (FK→users), room_code, room_name, room_type (call|interview), status (active|ended), started_at, ended_at, max_participants. Partial index on `room_code WHERE status='active'`.
+  - `meeting_participants` table: UUID PK, meeting_id (FK→meetings), user_id (FK→users, nullable for anonymous), identity, display_name, role (host|co-host|presenter|participant|interviewer|interviewee), joined_at, left_at.
+  - All CHECK constraints, indexes on FKs, and cascading deletes configured.
+- `token-server/index.js` — MODIFIED. Added `require('./db')`, updated `/health` to include PostgreSQL connection check (`SELECT 1`).
+- `token-server/.env.example` — MODIFIED. Added `DATABASE_URL` variable.
+- `token-server/package.json` — MODIFIED. Added `pg` dependency.
+
+**Why**: PostgreSQL provides persistent storage for user accounts, meeting history, and participant logs. This is the foundation for auth (Phase 6.3), meeting management (Phase 9), and all features requiring data persistence.
+
+**Verification**:
+- `node migrate.js` applies 001_initial_schema.sql successfully
+- `psql -d inter_dev -c "\dt"` shows 4 tables: users, meetings, meeting_participants, schema_migrations
+- All column types, constraints, indexes, triggers verified via `\d` output
+- `GET /health` returns `{"status":"ok","redis":"connected","postgres":"connected","rooms":0}`
+- Re-running `node migrate.js` correctly reports "No pending migrations" (idempotent)
+
+---
+
+## [26 March 2026] — Phase 6.3: Authentication Middleware
+
+**Phase**: 6.3 from `implementation_plan.md`
+**Files changed**:
+- `token-server/auth.js` — CREATED. Full authentication module:
+  - `register(email, password, displayName)` — bcrypt hash (12 rounds), INSERT user, return user auth JWT
+  - `login(email, password)` — verify credentials, return JWT
+  - `authenticateToken` middleware — OPTIONAL. Checks `Authorization: Bearer` header. If present+valid → `req.user`. If absent → `req.user = null` (anonymous). If present+invalid → 401.
+  - `requireAuth` middleware — requires `req.user` to be non-null (401 if missing)
+  - `requireTier(minTier)` middleware — tier hierarchy: free < pro < hiring. Returns 403 if insufficient tier.
+  - User auth JWTs expire in 7 days, separate from LiveKit room JWTs.
+- `token-server/index.js` — MODIFIED:
+  - Added `require('./auth')`, applied `auth.authenticateToken` globally as Express middleware
+  - Added `POST /auth/register`, `POST /auth/login`, `GET /auth/me` (requires auth)
+  - `/room/create`: If `req.user` exists, persists meeting to `meetings` table + host to `meeting_participants`. Stores `meetingId` in Redis Hash for join-time reference. Best-effort — failure doesn't break room creation.
+  - `/room/join`: If `roomData.meetingId` exists, persists joiner to `meeting_participants` (user_id is NULL for anonymous guests).
+- `token-server/.env.example` — MODIFIED. Added `JWT_SECRET` variable.
+- `token-server/package.json` — MODIFIED. Added `bcryptjs` and `jsonwebtoken` dependencies.
+
+**Why**: Authentication is additive — the existing anonymous flow is completely untouched. Hosts who register get meeting history, participant tracking, and tier-based feature gating. Anonymous joiners can still join via room code with zero friction (Zoom model).
+
+**Verification**:
+- `POST /auth/register` → 201 with user + JWT
+- `POST /auth/login` → 200 with user + JWT
+- `GET /auth/me` with Bearer token → user info; without → 401
+- Duplicate email → 409 "Email already registered"
+- Wrong password → 401 "Invalid email or password"
+- Short password (<8 chars) → 400
+- Authenticated `POST /room/create` → Meeting persisted to PostgreSQL. Host logged as first participant with `role=host` and `user_id` linked.
+- Anonymous `POST /room/create` → Works exactly as before (no DB write)
+- Anonymous `POST /room/join` on authenticated room → Participant tracked with `user_id=NULL`, `role=participant`
+- **138/138 Xcode tests pass** (0 failures) — existing client fully backward-compatible

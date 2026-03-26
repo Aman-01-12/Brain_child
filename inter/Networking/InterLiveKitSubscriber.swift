@@ -52,6 +52,9 @@ import LiveKit
     /// A remote track ended (participant unpublished or left).
     @objc func remoteTrackDidEnd(_ kind: InterTrackKind, forParticipant participantId: String)
 
+    /// A remote participant's display name was discovered or updated.
+    @objc optional func remoteParticipantDidUpdateDisplayName(_ displayName: String, forParticipant participantId: String)
+
     /// The active/dominant speaker changed. Identity is empty string when no remote speaker is active.
     @objc optional func activeSpeakerDidChange(_ participantId: String)
 }
@@ -162,6 +165,11 @@ extension InterLiveKitSubscriber: RoomDelegate {
                      publication.sid.stringValue, participant.identity?.stringValue ?? "(unknown)")
 
         let participantId = participant.identity?.stringValue ?? "(unknown)"
+        let participantName = participant.name ?? participantId
+
+        // Forward the participant's display name to the renderer so tiles show
+        // human-readable labels instead of the raw identity UUID.
+        trackRenderer?.remoteParticipantDidUpdateDisplayName?(participantName, forParticipant: participantId)
 
         // Video tracks: attach a per-participant renderer
         if let videoTrack = track as? RemoteVideoTrack {

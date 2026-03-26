@@ -135,6 +135,8 @@ static NSString *const kScreenShareTileKey = @"__screenshare__";
 // ---------------------------------------------------------------------------
 @interface InterRemoteVideoLayoutManager ()
 
+/// Per-participant display names, keyed by participant identity string.
+@property (nonatomic, strong) NSMutableDictionary<NSString *, NSString *> *participantDisplayNames;
 /// Per-participant remote camera views, keyed by participant identity string.
 @property (nonatomic, strong) NSMutableDictionary<NSString *, InterRemoteVideoView *> *remoteCameraViews;
 /// Insertion-order list of participant IDs so grid layout is deterministic.
@@ -192,6 +194,7 @@ static const CGFloat kAnimationDuration      = 0.3;
     self.wantsLayer = YES;
     self.layer.backgroundColor = [NSColor blackColor].CGColor;
 
+    self.participantDisplayNames = [NSMutableDictionary dictionary];
     self.remoteCameraViews   = [NSMutableDictionary dictionary];
     self.cameraParticipantOrder = [NSMutableArray array];
     self.tileViews           = [NSMutableDictionary dictionary];
@@ -242,12 +245,24 @@ static const CGFloat kAnimationDuration      = 0.3;
 
 #pragma mark - Tile Factory
 
-/// Returns display name for a tile key. Screen share → "Screen Share", camera → participant ID.
+/// Returns display name for a tile key. Screen share → "Screen Share", camera → registered display name.
 - (NSString *)displayNameForTileKey:(NSString *)key {
     if ([key isEqualToString:kScreenShareTileKey]) {
         return @"Screen Share";
     }
-    return key;
+    NSString *registeredName = self.participantDisplayNames[key];
+    return registeredName.length > 0 ? registeredName : key;
+}
+
+- (void)registerDisplayName:(NSString *)displayName forParticipant:(NSString *)participantId {
+    if (!participantId || participantId.length == 0) return;
+    self.participantDisplayNames[participantId] = displayName ?: participantId;
+
+    // Update existing tile label if the tile was already created before the name arrived.
+    InterRemoteVideoTileView *tile = self.tileViews[participantId];
+    if (tile) {
+        tile.nameLabel.stringValue = [self displayNameForTileKey:participantId];
+    }
 }
 
 /// Wraps an InterRemoteVideoView in a tile (or returns existing tile).
@@ -314,6 +329,7 @@ static const CGFloat kAnimationDuration      = 0.3;
         [self removeTileForKey:participantId];
         [self.remoteCameraViews removeObjectForKey:participantId];
         [self.cameraParticipantOrder removeObject:participantId];
+        [self.participantDisplayNames removeObjectForKey:participantId];
     }
 
     // If the removed camera was spotlighted, reset to auto
@@ -821,6 +837,7 @@ static const CGFloat kAnimationDuration      = 0.3;
     }
     [self.remoteCameraViews removeAllObjects];
     [self.cameraParticipantOrder removeAllObjects];
+    [self.participantDisplayNames removeAllObjects];
 
     // Clean screen share state
     [self.remoteScreenShareView shutdownRenderingSynchronously];

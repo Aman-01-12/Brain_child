@@ -90,4 +90,13 @@
     });
 }
 
+- (void)remoteParticipantDidUpdateDisplayName:(NSString *)displayName forParticipant:(NSString *)participantId {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        InterRemoteVideoLayoutManager *mgr = self.layoutManager;
+        if (mgr) {
+            [mgr registerDisplayName:displayName forParticipant:participantId];
+        }
+    });
+}
+
 @end

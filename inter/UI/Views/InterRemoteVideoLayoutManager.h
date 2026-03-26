@@ -108,6 +108,11 @@ typedef NS_ENUM(NSUInteger, InterRemoteVideoLayoutMode) {
 /// Call when a remote track ends completely.
 - (void)handleRemoteTrackEnded:(NSUInteger)trackKind forParticipant:(NSString *)participantId;
 
+/// Register a human-readable display name for a participant identity.
+/// Once registered, tiles for this participant show the display name
+/// instead of the raw identity string (UUID).
+- (void)registerDisplayName:(NSString *)displayName forParticipant:(NSString *)participantId;
+
 /// Programmatically spotlight a specific feed.
 /// @param tileKey The tile key to spotlight. Screen share tile key is @"__screenshare__".
 ///                Camera tile keys are the participant identity string.

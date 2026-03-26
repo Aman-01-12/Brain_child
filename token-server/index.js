@@ -1,24 +1,39 @@
 // ============================================================================
 // Token Server for Inter — LiveKit Integration
-// Phase 0.2 [G7]
+// Phase 6.1 [G6.1] — Redis-backed
 //
 // Endpoints:
 //   POST /room/create  — Host creates a room, gets a 6-char code + JWT
 //   POST /room/join    — Joiner enters a room code, gets a JWT
 //   POST /token/refresh — Refresh an expiring JWT for an active participant
+//   GET  /room/info/:code — Check room status without joining
+//   GET  /health       — Health check (includes Redis status)
+//
+// STORAGE:
+//   Room data  → Redis Hash  `room:{CODE}`  (TTL 24h, auto-expires)
+//   Participants → Redis Set `room:{CODE}:participants`  (TTL 24h)
+//   Rate limits → Redis key  `ratelimit:{identity}`  (TTL 60s, INCR)
 //
 // SECURITY:
 //   - API key/secret are server-side only. NEVER sent to the client.
 //   - Tokens are returned but NEVER logged.
-//   - Room codes expire after 24 hours.
-//   - Rate limited: 10 requests/minute per identity.
+//   - Room codes expire after 24 hours (Redis TTL — no manual cleanup).
+//   - Rate limited: 10 requests/minute per identity (Redis INCR+EXPIRE).
 // ============================================================================
+
+require('dotenv').config();
 
 const express = require('express');
 const { AccessToken } = require('livekit-server-sdk');
+const redis = require('./redis');
+const db = require('./db');
+const auth = require('./auth');
 
 const app = express();
 app.use(express.json());
+
+// Apply optional auth middleware globally — attaches req.user if Bearer token present
+app.use(auth.authenticateToken);
 
 // ---------------------------------------------------------------------------
 // Configuration — from environment or dev defaults
@@ -27,33 +42,25 @@ const LIVEKIT_API_KEY = process.env.LIVEKIT_API_KEY || 'devkey';
 const LIVEKIT_API_SECRET = process.env.LIVEKIT_API_SECRET || 'secret';
 const PORT = process.env.PORT || 3000;
 const TOKEN_TTL_SECONDS = 6 * 60 * 60; // 6 hours
-const ROOM_CODE_EXPIRY_MS = 24 * 60 * 60 * 1000; // 24 hours
+const ROOM_CODE_EXPIRY_SECONDS = 24 * 60 * 60; // 24 hours (Redis TTL in seconds)
 const MAX_PARTICIPANTS_PER_ROOM = 4; // Soft cap — designed for N, shipping at 4
 
 // ---------------------------------------------------------------------------
-// In-memory room code store (Redis in production — see plan step 5.2.3)
-// Map: roomCode → { roomName, createdAt, hostIdentity, roomType, participants }
-// roomType: "call" | "interview" (extensible for future types)
-// participants: Set<string> of identity strings currently in the room
+// Rate limiting — Redis INCR + EXPIRE (10 req/min per identity)
+// Atomic: INCR creates key if missing, EXPIRE sets auto-cleanup.
+// No manual cleanup needed — Redis handles it.
 // ---------------------------------------------------------------------------
-const roomCodes = new Map();
-
-// ---------------------------------------------------------------------------
-// Rate limiting — simple in-memory (10 req/min per identity)
-// ---------------------------------------------------------------------------
-const rateLimitMap = new Map();
 const RATE_LIMIT_MAX = 10;
-const RATE_LIMIT_WINDOW_MS = 60 * 1000;
+const RATE_LIMIT_WINDOW_SECONDS = 60;
 
-function checkRateLimit(identity) {
-  const now = Date.now();
-  let entry = rateLimitMap.get(identity);
-  if (!entry || now - entry.windowStart > RATE_LIMIT_WINDOW_MS) {
-    entry = { windowStart: now, count: 0 };
-    rateLimitMap.set(identity, entry);
+async function checkRateLimit(identity) {
+  const key = `ratelimit:${identity}`;
+  const count = await redis.incr(key);
+  if (count === 1) {
+    // First request in this window — set the TTL
+    await redis.expire(key, RATE_LIMIT_WINDOW_SECONDS);
   }
-  entry.count++;
-  return entry.count <= RATE_LIMIT_MAX;
+  return count <= RATE_LIMIT_MAX;
 }
 
 // ---------------------------------------------------------------------------
@@ -102,24 +109,85 @@ async function createToken(identity, displayName, roomName, isHost, metadata = n
   return await token.toJwt();
 }
 
+// ===========================================================================
+// AUTH ENDPOINTS
+// ===========================================================================
+
 // ---------------------------------------------------------------------------
-// Cleanup expired room codes and stale rate-limit entries (runs every hour)
+// POST /auth/register
+// Body: { email, password, displayName }
+// Returns: { user, token }
 // ---------------------------------------------------------------------------
-setInterval(() => {
-  const now = Date.now();
-  for (const [code, data] of roomCodes) {
-    if (now - data.createdAt > ROOM_CODE_EXPIRY_MS) {
-      roomCodes.delete(code);
-      console.log(`[audit] Room code expired and removed: ${code}`);
-    }
+app.post('/auth/register', async (req, res) => {
+  const { email, password, displayName } = req.body;
+
+  try {
+    const result = await auth.register(email, password, displayName);
+    console.log(`[audit] User registered: ${result.user.email} (${result.user.id})`);
+    res.status(201).json(result);
+  } catch (err) {
+    const status = err.message.includes('already registered') ? 409
+                 : err.message.includes('required') ? 400
+                 : err.message.includes('at least') ? 400
+                 : 500;
+    res.status(status).json({ error: err.message });
   }
-  // Purge stale rate-limit entries to prevent unbounded memory growth
-  for (const [identity, entry] of rateLimitMap) {
-    if (now - entry.windowStart > RATE_LIMIT_WINDOW_MS) {
-      rateLimitMap.delete(identity);
-    }
+});
+
+// ---------------------------------------------------------------------------
+// POST /auth/login
+// Body: { email, password }
+// Returns: { user, token }
+// ---------------------------------------------------------------------------
+app.post('/auth/login', async (req, res) => {
+  const { email, password } = req.body;
+
+  try {
+    const result = await auth.login(email, password);
+    console.log(`[audit] User logged in: ${result.user.email}`);
+    res.json(result);
+  } catch (err) {
+    const status = err.message.includes('Invalid') ? 401
+                 : err.message.includes('required') ? 400
+                 : 500;
+    res.status(status).json({ error: err.message });
   }
-}, 60 * 60 * 1000);
+});
+
+// ---------------------------------------------------------------------------
+// GET /auth/me — get current user info (requires auth)
+// Returns: { userId, email, displayName, tier }
+// ---------------------------------------------------------------------------
+app.get('/auth/me', auth.requireAuth, (req, res) => {
+  res.json(req.user);
+});
+
+// ---------------------------------------------------------------------------
+// Redis key helpers
+// ---------------------------------------------------------------------------
+function roomKey(code) { return `room:${code}`; }
+function roomParticipantsKey(code) { return `room:${code}:participants`; }
+
+// ---------------------------------------------------------------------------
+// Room data helpers — read/write room Hash + participants Set in Redis
+// ---------------------------------------------------------------------------
+async function getRoomData(code) {
+  const data = await redis.hgetall(roomKey(code));
+  if (!data || Object.keys(data).length === 0) return null;
+  return data; // { roomName, createdAt, hostIdentity, roomType }
+}
+
+async function getParticipantCount(code) {
+  return await redis.scard(roomParticipantsKey(code));
+}
+
+async function isParticipant(code, identity) {
+  return await redis.sismember(roomParticipantsKey(code), identity);
+}
+
+async function addParticipant(code, identity) {
+  return await redis.sadd(roomParticipantsKey(code), identity);
+}
 
 // ---------------------------------------------------------------------------
 // POST /room/create
@@ -136,26 +204,33 @@ app.post('/room/create', async (req, res) => {
   // Normalize roomType — default to "call" for backward compatibility
   const roomType = (rawRoomType === 'interview') ? 'interview' : 'call';
 
-  if (!checkRateLimit(identity)) {
+  if (!(await checkRateLimit(identity))) {
     return res.status(429).json({ error: 'Rate limit exceeded. Try again in 1 minute.' });
   }
 
-  // Generate unique room code
+  // Generate unique room code (check Redis for collision)
   let roomCode;
+  let exists;
   do {
     roomCode = generateRoomCode();
-  } while (roomCodes.has(roomCode));
+    exists = await redis.exists(roomKey(roomCode));
+  } while (exists);
 
   const roomName = `inter-${roomCode}`;
 
-  // Store the room code mapping (roomType persisted for join-time lookup)
-  roomCodes.set(roomCode, {
-    roomName,
-    createdAt: Date.now(),
-    hostIdentity: identity,
-    roomType,
-    participants: new Set([identity]),
-  });
+  // Store room data as a Redis Hash with 24h TTL
+  const pipeline = redis.pipeline();
+  pipeline.hset(roomKey(roomCode),
+    'roomName', roomName,
+    'createdAt', Date.now().toString(),
+    'hostIdentity', identity,
+    'roomType', roomType,
+  );
+  pipeline.expire(roomKey(roomCode), ROOM_CODE_EXPIRY_SECONDS);
+  // Participants stored as a Redis Set (identity dedup is automatic)
+  pipeline.sadd(roomParticipantsKey(roomCode), identity);
+  pipeline.expire(roomParticipantsKey(roomCode), ROOM_CODE_EXPIRY_SECONDS);
+  await pipeline.exec();
 
   try {
     // Host metadata includes role for future multi-interviewer support
@@ -163,6 +238,33 @@ app.post('/room/create', async (req, res) => {
     const metadata = hostRole ? { role: hostRole } : null;
     const jwt = await createToken(identity, displayName, roomName, true, metadata);
     console.log(`[audit] Room created: code=${roomCode} type=${roomType} host=${identity}`);
+
+    // Persist meeting to PostgreSQL (if user is authenticated)
+    // Best-effort — don't fail the room creation if DB write fails
+    if (req.user) {
+      try {
+        const meetingResult = await db.query(
+          `INSERT INTO meetings (host_user_id, room_code, room_name, room_type)
+           VALUES ($1, $2, $3, $4)
+           RETURNING id`,
+          [req.user.userId, roomCode, roomName, roomType]
+        );
+        const meetingId = meetingResult.rows[0].id;
+        // Also log host as first participant
+        await db.query(
+          `INSERT INTO meeting_participants (meeting_id, user_id, identity, display_name, role)
+           VALUES ($1, $2, $3, $4, $5)`,
+          [meetingId, req.user.userId, identity, displayName, 'host']
+        );
+        // Store meeting ID in Redis so join endpoint can reference it
+        await redis.hset(roomKey(roomCode), 'meetingId', meetingId);
+        console.log(`[audit] Meeting persisted: ${meetingId} for room ${roomCode}`);
+      } catch (dbErr) {
+        console.error(`[warn] Failed to persist meeting to DB:`, dbErr.message);
+        // Non-fatal — room still works via Redis
+      }
+    }
+
     // NEVER log the token
     res.json({
       roomCode,
@@ -191,31 +293,28 @@ app.post('/room/join', async (req, res) => {
     return res.status(400).json({ error: 'roomCode, identity, and displayName are required' });
   }
 
-  if (!checkRateLimit(identity)) {
+  if (!(await checkRateLimit(identity))) {
     return res.status(429).json({ error: 'Rate limit exceeded. Try again in 1 minute.' });
   }
 
-  const roomData = roomCodes.get(roomCode.toUpperCase());
+  const code = roomCode.toUpperCase();
+  const roomData = await getRoomData(code);
 
   if (!roomData) {
-    // Could be invalid or expired — we can't distinguish after cleanup
-    // If the code was recently cleaned up, it's expired. Otherwise invalid.
-    return res.status(404).json({ error: 'Invalid room code' });
-  }
-
-  // Check if expired (before cleanup runs)
-  if (Date.now() - roomData.createdAt > ROOM_CODE_EXPIRY_MS) {
-    roomCodes.delete(roomCode.toUpperCase());
-    return res.status(410).json({ error: 'Room code has expired' });
+    // Room doesn't exist — either invalid code or expired (Redis TTL auto-deleted)
+    return res.status(404).json({ error: 'Invalid or expired room code' });
   }
 
   // Enforce participant cap (soft — identity dedup means reconnects don't count double)
-  if (!roomData.participants.has(identity) && roomData.participants.size >= MAX_PARTICIPANTS_PER_ROOM) {
-    console.log(`[audit] Room full: code=${roomCode} rejected=${identity} (${roomData.participants.size}/${MAX_PARTICIPANTS_PER_ROOM})`);
+  const alreadyIn = await isParticipant(code, identity);
+  const participantCount = await getParticipantCount(code);
+
+  if (!alreadyIn && participantCount >= MAX_PARTICIPANTS_PER_ROOM) {
+    console.log(`[audit] Room full: code=${code} rejected=${identity} (${participantCount}/${MAX_PARTICIPANTS_PER_ROOM})`);
     return res.status(403).json({
       error: 'Room is full',
       maxParticipants: MAX_PARTICIPANTS_PER_ROOM,
-      participantCount: roomData.participants.size,
+      participantCount,
     });
   }
 
@@ -224,15 +323,31 @@ app.post('/room/join', async (req, res) => {
     const joinerRole = (roomData.roomType === 'interview') ? 'interviewee' : null;
     const metadata = joinerRole ? { role: joinerRole } : null;
     const jwt = await createToken(identity, displayName, roomData.roomName, false, metadata);
-    roomData.participants.add(identity);
-    console.log(`[audit] Room joined: code=${roomCode} type=${roomData.roomType} participant=${identity} (${roomData.participants.size}/${MAX_PARTICIPANTS_PER_ROOM})`);
+    await addParticipant(code, identity);
+    const newCount = await getParticipantCount(code);
+    console.log(`[audit] Room joined: code=${code} type=${roomData.roomType} participant=${identity} (${newCount}/${MAX_PARTICIPANTS_PER_ROOM})`);
+
+    // Persist participant join to PostgreSQL (best-effort)
+    if (roomData.meetingId) {
+      try {
+        const role = joinerRole || 'participant';
+        await db.query(
+          `INSERT INTO meeting_participants (meeting_id, user_id, identity, display_name, role)
+           VALUES ($1, $2, $3, $4, $5)`,
+          [roomData.meetingId, req.user?.userId || null, identity, displayName, role]
+        );
+      } catch (dbErr) {
+        console.error(`[warn] Failed to persist participant to DB:`, dbErr.message);
+      }
+    }
+
     res.json({
       roomName: roomData.roomName,
       token: jwt,
       serverURL: process.env.LIVEKIT_SERVER_URL || 'ws://localhost:7880',
       roomType: roomData.roomType,
       maxParticipants: MAX_PARTICIPANTS_PER_ROOM,
-      participantCount: roomData.participants.size,
+      participantCount: newCount,
     });
   } catch (err) {
     console.error(`[error] Token creation failed for ${identity}:`, err.message);
@@ -252,26 +367,22 @@ app.post('/token/refresh', async (req, res) => {
     return res.status(400).json({ error: 'roomCode and identity are required' });
   }
 
-  if (!checkRateLimit(identity)) {
+  if (!(await checkRateLimit(identity))) {
     return res.status(429).json({ error: 'Rate limit exceeded. Try again in 1 minute.' });
   }
 
-  const roomData = roomCodes.get(roomCode.toUpperCase());
+  const code = roomCode.toUpperCase();
+  const roomData = await getRoomData(code);
 
   if (!roomData) {
-    return res.status(404).json({ error: 'Invalid room code' });
-  }
-
-  if (Date.now() - roomData.createdAt > ROOM_CODE_EXPIRY_MS) {
-    roomCodes.delete(roomCode.toUpperCase());
-    return res.status(410).json({ error: 'Room code has expired' });
+    return res.status(404).json({ error: 'Invalid or expired room code' });
   }
 
   const isHost = roomData.hostIdentity === identity;
 
   try {
     const jwt = await createToken(identity, identity, roomData.roomName, isHost);
-    console.log(`[audit] Token refreshed: code=${roomCode} participant=${identity}`);
+    console.log(`[audit] Token refreshed: code=${code} participant=${identity}`);
     res.json({ token: jwt });
   } catch (err) {
     console.error(`[error] Token refresh failed for ${identity}:`, err.message);
@@ -283,33 +394,58 @@ app.post('/token/refresh', async (req, res) => {
 // GET /room/info/:code — check room status without joining
 // Returns: { roomCode, roomType, participantCount, maxParticipants, isFull }
 // ---------------------------------------------------------------------------
-app.get('/room/info/:code', (req, res) => {
-  const roomCode = req.params.code.toUpperCase();
-  const roomData = roomCodes.get(roomCode);
+app.get('/room/info/:code', async (req, res) => {
+  const code = req.params.code.toUpperCase();
+  const roomData = await getRoomData(code);
 
   if (!roomData) {
-    return res.status(404).json({ error: 'Invalid room code' });
+    return res.status(404).json({ error: 'Invalid or expired room code' });
   }
 
-  if (Date.now() - roomData.createdAt > ROOM_CODE_EXPIRY_MS) {
-    roomCodes.delete(roomCode);
-    return res.status(410).json({ error: 'Room code has expired' });
-  }
+  const participantCount = await getParticipantCount(code);
 
   res.json({
-    roomCode,
+    roomCode: code,
     roomType: roomData.roomType,
-    participantCount: roomData.participants.size,
+    participantCount,
     maxParticipants: MAX_PARTICIPANTS_PER_ROOM,
-    isFull: roomData.participants.size >= MAX_PARTICIPANTS_PER_ROOM,
+    isFull: participantCount >= MAX_PARTICIPANTS_PER_ROOM,
   });
 });
 
 // ---------------------------------------------------------------------------
-// Health check
+// Health check — includes Redis + PostgreSQL connection status
 // ---------------------------------------------------------------------------
-app.get('/health', (req, res) => {
-  res.json({ status: 'ok', rooms: roomCodes.size });
+app.get('/health', async (req, res) => {
+  let redisStatus = 'disconnected';
+  let dbStatus = 'disconnected';
+  let roomCount = 0;
+
+  // Check Redis
+  try {
+    const pong = await redis.ping();
+    redisStatus = pong === 'PONG' ? 'connected' : 'error';
+    const keys = await redis.keys('room:*');
+    roomCount = keys.filter(k => !k.includes(':participants')).length;
+  } catch (err) {
+    redisStatus = 'error';
+  }
+
+  // Check PostgreSQL
+  try {
+    const result = await db.query('SELECT 1');
+    dbStatus = result.rows.length > 0 ? 'connected' : 'error';
+  } catch (err) {
+    dbStatus = 'error';
+  }
+
+  const isHealthy = redisStatus === 'connected' && dbStatus === 'connected';
+  res.status(isHealthy ? 200 : 503).json({
+    status: isHealthy ? 'ok' : 'degraded',
+    redis: redisStatus,
+    postgres: dbStatus,
+    rooms: roomCount,
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -318,5 +454,6 @@ app.get('/health', (req, res) => {
 app.listen(PORT, () => {
   console.log(`[token-server] Running on http://localhost:${PORT}`);
   console.log(`[token-server] LiveKit API Key: ${LIVEKIT_API_KEY}`);
-  console.log(`[token-server] Endpoints: POST /room/create, /room/join, /token/refresh`);
+  console.log(`[token-server] Redis: ${process.env.REDIS_URL || 'redis://localhost:6379'}`);
+  console.log(`[token-server] Endpoints: POST /room/create, /room/join, /token/refresh, /auth/register, /auth/login | GET /room/info/:code, /auth/me, /health`);
 });
