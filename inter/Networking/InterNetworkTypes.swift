@@ -153,13 +153,18 @@ enum InterMicrophoneNetworkAction {
     /// server response on join. Empty string means unspecified (defaults to "call").
     @objc public var roomType: String
 
+    /// Maximum number of participants allowed in the room. [Phase 7]
+    /// Set from the token server response. Defaults to InterMaxParticipantsPerRoom.
+    @objc public var maxParticipants: Int
+
     @objc public init(serverURL: String,
                       tokenServerURL: String,
                       roomCode: String = "",
                       participantIdentity: String,
                       participantName: String,
                       isHost: Bool = false,
-                      roomType: String = "") {
+                      roomType: String = "",
+                      maxParticipants: Int = InterMaxParticipantsPerRoom) {
         self.serverURL = serverURL
         self.tokenServerURL = tokenServerURL
         self.roomCode = roomCode
@@ -167,6 +172,7 @@ enum InterMicrophoneNetworkAction {
         self.participantName = participantName
         self.isHost = isHost
         self.roomType = roomType
+        self.maxParticipants = maxParticipants
         super.init()
     }
 
@@ -178,23 +184,23 @@ enum InterMicrophoneNetworkAction {
             participantIdentity: participantIdentity,
             participantName: participantName,
             isHost: isHost,
-            roomType: roomType
+            roomType: roomType,
+            maxParticipants: maxParticipants
         )
         return copy
     }
 
     public override var description: String {
         // Never log tokens or secrets. Room code is semi-sensitive but useful for debugging.
-        return "<InterRoomConfiguration server=\(serverURL) identity=\(participantIdentity) isHost=\(isHost) roomCode=\(roomCode.isEmpty ? "(none)" : "***")>"
+        return "<InterRoomConfiguration server=\(serverURL) identity=\(participantIdentity) isHost=\(isHost) maxParticipants=\(maxParticipants) roomCode=\(roomCode.isEmpty ? "(none)" : "***")>"
     }
 }
 
 // MARK: - Multi-Participant Constants
 
 /// Maximum number of participants allowed per room.
-/// Designed for N; shipping with a soft cap of 4 (Phase A).
-/// The token server enforces this on /room/join.
-public let InterMaxParticipantsPerRoom: Int = 4
+/// Phase 7: scaled from 4 to 50. The token server enforces this on /room/join.
+public let InterMaxParticipantsPerRoom: Int = 50
 
 // MARK: - Error Domain [G7]
 

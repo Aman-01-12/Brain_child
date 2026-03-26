@@ -1,0 +1,10 @@
+**/node_modules/**
+**/dist/**
+**/build/**
+**/.next/**
+future_developments.md
+implementation_plan.md
+new_feature.md
+tasks.txt
+.gitignore
+work_done.md

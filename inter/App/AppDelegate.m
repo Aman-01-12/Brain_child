@@ -14,13 +14,17 @@
 #import "InterTrackRendererBridge.h"
 #import "InterParticipantOverlayView.h"
 #import "InterNetworkStatusView.h"
+#import "InterChatPanel.h"
+#import "InterSpeakerQueuePanel.h"
+
+#import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 
 // [2.5.1] Swift module import for networking layer
 #if __has_include("inter-Swift.h")
 #import "inter-Swift.h"
 #endif
 
-@interface AppDelegate () <NSWindowDelegate, InterConnectionSetupPanelDelegate, InterParticipantOverlayDelegate>
+@interface AppDelegate () <NSWindowDelegate, InterConnectionSetupPanelDelegate, InterParticipantOverlayDelegate, InterChatPanelDelegate, InterSpeakerQueuePanelDelegate, InterMediaWiringDelegate>
 @property (nonatomic, strong) NSMutableArray<CapWindow *> *capWindows;
 @property (nonatomic, strong) SecureWindowController *secureController;
 @property (nonatomic, strong) NSWindow *setupWindow;
@@ -37,6 +41,16 @@
 @property (nonatomic, strong, nullable) InterTrackRendererBridge *normalTrackRendererBridge;
 @property (nonatomic, strong, nullable) InterNetworkStatusView *normalNetworkStatusView;
 @property (nonatomic, strong, nullable) InterMediaWiringController *normalMediaWiring;
+
+// [Phase 8] In-meeting communication
+@property (nonatomic, strong, nullable) InterChatController *chatController;
+@property (nonatomic, strong, nullable) InterChatPanel *normalChatPanel;
+@property (nonatomic, strong, nullable) InterSpeakerQueue *speakerQueue;
+@property (nonatomic, strong, nullable) InterSpeakerQueuePanel *normalSpeakerQueuePanel;
+@property (nonatomic, strong, nullable) NSButton *normalChatToggleButton;
+@property (nonatomic, strong, nullable) NSButton *normalHandRaiseButton;
+@property (nonatomic, strong, nullable) NSButton *normalQueueToggleButton;
+@property (nonatomic, copy, nullable) NSString *normalChatSelectedRecipient;
 @property (nonatomic, assign) BOOL normalShareSystemAudioEnabled;
 @property (nonatomic, assign) BOOL isScreenObserverRegistered;
 @property (nonatomic, assign) BOOL isShowingExternalDisplayAlert;
@@ -95,7 +109,15 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
     // [B1] Create shared media wiring controller for KVO + toggle logic
     self.normalMediaWiring = [[InterMediaWiringController alloc] init];
     self.normalMediaWiring.roomController = self.roomController;
+    self.normalMediaWiring.delegate = self;
     [self.normalMediaWiring setupRoomControllerKVO];
+
+    // [Phase 8] Create chat controller and speaker queue
+    self.chatController = [[InterChatController alloc] init];
+    self.speakerQueue = [[InterSpeakerQueue alloc] init];
+    if (self.roomController) {
+        self.roomController.chatController = self.chatController;
+    }
 
     [self launchSetupUI];
     [self preflightMediaPermissions];
@@ -122,6 +144,13 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
     // [2.5.7] Disconnect room on app terminate
     [self.normalMediaWiring teardownRoomControllerKVO];
     self.normalMediaWiring = nil;
+
+    // [Phase 8] Clean up chat controller
+    [self.chatController detach];
+    [self.chatController reset];
+    self.chatController = nil;
+    self.speakerQueue = nil;
+
     if (self.roomController) {
         [self.roomController disconnect];
         self.roomController = nil;
@@ -256,6 +285,17 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
     [self teardownActiveWindows];
     [self.settingsWindow orderOut:nil];
     InterTeardownSetupWindow(&_setupWindow, &_setupRenderView, &_connectionPanel);
+
+    // [Phase 8] Attach chat controller to room after connect
+    if (self.roomController && self.chatController) {
+        InterRoomConfiguration *cfg = nil;
+        // The configuration is internal to the room controller; use the identity
+        // we stored from the connect flow. Fall back to a generated identity.
+        NSString *identity = self.roomController.publisher.localParticipant.identity.stringValue ?: [[NSUUID UUID] UUIDString];
+        NSString *displayName = self.roomController.publisher.localParticipant.name ?: @"You";
+        [self.chatController attach:self.roomController identity:identity displayName:displayName];
+    }
+    [self.speakerQueue reset];
 
     if (isIntervieweeMode) {
         [self applyKioskRestrictions];
@@ -618,6 +658,24 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
     // [3.4.2] Carry over connection status + room code from the setup phase
     [self updateNormalConnectionStatus];
 
+    // [Phase 8] Add chat panel (full-height, overlays content from right edge)
+    self.normalChatPanel = [[InterChatPanel alloc] initWithFrame:view.bounds];
+    self.normalChatPanel.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+    self.normalChatPanel.delegate = self;
+    [view addSubview:self.normalChatPanel];
+
+    // [Phase 8] Speaker queue panel (positioned above control panel)
+    CGFloat queueX = view.bounds.size.width - 300.0 - 260.0 - 12.0;
+    self.normalSpeakerQueuePanel = [[InterSpeakerQueuePanel alloc] initWithFrame:NSMakeRect(queueX, 22.0, 260.0, 300.0)];
+    self.normalSpeakerQueuePanel.autoresizingMask = NSViewMinXMargin | NSViewMaxYMargin;
+    self.normalSpeakerQueuePanel.delegate = self;
+    [view addSubview:self.normalSpeakerQueuePanel];
+
+    // [Phase 8] Wire chat controller delegates
+    self.chatController.chatDelegate = (id<InterChatControllerDelegate>)self;
+    self.chatController.controlDelegate = (id<InterControlSignalDelegate>)self;
+    self.chatController.isChatVisible = NO;
+
     [self.normalCallWindow makeKeyAndOrderFront:nil];
 }
 
@@ -682,6 +740,30 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
                                                                                       action:@selector(forwardDiagnosticTripleClick:)];
     tripleClick.numberOfClicksRequired = 3;
     [self.normalControlPanel.networkStatusContainerView addGestureRecognizer:tripleClick];
+
+    // [Phase 8] Chat, hand-raise, and queue toggle buttons — bottom bar next to End Call
+    self.normalChatToggleButton = [[NSButton alloc] initWithFrame:NSMakeRect(220, 40, 80, 42)];
+    self.normalChatToggleButton.autoresizingMask = NSViewMaxXMargin | NSViewMaxYMargin;
+    [self.normalChatToggleButton setTitle:@"💬 Chat"];
+    [self.normalChatToggleButton setTarget:self];
+    [self.normalChatToggleButton setAction:@selector(toggleNormalChatPanel)];
+    [self.normalChatToggleButton setKeyEquivalent:@"c"];
+    [self.normalChatToggleButton setKeyEquivalentModifierMask:(NSEventModifierFlagCommand | NSEventModifierFlagShift)];
+    [view addSubview:self.normalChatToggleButton];
+
+    self.normalHandRaiseButton = [[NSButton alloc] initWithFrame:NSMakeRect(310, 40, 100, 42)];
+    self.normalHandRaiseButton.autoresizingMask = NSViewMaxXMargin | NSViewMaxYMargin;
+    [self.normalHandRaiseButton setTitle:@"✋ Raise"];
+    [self.normalHandRaiseButton setTarget:self];
+    [self.normalHandRaiseButton setAction:@selector(toggleNormalHandRaise)];
+    [view addSubview:self.normalHandRaiseButton];
+
+    self.normalQueueToggleButton = [[NSButton alloc] initWithFrame:NSMakeRect(420, 40, 90, 42)];
+    self.normalQueueToggleButton.autoresizingMask = NSViewMaxXMargin | NSViewMaxYMargin;
+    [self.normalQueueToggleButton setTitle:@"📋 Queue"];
+    [self.normalQueueToggleButton setTarget:self];
+    [self.normalQueueToggleButton setAction:@selector(toggleNormalSpeakerQueue)];
+    [view addSubview:self.normalQueueToggleButton];
 }
 
 - (void)startNormalLocalMediaFlow {
@@ -985,6 +1067,130 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
     [self requestExitCurrentMode];
 }
 
+#pragma mark - Phase 8: In-Meeting Communication
+
+// MARK: Button Actions
+
+- (void)toggleNormalChatPanel {
+    if (!self.normalChatPanel) return;
+    [self.normalChatPanel togglePanel];
+    self.chatController.isChatVisible = self.normalChatPanel.isExpanded;
+    if (self.normalChatPanel.isExpanded) {
+        [self.normalChatPanel setUnreadBadge:0];
+    }
+}
+
+- (void)toggleNormalHandRaise {
+    if (!self.chatController) return;
+    NSString *localIdentity = self.roomController.publisher.localParticipant.identity.stringValue;
+    if (localIdentity && [self.speakerQueue isHandRaisedFor:localIdentity]) {
+        [self.chatController lowerHand];
+        [self.speakerQueue removeHandFor:localIdentity];
+        [self.normalHandRaiseButton setTitle:@"✋ Raise"];
+    } else {
+        [self.chatController raiseHand];
+        NSString *displayName = self.roomController.publisher.localParticipant.name ?: @"You";
+        [self.speakerQueue addHandWithIdentity:localIdentity displayName:displayName];
+        [self.normalHandRaiseButton setTitle:@"🖐 Lower"];
+    }
+    [self.normalSpeakerQueuePanel setEntries:self.speakerQueue.entries];
+}
+
+- (void)toggleNormalSpeakerQueue {
+    [self.normalSpeakerQueuePanel togglePanel];
+}
+
+// MARK: InterChatControllerDelegate
+
+- (void)chatController:(InterChatController *)controller
+      didReceiveMessage:(InterChatMessageInfo *)message {
+    [self.normalChatPanel appendMessage:message];
+    if (!self.normalChatPanel.isExpanded) {
+        [self.normalChatPanel setUnreadBadge:controller.unreadCount];
+    }
+}
+
+- (void)chatController:(InterChatController *)controller
+   didUpdateUnreadCount:(NSInteger)count {
+    if (!self.normalChatPanel.isExpanded) {
+        [self.normalChatPanel setUnreadBadge:count];
+    }
+}
+
+// MARK: InterControlSignalDelegate
+
+- (void)chatController:(InterChatController *)controller
+  participantDidRaiseHand:(NSString *)identity
+            displayName:(NSString *)displayName {
+    [self.speakerQueue addHandWithIdentity:identity displayName:displayName];
+    [self.normalSpeakerQueuePanel setEntries:self.speakerQueue.entries];
+    [self.normalRemoteLayout setHandRaised:YES forParticipant:identity];
+}
+
+- (void)chatController:(InterChatController *)controller
+  participantDidLowerHand:(NSString *)identity {
+    [self.speakerQueue removeHandFor:identity];
+    [self.normalSpeakerQueuePanel setEntries:self.speakerQueue.entries];
+    [self.normalRemoteLayout setHandRaised:NO forParticipant:identity];
+}
+
+// MARK: InterChatPanelDelegate
+
+- (void)chatPanel:(InterChatPanel *)panel didSubmitMessage:(NSString *)text {
+    if (self.normalChatSelectedRecipient.length > 0) {
+        [self.chatController sendDirectMessage:text to:self.normalChatSelectedRecipient];
+    } else {
+        [self.chatController sendPublicMessage:text];
+    }
+}
+
+- (void)chatPanelDidRequestExport:(InterChatPanel *)panel {
+#pragma unused(panel)
+    NSURL *exportedURL = [self.chatController exportTranscriptText];
+    if (!exportedURL) return;
+
+    NSSavePanel *savePanel = [NSSavePanel savePanel];
+    [savePanel setAllowedContentTypes:@[[UTType typeWithIdentifier:@"public.plain-text"]]];
+    [savePanel setNameFieldStringValue:exportedURL.lastPathComponent];
+
+    [savePanel beginSheetModalForWindow:self.normalCallWindow completionHandler:^(NSModalResponse result) {
+        if (result != NSModalResponseOK || !savePanel.URL) return;
+        NSError *error = nil;
+        [[NSFileManager defaultManager] copyItemAtURL:exportedURL toURL:savePanel.URL error:&error];
+        if (error) {
+            NSLog(@"[Phase 8] Transcript export copy failed: %@", error.localizedDescription);
+        }
+    }];
+}
+
+- (void)chatPanel:(InterChatPanel *)panel didSelectRecipient:(NSString *)recipientIdentity {
+#pragma unused(panel)
+    self.normalChatSelectedRecipient = recipientIdentity;
+}
+
+// MARK: InterSpeakerQueuePanelDelegate
+
+- (void)speakerQueuePanel:(InterSpeakerQueuePanel *)panel didDismissParticipant:(NSString *)identity {
+#pragma unused(panel)
+    [self.chatController lowerHandForParticipant:identity];
+    [self.speakerQueue removeHandFor:identity];
+    [self.normalSpeakerQueuePanel setEntries:self.speakerQueue.entries];
+    [self.normalRemoteLayout setHandRaised:NO forParticipant:identity];
+}
+
+// MARK: InterMediaWiringDelegate (Phase 8 — participant list sync)
+
+- (void)mediaWiringControllerDidChangePresenceState:(NSInteger)state {
+#pragma unused(state)
+    [self refreshChatParticipantList];
+}
+
+- (void)refreshChatParticipantList {
+    if (!self.normalChatPanel || !self.roomController) return;
+    NSArray<NSDictionary<NSString *, NSString *> *> *participants = [self.roomController remoteParticipantList];
+    [self.normalChatPanel setParticipantList:participants];
+}
+
 #pragma mark - Diagnostics [3.4.5]
 
 /// [B1] Trampoline: gesture recognizer target must be self; forward to wiring controller.
@@ -1064,6 +1270,25 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
     [self.normalMediaController shutdown];
     self.normalMediaController = nil;
     self.normalControlPanel = nil;
+
+    // [Phase 8] Tear down chat and speaker queue UI
+    [self.chatController detach];
+    [self.speakerQueue reset];
+    self.chatController.chatDelegate = nil;
+    self.chatController.controlDelegate = nil;
+    self.chatController.isChatVisible = NO;
+    self.normalChatSelectedRecipient = nil;
+    if (self.normalChatPanel) {
+        [self.normalChatPanel removeFromSuperview];
+        self.normalChatPanel = nil;
+    }
+    if (self.normalSpeakerQueuePanel) {
+        [self.normalSpeakerQueuePanel removeFromSuperview];
+        self.normalSpeakerQueuePanel = nil;
+    }
+    self.normalChatToggleButton = nil;
+    self.normalHandRaiseButton = nil;
+    self.normalQueueToggleButton = nil;
 
     // [3.2] Tear down remote video layout
     if (self.normalRemoteLayout) {

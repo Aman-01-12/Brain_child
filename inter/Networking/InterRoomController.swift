@@ -73,6 +73,10 @@ import LiveKit
     /// Stats collector: periodic stats gathering. Created on connect, destroyed on disconnect.
     @objc public private(set) var statsCollector: InterCallStatsCollector?
 
+    /// [Phase 8] Chat + control signal controller. Created by the caller (AppDelegate)
+    /// and wired in before connect. The room controller forwards DataChannel data to it.
+    @objc public weak var chatController: InterChatController?
+
     // MARK: - Private Properties
 
     /// The LiveKit Room instance. Created fresh for each connection.
@@ -227,7 +231,12 @@ import LiveKit
             reconnectAttemptDelay: 2.0
         )
 
-        let roomOptions = RoomOptions()
+        // Phase 7.2.1: Enable adaptive streaming — LiveKit automatically adjusts
+        // video resolution/framerate based on subscriber viewport size.
+        let roomOptions = RoomOptions(
+            adaptiveStream: true,
+            dynacast: true
+        )
 
         let newRoom = Room(delegate: self, connectOptions: connectOptions, roomOptions: roomOptions)
 
@@ -607,6 +616,20 @@ import LiveKit
         participantGraceTimer?.cancel()
         participantGraceTimer = nil
     }
+
+    // MARK: - Phase 8: Participant List for DM Selector
+
+    /// Returns an array of dictionaries with "identity" and "name" keys
+    /// for each remote participant currently in the room.
+    @objc public func remoteParticipantList() -> [[String: String]] {
+        guard let room = room else { return [] }
+        return room.remoteParticipants.values.map { participant in
+            [
+                "identity": participant.identity?.stringValue ?? "",
+                "name": participant.name ?? participant.identity?.stringValue ?? "Unknown"
+            ]
+        }
+    }
 }
 
 // MARK: - RoomDelegate
@@ -693,6 +716,18 @@ extension InterRoomController: RoomDelegate {
                 interLogInfo(InterLog.networking, "RoomController: active speaker → %{public}@",
                              identity.isEmpty ? "(none)" : identity)
             }
+        }
+    }
+
+    // MARK: DataChannel [Phase 8]
+
+    public nonisolated func room(_ room: Room, participant: RemoteParticipant?, didReceiveData data: Data, forTopic topic: String) {
+        let senderIdentity = participant?.identity?.stringValue
+        interLogDebug(InterLog.room, "RoomController: received data (%d bytes) on topic '%{public}@' from %{public}@",
+                      data.count, topic, senderIdentity ?? "server")
+
+        DispatchQueue.main.async {
+            self.chatController?.handleReceivedData(data, topic: topic, participant: senderIdentity)
         }
     }
 }

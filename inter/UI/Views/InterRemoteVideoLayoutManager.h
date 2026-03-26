@@ -3,6 +3,25 @@
 NS_ASSUME_NONNULL_BEGIN
 
 @class InterParticipantOverlayView;
+@class InterRemoteVideoLayoutManager;
+
+/// Delegate protocol for layout manager to request track visibility/quality changes. [Phase 7]
+/// Implemented by the media wiring controller to relay to InterLiveKitSubscriber.
+@protocol InterRemoteVideoLayoutManagerDelegate <NSObject>
+@optional
+/// Called when a tile's visibility changes (e.g. paged in/out of grid).
+- (void)layoutManager:(InterRemoteVideoLayoutManager *)manager
+    didChangeVisibility:(BOOL)visible
+       forParticipant:(NSString *)participantId
+               source:(NSUInteger)trackKind;
+
+/// Called when the layout requests a different video quality for a participant.
+/// Dimensions represent the desired render size (e.g. 320×180 for filmstrip, 1280×720 for stage).
+- (void)layoutManager:(InterRemoteVideoLayoutManager *)manager
+    didRequestDimensions:(CGSize)dimensions
+       forParticipant:(NSString *)participantId
+               source:(NSUInteger)trackKind;
+@end
 
 /// Layout mode for remote video views based on which remote tracks are active.
 ///
@@ -41,6 +60,9 @@ typedef NS_ENUM(NSUInteger, InterRemoteVideoLayoutMode) {
 /// The overlay sub-view handles "waiting" / "participant left" states.
 @interface InterRemoteVideoLayoutManager : NSView
 
+/// Delegate for track visibility/quality change notifications. [Phase 7]
+@property (nonatomic, weak, nullable) id<InterRemoteVideoLayoutManagerDelegate> layoutDelegate;
+
 /// Current layout mode (read-only, changes automatically).
 @property (nonatomic, readonly) InterRemoteVideoLayoutMode layoutMode;
 
@@ -58,6 +80,26 @@ typedef NS_ENUM(NSUInteger, InterRemoteVideoLayoutMode) {
 /// Total remote participant count (including those who may not have published video yet).
 /// Used for participant count badge and overlay messaging.
 @property (nonatomic, assign) NSUInteger remoteParticipantCount;
+
+// MARK: — Phase 7: Pagination (Grid Mode)
+
+/// Current page index in paginated grid mode (0-based). Read-only.
+@property (nonatomic, readonly) NSUInteger currentGridPage;
+
+/// Total number of pages in paginated grid mode. Read-only.
+@property (nonatomic, readonly) NSUInteger totalGridPages;
+
+/// Maximum tiles per grid page before pagination kicks in. Default 25 (5×5).
+@property (nonatomic, assign) NSUInteger maxTilesPerPage;
+
+/// Navigate to the next grid page (wraps to first if at end).
+- (void)nextGridPage;
+
+/// Navigate to the previous grid page (wraps to last if at start).
+- (void)previousGridPage;
+
+/// Navigate to a specific grid page (clamped to valid range).
+- (void)goToGridPage:(NSUInteger)page;
 
 /// Optional callback fired when the user manually selects or clears a spotlight tile.
 /// This is intended for container-level UI reactions outside the layout manager itself,
@@ -93,6 +135,11 @@ typedef NS_ENUM(NSUInteger, InterRemoteVideoLayoutMode) {
 /// single tile to stage+filmstrip or back.
 @property (nonatomic, copy, nullable) dispatch_block_t layoutStateChangedHandler;
 
+/// When YES and in stage+filmstrip mode, automatically promotes the active speaker
+/// to the main stage spotlight. Resets to the previous tile 3 seconds after the speaker
+/// stops (or a new speaker takes over). Default is NO. [Phase 7.4.2]
+@property (nonatomic, assign) BOOL autoSpotlightActiveSpeaker;
+
 /// Call when a remote camera frame arrives from a participant.
 - (void)handleRemoteCameraFrame:(CVPixelBufferRef)pixelBuffer fromParticipant:(NSString *)participantId;
 
@@ -112,6 +159,9 @@ typedef NS_ENUM(NSUInteger, InterRemoteVideoLayoutMode) {
 /// Once registered, tiles for this participant show the display name
 /// instead of the raw identity string (UUID).
 - (void)registerDisplayName:(NSString *)displayName forParticipant:(NSString *)participantId;
+
+/// [Phase 8.2.3] Show or hide the raised-hand badge (✋) on a participant's tile.
+- (void)setHandRaised:(BOOL)raised forParticipant:(NSString *)participantId;
 
 /// Programmatically spotlight a specific feed.
 /// @param tileKey The tile key to spotlight. Screen share tile key is @"__screenshare__".

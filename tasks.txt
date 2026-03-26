@@ -1,8 +1,8 @@
 # LiveKit Integration — Implementation Plan
 
-> **Status**: Phase 0 complete. Phase 1 complete. Phase 2 complete. Phase 3 complete. Post-Phase 3 complete. Phase 4 complete (Steps 1–7). Phase 5A (Multi-Participant cap-4) complete — token server enforcement, active speaker, grid layout, participant badge, 138 tests passing. Only Step 8 (production deployment) remains.  
-> **Last updated**: 19 March 2026 (session 4)  
-> **Tracking**: Changes logged in `work_done.md`
+> **Status**: Phase 0–5A complete. Phase 6 (Infrastructure Foundation) complete — Redis migration, PostgreSQL schema, auth middleware. Phase 7 (Scale to 50 Participants) complete — cap raised, adaptive grid, pagination, selective subscription, active speaker highlight. Phase 8 (In-Meeting Communication) complete — public chat via DataChannel, DMs, raise hand + speaker queue, chat transcript export. 138 tests passing. See `implementation_plan.md` for Phases 9–14 roadmap.  
+> **Last updated**: 27 March 2026 (session 7)  
+> **Tracking**: Changes logged in `work_done.md`. Long-term plan in `implementation_plan.md`.
 
 ---
 
@@ -955,3 +955,61 @@ LiveKit SFU handles all media forwarding — no transcoding.
 - Dominant speaker auto-spotlight in filmstrip mode
 - Adaptive simulcast layer selection (high for spotlight, low for filmstrip)
 - Phase 5C: 25 participants (pagination, selective subscribe)
+
+---
+
+## Phase 6 — Infrastructure Foundation ✅ COMPLETE
+
+> **Completed**: 26 March 2026  
+> **Detailed plan**: See `implementation_plan.md` (Phases 6–14)  
+> **Tests**: 138/138 passing after all changes
+
+### Pre-Phase 6: DisplayName Bug Fix ✅ DONE
+- Remote participant tiles showed raw UUIDs instead of human display names
+- Root cause: `InterLiveKitSubscriber` extracted `participant.identity` (UUID) not `participant.name`
+- Fix: Added `remoteParticipantDidUpdateDisplayName` protocol method, wired through bridge → layout manager
+- Added `participantDisplayNames` dictionary in `InterRemoteVideoLayoutManager` for name lookup
+
+**Files**: `InterLiveKitSubscriber.swift`, `InterTrackRendererBridge.m`, `InterRemoteVideoLayoutManager.h/.m`
+
+### 6.1: Redis Migration ✅ DONE
+- Replaced in-memory `Map` objects with Redis Hash (`room:{CODE}`) + Set (`room:{CODE}:participants`)
+- Room data auto-expires via Redis TTL (24h) — removed manual `setInterval` cleanup
+- Rate limiting via atomic Redis `INCR` + `EXPIRE` (60s window)
+- Created `redis.js` client module (ioredis, reconnection with backoff)
+- All endpoints now async (Redis commands return promises)
+- Uses `redis.pipeline()` for atomic multi-key writes
+
+**Files**: `token-server/redis.js` (NEW), `token-server/index.js`, `token-server/.env.example` (NEW), `token-server/package.json`  
+**Deps added**: `ioredis`, `dotenv`
+
+### 6.2: PostgreSQL Schema + Migrations ✅ DONE
+- Created `db.js` connection pool module (pg, max 10 connections)
+- Created `migrate.js` — idempotent sequential SQL migration runner with transaction support
+- Schema `001_initial_schema.sql`:
+  - `users` — UUID PK, email (unique), display_name, password_hash, tier (free|pro|hiring), updated_at trigger
+  - `meetings` — UUID PK, host_user_id (FK→users), room_code, room_name, room_type (call|interview), status (active|ended)
+  - `meeting_participants` — UUID PK, meeting_id (FK→meetings), user_id (FK→users, nullable for anonymous), identity, display_name, role (host|co-host|presenter|participant|interviewer|interviewee)
+  - All CHECK constraints, indexes on FKs, cascading deletes
+- `/health` endpoint now reports both Redis + PostgreSQL status
+
+**Files**: `token-server/db.js` (NEW), `token-server/migrate.js` (NEW), `token-server/migrations/001_initial_schema.sql` (NEW), `token-server/index.js`, `token-server/package.json`  
+**Deps added**: `pg`
+
+### 6.3: Authentication Middleware ✅ DONE
+- Created `auth.js` module:
+  - `register(email, password, displayName)` — bcrypt (12 rounds), INSERT, return user auth JWT (7d expiry)
+  - `login(email, password)` — verify credentials, return JWT
+  - `authenticateToken` middleware — OPTIONAL globally applied. Bearer present+valid → `req.user`. Absent → `req.user = null` (anonymous). Invalid → 401.
+  - `requireAuth` middleware — 401 if `req.user` is null
+  - `requireTier(minTier)` middleware — tier hierarchy: free < pro < hiring. 403 if insufficient.
+- Added endpoints: `POST /auth/register`, `POST /auth/login`, `GET /auth/me`
+- Auth is ADDITIVE — anonymous flow fully preserved (Zoom model)
+- Authenticated room creation persists meeting + host to PostgreSQL (best-effort)
+- Anonymous/authenticated joiners tracked in `meeting_participants` with `user_id = NULL` for guests
+
+**Files**: `token-server/auth.js` (NEW), `token-server/index.js`, `token-server/.env.example`, `token-server/package.json`  
+**Deps added**: `bcryptjs`, `jsonwebtoken`
+
+---
+

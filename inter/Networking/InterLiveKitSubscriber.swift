@@ -100,6 +100,75 @@ import LiveKit
         interLogInfo(InterLog.media, "Subscriber: attached to room")
     }
 
+    // MARK: - Phase 7.2.2: Track Visibility Binding
+
+    /// Enable or disable a remote participant's video subscription based on tile visibility.
+    /// When a tile scrolls off-screen or is paged out, calling this with `visible: false`
+    /// tells LiveKit to stop sending video for that participant (bandwidth savings).
+    /// When the tile becomes visible again, calling with `visible: true` resumes the stream.
+    @objc public func setTrackVisibility(_ visible: Bool, forParticipant participantId: String, source: InterTrackKind) {
+        guard let room = room else { return }
+
+        let lkSource: Track.Source
+        switch source {
+        case .camera:
+            lkSource = .camera
+        case .screenShare:
+            lkSource = .screenShareVideo
+        default:
+            return
+        }
+
+        // Find the remote participant and their published track
+        for (_, participant) in room.remoteParticipants {
+            guard participant.identity?.stringValue == participantId else { continue }
+
+            for (_, publication) in participant.trackPublications {
+                guard publication.source == lkSource else { continue }
+
+                if let remotePub = publication as? RemoteTrackPublication {
+                    remotePub.set(enabled: visible)
+                    interLogInfo(InterLog.media, "Subscriber: track visibility %{public}@ for %{public}@ source=%d",
+                                 visible ? "enabled" : "disabled", participantId, source.rawValue)
+                }
+            }
+            break
+        }
+    }
+
+    /// Update the preferred video dimensions for a remote participant's track. [Phase 7.3.4]
+    /// Filmstrip tiles should request lower resolution to save bandwidth.
+    /// Spotlight/stage tiles should request higher resolution.
+    @objc public func setPreferredDimensions(_ dimensions: CGSize, forParticipant participantId: String, source: InterTrackKind) {
+        guard let room = room else { return }
+
+        let lkSource: Track.Source
+        switch source {
+        case .camera:
+            lkSource = .camera
+        case .screenShare:
+            lkSource = .screenShareVideo
+        default:
+            return
+        }
+
+        for (_, participant) in room.remoteParticipants {
+            guard participant.identity?.stringValue == participantId else { continue }
+
+            for (_, publication) in participant.trackPublications {
+                guard publication.source == lkSource else { continue }
+
+                if let remotePub = publication as? RemoteTrackPublication {
+                    remotePub.set(preferredDimensions: dimensions)
+                    interLogInfo(InterLog.media, "Subscriber: preferred dims %.0fx%.0f for %{public}@ source=%d",
+                                 dimensions.width, dimensions.height, participantId, source.rawValue)
+                }
+            }
+            break
+        }
+    }
+    }
+
     /// Unregister from the room and clean up all renderers.
     @objc public func detach() {
         interLogInfo(InterLog.media, "Subscriber: detaching")

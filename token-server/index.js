@@ -43,7 +43,7 @@ const LIVEKIT_API_SECRET = process.env.LIVEKIT_API_SECRET || 'secret';
 const PORT = process.env.PORT || 3000;
 const TOKEN_TTL_SECONDS = 6 * 60 * 60; // 6 hours
 const ROOM_CODE_EXPIRY_SECONDS = 24 * 60 * 60; // 24 hours (Redis TTL in seconds)
-const MAX_PARTICIPANTS_PER_ROOM = 4; // Soft cap — designed for N, shipping at 4
+const MAX_PARTICIPANTS_PER_ROOM = 50; // Phase 7: scaled from 4 to 50
 
 // ---------------------------------------------------------------------------
 // Rate limiting — Redis INCR + EXPIRE (10 req/min per identity)

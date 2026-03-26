@@ -538,6 +538,10 @@ static const CGFloat InterSecureBottomWorkspaceMargin = 100.0;
 
 #pragma mark - Diagnostics [3.4.5]
 
+// TODO: [Phase 8.1.5] Add chat panel / hand-raise UI to secure interviewee mode.
+// The chatController is already attached via AppDelegate.enterMode: so data flows.
+// Secure mode needs a minimal chat UI (or at least a notification badge).
+
 /// [B1] Trampoline: gesture recognizer target must be self; forward to wiring controller.
 - (void)forwardDiagnosticTripleClick:(NSClickGestureRecognizer *)recognizer {
 #pragma unused(recognizer)

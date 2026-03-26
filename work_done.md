@@ -738,3 +738,131 @@ Token TTL was already configured at 6 hours in `token-server/index.js` (`TOKEN_T
 - Anonymous `POST /room/create` → Works exactly as before (no DB write)
 - Anonymous `POST /room/join` on authenticated room → Participant tracked with `user_id=NULL`, `role=participant`
 - **138/138 Xcode tests pass** (0 failures) — existing client fully backward-compatible
+
+---
+
+## [26 March 2026] — Phase 7: Scale to 50 Participants
+
+**Phase**: 7.1–7.4 from `implementation_plan.md`
+**Files changed**:
+- `token-server/index.js` — MODIFIED. `MAX_PARTICIPANTS_PER_ROOM` raised from 4 to 50.
+- `inter/Networking/InterNetworkTypes.swift` — MODIFIED:
+  - `InterMaxParticipantsPerRoom` raised from 4 to 50.
+  - Added `maxParticipants` property to `InterRoomConfiguration` (default 50, propagated through copy/init/description).
+- `inter/Networking/InterRoomController.swift` — MODIFIED:
+  - Enabled `adaptiveStream: true` and `dynacast: true` in `RoomOptions`. LiveKit now auto-adjusts video resolution/framerate based on subscriber viewport size. [7.2.1]
+- `inter/Networking/InterLiveKitSubscriber.swift` — MODIFIED:
+  - Added `setTrackVisibility(_:forParticipant:source:)` — enables/disables remote track subscriptions based on tile visibility (bandwidth savings for paged-out participants). [7.2.2]
+  - Added `setPreferredDimensions(_:forParticipant:source:)` — requests specific video dimensions per remote track (high-res for spotlight, low-res for filmstrip tiles). [7.3.4]
+- `inter/UI/Views/InterRemoteVideoLayoutManager.h` — MODIFIED:
+  - Added `InterRemoteVideoLayoutManagerDelegate` protocol with `didChangeVisibility:forParticipant:source:` and `didRequestDimensions:forParticipant:source:` callbacks.
+  - Added `layoutDelegate` property.
+  - Added pagination API: `currentGridPage`, `totalGridPages`, `maxTilesPerPage`, `nextGridPage`, `previousGridPage`, `goToGridPage:`.
+  - Added `autoSpotlightActiveSpeaker` property for auto-spotlight in stage+filmstrip mode. [7.4.2]
+- `inter/UI/Views/InterRemoteVideoLayoutManager.m` — MODIFIED:
+  - **Adaptive grid** [7.3.1]: Dynamic grid sizing — 1→1×1, 2→2×1, 3-4→2×2, 5-6→3×2, 7-9→3×3, 10-12→4×3, 13-16→4×4, 17-20→5×4, 21-25→5×5. Replaces old fixed 2-column grid.
+  - **Pagination** [7.3.2]: Max 25 tiles per page. Bottom page indicator bar with ◀/▶ buttons and "Page X of Y" label. Left/right arrow keyboard shortcuts for navigation.
+  - **Tile recycling** [7.3.3]: Removed views are pooled (up to 10) for reuse instead of being destroyed. Reduces allocation churn at 50 participants.
+  - **Dynamic quality** [7.3.4]: Grid tiles request quality based on count (1280×720 for ≤4, 640×360 for ≤9, 480×270 for ≤16, 320×180 for 17-25). Filmstrip tiles request 320×180. Spotlight always requests 1280×720.
+  - **Active speaker in filmstrip** [7.4.1]: Green border highlight now applied inside `applyStageAndFilmstripLayoutAnimated:` for filmstrip tiles (previously only in grid mode).
+  - **Auto-spotlight** [7.4.2]: `autoSpotlightActiveSpeaker` flag. When enabled, active speaker auto-promoted to main stage. Reverts to previous spotlight 3s after speaker stops.
+  - Added `notifyVisibilityChangesFrom:to:` and `notifyDimensionsChange:forParticipant:` delegate notification helpers.
+  - Teardown cleans up recycling pool, pagination state, and auto-spotlight timer.
+
+**Why**: Scale from 4 to 50 participants with graceful UI handling. Adaptive grid avoids tiny tiles. Pagination keeps grid usable beyond 25 participants. Selective subscription + dynamic quality save bandwidth for large rooms. Auto-spotlight keeps the active speaker visible without manual intervention.
+
+**Verification gate**:
+- Server: `MAX_PARTICIPANTS_PER_ROOM = 50` — room/join accepts up to 50 participants
+- Client: `InterMaxParticipantsPerRoom = 50` — matches server cap
+- Room options: `adaptiveStream` and `dynacast` enabled for bandwidth-efficient large rooms
+- Grid adapts: 2→side-by-side, 4→2×2, 9→3×3, 16→4×4, 25→5×5
+- 26+ participants paginate (max 25/page), page indicator visible with arrow navigation
+- Tile recycling pool caps at 10 reusable views
+- Active speaker green border in both grid and filmstrip modes
+- Auto-spotlight promotes active speaker to stage (3s revert delay)
+
+## [27 March 2026] — Phase 8: In-Meeting Communication (Chat, Raise Hand, DMs, Transcript Export)
+
+**Phase**: 8.1–8.4
+**Files changed**:
+- `inter/Networking/InterChatMessage.swift` — CREATED:
+  - `InterChatMessageType` enum: `.publicMessage`, `.directMessage`, `.system`
+  - `InterControlSignalType` enum: `.raiseHand`, `.lowerHand`
+  - `InterChatMessage` struct: Codable message model with id, senderIdentity, senderName, text, timestamp, type, recipientIdentity. JSON serialization helpers.
+  - `InterControlSignal` struct: Codable control signal model for hand raise/lower.
+  - `InterChatMessageInfo` class: `@objc` wrapper for ObjC UI binding with `formattedTime` property (HH:mm format).
+- `inter/Networking/InterChatController.swift` — CREATED:
+  - `InterChatControllerDelegate` protocol: `didReceiveMessage`, `didUpdateUnreadCount`
+  - `InterControlSignalDelegate` protocol: `participantDidRaiseHand`, `participantDidLowerHand`
+  - Core chat + control signal logic via LiveKit DataChannel. Two topics: "chat" for messages, "control" for raise hand signals.
+  - `attach(to:identity:displayName:)` / `detach()` / `reset()` lifecycle.
+  - `sendPublicMessage(_:)` — publishes to all via DataChannel, optimistic local add. [8.1]
+  - `sendDirectMessage(_:to:)` — targeted publish with `destinationIdentities:`. [8.3]
+  - `raiseHand()` / `lowerHand()` / `lowerHand(forParticipant:)` — control signals. [8.2]
+  - `handleReceivedData(_:topic:participant:)` — routes by topic, deduplicates by message ID.
+  - `exportTranscriptJSON()` / `exportTranscriptText()` — writes to caches directory. [8.4]
+  - Message cap at 500 messages. Unread count tracking with `isChatVisible` reset.
+- `inter/Networking/InterSpeakerQueue.swift` — CREATED:
+  - `InterRaisedHandEntry` class: participantIdentity, displayName, timestamp.
+  - `InterSpeakerQueue` class: Chronologically-ordered raised-hand queue. KVO-observable `count`. Deduplication via `raisedIdentities` set.
+  - Methods: `addHand`, `removeHand`, `removeDisconnectedParticipant`, `reset`, `isHandRaised`, `queuePosition` (1-based).
+- `inter/UI/Views/InterChatPanel.h` — CREATED:
+  - `InterChatPanelDelegate` protocol: `didSubmitMessage:`, `didRequestExport:`, `didSelectRecipient:`
+  - Chat panel interface with `appendMessage:`, `setUnreadBadge:`, `setParticipantList:`, `togglePanel`/`expandPanel`/`collapsePanel`.
+- `inter/UI/Views/InterChatPanel.m` — CREATED:
+  - Dark-themed 300px slide-in panel from right edge. Header bar with close/export buttons.
+  - NSPopUpButton recipient selector ("Everyone" + per-participant DM targets).
+  - NSScrollView + NSTableView message list with colored headers (blue=own, purple=DM, gray=system).
+  - NSTextField input + Send button. Enter key submits. Auto-scroll to bottom.
+  - Red unread badge counter (hidden when 0, "99+" for >99).
+  - 0.25s slide animation for toggle.
+- `inter/UI/Views/InterSpeakerQueuePanel.h` — CREATED:
+  - `InterSpeakerQueuePanelDelegate` protocol: `didDismissParticipant:`
+- `inter/UI/Views/InterSpeakerQueuePanel.m` — CREATED:
+  - Host-facing raised-hand queue display. Position badge (#1, #2…), ✋ emoji, display name, "Dismiss" button per entry.
+  - Show/hide/toggle with fade animation.
+- `inter/Networking/InterRoomController.swift` — MODIFIED:
+  - Added `chatController` property (weak reference to InterChatController).
+  - Added `didReceiveData` RoomDelegate method — dispatches to main queue, forwards to chatController.
+  - Added `remoteParticipantList()` — returns identity/name dict array for DM recipient selector.
+- `inter/UI/Views/InterRemoteVideoLayoutManager.h` — MODIFIED:
+  - Added `setHandRaised:forParticipant:` declaration.
+- `inter/UI/Views/InterRemoteVideoLayoutManager.m` — MODIFIED:
+  - Added `handRaiseBadge` (✋ emoji) and `handRaised` property to `InterRemoteVideoTileView`.
+  - Badge positioned top-left corner (4px inset, 24×24, dark background, rounded).
+  - `setHandRaised:forParticipant:` method on layout manager — looks up tile and toggles badge.
+- `inter/App/AppDelegate.m` — MODIFIED:
+  - Added imports for InterChatPanel.h, InterSpeakerQueuePanel.h, UniformTypeIdentifiers.
+  - Extended protocol conformance: InterChatPanelDelegate, InterSpeakerQueuePanelDelegate, InterMediaWiringDelegate.
+  - Phase 8 properties: chatController, normalChatPanel, speakerQueue, normalSpeakerQueuePanel, normalChatToggleButton, normalHandRaiseButton, normalQueueToggleButton, normalChatSelectedRecipient.
+  - `applicationDidFinishLaunching:` — creates InterChatController + InterSpeakerQueue, sets roomController.chatController.
+  - `enterMode:role:` — attaches chatController with identity/displayName, resets speakerQueue.
+  - `launchNormalCallWindow` — adds chat panel (full-height overlay), speaker queue panel, wires delegates.
+  - `attachNormalCallControlsInView:` — adds Chat (💬), Raise Hand (✋), Queue (📋) toggle buttons. Chat button has ⌘+Shift+C shortcut.
+  - Action methods: `toggleNormalChatPanel` (syncs isChatVisible), `toggleNormalHandRaise` (toggle local hand state), `toggleNormalSpeakerQueue`.
+  - InterChatControllerDelegate: forwards messages to chat panel, updates unread badge.
+  - InterControlSignalDelegate: updates speaker queue + queue panel + hand-raise badge on tiles.
+  - InterChatPanelDelegate: routes send to public or DM based on selected recipient, transcript export via NSSavePanel.
+  - InterSpeakerQueuePanelDelegate: dismisses participant hand.
+  - InterMediaWiringDelegate: `mediaWiringControllerDidChangePresenceState:` refreshes DM recipient list.
+  - `teardownActiveWindows` — detaches chatController, resets speakerQueue, removes Phase 8 UI.
+  - `applicationWillTerminate:` — detaches + resets + nils chatController.
+- `inter/UI/Controllers/SecureWindowController.m` — MODIFIED:
+  - Added TODO comment for Phase 8.1.5 secure mode chat UI (chat data flows via AppDelegate wiring; UI deferred).
+
+**Why**: Phase 8 implements the full in-meeting communication stack. Public chat enables text collaboration alongside audio/video. DMs enable private side-conversations (Pro tier). Raise hand + speaker queue gives hosts an ordered mechanism to manage who speaks next. Transcript export preserves chat history for after-meeting review.
+
+**Architecture notes**:
+- DataChannel approach: Uses LiveKit's built-in DataChannel with reliable transport. Two topics ("chat" and "control") keep message routing clean. No additional WebSocket or server endpoint needed.
+- ChatController lifecycle: Created once at launch (like roomController), attached per enterMode, detached/reset on teardown. Survives mode transitions.
+- ObjC/Swift bridging: InterChatMessageInfo wraps the pure-Swift InterChatMessage struct for ObjC UI consumption. Protocols are @objc-compatible.
+- Secure mode deferred: Interview mode (SecureWindowController) receives chat data but lacks UI. To be added in a future phase.
+
+**Verification gate**:
+- No compilation errors across all modified and new files
+- Chat panel slides in/out with animation, messages display with colored headers
+- Raise hand toggles local button text, updates speaker queue + remote tile badge
+- DM recipient selector populated from remote participant list
+- Transcript export via NSSavePanel to user-chosen location
+- ⌘+Shift+C keyboard shortcut toggles chat panel
+- Teardown properly cleans up all Phase 8 objects

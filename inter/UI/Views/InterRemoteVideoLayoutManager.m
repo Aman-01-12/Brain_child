@@ -26,6 +26,9 @@ static NSString *const kScreenShareTileKey = @"__screenshare__";
 @property (nonatomic, assign) BOOL isHovered;
 @property (nonatomic, assign) BOOL isSpeaking;
 @property (nonatomic, strong) NSTrackingArea *hoverTrackingArea;
+/// [Phase 8.2.3] Hand-raise badge (✋ emoji in top-left corner).
+@property (nonatomic, strong) NSTextField *handRaiseBadge;
+@property (nonatomic, assign) BOOL handRaised;
 @end
 
 @implementation InterRemoteVideoTileView
@@ -57,7 +60,23 @@ static NSString *const kScreenShareTileKey = @"__screenshare__";
     self.nameLabel.maximumNumberOfLines = 1;
     [self addSubview:self.nameLabel];
 
+    // [Phase 8.2.3] Hand raise badge — top-left corner
+    self.handRaiseBadge = [NSTextField labelWithString:@"✋"];
+    self.handRaiseBadge.font = [NSFont systemFontOfSize:16];
+    self.handRaiseBadge.frame = NSMakeRect(4, 0, 24, 24);
+    [self.handRaiseBadge setWantsLayer:YES];
+    self.handRaiseBadge.layer.backgroundColor = [NSColor colorWithWhite:0.0 alpha:0.6].CGColor;
+    self.handRaiseBadge.layer.cornerRadius = 4.0;
+    self.handRaiseBadge.alignment = NSTextAlignmentCenter;
+    self.handRaiseBadge.hidden = YES;
+    [self addSubview:self.handRaiseBadge];
+
     return self;
+}
+
+- (void)setHandRaised:(BOOL)handRaised {
+    _handRaised = handRaised;
+    self.handRaiseBadge.hidden = !handRaised;
 }
 
 - (void)layout {
@@ -68,6 +87,8 @@ static NSString *const kScreenShareTileKey = @"__screenshare__";
     // Name label at bottom, 22px tall
     CGFloat labelH = 22.0;
     self.nameLabel.frame = NSMakeRect(0, 0, b.size.width, labelH);
+    // Hand raise badge at top-left
+    self.handRaiseBadge.frame = NSMakeRect(4, b.size.height - 28, 24, 24);
 }
 
 - (void)updateTrackingAreas {
@@ -171,6 +192,35 @@ static NSString *const kScreenShareTileKey = @"__screenshare__";
 /// Small label showing participant count (top-right corner).
 @property (nonatomic, strong) NSTextField *participantCountBadge;
 
+// -- Phase 7: Pagination state --
+
+/// Current grid page (0-based).
+@property (nonatomic, assign) NSUInteger currentGridPage;
+
+/// Page indicator bar at bottom of grid area.
+@property (nonatomic, strong) NSView *pageIndicatorBar;
+
+/// Left arrow button for page navigation.
+@property (nonatomic, strong) NSButton *pageLeftButton;
+
+/// Right arrow button for page navigation.
+@property (nonatomic, strong) NSButton *pageRightButton;
+
+/// Page label showing "Page X of Y".
+@property (nonatomic, strong) NSTextField *pageLabel;
+
+/// Set of participant IDs currently visible (for track visibility callbacks).
+@property (nonatomic, strong) NSMutableSet<NSString *> *visibleParticipantIds;
+
+/// Tile recycling pool — reusable InterRemoteVideoView instances. [Phase 7.3.3]
+@property (nonatomic, strong) NSMutableArray<InterRemoteVideoView *> *recycledVideoViews;
+
+/// Spotlight key prior to auto-speaker-spotlight, for restoring after speaker stops. [Phase 7.4.2]
+@property (nonatomic, copy, nullable) NSString *preAutoSpotlightKey;
+
+/// Timer to revert auto-speaker-spotlight 3s after speaker stops. [Phase 7.4.2]
+@property (nonatomic, strong, nullable) NSTimer *autoSpotlightRevertTimer;
+
 @end
 
 // ---------------------------------------------------------------------------
@@ -182,6 +232,9 @@ static const CGFloat kFilmstripMaxWidth      = 280.0;
 static const CGFloat kFilmstripTileGap       = 8.0;
 static const CGFloat kFilmstripPadding       = 8.0;
 static const CGFloat kAnimationDuration      = 0.3;
+static const NSUInteger kDefaultMaxTilesPerPage = 25;  // Phase 7: 5×5 grid max before pagination
+static const CGFloat kPageIndicatorHeight    = 30.0;
+static const CGFloat kPageIndicatorPadding   = 8.0;
 
 @implementation InterRemoteVideoLayoutManager
 
@@ -230,6 +283,35 @@ static const CGFloat kAnimationDuration      = 0.3;
     self.participantCountBadge.hidden = YES;
     [self addSubview:self.participantCountBadge];
 
+    // Phase 7: Pagination UI
+    self.maxTilesPerPage = kDefaultMaxTilesPerPage;
+    self.currentGridPage = 0;
+    self.visibleParticipantIds = [NSMutableSet set];
+    self.recycledVideoViews = [NSMutableArray array];
+
+    self.pageIndicatorBar = [[NSView alloc] initWithFrame:NSZeroRect];
+    self.pageIndicatorBar.wantsLayer = YES;
+    self.pageIndicatorBar.layer.backgroundColor = [NSColor colorWithWhite:0.1 alpha:0.85].CGColor;
+    self.pageIndicatorBar.layer.cornerRadius = 6.0;
+    self.pageIndicatorBar.hidden = YES;
+    [self addSubview:self.pageIndicatorBar];
+
+    self.pageLeftButton = [NSButton buttonWithTitle:@"◀" target:self action:@selector(previousGridPage)];
+    self.pageLeftButton.bezelStyle = NSBezelStyleRounded;
+    self.pageLeftButton.font = [NSFont systemFontOfSize:14];
+    [self.pageIndicatorBar addSubview:self.pageLeftButton];
+
+    self.pageRightButton = [NSButton buttonWithTitle:@"▶" target:self action:@selector(nextGridPage)];
+    self.pageRightButton.bezelStyle = NSBezelStyleRounded;
+    self.pageRightButton.font = [NSFont systemFontOfSize:14];
+    [self.pageIndicatorBar addSubview:self.pageRightButton];
+
+    self.pageLabel = [NSTextField labelWithString:@""];
+    self.pageLabel.font = [NSFont systemFontOfSize:11 weight:NSFontWeightMedium];
+    self.pageLabel.textColor = [NSColor whiteColor];
+    self.pageLabel.alignment = NSTextAlignmentCenter;
+    [self.pageIndicatorBar addSubview:self.pageLabel];
+
     self.layoutMode = InterRemoteVideoLayoutModeNone;
     self.allowsManualSpotlightSelection = YES;
     self.preferStageLayoutForMultipleCameras = NO;
@@ -262,6 +344,15 @@ static const CGFloat kAnimationDuration      = 0.3;
     InterRemoteVideoTileView *tile = self.tileViews[participantId];
     if (tile) {
         tile.nameLabel.stringValue = [self displayNameForTileKey:participantId];
+    }
+}
+
+// [Phase 8.2.3] Show/hide hand-raise badge on participant tile.
+- (void)setHandRaised:(BOOL)raised forParticipant:(NSString *)participantId {
+    if (!participantId || participantId.length == 0) return;
+    InterRemoteVideoTileView *tile = self.tileViews[participantId];
+    if (tile) {
+        tile.handRaised = raised;
     }
 }
 
@@ -302,8 +393,15 @@ static const CGFloat kAnimationDuration      = 0.3;
 - (InterRemoteVideoView *)cameraViewForParticipant:(NSString *)participantId {
     InterRemoteVideoView *view = self.remoteCameraViews[participantId];
     if (!view) {
-        view = [[InterRemoteVideoView alloc] initWithFrame:self.bounds];
-        view.hidden = YES;
+        // Phase 7.3.3: Try recycling pool before creating new
+        if (self.recycledVideoViews.count > 0) {
+            view = self.recycledVideoViews.lastObject;
+            [self.recycledVideoViews removeLastObject];
+            view.hidden = YES;
+        } else {
+            view = [[InterRemoteVideoView alloc] initWithFrame:self.bounds];
+            view.hidden = YES;
+        }
         view.isMirrored = YES;  // Mirror camera feeds for natural appearance
         self.remoteCameraViews[participantId] = view;
         [self.cameraParticipantOrder addObject:participantId];
@@ -322,15 +420,23 @@ static const CGFloat kAnimationDuration      = 0.3;
 - (void)removeCameraViewForParticipant:(NSString *)participantId {
     InterRemoteVideoView *view = self.remoteCameraViews[participantId];
     if (view) {
-        // Remote preview tiles run their own display-link renderer. Stop that
-        // renderer before releasing the final strong reference so view teardown
-        // cannot race CAMetalLayer access on a background callback.
-        [view shutdownRenderingSynchronously];
+        // Phase 7.3.3: Recycle view instead of destroying it (up to 10 pooled).
+        // Beyond 10, shut down rendering to cap memory usage.
         [self removeTileForKey:participantId];
+        [view clearFrame];
+        if (self.recycledVideoViews.count < 10) {
+            [view removeFromSuperview];
+            [self.recycledVideoViews addObject:view];
+        } else {
+            [view shutdownRenderingSynchronously];
+        }
         [self.remoteCameraViews removeObjectForKey:participantId];
         [self.cameraParticipantOrder removeObject:participantId];
         [self.participantDisplayNames removeObjectForKey:participantId];
     }
+
+    // Remove from visible set
+    [self.visibleParticipantIds removeObject:participantId];
 
     // If the removed camera was spotlighted, reset to auto
     if ([self.spotlightedTileKey isEqualToString:participantId]) {
@@ -652,6 +758,11 @@ static const CGFloat kAnimationDuration      = 0.3;
         NSRect stageFrame = NSMakeRect(0, kFilmstripPadding,
                                        stageW - kFilmstripPadding, H - 2 * kFilmstripPadding);
         [self setTile:stageTile frame:stageFrame animated:animated];
+
+        // Phase 7.3.4: Request high-res for spotlighted view
+        if (![spotlightKey isEqualToString:kScreenShareTileKey]) {
+            [self notifyDimensionsChange:CGSizeMake(1280, 720) forParticipant:spotlightKey];
+        }
     }
 
     // --- Filmstrip ---
@@ -715,6 +826,11 @@ static const CGFloat kAnimationDuration      = 0.3;
         tile.hidden = NO;
         videoView.hidden = NO;
 
+        // Apply active speaker highlight in filmstrip tiles too
+        if (![key isEqualToString:kScreenShareTileKey]) {
+            tile.isSpeaking = [key isEqualToString:self.activeSpeakerIdentity];
+        }
+
         NSUInteger visualIndex = itemIndex + i;
         CGFloat y = totalH - kFilmstripPadding - (visualIndex + 1) * tileH - visualIndex * kFilmstripTileGap;
         NSRect tileFrame = NSMakeRect(kFilmstripPadding, y, tileW, tileH);
@@ -725,43 +841,143 @@ static const CGFloat kAnimationDuration      = 0.3;
         } else {
             tile.frame = tileFrame;
         }
+
+        // Phase 7.3.4: Request low-res for filmstrip tiles
+        if (![key isEqualToString:kScreenShareTileKey]) {
+            [self notifyDimensionsChange:CGSizeMake(320, 180) forParticipant:key];
+        }
     }
 }
 
-#pragma mark - Camera Grid
+#pragma mark - Camera Grid (Phase 7: Adaptive + Paginated)
+
+/// Compute optimal grid dimensions for a given participant count.
+/// 1 → 1×1, 2 → 2×1, 3-4 → 2×2, 5-6 → 3×2, 7-9 → 3×3,
+/// 10-12 → 4×3, 13-16 → 4×4, 17-20 → 5×4, 21-25 → 5×5.
+- (void)gridDimensionsForCount:(NSUInteger)count cols:(NSUInteger *)outCols rows:(NSUInteger *)outRows {
+    NSUInteger cols, rows;
+    if (count <= 1) {
+        cols = 1; rows = 1;
+    } else if (count <= 2) {
+        cols = 2; rows = 1;
+    } else if (count <= 4) {
+        cols = 2; rows = 2;
+    } else if (count <= 6) {
+        cols = 3; rows = 2;
+    } else if (count <= 9) {
+        cols = 3; rows = 3;
+    } else if (count <= 12) {
+        cols = 4; rows = 3;
+    } else if (count <= 16) {
+        cols = 4; rows = 4;
+    } else if (count <= 20) {
+        cols = 5; rows = 4;
+    } else {
+        cols = 5; rows = 5;
+    }
+    *outCols = cols;
+    *outRows = rows;
+}
+
+- (NSUInteger)totalGridPages {
+    NSUInteger count = self.cameraParticipantOrder.count;
+    if (count <= self.maxTilesPerPage) return 1;
+    return (count + self.maxTilesPerPage - 1) / self.maxTilesPerPage;
+}
+
+- (void)nextGridPage {
+    NSUInteger total = self.totalGridPages;
+    if (total <= 1) return;
+    self.currentGridPage = (self.currentGridPage + 1) % total;
+    [self updateLayoutAnimated:YES];
+}
+
+- (void)previousGridPage {
+    NSUInteger total = self.totalGridPages;
+    if (total <= 1) return;
+    if (self.currentGridPage == 0) {
+        self.currentGridPage = total - 1;
+    } else {
+        self.currentGridPage -= 1;
+    }
+    [self updateLayoutAnimated:YES];
+}
+
+- (void)goToGridPage:(NSUInteger)page {
+    NSUInteger total = self.totalGridPages;
+    if (total <= 1) {
+        self.currentGridPage = 0;
+        return;
+    }
+    self.currentGridPage = MIN(page, total - 1);
+    [self updateLayoutAnimated:YES];
+}
 
 - (void)arrangeCameraGridInRect:(NSRect)rect animated:(BOOL)animated {
-    NSArray<NSString *> *participants = [self.cameraParticipantOrder copy];
-    NSUInteger count = participants.count;
-    if (count == 0) return;
+    NSArray<NSString *> *allParticipants = [self.cameraParticipantOrder copy];
+    NSUInteger totalCount = allParticipants.count;
+    if (totalCount == 0) return;
 
-    // Grid dimensions:
-    //   1 → 1×1 (fill)
-    //   2 → 2×1 (side-by-side)
-    //   3 → 2×2 (bottom row centered)
-    //   4 → 2×2 (full grid)
-    NSUInteger cols, rows;
-    if (count <= 2) {
-        cols = count;
-        rows = 1;
-    } else {
-        cols = 2;
-        rows = (count + 1) / 2;
+    NSUInteger maxPerPage = self.maxTilesPerPage;
+    BOOL isPaginated = (totalCount > maxPerPage);
+    NSUInteger pages = self.totalGridPages;
+
+    // Clamp current page to valid range
+    if (self.currentGridPage >= pages) {
+        self.currentGridPage = (pages > 0) ? pages - 1 : 0;
     }
 
-    CGFloat gap = 6.0;
-    CGFloat totalGapW = (cols - 1) * gap;
-    CGFloat totalGapH = (rows - 1) * gap;
-    CGFloat cellW = (rect.size.width - totalGapW) / cols;
-    CGFloat cellH = (rect.size.height - totalGapH) / rows;
+    // Determine which participants are on the current page
+    NSUInteger startIdx = self.currentGridPage * maxPerPage;
+    NSUInteger endIdx = MIN(startIdx + maxPerPage, totalCount);
+    NSArray<NSString *> *pageParticipants = [allParticipants subarrayWithRange:NSMakeRange(startIdx, endIdx - startIdx)];
+    NSUInteger count = pageParticipants.count;
 
-    // Check if the last row is incomplete (odd count with 2 cols)
-    BOOL lastRowIncomplete = (count > 2) && (count % cols != 0);
+    // Phase 7.3.3: Track visibility changes for paged-out participants
+    NSMutableSet<NSString *> *newVisibleSet = [NSMutableSet setWithArray:pageParticipants];
+    [self notifyVisibilityChangesFrom:self.visibleParticipantIds to:newVisibleSet];
+    self.visibleParticipantIds = newVisibleSet;
+
+    // Reserve space for page indicator if paginated
+    NSRect gridRect = rect;
+    if (isPaginated) {
+        gridRect.size.height -= (kPageIndicatorHeight + kPageIndicatorPadding);
+        gridRect.origin.y += (kPageIndicatorHeight + kPageIndicatorPadding);
+        [self updatePageIndicatorInRect:rect pageIndex:self.currentGridPage totalPages:pages];
+    } else {
+        self.pageIndicatorBar.hidden = YES;
+    }
+
+    // Phase 7.3.1: Dynamic grid dimensions
+    NSUInteger cols, rows;
+    [self gridDimensionsForCount:count cols:&cols rows:&rows];
+
+    CGFloat gap = 6.0;
+    CGFloat totalGapW = (cols > 0) ? (cols - 1) * gap : 0;
+    CGFloat totalGapH = (rows > 0) ? (rows - 1) * gap : 0;
+    CGFloat cellW = (gridRect.size.width - totalGapW) / MAX(cols, 1);
+    CGFloat cellH = (gridRect.size.height - totalGapH) / MAX(rows, 1);
+
+    // Check if the last row is incomplete
+    BOOL lastRowIncomplete = (count > 0) && (count % cols != 0);
     NSUInteger lastRowCount = lastRowIncomplete ? (count % cols) : cols;
-    NSUInteger lastRow = rows - 1;
+    NSUInteger lastRow = (count > 0) ? ((count - 1) / cols) : 0;
+
+    // Phase 7.3.4: Determine quality based on tile size for stage vs filmstrip
+    CGSize tileDimensions = CGSizeMake(cellW, cellH);
+    CGSize qualityDimensions;
+    if (count <= 4) {
+        qualityDimensions = CGSizeMake(1280, 720);  // High quality for few participants
+    } else if (count <= 9) {
+        qualityDimensions = CGSizeMake(640, 360);  // Medium quality
+    } else if (count <= 16) {
+        qualityDimensions = CGSizeMake(480, 270);  // Lower quality
+    } else {
+        qualityDimensions = CGSizeMake(320, 180);  // Thumbnail quality for 17-25 per page
+    }
 
     for (NSUInteger i = 0; i < count; i++) {
-        NSString *pid = participants[i];
+        NSString *pid = pageParticipants[i];
         InterRemoteVideoView *view = self.remoteCameraViews[pid];
         if (!view) continue;
 
@@ -779,19 +995,80 @@ static const CGFloat kAnimationDuration      = 0.3;
         NSUInteger row = i / cols;
 
         CGFloat x, y;
-        y = rect.origin.y + (rows - 1 - row) * (cellH + gap);
+        y = gridRect.origin.y + (rows - 1 - row) * (cellH + gap);
 
         // Center the last row if it has fewer tiles than cols
         if (row == lastRow && lastRowIncomplete) {
             CGFloat lastRowTotalW = lastRowCount * cellW + (lastRowCount - 1) * gap;
-            CGFloat offsetX = (rect.size.width - lastRowTotalW) / 2.0;
-            x = rect.origin.x + offsetX + col * (cellW + gap);
+            CGFloat offsetX = (gridRect.size.width - lastRowTotalW) / 2.0;
+            x = gridRect.origin.x + offsetX + col * (cellW + gap);
         } else {
-            x = rect.origin.x + col * (cellW + gap);
+            x = gridRect.origin.x + col * (cellW + gap);
         }
 
         NSRect frame = NSMakeRect(x, y, cellW, cellH);
         [self setTile:tile frame:frame animated:animated];
+
+        // Phase 7.3.4: Request appropriate quality for this tile
+        [self notifyDimensionsChange:qualityDimensions forParticipant:pid];
+    }
+}
+
+#pragma mark - Page Indicator
+
+- (void)updatePageIndicatorInRect:(NSRect)containerRect pageIndex:(NSUInteger)page totalPages:(NSUInteger)total {
+    self.pageIndicatorBar.hidden = NO;
+
+    CGFloat barW = 180.0;
+    CGFloat barH = kPageIndicatorHeight;
+    CGFloat barX = (containerRect.size.width - barW) / 2.0;
+    CGFloat barY = containerRect.origin.y + kPageIndicatorPadding;
+    self.pageIndicatorBar.frame = NSMakeRect(barX, barY, barW, barH);
+
+    // Layout: [◀] [Page X of Y] [▶]
+    CGFloat btnW = 30.0;
+    self.pageLeftButton.frame = NSMakeRect(4, 2, btnW, barH - 4);
+    self.pageRightButton.frame = NSMakeRect(barW - btnW - 4, 2, btnW, barH - 4);
+    self.pageLabel.frame = NSMakeRect(btnW + 4, 0, barW - 2 * (btnW + 8), barH);
+    self.pageLabel.stringValue = [NSString stringWithFormat:@"Page %lu of %lu",
+                                  (unsigned long)(page + 1), (unsigned long)total];
+
+    self.pageLeftButton.enabled = (total > 1);
+    self.pageRightButton.enabled = (total > 1);
+}
+
+#pragma mark - Visibility & Quality Notifications [Phase 7]
+
+/// Notify delegate about participants that became visible or hidden due to pagination.
+- (void)notifyVisibilityChangesFrom:(NSMutableSet<NSString *> *)oldSet to:(NSMutableSet<NSString *> *)newSet {
+    id<InterRemoteVideoLayoutManagerDelegate> delegate = self.layoutDelegate;
+    if (!delegate) return;
+
+    // Participants that were visible but are now hidden
+    for (NSString *pid in oldSet) {
+        if (![newSet containsObject:pid]) {
+            if ([delegate respondsToSelector:@selector(layoutManager:didChangeVisibility:forParticipant:source:)]) {
+                [delegate layoutManager:self didChangeVisibility:NO forParticipant:pid source:0 /* camera */];
+            }
+        }
+    }
+
+    // Participants that were hidden but are now visible
+    for (NSString *pid in newSet) {
+        if (![oldSet containsObject:pid]) {
+            if ([delegate respondsToSelector:@selector(layoutManager:didChangeVisibility:forParticipant:source:)]) {
+                [delegate layoutManager:self didChangeVisibility:YES forParticipant:pid source:0 /* camera */];
+            }
+        }
+    }
+}
+
+/// Notify delegate of preferred render dimensions for a participant's camera track.
+- (void)notifyDimensionsChange:(CGSize)dimensions forParticipant:(NSString *)participantId {
+    id<InterRemoteVideoLayoutManagerDelegate> delegate = self.layoutDelegate;
+    if (!delegate) return;
+    if ([delegate respondsToSelector:@selector(layoutManager:didRequestDimensions:forParticipant:source:)]) {
+        [delegate layoutManager:self didRequestDimensions:dimensions forParticipant:participantId source:0 /* camera */];
     }
 }
 
@@ -819,6 +1096,26 @@ static const CGFloat kAnimationDuration      = 0.3;
     [super setFrame:frame];
     [self applyCurrentLayoutAnimated:NO];
     [self updateParticipantCountBadge];
+}
+
+#pragma mark - Keyboard Navigation (Phase 7)
+
+- (BOOL)acceptsFirstResponder {
+    return YES;
+}
+
+- (void)keyDown:(NSEvent *)event {
+    // Arrow keys for grid page navigation
+    if (self.totalGridPages > 1 && self.layoutMode == InterRemoteVideoLayoutModeMultiCamera) {
+        if (event.keyCode == 123) { // Left arrow
+            [self previousGridPage];
+            return;
+        } else if (event.keyCode == 124) { // Right arrow
+            [self nextGridPage];
+            return;
+        }
+    }
+    [super keyDown:event];
 }
 
 #pragma mark - Teardown
@@ -852,6 +1149,18 @@ static const CGFloat kAnimationDuration      = 0.3;
     }
     self.filmstripScrollView.hidden = YES;
 
+    // Phase 7: Clean recycling pool and pagination state
+    for (InterRemoteVideoView *recycled in self.recycledVideoViews) {
+        [recycled shutdownRenderingSynchronously];
+    }
+    [self.recycledVideoViews removeAllObjects];
+    [self.visibleParticipantIds removeAllObjects];
+    self.currentGridPage = 0;
+    self.pageIndicatorBar.hidden = YES;
+    [self.autoSpotlightRevertTimer invalidate];
+    self.autoSpotlightRevertTimer = nil;
+    self.preAutoSpotlightKey = nil;
+
     self.participantOverlay.hidden = YES;
     self.layoutMode = InterRemoteVideoLayoutModeNone;
 }
@@ -880,6 +1189,42 @@ static const CGFloat kAnimationDuration      = 0.3;
         if (newTile) {
             newTile.isSpeaking = YES;
         }
+    }
+
+    // Phase 7.4.2: Auto-spotlight active speaker in stage+filmstrip mode
+    if (self.autoSpotlightActiveSpeaker &&
+        (self.layoutMode == InterRemoteVideoLayoutModeScreenShareWithCameras ||
+         (self.layoutMode == InterRemoteVideoLayoutModeMultiCamera && self.preferStageLayoutForMultipleCameras))) {
+
+        // Cancel any pending revert timer
+        [self.autoSpotlightRevertTimer invalidate];
+        self.autoSpotlightRevertTimer = nil;
+
+        if (_activeSpeakerIdentity.length > 0 && self.remoteCameraViews[_activeSpeakerIdentity]) {
+            // Save current spotlight for later restoration (only if not already in auto mode)
+            if (!self.preAutoSpotlightKey) {
+                self.preAutoSpotlightKey = self.spotlightedTileKey;
+            }
+            self.spotlightedTileKey = _activeSpeakerIdentity;
+            [self updateLayoutAnimated:YES];
+        } else if (_activeSpeakerIdentity.length == 0 && self.preAutoSpotlightKey) {
+            // Speaker stopped — start 3s timer before reverting to previous spotlight
+            self.autoSpotlightRevertTimer = [NSTimer scheduledTimerWithTimeInterval:3.0
+                                                                             target:self
+                                                                           selector:@selector(revertAutoSpotlight)
+                                                                           userInfo:nil
+                                                                            repeats:NO];
+        }
+    }
+}
+
+/// Revert auto-spotlight back to the previous spotlight key after timeout. [Phase 7.4.2]
+- (void)revertAutoSpotlight {
+    self.autoSpotlightRevertTimer = nil;
+    if (self.preAutoSpotlightKey) {
+        self.spotlightedTileKey = self.preAutoSpotlightKey;
+        self.preAutoSpotlightKey = nil;
+        [self updateLayoutAnimated:YES];
     }
 }
 
