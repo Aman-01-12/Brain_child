@@ -81,6 +81,11 @@ NS_ASSUME_NONNULL_BEGIN
 /// Two-phase microphone toggle: same G2 ordering as camera.
 - (void)twoPhaseToggleMicrophone;
 
+/// Whether the microphone track is currently muted at the network level
+/// (while connected). Used to avoid AVCaptureSession modifications that
+/// interrupt the camera preview.
+@property (nonatomic, readonly) BOOL isMicNetworkMuted;
+
 // -- Simple Device Toggles -------------------------------------------------
 
 /// Toggle camera on/off (local device only, no G2 network coordination).

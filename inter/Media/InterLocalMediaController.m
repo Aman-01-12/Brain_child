@@ -492,6 +492,17 @@ static const void *InterLocalMediaSessionQueueKey = &InterLocalMediaSessionQueue
     });
 }
 
+- (void)storePreferredAudioDeviceID:(nullable NSString *)deviceID {
+    dispatch_queue_t queue = _sessionQueue;
+    if (!queue || self.isShuttingDown) {
+        return;
+    }
+    NSString *normalizedID = deviceID.length > 0 ? [deviceID copy] : nil;
+    dispatch_async(queue, ^{
+        self->_preferredAudioDeviceID = normalizedID;
+    });
+}
+
 - (void)attachPreviewToView:(NSView *)view {
     if (!view) {
         return;

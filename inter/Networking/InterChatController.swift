@@ -229,7 +229,7 @@ import LiveKit
             do {
                 let localParticipant = rc.publisher.localParticipant
                 try await localParticipant?.publish(data: data, options: DataPublishOptions(
-                    destinationIdentities: [Identity(stringValue: recipientIdentity)],
+                    destinationIdentities: [Participant.Identity(from: recipientIdentity)],
                     topic: Self.chatTopic,
                     reliable: true
                 ))
@@ -260,12 +260,12 @@ import LiveKit
 
     /// Lower another participant's hand (host action).
     @objc public func lowerHand(forParticipant identity: String) {
-        // Send a lower-hand signal with our identity as sender
-        // The speaker queue model handles the removal
+        // Send with the HOST's identity as sender and the dismissed participant as target
         let signal = InterControlSignal(
             type: .lowerHand,
-            senderIdentity: identity,
-            senderName: ""  // Not needed for lower-hand
+            senderIdentity: localIdentity,
+            senderName: localDisplayName,
+            targetIdentity: identity
         )
 
         guard let data = signal.toJSONData() else { return }
@@ -285,7 +285,7 @@ import LiveKit
             }
         }
 
-        // Process locally
+        // Process locally on the host side
         controlDelegate?.chatController(self, participantDidLowerHand: identity)
     }
 
@@ -477,17 +477,27 @@ import LiveKit
             return
         }
 
-        // Skip own signals (already processed locally in sendControlSignal)
-        guard signal.senderIdentity != localIdentity else { return }
-
         switch signal.type {
         case .raiseHand:
+            // Skip own raise signals (already processed locally)
+            guard signal.senderIdentity != localIdentity else { return }
             interLogInfo(InterLog.room, "ChatController: %{public}@ raised hand", signal.senderName)
             controlDelegate?.chatController(self, participantDidRaiseHand: signal.senderIdentity,
                                             displayName: signal.senderName)
         case .lowerHand:
-            interLogInfo(InterLog.room, "ChatController: %{public}@ lowered hand", signal.senderIdentity)
-            controlDelegate?.chatController(self, participantDidLowerHand: signal.senderIdentity)
+            let targetId = signal.targetIdentity ?? signal.senderIdentity
+            if targetId == localIdentity && signal.senderIdentity != localIdentity {
+                // Host dismissed OUR hand — notify delegate so local button resets
+                interLogInfo(InterLog.room, "ChatController: host dismissed our raised hand")
+                controlDelegate?.chatController(self, participantDidLowerHand: localIdentity)
+            } else if signal.senderIdentity == localIdentity {
+                // Our own lower signal echoed back — skip
+                return
+            } else {
+                // Another participant lowered their own hand
+                interLogInfo(InterLog.room, "ChatController: %{public}@ lowered hand", targetId)
+                controlDelegate?.chatController(self, participantDidLowerHand: targetId)
+            }
         @unknown default:
             interLogDebug(InterLog.room, "ChatController: unknown control signal type %d", signal.type.rawValue)
         }

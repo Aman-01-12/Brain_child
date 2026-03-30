@@ -10,6 +10,8 @@ NS_ASSUME_NONNULL_BEGIN
 @optional
 /// Host dismissed a raised hand from the queue.
 - (void)speakerQueuePanel:(InterSpeakerQueuePanel *)panel didDismissParticipant:(NSString *)identity;
+/// Host dismissed all raised hands at once.
+- (void)speakerQueuePanelDidDismissAll:(InterSpeakerQueuePanel *)panel;
 @end
 
 /// [Phase 8.2.4] Host-facing raised-hand queue panel.

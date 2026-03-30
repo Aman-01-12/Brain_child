@@ -127,7 +127,9 @@ import LiveKit
                 guard publication.source == lkSource else { continue }
 
                 if let remotePub = publication as? RemoteTrackPublication {
-                    remotePub.set(enabled: visible)
+                    Task {
+                        try? await remotePub.set(enabled: visible)
+                    }
                     interLogInfo(InterLog.media, "Subscriber: track visibility %{public}@ for %{public}@ source=%d",
                                  visible ? "enabled" : "disabled", participantId, source.rawValue)
                 }
@@ -159,14 +161,16 @@ import LiveKit
                 guard publication.source == lkSource else { continue }
 
                 if let remotePub = publication as? RemoteTrackPublication {
-                    remotePub.set(preferredDimensions: dimensions)
+                    let lkDims = Dimensions(width: Int32(dimensions.width), height: Int32(dimensions.height))
+                    Task {
+                        try? await remotePub.set(preferredDimensions: lkDims)
+                    }
                     interLogInfo(InterLog.media, "Subscriber: preferred dims %.0fx%.0f for %{public}@ source=%d",
                                  dimensions.width, dimensions.height, participantId, source.rawValue)
                 }
             }
             break
         }
-    }
     }
 
     /// Unregister from the room and clean up all renderers.

@@ -45,6 +45,13 @@ typedef void (^InterLocalMediaAudioSampleBufferHandler)(CMSampleBufferRef sample
 - (void)selectAudioInputDeviceWithID:(nullable NSString *)deviceID
                           completion:(void (^ _Nullable)(BOOL success))completion;
 
+/// Store a preferred audio device ID without reconfiguring the capture session.
+/// Use this when the session is actively capturing video and you want to avoid
+/// the momentary interruption caused by beginConfiguration/commitConfiguration.
+/// The stored preference will be applied on the next selectAudioInputDeviceWithID:
+/// call or session reconfiguration.
+- (void)storePreferredAudioDeviceID:(nullable NSString *)deviceID;
+
 - (void)attachPreviewToView:(NSView *)view;
 - (void)detachPreview;
 

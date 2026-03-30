@@ -77,6 +77,21 @@ import LiveKit
     /// and wired in before connect. The room controller forwards DataChannel data to it.
     @objc public weak var chatController: InterChatController?
 
+    /// The local participant's identity string (ObjC-safe accessor).
+    @objc public var localParticipantIdentity: String {
+        return room?.localParticipant.identity?.stringValue ?? ""
+    }
+
+    /// The local participant's display name (ObjC-safe accessor).
+    @objc public var localParticipantName: String {
+        return room?.localParticipant.name ?? "You"
+    }
+
+    /// Whether the local participant is the host (room creator).
+    @objc public var isHost: Bool {
+        return configuration?.isHost ?? false
+    }
+
     // MARK: - Private Properties
 
     /// The LiveKit Room instance. Created fresh for each connection.
@@ -99,6 +114,13 @@ import LiveKit
 
     /// Whether screen share was unpublished due to memory pressure (for auto-restore).
     private var screenShareSuspendedForMemory = false
+
+    /// Debounce work item for clearing active speaker identity.
+    /// Prevents green border flicker when VAD briefly sends active=false during continuous speech.
+    private var activeSpeakerClearWork: DispatchWorkItem?
+
+    /// Cooldown interval (seconds) before clearing the active speaker border.
+    private let activeSpeakerClearDelay: TimeInterval = 1.0
 
     /// Flag to prevent double-connect.
     private(set) var isConnecting = false
@@ -390,6 +412,8 @@ import LiveKit
         DispatchQueue.main.async {
             self.remoteParticipantCount = 0
             self.participantPresenceState = .alone
+            self.activeSpeakerClearWork?.cancel()
+            self.activeSpeakerClearWork = nil
             self.activeSpeakerIdentity = ""
             self.roomCode = ""
             self.roomType = ""
@@ -711,17 +735,36 @@ extension InterRoomController: RoomDelegate {
         let identity = remoteSpeaker?.identity?.stringValue ?? ""
 
         DispatchQueue.main.async {
-            if self.activeSpeakerIdentity != identity {
-                self.activeSpeakerIdentity = identity
-                interLogInfo(InterLog.networking, "RoomController: active speaker → %{public}@",
-                             identity.isEmpty ? "(none)" : identity)
+            // Cancel any pending "clear speaker" timer.
+            self.activeSpeakerClearWork?.cancel()
+            self.activeSpeakerClearWork = nil
+
+            if !identity.isEmpty {
+                // Active remote speaker detected — update immediately.
+                if self.activeSpeakerIdentity != identity {
+                    self.activeSpeakerIdentity = identity
+                    interLogInfo(InterLog.networking, "RoomController: active speaker → %{public}@", identity)
+                }
+            } else {
+                // No remote speaker right now. Debounce the clear so brief VAD
+                // dips (breaths, pauses between words) don't flicker the border.
+                guard !self.activeSpeakerIdentity.isEmpty else { return }
+
+                let work = DispatchWorkItem { [weak self] in
+                    guard let self = self else { return }
+                    self.activeSpeakerIdentity = ""
+                    self.activeSpeakerClearWork = nil
+                    interLogInfo(InterLog.networking, "RoomController: active speaker → (none) [debounced]")
+                }
+                self.activeSpeakerClearWork = work
+                DispatchQueue.main.asyncAfter(deadline: .now() + self.activeSpeakerClearDelay, execute: work)
             }
         }
     }
 
     // MARK: DataChannel [Phase 8]
 
-    public nonisolated func room(_ room: Room, participant: RemoteParticipant?, didReceiveData data: Data, forTopic topic: String) {
+    public nonisolated func room(_ room: Room, participant: RemoteParticipant?, didReceiveData data: Data, forTopic topic: String, encryptionType: EncryptionType) {
         let senderIdentity = participant?.identity?.stringValue
         interLogDebug(InterLog.room, "RoomController: received data (%d bytes) on topic '%{public}@' from %{public}@",
                       data.count, topic, senderIdentity ?? "server")

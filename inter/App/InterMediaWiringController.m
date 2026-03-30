@@ -32,6 +32,9 @@ static void *InterWiringParticipantCountContext = &InterWiringParticipantCountCo
 @property (nonatomic, strong, nullable) dispatch_source_t reconnectionTimeoutTimer;
 /// Whether the connection-lost alert is currently visible.
 @property (nonatomic, assign) BOOL isShowingConnectionLostAlert;
+/// Tracks whether the mic LiveKit track is muted while connected.
+/// Used by twoPhaseToggleMicrophone to avoid AVCaptureSession reconfiguration.
+@property (nonatomic, assign, readwrite) BOOL isMicNetworkMuted;
 @end
 
 @implementation InterMediaWiringController
@@ -112,25 +115,41 @@ static void *InterWiringParticipantCountContext = &InterWiringParticipantCountCo
 - (void)twoPhaseToggleMicrophone {
     InterLocalMediaController *media = self.mediaController;
     InterRoomController *rc = self.roomController;
-    BOOL shouldEnable = !media.isMicrophoneEnabled;
+    BOOL isConnected = rc && rc.connectionState == InterRoomConnectionStateConnected;
 
-    __weak typeof(self) weakSelf = self;
+    if (isConnected) {
+        // ── Connected path ──────────────────────────────────────────────
+        // Only mute/unmute the LiveKit audio track. Do NOT touch
+        // InterLocalMediaController / AVCaptureSession — modifying the
+        // shared session's audio inputs calls beginConfiguration /
+        // commitConfiguration, which momentarily interrupts ALL session
+        // outputs including the camera video preview.
+        BOOL shouldMute = !self.isMicNetworkMuted;
+        __weak typeof(self) weakSelf = self;
 
-    if (!shouldEnable) {
-        // DISABLE: [G2] Mute LiveKit track FIRST → then stop capture
-        if (rc && rc.connectionState == InterRoomConnectionStateConnected) {
+        if (shouldMute) {
             [rc.publisher muteMicrophoneTrackWithCompletion:^{
-                [weakSelf toggleMicrophone];
+                weakSelf.isMicNetworkMuted = YES;
+                [weakSelf.controlPanel setMicrophoneEnabled:NO];
+                NSString *summary = weakSelf.mediaStateSummaryBlock ? weakSelf.mediaStateSummaryBlock() : nil;
+                if (summary) {
+                    [weakSelf.controlPanel setMediaStatusText:summary];
+                }
             }];
         } else {
-            [self toggleMicrophone];
+            [rc.publisher unmuteMicrophoneTrack];
+            self.isMicNetworkMuted = NO;
+            [self.controlPanel setMicrophoneEnabled:YES];
+            NSString *summary = self.mediaStateSummaryBlock ? self.mediaStateSummaryBlock() : nil;
+            if (summary) {
+                [self.controlPanel setMediaStatusText:summary];
+            }
         }
     } else {
-        // ENABLE: [G2] Start capture device FIRST → then unmute track
+        // ── Offline / pre-connect path ──────────────────────────────────
+        // No LiveKit track exists yet. Toggle the local capture device
+        // through the AVCaptureSession as before.
         [self toggleMicrophone];
-        if (rc && rc.connectionState == InterRoomConnectionStateConnected) {
-            [rc.publisher unmuteMicrophoneTrack];
-        }
     }
 }
 
@@ -146,6 +165,9 @@ static void *InterWiringParticipantCountContext = &InterWiringParticipantCountCo
     if (!media) {
         return;
     }
+
+    // Reset network-level mic mute state when (re-)wiring tracks.
+    self.isMicNetworkMuted = NO;
 
     AVCaptureSession *session = media.captureSession;
     dispatch_queue_t sessionQueue = media.sessionQueue;

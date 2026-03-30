@@ -47,6 +47,24 @@ static const CGFloat InterChatAnimationDuration = 0.25;
     return self.expanded;
 }
 
+/// Pass through mouse events when collapsed. Only forward hits that land
+/// inside the visible container view when expanded.
+- (NSView *)hitTest:(NSPoint)point {
+    if (!self.expanded) {
+        return nil;  // Fully transparent to clicks when collapsed
+    }
+    // point is in superview coordinates — convert to self's coords for child hit-testing
+    NSPoint pointInSelf = [self convertPoint:point fromView:self.superview];
+    // Check if the point falls inside the container
+    NSPoint containerPoint = [self.containerView convertPoint:pointInSelf fromView:self];
+    if (NSPointInRect(containerPoint, self.containerView.bounds)) {
+        // hitTest: expects the point in the *superview's* coordinate system,
+        // so pass pointInSelf (self is containerView's superview).
+        return [self.containerView hitTest:pointInSelf];
+    }
+    return nil;  // Click is outside the panel slide-in area
+}
+
 #pragma mark - Setup
 
 - (void)setupViews {

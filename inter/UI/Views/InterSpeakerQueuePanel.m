@@ -18,6 +18,7 @@ static const CGFloat InterQueuePadding = 8.0;
 @property (nonatomic, strong) NSTableView *tableView;
 @property (nonatomic, strong) NSMutableArray<InterRaisedHandEntry *> *queueEntries;
 @property (nonatomic, assign) BOOL panelVisible;
+@property (nonatomic, strong) NSButton *dismissAllButton;
 
 @end
 
@@ -31,6 +32,14 @@ static const CGFloat InterQueuePadding = 8.0;
         [self setupViews];
     }
     return self;
+}
+
+/// Pass through mouse events when hidden.
+- (NSView *)hitTest:(NSPoint)point {
+    if (!self.panelVisible) {
+        return nil;
+    }
+    return [super hitTest:point];
 }
 
 - (BOOL)isVisible {
@@ -47,16 +56,54 @@ static const CGFloat InterQueuePadding = 8.0;
     self.layer.borderWidth = 1.0;
     self.hidden = YES;
 
-    // Header
+    // Header bar background
+    NSView *headerBar = [[NSView alloc] initWithFrame:NSMakeRect(0,
+                                                                  self.bounds.size.height - InterQueueHeaderHeight,
+                                                                  self.bounds.size.width,
+                                                                  InterQueueHeaderHeight)];
+    headerBar.autoresizingMask = NSViewWidthSizable | NSViewMinYMargin;
+    [headerBar setWantsLayer:YES];
+    headerBar.layer.backgroundColor = [NSColor colorWithWhite:0.15 alpha:1.0].CGColor;
+    [self addSubview:headerBar];
+
+    // Header label
     self.headerLabel = [NSTextField labelWithString:@"✋ Raised Hands"];
-    self.headerLabel.frame = NSMakeRect(InterQueuePadding,
-                                        self.bounds.size.height - InterQueueHeaderHeight,
-                                        self.bounds.size.width - InterQueuePadding * 2,
-                                        InterQueueHeaderHeight);
+    self.headerLabel.frame = NSMakeRect(InterQueuePadding, 8,
+                                        self.bounds.size.width - InterQueuePadding * 2 - 36,
+                                        20);
     self.headerLabel.autoresizingMask = NSViewWidthSizable | NSViewMinYMargin;
     self.headerLabel.font = [NSFont boldSystemFontOfSize:13];
     self.headerLabel.textColor = [NSColor colorWithWhite:0.92 alpha:1.0];
-    [self addSubview:self.headerLabel];
+    [headerBar addSubview:self.headerLabel];
+
+    // Close button
+    NSButton *closeBtn = [[NSButton alloc] initWithFrame:NSMakeRect(self.bounds.size.width - 36, 6, 28, 24)];
+    closeBtn.autoresizingMask = NSViewMinXMargin | NSViewMinYMargin;
+    [closeBtn setImage:[NSImage imageWithSystemSymbolName:@"xmark"
+                                accessibilityDescription:@"Close"]];
+    [closeBtn setImagePosition:NSImageOnly];
+    [closeBtn setBordered:NO];
+    closeBtn.contentTintColor = [NSColor colorWithWhite:0.7 alpha:1.0];
+    [closeBtn setTarget:self];
+    [closeBtn setAction:@selector(closeAction:)];
+    closeBtn.toolTip = @"Close queue";
+    [headerBar addSubview:closeBtn];
+
+    // Dismiss All button — sits below the header bar, above the table
+    CGFloat dismissAllY = self.bounds.size.height - InterQueueHeaderHeight - 28;
+    self.dismissAllButton = [[NSButton alloc] initWithFrame:NSMakeRect(InterQueuePadding, dismissAllY,
+                                                                       self.bounds.size.width - InterQueuePadding * 2, 22)];
+    self.dismissAllButton.autoresizingMask = NSViewWidthSizable | NSViewMinYMargin;
+    [self.dismissAllButton setTitle:@"Dismiss All"];
+    self.dismissAllButton.font = [NSFont systemFontOfSize:11 weight:NSFontWeightMedium];
+    self.dismissAllButton.contentTintColor = [NSColor systemRedColor];
+    [self.dismissAllButton setBordered:NO];
+    self.dismissAllButton.alignment = NSTextAlignmentRight;
+    [self.dismissAllButton setTarget:self];
+    [self.dismissAllButton setAction:@selector(dismissAllAction:)];
+    self.dismissAllButton.toolTip = @"Dismiss all raised hands";
+    self.dismissAllButton.hidden = YES; // hidden when queue is empty
+    [self addSubview:self.dismissAllButton];
 
     // Empty state
     self.emptyLabel = [NSTextField labelWithString:@"No raised hands"];
@@ -69,7 +116,8 @@ static const CGFloat InterQueuePadding = 8.0;
     [self addSubview:self.emptyLabel];
 
     // Scroll + Table
-    CGFloat scrollHeight = self.bounds.size.height - InterQueueHeaderHeight - InterQueuePadding;
+    CGFloat dismissAllBarHeight = 28.0;
+    CGFloat scrollHeight = self.bounds.size.height - InterQueueHeaderHeight - dismissAllBarHeight - InterQueuePadding;
     self.scrollView = [[NSScrollView alloc] initWithFrame:NSMakeRect(0, 0,
                                                                       self.bounds.size.width,
                                                                       scrollHeight)];
@@ -103,7 +151,9 @@ static const CGFloat InterQueuePadding = 8.0;
     [self.queueEntries removeAllObjects];
     [self.queueEntries addObjectsFromArray:entries];
     [self.tableView reloadData];
-    self.emptyLabel.hidden = (self.queueEntries.count > 0);
+    BOOL hasEntries = (self.queueEntries.count > 0);
+    self.emptyLabel.hidden = hasEntries;
+    self.dismissAllButton.hidden = !hasEntries;
 }
 
 - (void)showPanel {
@@ -211,6 +261,19 @@ static const CGFloat InterQueuePadding = 8.0;
     NSString *identity = sender.cell.representedObject;
     if (identity && [self.delegate respondsToSelector:@selector(speakerQueuePanel:didDismissParticipant:)]) {
         [self.delegate speakerQueuePanel:self didDismissParticipant:identity];
+    }
+}
+
+- (void)closeAction:(id)sender {
+#pragma unused(sender)
+    [self hidePanel];
+}
+
+- (void)dismissAllAction:(id)sender {
+#pragma unused(sender)
+    if (self.queueEntries.count == 0) return;
+    if ([self.delegate respondsToSelector:@selector(speakerQueuePanelDidDismissAll:)]) {
+        [self.delegate speakerQueuePanelDidDismissAll:self];
     }
 }
 

@@ -291,9 +291,10 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
         InterRoomConfiguration *cfg = nil;
         // The configuration is internal to the room controller; use the identity
         // we stored from the connect flow. Fall back to a generated identity.
-        NSString *identity = self.roomController.publisher.localParticipant.identity.stringValue ?: [[NSUUID UUID] UUIDString];
-        NSString *displayName = self.roomController.publisher.localParticipant.name ?: @"You";
-        [self.chatController attach:self.roomController identity:identity displayName:displayName];
+        NSString *identity = self.roomController.localParticipantIdentity;
+        if (identity.length == 0) identity = [[NSUUID UUID] UUIDString];
+        NSString *displayName = self.roomController.localParticipantName;
+        [self.chatController attachTo:self.roomController identity:identity displayName:displayName];
     }
     [self.speakerQueue reset];
 
@@ -436,7 +437,8 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
                                      participantIdentity:identity
                                          participantName:displayName
                                                   isHost:YES
-                                                roomType:(mode == InterCallModeInterview) ? @"interview" : @"call"];
+                                                roomType:(mode == InterCallModeInterview) ? @"interview" : @"call"
+                                        maxParticipants:50];
 
     __weak typeof(self) weakSelf = self;
     [rc connectWithConfiguration:config completion:^(NSError * _Nullable error) {
@@ -498,7 +500,8 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
                                      participantIdentity:identity
                                          participantName:displayName
                                                   isHost:NO
-                                                roomType:@""];
+                                                roomType:@""
+                                        maxParticipants:50];
 
     __weak typeof(self) weakSelf = self;
     [rc connectWithConfiguration:config completion:^(NSError * _Nullable error) {
@@ -664,9 +667,9 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
     self.normalChatPanel.delegate = self;
     [view addSubview:self.normalChatPanel];
 
-    // [Phase 8] Speaker queue panel (positioned above control panel)
+    // [Phase 8] Speaker queue panel (positioned above the bottom control bar)
     CGFloat queueX = view.bounds.size.width - 300.0 - 260.0 - 12.0;
-    self.normalSpeakerQueuePanel = [[InterSpeakerQueuePanel alloc] initWithFrame:NSMakeRect(queueX, 22.0, 260.0, 300.0)];
+    self.normalSpeakerQueuePanel = [[InterSpeakerQueuePanel alloc] initWithFrame:NSMakeRect(queueX, 90.0, 260.0, 300.0)];
     self.normalSpeakerQueuePanel.autoresizingMask = NSViewMinXMargin | NSViewMaxYMargin;
     self.normalSpeakerQueuePanel.delegate = self;
     [view addSubview:self.normalSpeakerQueuePanel];
@@ -758,12 +761,15 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
     [self.normalHandRaiseButton setAction:@selector(toggleNormalHandRaise)];
     [view addSubview:self.normalHandRaiseButton];
 
-    self.normalQueueToggleButton = [[NSButton alloc] initWithFrame:NSMakeRect(420, 40, 90, 42)];
-    self.normalQueueToggleButton.autoresizingMask = NSViewMaxXMargin | NSViewMaxYMargin;
-    [self.normalQueueToggleButton setTitle:@"📋 Queue"];
-    [self.normalQueueToggleButton setTarget:self];
-    [self.normalQueueToggleButton setAction:@selector(toggleNormalSpeakerQueue)];
-    [view addSubview:self.normalQueueToggleButton];
+    // Only show the speaker queue button to the host / co-host
+    if (self.roomController.isHost) {
+        self.normalQueueToggleButton = [[NSButton alloc] initWithFrame:NSMakeRect(420, 40, 90, 42)];
+        self.normalQueueToggleButton.autoresizingMask = NSViewMaxXMargin | NSViewMaxYMargin;
+        [self.normalQueueToggleButton setTitle:@"📋 Queue"];
+        [self.normalQueueToggleButton setTarget:self];
+        [self.normalQueueToggleButton setAction:@selector(toggleNormalSpeakerQueue)];
+        [view addSubview:self.normalQueueToggleButton];
+    }
 }
 
 - (void)startNormalLocalMediaFlow {
@@ -874,7 +880,11 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
 
 - (NSString *)normalMediaStateSummary {
     BOOL cameraOn = self.normalMediaController.isCameraEnabled;
-    BOOL microphoneOn = self.normalMediaController.isMicrophoneEnabled;
+    // When connected the mic toggle only mutes the LiveKit track and
+    // does NOT touch InterLocalMediaController, so isMicrophoneEnabled
+    // stays YES. Use the wiring controller's network mute flag instead.
+    BOOL microphoneOn = self.normalMediaController.isMicrophoneEnabled
+                        && !self.normalMediaWiring.isMicNetworkMuted;
     return [NSString stringWithFormat:@"Camera %@, Mic %@.",
             cameraOn ? @"on" : @"off",
             microphoneOn ? @"on" : @"off"];
@@ -892,6 +902,22 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
 
 - (void)handleNormalAudioInputSelection:(NSString * _Nullable)deviceID {
     if (!self.normalMediaController) {
+        return;
+    }
+
+    // When connected, modifying the AVCaptureSession's audio input calls
+    // beginConfiguration / commitConfiguration which momentarily interrupts
+    // ALL session outputs — including the camera video preview. LiveKit
+    // captures the mic natively (not through the session) so changing the
+    // session's audio input has no effect on what remote participants hear.
+    // Store the preference and skip the disruptive reconfiguration.
+    InterRoomController *rc = self.roomController;
+    BOOL isConnected = rc && rc.connectionState == InterRoomConnectionStateConnected;
+    if (isConnected) {
+        // Remember the selection so it's applied on next session setup /
+        // reconnect, and refresh the UI to reflect the stored choice.
+        [self.normalMediaController storePreferredAudioDeviceID:deviceID];
+        [self refreshNormalAudioInputOptions];
         return;
     }
 
@@ -1082,14 +1108,14 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
 
 - (void)toggleNormalHandRaise {
     if (!self.chatController) return;
-    NSString *localIdentity = self.roomController.publisher.localParticipant.identity.stringValue;
-    if (localIdentity && [self.speakerQueue isHandRaisedFor:localIdentity]) {
+    NSString *localIdentity = self.roomController.localParticipantIdentity;
+    if (localIdentity.length > 0 && [self.speakerQueue isHandRaisedFor:localIdentity]) {
         [self.chatController lowerHand];
         [self.speakerQueue removeHandFor:localIdentity];
         [self.normalHandRaiseButton setTitle:@"✋ Raise"];
     } else {
         [self.chatController raiseHand];
-        NSString *displayName = self.roomController.publisher.localParticipant.name ?: @"You";
+        NSString *displayName = self.roomController.localParticipantName;
         [self.speakerQueue addHandWithIdentity:localIdentity displayName:displayName];
         [self.normalHandRaiseButton setTitle:@"🖐 Lower"];
     }
@@ -1132,6 +1158,12 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
     [self.speakerQueue removeHandFor:identity];
     [self.normalSpeakerQueuePanel setEntries:self.speakerQueue.entries];
     [self.normalRemoteLayout setHandRaised:NO forParticipant:identity];
+
+    // If the dismissed identity is our own (host lowered our hand), reset the local button
+    NSString *localIdentity = self.roomController.localParticipantIdentity;
+    if ([identity isEqualToString:localIdentity]) {
+        [self.normalHandRaiseButton setTitle:@"✋ Raise"];
+    }
 }
 
 // MARK: InterChatPanelDelegate
@@ -1176,6 +1208,18 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
     [self.speakerQueue removeHandFor:identity];
     [self.normalSpeakerQueuePanel setEntries:self.speakerQueue.entries];
     [self.normalRemoteLayout setHandRaised:NO forParticipant:identity];
+}
+
+- (void)speakerQueuePanelDidDismissAll:(InterSpeakerQueuePanel *)panel {
+#pragma unused(panel)
+    // Dismiss each raised hand via the network so participants get notified
+    NSArray<InterRaisedHandEntry *> *entries = [self.speakerQueue.entries copy];
+    for (InterRaisedHandEntry *entry in entries) {
+        [self.chatController lowerHandForParticipant:entry.participantIdentity];
+        [self.normalRemoteLayout setHandRaised:NO forParticipant:entry.participantIdentity];
+    }
+    [self.speakerQueue reset];
+    [self.normalSpeakerQueuePanel setEntries:self.speakerQueue.entries];
 }
 
 // MARK: InterMediaWiringDelegate (Phase 8 — participant list sync)

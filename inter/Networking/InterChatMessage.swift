@@ -116,6 +116,10 @@ public struct InterControlSignal: Codable {
     /// Human-readable display name of the sender.
     public let senderName: String
 
+    /// The participant this signal is directed at (for host-initiated actions like dismiss).
+    /// nil for self-originated signals (raise/lower own hand).
+    public let targetIdentity: String?
+
     /// Unix timestamp (seconds since epoch).
     public let timestamp: TimeInterval
 
@@ -125,11 +129,13 @@ public struct InterControlSignal: Codable {
         type: InterControlSignalType,
         senderIdentity: String,
         senderName: String,
+        targetIdentity: String? = nil,
         timestamp: TimeInterval = Date().timeIntervalSince1970
     ) {
         self.type = type
         self.senderIdentity = senderIdentity
         self.senderName = senderName
+        self.targetIdentity = targetIdentity
         self.timestamp = timestamp
     }
 
