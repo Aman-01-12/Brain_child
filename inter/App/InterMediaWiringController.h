@@ -86,6 +86,32 @@ NS_ASSUME_NONNULL_BEGIN
 /// interrupt the camera preview.
 @property (nonatomic, readonly) BOOL isMicNetworkMuted;
 
+/// Apply a remote (server-side / host-initiated) mic mute. Updates local state
+/// and control panel UI to reflect that the mic has been muted externally.
+- (void)applyRemoteMicMute;
+
+/// Host allowed this participant to speak. Unmutes the mic track but keeps
+/// isHostMuted=YES so if the participant turns mic off again they go back
+/// to "raise hand" mode.
+- (void)applyAllowToSpeak;
+
+/// Host pressed "Unmute All". Clears isHostMuted so participants can freely
+/// toggle their mic. Does NOT auto-unmute — participants choose when to turn on.
+- (void)applyUnmuteAll;
+
+/// Whether the mic is locked by the host (hard mute). When YES, the
+/// participant cannot unmute from the UI — they must raise hand to speak.
+@property (nonatomic, readonly) BOOL isHostMuted;
+
+/// Whether the host has temporarily allowed the participant to speak.
+/// Only meaningful when isHostMuted=YES. Cleared when participant turns
+/// mic off or when host unmutes all.
+@property (nonatomic, readonly) BOOL isAllowedToSpeak;
+
+/// Revoke the one-time speak permission and put the mic button back to
+/// "raise hand" mode. Called when participant turns mic off while isHostMuted.
+- (void)revokeAllowToSpeak;
+
 // -- Simple Device Toggles -------------------------------------------------
 
 /// Toggle camera on/off (local device only, no G2 network coordination).

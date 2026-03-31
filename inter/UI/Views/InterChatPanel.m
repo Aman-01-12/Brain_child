@@ -514,4 +514,24 @@ static const CGFloat InterChatAnimationDuration = 0.25;
     }
 }
 
+#pragma mark - Phase 9: Moderation
+
+- (void)setChatInputEnabled:(BOOL)enabled {
+    self.inputField.enabled = enabled;
+    self.sendButton.enabled = enabled;
+    if (!enabled) {
+        self.inputField.placeholderString = @"Chat is disabled";
+    } else if (self.selectedRecipient) {
+        NSString *displayName = self.recipientSelector.selectedItem.title ?: self.selectedRecipient;
+        self.inputField.placeholderString = [NSString stringWithFormat:@"DM to %@…", displayName];
+    } else {
+        self.inputField.placeholderString = @"Type a message…";
+    }
+}
+
+- (void)displaySystemMessage:(NSString *)text {
+    InterChatMessageInfo *sysMessage = [[InterChatMessageInfo alloc] initWithSystemText:text];
+    [self appendMessage:sysMessage];
+}
+
 @end

@@ -29,6 +29,10 @@ NS_ASSUME_NONNULL_BEGIN
 - (void)setPanelTitleText:(NSString *)title;
 - (void)setCameraEnabled:(BOOL)enabled;
 - (void)setMicrophoneEnabled:(BOOL)enabled;
+
+/// Set a custom microphone button title. Pass nil to restore the default
+/// state-based title ("Turn Mic On" / "Turn Mic Off").
+- (void)setMicrophoneButtonTitle:(nullable NSString *)title;
 - (void)setSharingEnabled:(BOOL)enabled;
 - (void)setShareStartPending:(BOOL)pending;
 - (void)setMediaStatusText:(NSString *)text;

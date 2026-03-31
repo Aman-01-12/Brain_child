@@ -24,6 +24,8 @@ static const CGFloat InterQueuePadding = 8.0;
 
 @implementation InterSpeakerQueuePanel
 
+@synthesize showAllowActions = _showAllowActions;
+
 - (instancetype)initWithFrame:(NSRect)frameRect {
     self = [super initWithFrame:frameRect];
     if (self) {
@@ -44,6 +46,13 @@ static const CGFloat InterQueuePadding = 8.0;
 
 - (BOOL)isVisible {
     return self.panelVisible;
+}
+
+- (void)setShowAllowActions:(BOOL)showAllowActions {
+    if (_showAllowActions == showAllowActions) return;
+    _showAllowActions = showAllowActions;
+    // Force full cell re-creation by clearing cached cells, then reload
+    [self.tableView reloadData];
 }
 
 #pragma mark - Setup
@@ -154,6 +163,10 @@ static const CGFloat InterQueuePadding = 8.0;
     BOOL hasEntries = (self.queueEntries.count > 0);
     self.emptyLabel.hidden = hasEntries;
     self.dismissAllButton.hidden = !hasEntries;
+    self.headerLabel.stringValue = @"✋ Raised Hands";
+    if (!hasEntries) {
+        self.emptyLabel.stringValue = @"No raised hands";
+    }
 }
 
 - (void)showPanel {
@@ -200,12 +213,14 @@ static const CGFloat InterQueuePadding = 8.0;
 - (NSView *)tableView:(NSTableView *)tableView viewForTableColumn:(NSTableColumn *)tableColumn row:(NSInteger)row {
 #pragma unused(tableColumn)
 
-    static NSString *const kCellId = @"QueueEntryCell";
+    // Use different cell identifiers based on whether allow actions are shown,
+    // so cells don't get recycled into the wrong layout.
+    NSString *cellId = self.showAllowActions ? @"AllowEntryCell" : @"QueueEntryCell";
 
-    NSTableCellView *cell = [tableView makeViewWithIdentifier:kCellId owner:nil];
+    NSTableCellView *cell = [tableView makeViewWithIdentifier:cellId owner:nil];
     if (!cell) {
         cell = [[NSTableCellView alloc] initWithFrame:NSMakeRect(0, 0, InterQueuePanelWidth, InterQueueRowHeight)];
-        cell.identifier = kCellId;
+        cell.identifier = cellId;
 
         // Position badge
         NSTextField *posLabel = [NSTextField labelWithString:@""];
@@ -227,19 +242,44 @@ static const CGFloat InterQueuePadding = 8.0;
         nameLabel.tag = 202;
         nameLabel.font = [NSFont systemFontOfSize:12];
         nameLabel.textColor = [NSColor colorWithWhite:0.9 alpha:1.0];
-        nameLabel.frame = NSMakeRect(58, 12, 120, 18);
         nameLabel.lineBreakMode = NSLineBreakByTruncatingTail;
         [cell addSubview:nameLabel];
 
-        // Dismiss button
-        NSButton *dismissBtn = [[NSButton alloc] initWithFrame:NSMakeRect(InterQueuePanelWidth - 80, 8, 68, 24)];
-        dismissBtn.tag = 203;
-        [dismissBtn setTitle:@"Dismiss"];
-        dismissBtn.font = [NSFont systemFontOfSize:10];
-        dismissBtn.autoresizingMask = NSViewMinXMargin;
-        [dismissBtn setTarget:self];
-        [dismissBtn setAction:@selector(dismissAction:)];
-        [cell addSubview:dismissBtn];
+        if (self.showAllowActions) {
+            // When host has muted all: show "Allow" (green) + "Dismiss"
+            nameLabel.frame = NSMakeRect(58, 12, 80, 18);
+
+            NSButton *allowBtn = [[NSButton alloc] initWithFrame:NSMakeRect(InterQueuePanelWidth - 146, 8, 60, 24)];
+            allowBtn.tag = 204;
+            [allowBtn setTitle:@"Allow"];
+            allowBtn.font = [NSFont systemFontOfSize:10 weight:NSFontWeightMedium];
+            allowBtn.contentTintColor = [NSColor systemGreenColor];
+            allowBtn.autoresizingMask = NSViewMinXMargin;
+            [allowBtn setTarget:self];
+            [allowBtn setAction:@selector(allowAction:)];
+            [cell addSubview:allowBtn];
+
+            NSButton *dismissBtn = [[NSButton alloc] initWithFrame:NSMakeRect(InterQueuePanelWidth - 80, 8, 68, 24)];
+            dismissBtn.tag = 203;
+            [dismissBtn setTitle:@"Dismiss"];
+            dismissBtn.font = [NSFont systemFontOfSize:10];
+            dismissBtn.autoresizingMask = NSViewMinXMargin;
+            [dismissBtn setTarget:self];
+            [dismissBtn setAction:@selector(dismissAction:)];
+            [cell addSubview:dismissBtn];
+        } else {
+            // Normal: just "Dismiss"
+            nameLabel.frame = NSMakeRect(58, 12, 120, 18);
+
+            NSButton *dismissBtn = [[NSButton alloc] initWithFrame:NSMakeRect(InterQueuePanelWidth - 80, 8, 68, 24)];
+            dismissBtn.tag = 203;
+            [dismissBtn setTitle:@"Dismiss"];
+            dismissBtn.font = [NSFont systemFontOfSize:10];
+            dismissBtn.autoresizingMask = NSViewMinXMargin;
+            [dismissBtn setTarget:self];
+            [dismissBtn setAction:@selector(dismissAction:)];
+            [cell addSubview:dismissBtn];
+        }
     }
 
     InterRaisedHandEntry *entry = self.queueEntries[row];
@@ -251,8 +291,12 @@ static const CGFloat InterQueuePadding = 8.0;
     posLabel.stringValue = [NSString stringWithFormat:@"#%ld", (long)(row + 1)];
     nameLabel.stringValue = entry.displayName;
 
-    // Store identity on the button for the action
+    // Store identity on the action buttons
     dismissBtn.cell.representedObject = entry.participantIdentity;
+    if (self.showAllowActions) {
+        NSButton *allowBtn = [cell viewWithTag:204];
+        allowBtn.cell.representedObject = entry.participantIdentity;
+    }
 
     return cell;
 }
@@ -261,6 +305,13 @@ static const CGFloat InterQueuePadding = 8.0;
     NSString *identity = sender.cell.representedObject;
     if (identity && [self.delegate respondsToSelector:@selector(speakerQueuePanel:didDismissParticipant:)]) {
         [self.delegate speakerQueuePanel:self didDismissParticipant:identity];
+    }
+}
+
+- (void)allowAction:(NSButton *)sender {
+    NSString *identity = sender.cell.representedObject;
+    if (identity && [self.delegate respondsToSelector:@selector(speakerQueuePanel:didAllowParticipant:)]) {
+        [self.delegate speakerQueuePanel:self didAllowParticipant:identity];
     }
 }
 

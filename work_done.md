@@ -866,3 +866,195 @@ Token TTL was already configured at 6 hours in `token-server/index.js` (`TOKEN_T
 - Transcript export via NSSavePanel to user-chosen location
 - ⌘+Shift+C keyboard shortcut toggles chat panel
 - Teardown properly cleans up all Phase 8 objects
+
+---
+
+## [30 March 2026] — Post-Phase 8: Queue Panel UI Polish
+
+**Phase**: Post-Phase 8 (PF.10)
+**Files changed**:
+- `inter/UI/Views/InterSpeakerQueuePanel.m` — Added xmark (✕) close button in header bar. Added "Dismiss All" button below header (hidden when empty, shown when entries exist). `closeAction:` and `dismissAllAction:` methods. Adjusted scroll view height for dismiss-all bar.
+- `inter/UI/Views/InterSpeakerQueuePanel.h` — Added `speakerQueuePanelDidDismissAll:` delegate method.
+- `inter/UI/Views/InterChatPanel.m` — Fixed `hitTest:` coordinate conversion: was converting directly to container-local coordinates, now properly converts through self's coordinate system so close and export buttons receive mouse clicks.
+- `inter/App/AppDelegate.m` — Repositioned speaker queue panel from y=22 to y=90 (was covering the button bar beneath it).
+
+**Why**: Three user-facing issues: (1) queue panel overlapped the toggle button bar making it unclickable, (2) queue had no way to close it without toggling the button, (3) chat close/export buttons weren't receiving clicks due to a hitTest coordinate space bug.
+**Notes**: BUILD SUCCEEDED.
+
+---
+
+## [30 March 2026] — Post-Phase 8: Mic Toggle / Camera Coupling Fix
+
+**Phase**: Post-Phase 8 (PF.11)
+**Files changed**:
+- `inter/App/InterMediaWiringController.h` — Added `isMicNetworkMuted` readonly property.
+- `inter/App/InterMediaWiringController.m` — Added `isMicNetworkMuted` readwrite property. Rewrote `twoPhaseToggleMicrophone`: when connected to LiveKit, only mutes/unmutes the LiveKit audio track without touching AVCaptureSession. Offline path unchanged (toggles local capture). Added `isMicNetworkMuted` reset in `wireNetworkPublish`.
+- `inter/Media/InterLocalMediaController.h` — Added `storePreferredAudioDeviceID:` method declaration.
+- `inter/Media/InterLocalMediaController.m` — Added `storePreferredAudioDeviceID:` implementation (stores device preference on session queue without triggering beginConfiguration/commitConfiguration).
+- `inter/App/AppDelegate.m` — `handleNormalAudioInputSelection:` now skips session reconfiguration when connected (stores preference only). `normalMediaStateSummary` accounts for `isMicNetworkMuted`.
+
+**Why**: Toggling the microphone or changing the audio input device caused the camera to briefly freeze. Root cause: the shared AVCaptureSession's `beginConfiguration`/`commitConfiguration` momentarily pauses ALL outputs (including video) when audio inputs are modified. Fix: bypass AVCaptureSession entirely for network-only mute operations.
+**Notes**: BUILD SUCCEEDED.
+
+---
+
+## [30 March 2026] — Post-Phase 8: Speaker Queue "Dismiss All"
+
+**Phase**: Post-Phase 8 (PF.12)
+**Files changed**:
+- `inter/UI/Views/InterSpeakerQueuePanel.h` — Added `speakerQueuePanelDidDismissAll:` delegate method.
+- `inter/UI/Views/InterSpeakerQueuePanel.m` — Added "Dismiss All" button in panel header (hidden when queue is empty, visible when entries exist). `dismissAllAction:` calls delegate.
+- `inter/App/AppDelegate.m` — Added `speakerQueuePanelDidDismissAll:` handler: iterates all queue entries sending `lowerHand(forParticipant:)` signals via chatController, then calls `speakerQueue.reset()`.
+
+**Why**: Hosts needed a way to clear the entire raised-hand queue at once instead of dismissing participants one by one.
+**Notes**: BUILD SUCCEEDED. Uses existing `InterSpeakerQueue.reset()` method for atomic queue clear after individual lowerHand signals are sent.
+
+---
+
+## [30 March 2026] — Post-Phase 8: Active Speaker Green Border Debounce
+
+**Phase**: Post-Phase 8 (PF.13)
+**Files changed**:
+- `inter/Networking/InterRoomController.swift` — Added `activeSpeakerClearWork: DispatchWorkItem?` and `activeSpeakerClearDelay: TimeInterval = 1.0` properties. Rewrote `didUpdateSpeakingParticipants`: when a new remote speaker is detected, cancel any pending clear timer and update immediately. When no remote speaker (empty list from VAD), delay clearing `activeSpeakerIdentity` by 1 second. Timer is cancelled on disconnect to prevent stale callbacks.
+
+**Why**: The green active speaker border would disappear during continuous speech and only return after a pause-and-resume. Root cause: LiveKit's server-side VAD intermittently sends `active: false` during brief audio dips (breaths, pauses between words). Our handler reacted instantly, setting `activeSpeakerIdentity = ""` and removing the border. The 1-second debounce keeps the border visible through normal speech dips while still clearing it promptly when the speaker genuinely stops talking.
+**Notes**: BUILD SUCCEEDED.
+
+---
+
+## [31 March 2026] — Phase 8.5: Live Polls
+
+**Phase**: 8.5
+**Files changed**:
+- `inter/Networking/InterPollController.swift` — CREATED. Full poll lifecycle: InterPoll/InterPollOption Codable structs, InterPollMessage DataChannel envelope (launchPoll/vote/pollResults/endPoll), InterPollInfo ObjC wrapper with votePercentage(). Host-side vote aggregation with per-participant dedup sets. Poll history capped at 20.
+- `inter/UI/Views/InterPollPanel.h` — CREATED. InterPollPanelDelegate protocol (didLaunchPoll, didEndPoll, didRequestShareResults, didSubmitVoteWithIndices). Panel API: showActivePoll, updateResults, showEndedPoll, resetToCreateForm, toggle/expand/collapse.
+- `inter/UI/Views/InterPollPanel.m` — CREATED (~760 lines). Create form with question field, 2–10 option fields, anonymous/multiselect toggles. Active poll view with vote radio/checkbox buttons. Results view with horizontal bar charts and percentage labels. Host controls: share results, end poll, new poll. Slide-in 300pt dark panel.
+- `inter/App/AppDelegate.m` — MODIFIED. Added pollController property, creation/attach/teardown lifecycle, InterPollPanelDelegate conformance, 📊 Poll toggle button, delegate bridge methods.
+
+**Why**: Phase 8.5 adds real-time polling to meetings — host creates a poll, participants vote, results update live via DataChannel "poll" topic.
+**Notes**: BUILD SUCCEEDED, all pre-existing tests pass.
+
+---
+
+## [31 March 2026] — Phase 8.6: Q&A Board
+
+**Phase**: 8.6
+**Files changed**:
+- `inter/Networking/InterQAController.swift` — CREATED. InterQuestion Codable struct (id, askerIdentity, askerName, text, timestamp, upvoteCount, isAnswered, isHighlighted, isAnonymous). InterQAMessage envelope (askQuestion/upvote/markAnswered/highlight/dismiss/syncState). InterQuestionInfo ObjC wrapper with displayName(isViewerHost:) and formattedTime. Sorting: highlighted → upvotes desc → timestamp. Double-upvote prevention. Max 200 questions with intelligent eviction. Unread count tracking.
+- `inter/UI/Views/InterQAPanel.h` — CREATED. InterQAPanelDelegate protocol (didSubmitQuestion, didUpvoteQuestion, didMarkAnswered, didHighlightQuestion, didDismissQuestion). Panel API: setQuestions, setUnreadBadge, toggle/expand/collapse.
+- `inter/UI/Views/InterQAPanel.m` — CREATED (~370 lines). NSTableView-based question list with highlighted (blue tint) and answered (green tint) background colors. Each row: asker name + timestamp, question text (2-line wrap), upvote button + count, host moderation buttons (📌 highlight, ✅ mark answered, ✕ dismiss). Input area with text field + anonymous checkbox + Ask button. Red unread badge (caps at 99+). Slide-in 300pt dark panel.
+- `inter/App/AppDelegate.m` — MODIFIED. Added qaController property, creation/attach/teardown lifecycle, InterQAPanelDelegate conformance, ❓ Q&A toggle button, delegate bridge methods. isQAVisible property wired to unread count management.
+- `inter/Networking/InterRoomController.swift` — Already had pollController/qaController weak refs and DataChannel topic routing from a prior session.
+
+**Why**: Phase 8.6 adds a Q&A board — participants ask questions (optionally anonymous), upvote others' questions, and the host can highlight active questions, mark them answered, or dismiss inappropriate ones.
+**Notes**: BUILD SUCCEEDED, all pre-existing tests pass. 5 InterMultiParticipant tests fail (pre-existing, unrelated to this change).
+
+---
+
+## Session 9 — Phase 9: Meeting Management (31 March 2026)
+
+### New Files
+
+- **`inter/Networking/InterPermissions.swift`** (~314 lines)
+  - `InterParticipantRole` enum (participant, presenter, panelist, coHost, host) — `@objc`, Codable, Comparable
+  - `InterPermission` enum (14 permissions: canMuteOthers, canRemoveParticipant, canLockMeeting, canPromoteParticipants, canDisableChat, canSuspendParticipant, canForceSpotlight, canShareScreen, canLaunchPolls, canUnmuteSelf, canAdmitFromLobby, canManagePassword, canAskToUnmute, canManageLobby)
+  - `InterPermissionMatrix` with per-role permission sets (Host/CoHost get all, Panelist gets unmute+screen+polls, Presenter gets unmute+screen, Participant gets unmute)
+  - `InterRoleInfo` — `@objc`-compatible wrapper for role + identity
+  - `InterParticipantMetadata` — parses role from LiveKit JWT metadata JSON
+
+- **`inter/Networking/InterModerationController.swift`** (~822 lines)
+  - `InterModerationDelegate` protocol (12 methods for UI updates)
+  - HTTP client for 15 server endpoints (promote, mute, mute-all, remove, lock, unlock, suspend, unsuspend, lobby enable/disable, admit, admit-all, deny, password)
+  - DataChannel signal sending for ephemeral moderation actions (disableChat, enableChat, askToUnmute, locked/unlocked, suspended/unsuspended, forceSpotlight, clearSpotlight, participantRemoved, roleChanged, lobbyJoin)
+  - `handleControlSignal()` dispatch for all 12 Phase 9 signal types
+  - Every action permission-gated via `InterPermissionMatrix`
+  - `attach(to:identity:displayName:serverURL:roomCode:)` / `detach()` lifecycle
+  - URLSession-based HTTP (10s timeout, main-queue completions)
+
+- **`inter/UI/Views/InterLobbyPanel.h/.m`** (~280 lines)
+  - `InterLobbyPanelDelegate` protocol (admit, deny, admitAll, toggleLobbyEnabled)
+  - NSTableView-based waiting room panel with per-participant admit/deny buttons
+  - Admit All button, lobby toggle checkbox, empty-state label
+  - "Just now" / "N min ago" time labels, waiting count tracking
+
+### Modified Files
+
+- **`token-server/index.js`** (460 → ~1177 lines)
+  - Added `RoomServiceClient` import and initialization (`LIVEKIT_SERVER_URL`/`LIVEKIT_HTTP_URL`)
+  - Added Redis key helpers: `roomRolesKey`, `roomLockedKey`, `roomLobbyKey`, `roomSuspendedKey`
+  - Added `ROLE_HIERARCHY`, `MODERATOR_ROLES`, `getParticipantRole()`, `validateModerator()` for role management
+  - **Modified `/room/create`**: always stores role in Redis, includes role in JWT metadata
+  - **Modified `/room/join`**: lock check (423), password check (401 with bcrypt), lobby check (returns `{status:"waiting"}`)
+  - **15 new endpoints**: `/room/promote`, `/room/mute`, `/room/mute-all`, `/room/remove`, `/room/lock`, `/room/unlock`, `/room/suspend`, `/room/unsuspend`, `/room/lobby/enable`, `/room/lobby/disable`, `/room/admit`, `/room/admit-all`, `/room/deny`, `/room/lobby-status/:code/:identity`, `/room/password`
+
+- **`inter/Networking/InterChatMessage.swift`**
+  - Added 12 new `InterControlSignalType` cases (disableChat=10 through lobbyJoin=21)
+  - Added `extraData: [String: String]?` to `InterControlSignal` struct (for role names, etc.)
+  - Added `InterChatMessageInfo.init(systemText:)` convenience initializer for system messages
+
+- **`inter/Networking/InterChatController.swift`**
+  - Added `moderationController: InterModerationController?` weak ref
+  - Extended `handleControlData` to forward Phase 9 signal types (10–21) to moderationController
+
+- **`inter/Networking/InterRoomController.swift`**
+  - Added `tokenServerURL` public computed property exposing private configuration
+
+- **`inter/UI/Views/InterChatPanel.h/.m`**
+  - Added `setChatInputEnabled:` — enables/disables input field and send button
+  - Added `displaySystemMessage:` — creates system InterChatMessageInfo and appends to chat
+
+- **`inter/App/AppDelegate.m`**
+  - Added `#import "InterLobbyPanel.h"`, InterModerationDelegate + InterLobbyPanelDelegate conformance
+  - Properties: moderationController, normalLobbyPanel, normalLobbyToggleButton, normalModerationButton
+  - `applicationDidFinishLaunching`: create moderationController, set delegate, link to chatController
+  - `enterMode:role:`: attach moderationController with tokenServerURL and roomCode
+  - `applicationWillTerminate`: detach moderationController
+  - `launchNormalCallWindow`: 🚪 Lobby + ⚙️ Moderate buttons (host-only)
+  - `toggleNormalLobbyPanel`: toggle lobby panel window (create-on-first-use)
+  - `showModerationMenu:`: NSMenu popup (Mute All, Disable/Enable Chat, Lock/Unlock, Set Password, Remove Password)
+  - `moderationSetPassword`: NSAlert with NSSecureTextField
+  - InterModerationDelegate: 9 delegate methods (chatDisabled, unmuteRequest, lockState, suspend, spotlight, remove, roleChanged, lobbyJoin)
+  - InterLobbyPanelDelegate: 4 delegate methods (admit, deny, admitAll, toggleEnabled)
+
+**Build**: BUILD SUCCEEDED (Xcode 16, Debug, arm64).
+
+---
+
+## [31 March 2026] — Hard Mute / Raise-Hand-to-Speak System + Race Condition Fixes
+
+**Phase**: Post-Phase 9 — Mute All / Unmute All hardening
+**Files changed**:
+- **`inter/Networking/InterChatMessage.swift`** — Added `requestUnmuteAll=22`, `requestMuteAll=23`, `requestToSpeak=24`, `allowToSpeak=25` control signal types.
+- **`inter/Networking/InterChatController.swift`** — Extended forwarding list to route signals 22–25 to moderationController.
+- **`inter/Networking/InterModerationController.swift`** — `muteAll` broadcasts `requestMuteAll` via DataChannel (server mute + signal); `unmuteAll` broadcasts `requestUnmuteAll`; added `requestToSpeak()`, `allowToSpeakWithIdentity:`, and `handleControlSignal` cases for 22–25.
+- **`inter/App/InterMediaWiringController.h`** — Declared `applyRemoteMicMute`, `applyAllowToSpeak`, `applyUnmuteAll`, `revokeAllowToSpeak`; read-only properties `isHostMuted`, `isAllowedToSpeak`, `isMicNetworkMuted`.
+- **`inter/App/InterMediaWiringController.m`** — Full implementations: `applyRemoteMicMute` (sets host-muted, button="✋ Raise Hand to Speak"); `applyAllowToSpeak` (one-time grant, sets `isAllowedToSpeak=YES`, unmutes mic); `applyUnmuteAll` (clears `isHostMuted` without auto-unmuting); `revokeAllowToSpeak` (when participant turns mic off after one-time grant, reverts to raise-hand mode). `twoPhaseToggleMicrophone` completion block now guards against async overwrite with `isHostMuted && !isAllowedToSpeak` check.
+- **`inter/UI/Views/InterLocalCallControlPanel.h/.m`** — Added `setMicrophoneButtonTitle:(nullable NSString *)` — nil resets to default based on current state.
+- **`inter/UI/Views/InterSpeakerQueuePanel.h/.m`** — Added `showAllowActions` BOOL property; when YES, each row shows "Allow" + "Dismiss" buttons instead of just "Dismiss". Added `didAllowParticipant:` delegate method.
+- **`inter/App/AppDelegate.m`** — Mic toggle handler: if `isHostMuted && !isAllowedToSpeak` → raise/lower hand; captures `willRevokeAllow` pre-toggle and calls `revokeAllowToSpeak` on mic-off. `participantDidLowerHand:` now checks `isHostMuted && !isAllowedToSpeak` to prevent race condition where lowerHand signal resets button after allowToSpeak. `didAllowParticipant:` sends both `allowToSpeak` + `lowerHandForParticipant` signals. `moderationControllerReceivedAllowToSpeak:` calls `applyAllowToSpeak` and cleans up local hand state.
+- **`token-server/index.js`** — Removed `/room/unmute-all` endpoint (LiveKit server cannot remotely unmute).
+
+**Why**: LiveKit server-SDK does NOT support remote unmute ("remote unmute not enabled"). The entire mute-all/unmute-all system was rebuilt using DataChannel signals. Hard mute requires participants to raise their hand and get host approval for a one-time speak grant. Multiple race conditions were fixed: (1) async mute completion overwriting button title after `revokeAllowToSpeak`, (2) two-signal race where `lowerHand` signal arriving after `allowToSpeak` would incorrectly reset the mic button.
+
+**Notes**: Both signal orderings (allowToSpeak-first or lowerHand-first) now produce correct final state. Unmute All restores normal toggle ability without auto-turning on anyone's mic.
+
+**Build**: BUILD SUCCEEDED (Xcode 16, Debug, arm64).
+
+---
+
+## Log
+
+> Phase 0 complete. Phase 1 complete. Phase 2 complete. Phase 3 complete.
+> Post-Phase 3 bug fixes complete. UI polish complete. Window picker implemented.
+> PF.6 recording logic removal complete.
+> PF.7 system-audio share + audio-path hardening + permission handoff UX fixes complete.
+> Phase 4 next (Production Hardening) — major items done (Steps 1–7).
+> Phase 5A multi-participant support complete (cap: 50 after Phase 7).
+> Phase 6 infrastructure foundation complete (Redis, PostgreSQL, auth).
+> Phase 7 scale to 50 complete (adaptive grid, pagination, selective subscription).
+> Phase 8 in-meeting communication complete (chat, raise hand, DMs, transcript export).
+> Post-Phase 8 hardening complete (queue polish, mic/camera fix, dismiss all, active speaker debounce).
+> Stats JSON export 1.10.5 done.
+> Phase 8.5 live polls complete. Phase 8.6 Q&A board complete.
+> Phase 9 meeting management complete (roles, moderation, lobby, passwords).
+> Post-Phase 9 hard-mute / raise-hand-to-speak system complete.

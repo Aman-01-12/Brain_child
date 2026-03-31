@@ -35,6 +35,40 @@ import Foundation
     case raiseHand = 0
     /// Participant (or host) lowered a raised hand.
     case lowerHand = 1
+
+    // Phase 9.2 — Advanced moderation signals
+    /// Host disabled chat for all participants.
+    case disableChat = 10
+    /// Host re-enabled chat.
+    case enableChat = 11
+    /// Host is asking a participant to unmute their microphone.
+    case askToUnmute = 12
+    /// Meeting has been locked by host.
+    case meetingLocked = 13
+    /// Meeting has been unlocked.
+    case meetingUnlocked = 14
+    /// A participant has been suspended (all tracks muted + chat disabled).
+    case suspended = 15
+    /// A participant has been unsuspended.
+    case unsuspended = 16
+    /// Host-forced spotlight — all clients should spotlight this participant.
+    case forceSpotlight = 17
+    /// Clear host-forced spotlight — return to local control.
+    case clearForceSpotlight = 18
+    /// Participant was removed (notification before disconnect).
+    case participantRemoved = 19
+    /// Role change notification broadcast.
+    case roleChanged = 20
+    /// Lobby join notification (sent to host).
+    case lobbyJoin = 21
+    /// Host requests all participants to unmute their microphones.
+    case requestUnmuteAll = 22
+    /// Host has muted all participants' microphones (server-side mute + notification).
+    case requestMuteAll = 23
+    /// Participant requests permission to speak (when host-muted).
+    case requestToSpeak = 24
+    /// Host allows a participant to unmute and speak.
+    case allowToSpeak = 25
 }
 
 // MARK: - Chat Message
@@ -103,8 +137,8 @@ public struct InterChatMessage: Codable, Identifiable, Equatable {
 
 /// A control signal exchanged via LiveKit DataChannel (topic "control").
 ///
-/// Used for raise hand, lower hand, and future ephemeral signals
-/// that don't belong in the persistent chat log.
+/// Used for raise hand, lower hand, and Phase 9 moderation signals
+/// (disable chat, ask to unmute, suspend, force spotlight, etc.).
 public struct InterControlSignal: Codable {
 
     /// Signal type.
@@ -123,6 +157,10 @@ public struct InterControlSignal: Codable {
     /// Unix timestamp (seconds since epoch).
     public let timestamp: TimeInterval
 
+    /// Additional data payload for Phase 9 signals.
+    /// Used for: role name in roleChanged, target identities list in forceSpotlight, etc.
+    public let extraData: [String: String]?
+
     // MARK: - Init
 
     public init(
@@ -130,13 +168,15 @@ public struct InterControlSignal: Codable {
         senderIdentity: String,
         senderName: String,
         targetIdentity: String? = nil,
-        timestamp: TimeInterval = Date().timeIntervalSince1970
+        timestamp: TimeInterval = Date().timeIntervalSince1970,
+        extraData: [String: String]? = nil
     ) {
         self.type = type
         self.senderIdentity = senderIdentity
         self.senderName = senderName
         self.targetIdentity = targetIdentity
         self.timestamp = timestamp
+        self.extraData = extraData
     }
 
     // MARK: - Serialization
@@ -185,5 +225,19 @@ public struct InterControlSignal: Codable {
         let formatter = DateFormatter()
         formatter.dateFormat = "HH:mm"
         return formatter.string(from: date)
+    }
+
+    /// Convenience initializer for system messages (used by moderation UI).
+    @objc public convenience init(systemText: String) {
+        let msg = InterChatMessage(
+            id: UUID().uuidString,
+            senderIdentity: "system",
+            senderName: "System",
+            text: systemText,
+            timestamp: Date().timeIntervalSince1970,
+            type: .system,
+            recipientIdentity: ""
+        )
+        self.init(from: msg, isLocal: false)
     }
 }

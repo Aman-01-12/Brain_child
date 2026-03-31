@@ -228,6 +228,12 @@ public let InterNetworkErrorDomain = "com.secure.inter.network"
     case roomCodeExpired = 1007
     /// Room is full — participant cap reached (403 from token server).
     case roomFull = 1008
+    /// Meeting is locked — no new participants can join (423 from token server).
+    case meetingLocked = 1009
+    /// Lobby/waiting room active — participant must wait for host admission.
+    case lobbyWaiting = 1010
+    /// Meeting requires a password (401 from token server).
+    case passwordRequired = 1011
 }
 
 // MARK: - Error Helpers

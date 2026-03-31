@@ -52,6 +52,12 @@ NS_ASSUME_NONNULL_BEGIN
 /// Collapse the panel (no-op if already collapsed).
 - (void)collapsePanel;
 
+/// Enable or disable the chat input field (Phase 9 — moderation).
+- (void)setChatInputEnabled:(BOOL)enabled;
+
+/// Display a system message in the chat panel (Phase 9 — moderation).
+- (void)displaySystemMessage:(NSString *)text;
+
 @end
 
 NS_ASSUME_NONNULL_END
