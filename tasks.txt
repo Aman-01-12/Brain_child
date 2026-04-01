@@ -1,7 +1,7 @@
 # LiveKit Integration — Implementation Plan
 
-> **Status**: Phase 0–5A complete. Phase 6 (Infrastructure Foundation) complete — Redis migration, PostgreSQL schema, auth middleware. Phase 7 (Scale to 50 Participants) complete — cap raised, adaptive grid, pagination, selective subscription, active speaker highlight. Phase 8 (In-Meeting Communication) complete — public chat via DataChannel, DMs, raise hand + speaker queue, chat transcript export. 138 tests passing. See `implementation_plan.md` for Phases 9–14 roadmap.  
-> **Last updated**: 27 March 2026 (session 7)  
+> **Status**: Phase 0–5A complete. Phase 6 (Infrastructure Foundation) complete — Redis migration, PostgreSQL schema, auth middleware. Phase 7 (Scale to 50 Participants) complete — cap raised, adaptive grid, pagination, selective subscription, active speaker highlight. Phase 8 (In-Meeting Communication) complete — public chat via DataChannel, DMs, raise hand + speaker queue, chat transcript export. Code-quality audit (session 8) — 9 fixes across Swift, Node.js, and implementation plan (threading, completion callbacks, lobby caps, plan hardening). 138 tests passing. See `implementation_plan.md` for Phases 9–14 roadmap.  
+> **Last updated**: 1 April 2026 (session 8 — code-quality audit)  
 > **Tracking**: Changes logged in `work_done.md`. Long-term plan in `implementation_plan.md`.
 
 ---
@@ -1010,6 +1010,40 @@ LiveKit SFU handles all media forwarding — no transcoding.
 
 **Files**: `token-server/auth.js` (NEW), `token-server/index.js`, `token-server/.env.example`, `token-server/package.json`  
 **Deps added**: `bcryptjs`, `jsonwebtoken`
+
+---
+
+## Code-Quality & Security Audit — Session 8 (1 April 2026) ✅ COMPLETE
+
+> Systematic audit across Swift, Node.js, and implementation plan.
+> 12 findings reviewed, 9 unique fixes applied, 3 confirmed already resolved.
+
+### Audit — Phase 1 (Networking Layer)
+
+- [x] AUD.1.1 — `InterLiveKitAudioBridge.swift`: Fixed `beginMute(completion:)` to call `DispatchQueue.main.async { completion() }` on invalid state transition guard-else, matching `beginEnable` behaviour. Previously silently returned without invoking completion.
+
+### Audit — Phase 8 (In-Meeting Communication)
+
+- [x] AUD.8.1 — `InterQAController.swift`: Added `pendingQuestionIds.formIntersection(validIds)` in `handleSyncState` alongside existing `localUpvotes` and `upvoteRecords` pruning. Stale pending-question IDs could previously accumulate across sync cycles.
+- [x] AUD.8.2 — `implementation_plan.md` step 8.5.7: Added DataChannel router migration strategy — feature flag, dual-delivery shim, per-controller migration, deterministic cutover, test coverage requirements.
+- [x] AUD.8.3 — `implementation_plan.md` steps 8.6.2/8.6.4/8.6.6: Added Q&A server-side publish enforcement via `POST /room/qa/publish` endpoint spec. Server strips anonymous flag based on room setting.
+
+### Audit — Phase 9 (Moderation & Security)
+
+- [x] AUD.9.1 — `InterModerationController.swift`: Moved `lobbyWaitingParticipants` mutations (`.removeAll()` / `.remove(at:)`) into `completeOnMain` closures for `admitFromLobby`, `admitAllFromLobby`, and `denyFromLobby`. Prevents data-race from URLSession delegate queue.
+- [x] AUD.9.2 — `token-server/index.js`: `admitAllFromLobby` now enforces `MAX_PARTICIPANTS_PER_ROOM` — reads count via `getParticipantCount(code)`, increments per admission, breaks when full, sets `room_full` status for remaining lobby members.
+- [x] AUD.9.3 — `token-server/index.js`: Added explicit `room_full` handler in `/room/lobby-status/:code/:identity` endpoint between `denied` check and `zrank` fallback. Cleans up Redis keys, returns `{ status: 'room_full' }`.
+- [x] AUD.9.4 — `implementation_plan.md` step 9.4.2: Added password brute-force mitigation spec — per-requester exponential backoff, per-room global limit, TTL hygiene.
+
+### Audit — Phase 11 (Scheduling & OAuth)
+
+- [x] AUD.11.1 — `implementation_plan.md` step 11.2.1: Added migration safety note — `NOT NULL DEFAULT 'UTC'` on `host_timezone` is safe because `scheduled_meetings` is a new table with no pre-existing rows.
+- [x] AUD.11.2 — `implementation_plan.md` steps 11.2.4/11.2.5: Added key-versioned encryption spec for OAuth refresh tokens — `ENCRYPTION_SECRET_V1`/`V2` rotation system, version tags in ciphertext, rotation script, wipe-and-reauth fallback, server startup checks, secrets manager recommendation.
+
+### Confirmed Already Fixed (No Change Needed)
+
+- [x] AUD.DUP.1 — `admitAllFromLobby` threading (duplicate of AUD.9.1 — already covered by the same `completeOnMain` fix)
+- [x] AUD.DUP.2 — `denyFromLobby` threading (duplicate of AUD.9.1 — already covered by the same `completeOnMain` fix)
 
 ---
 

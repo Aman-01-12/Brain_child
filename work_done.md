@@ -866,3 +866,44 @@ Token TTL was already configured at 6 hours in `token-server/index.js` (`TOKEN_T
 - Transcript export via NSSavePanel to user-chosen location
 - ⌘+Shift+C keyboard shortcut toggles chat panel
 - Teardown properly cleans up all Phase 8 objects
+
+---
+
+## 1 April 2026 — Code-Quality & Security Audit (Session 8)
+
+**Phase**: Cross-cutting (touches Phases 3, 8, 9, 11)
+
+**Summary**: Systematic audit of existing code and implementation plan. 12 findings reviewed, 9 unique fixes applied (3 were confirmed duplicates already resolved).
+
+### Swift Code Fixes
+
+- `inter/Networking/InterLiveKitAudioBridge.swift` — MODIFIED:
+  - **beginMute completion consistency**: `beginMute(completion:)` guard-else on invalid state now calls `DispatchQueue.main.async { completion() }`, matching `beginEnable` behaviour. Previously silently returned without invoking completion, which could leave callers waiting indefinitely.
+
+- `inter/Networking/InterQAController.swift` — MODIFIED:
+  - **pendingQuestionIds sync pruning**: `handleSyncState` now includes `pendingQuestionIds.formIntersection(validIds)` alongside the existing `localUpvotes` and `upvoteRecords` pruning. Previously, stale pending-question IDs could accumulate across sync cycles.
+
+- `inter/Networking/InterModerationController.swift` — MODIFIED:
+  - **Lobby mutation threading** (3 methods): Moved `lobbyWaitingParticipants.removeAll()` / `.remove(at:)` mutations from URLSession delegate queue into `completeOnMain` closures for `admitFromLobby`, `admitAllFromLobby`, and `denyFromLobby`. Prevents data-race on the published array property.
+
+### Token Server Fixes
+
+- `token-server/index.js` — MODIFIED:
+  - **admitAllFromLobby participant cap**: Now reads current participant count before the admission loop via `getParticipantCount(code)`, increments on each admission, breaks when `MAX_PARTICIPANTS_PER_ROOM` is reached, and sets `room_full` status for remaining lobby members. Previously could exceed the room capacity.
+  - **room_full lobby-status handler**: Added explicit `room_full` status branch in `/room/lobby-status/:code/:identity` endpoint between the `denied` check and `zrank` fallback. Cleans up `lobby:status:` and `lobby:poll:` Redis keys, returns `{ status: 'room_full' }`. Previously returned `not_found` for overflow members.
+
+### Implementation Plan Updates
+
+- `implementation_plan.md` — MODIFIED (5 documentation hardening updates):
+  - **Step 8.5.7 — DataChannel router migration strategy**: Added sub-steps (a)–(e): feature flag, dual-delivery shim, per-controller migration, deterministic cutover, test coverage requirements.
+  - **Steps 8.6.2 / 8.6.4 / 8.6.6 — Q&A server-side publish enforcement**: Updated to require server-side question publishing via `POST /room/qa/publish` endpoint. Strips anonymous flag server-side based on room setting. New step 8.6.6 documents the full endpoint spec.
+  - **Step 9.4.2 — Password brute-force mitigation**: Added multi-layer spec: per-requester exponential backoff (Redis key `rate:join:{ip}:{code}`, doubling delay, 5-min cap), per-room global limit (10 failures/min across all IPs), TTL hygiene.
+  - **Step 11.2.1 — host_timezone migration safety**: Added assertion comment confirming `NOT NULL DEFAULT 'UTC'` is safe because `scheduled_meetings` is a new table with no pre-existing rows.
+  - **Steps 11.2.4 / 11.2.5 — Key-versioned encryption for OAuth tokens**: Full spec for `ENCRYPTION_SECRET_V1`/`V2` rotation system with version tags in ciphertext, rotation script for re-encryption, wipe-and-reauth fallback, server startup validation, secrets manager recommendation.
+
+**Why**: Hardening pass to close threading bugs, enforce capacity invariants, and ensure the implementation plan captures production-grade details for upcoming phases.
+
+**Verification gate**:
+- All 3 Swift files compile cleanly (`xcodebuild` exit 0)
+- All 12 audit findings resolved (9 unique fixes + 3 confirmed already addressed)
+- No regressions in existing functionality
