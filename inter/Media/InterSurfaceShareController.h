@@ -33,6 +33,13 @@ typedef void (^InterSurfaceShareAudioSampleObserverRegistrationBlock)(InterSurfa
 - (void)startSharingFromSurfaceView:(MetalSurfaceView *)surfaceView;
 - (void)stopSharingFromSurfaceView:(nullable MetalSurfaceView *)surfaceView;
 
+/// Add a live sink that begins receiving frames immediately if sharing is
+/// active. Thread-safe — may be called from any queue.
+- (void)addLiveSink:(id<InterShareSink>)sink;
+
+/// Remove a previously added live sink and stop it. Thread-safe.
+- (void)removeLiveSink:(id<InterShareSink>)sink;
+
 @end
 
 NS_ASSUME_NONNULL_END

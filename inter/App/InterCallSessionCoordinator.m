@@ -1,5 +1,9 @@
 #import "InterCallSessionCoordinator.h"
 
+#if __has_include("inter-Swift.h")
+#import "inter-Swift.h"
+#endif
+
 @interface InterCallSessionCoordinator ()
 @property (nonatomic, assign, readwrite) InterCallSessionPhase phase;
 @property (nonatomic, assign, readwrite) InterCallMode currentCallMode;
@@ -50,11 +54,17 @@
         return NO;
     }
 
+    // Auto-stop any active recording when the call session exits.
+    if (self.recordingCoordinator.canStop) {
+        [self.recordingCoordinator stopRecording];
+    }
+
     self.phase = InterCallSessionPhaseExiting;
     return YES;
 }
 
 - (void)finishExit {
+    self.recordingCoordinator = nil;
     self.phase = InterCallSessionPhaseIdle;
     self.currentCallMode = InterCallModeNone;
     self.currentInterviewRole = InterInterviewRoleNone;

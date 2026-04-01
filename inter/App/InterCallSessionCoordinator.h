@@ -4,6 +4,8 @@
 
 NS_ASSUME_NONNULL_BEGIN
 
+@class InterRecordingCoordinator;
+
 typedef NS_ENUM(NSUInteger, InterCallSessionPhase) {
     InterCallSessionPhaseIdle = 0,
     InterCallSessionPhaseEntering,
@@ -16,6 +18,9 @@ typedef NS_ENUM(NSUInteger, InterCallSessionPhase) {
 @property (nonatomic, readonly) InterCallSessionPhase phase;
 @property (nonatomic, readonly) InterCallMode currentCallMode;
 @property (nonatomic, readonly) InterInterviewRole currentInterviewRole;
+
+/// Recording coordinator — auto-stopped when the call session exits.
+@property (nonatomic, strong, nullable) InterRecordingCoordinator *recordingCoordinator;
 
 - (BOOL)beginEnteringMode:(InterCallMode)mode role:(InterInterviewRole)role;
 - (void)markActive;

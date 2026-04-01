@@ -16,11 +16,13 @@
 @property (nonatomic, strong) NSSegmentedControl *interviewToolSegmentedControl;
 @property (nonatomic, strong) NSPopUpButton *audioInputPopUpButton;
 @property (nonatomic, strong) NSButton *shareSystemAudioButton;
+@property (nonatomic, strong) NSButton *recordButton;
 @property (nonatomic, strong, readwrite) NSView *previewContainerView;
 @property (nonatomic, strong, readwrite) NSView *networkStatusContainerView;
 @property (nonatomic, assign) BOOL suppressAudioInputCallback;
 @property (nonatomic, assign) BOOL shareButtonActive;
 @property (nonatomic, assign) BOOL shareButtonStartPending;
+@property (nonatomic, assign) BOOL recordButtonActive;
 @end
 
 @implementation InterLocalCallControlPanel
@@ -179,7 +181,15 @@
     [self.microphoneButton setAction:@selector(handleMicrophoneToggle:)];
     [self addSubview:self.microphoneButton];
 
-    self.shareButton = [[NSButton alloc] initWithFrame:NSMakeRect(16, 22, self.bounds.size.width - 32, 30)];
+    self.recordButton = [[NSButton alloc] initWithFrame:NSMakeRect(16, 22, self.bounds.size.width - 32, 30)];
+    self.recordButton.autoresizingMask = NSViewWidthSizable | NSViewMaxYMargin;
+    [self.recordButton setTitle:@"Start Recording"];
+    [self.recordButton setTarget:self];
+    [self.recordButton setAction:@selector(handleRecordToggle:)];
+    self.recordButton.hidden = YES; // Shown when user has permission
+    [self addSubview:self.recordButton];
+
+    self.shareButton = [[NSButton alloc] initWithFrame:NSMakeRect(16, 54, self.bounds.size.width - 32, 30)];
     self.shareButton.autoresizingMask = NSViewWidthSizable | NSViewMaxYMargin;
     [self.shareButton setTitle:@"Start Surface Share"];
     [self.shareButton setTarget:self];
@@ -468,6 +478,27 @@
     // controller still exposes pending state, but the button only uses it to
     // suppress extra clicks until the share either becomes active or fails.
     self.shareButton.enabled = !self.shareButtonStartPending;
+}
+
+// ---------------------------------------------------------------------------
+// MARK: - Recording Button
+// ---------------------------------------------------------------------------
+
+- (void)handleRecordToggle:(id)sender {
+#pragma unused(sender)
+    dispatch_block_t handler = self.recordToggleHandler;
+    if (handler) {
+        handler();
+    }
+}
+
+- (void)setRecordingActive:(BOOL)active {
+    self.recordButtonActive = active;
+    self.recordButton.title = active ? @"Stop Recording" : @"Start Recording";
+}
+
+- (void)setRecordingButtonHidden:(BOOL)hidden {
+    self.recordButton.hidden = hidden;
 }
 
 @end

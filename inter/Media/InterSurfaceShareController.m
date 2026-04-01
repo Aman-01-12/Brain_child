@@ -167,6 +167,55 @@
     [self teardownSharingResourcesEmitStatus:YES];
 }
 
+#pragma mark - Live Sink Management
+
+- (void)addLiveSink:(id<InterShareSink>)sink {
+    if (!sink) return;
+
+    BOOL currentlySharing = NO;
+    InterShareSessionConfiguration *configurationSnapshot = nil;
+
+    os_unfair_lock_lock(&_stateLock);
+    NSMutableArray<id<InterShareSink>> *mutable = [_sinks mutableCopy];
+    if (![mutable containsObject:sink]) {
+        [mutable addObject:sink];
+        _sinks = [mutable copy];
+    }
+    currentlySharing = self.sharing;
+    if (currentlySharing) {
+        configurationSnapshot = [self.configuration copy];
+    }
+    os_unfair_lock_unlock(&_stateLock);
+
+    // If sharing is already active, start the newly added sink with the
+    // current configuration so it begins receiving frames immediately.
+    if (currentlySharing && configurationSnapshot) {
+        [sink startWithConfiguration:configurationSnapshot completion:^(BOOL active, NSString * _Nullable statusText) {
+#pragma unused(active, statusText)
+        }];
+    }
+}
+
+- (void)removeLiveSink:(id<InterShareSink>)sink {
+    if (!sink) return;
+
+    BOOL removed = NO;
+
+    os_unfair_lock_lock(&_stateLock);
+    NSMutableArray<id<InterShareSink>> *mutable = [_sinks mutableCopy];
+    NSUInteger idx = [mutable indexOfObject:sink];
+    if (idx != NSNotFound) {
+        [mutable removeObjectAtIndex:idx];
+        _sinks = [mutable copy];
+        removed = YES;
+    }
+    os_unfair_lock_unlock(&_stateLock);
+
+    if (removed) {
+        [sink stopWithCompletion:^{}];
+    }
+}
+
 #pragma mark - Internal
 
 - (id<InterShareVideoSource>)videoSourceForConfiguration:(InterShareSessionConfiguration *)configuration

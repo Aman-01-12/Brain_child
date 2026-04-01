@@ -14,6 +14,7 @@ NS_ASSUME_NONNULL_BEGIN
 @property (nonatomic, copy, nullable) void (^audioInputSelectionChangedHandler)(NSString * _Nullable deviceID);
 @property (nonatomic, copy, nullable) void (^shareSystemAudioChangedHandler)(BOOL enabled);
 @property (nonatomic, copy, nullable) void (^interviewToolChangedHandler)(InterInterviewToolKind toolKind);
+@property (nonatomic, copy, nullable) dispatch_block_t recordToggleHandler;
 
 @property (nonatomic, strong, readonly) NSView *previewContainerView;
 
@@ -51,6 +52,10 @@ NS_ASSUME_NONNULL_BEGIN
 /// Expected dictionary keys in `options`: @"id", @"name".
 - (void)setAudioInputOptions:(NSArray<NSDictionary<NSString *, NSString *> *> *)options
 			selectedDeviceID:(nullable NSString *)selectedDeviceID;
+
+/// Update the recording button title and state.
+- (void)setRecordingActive:(BOOL)active;
+- (void)setRecordingButtonHidden:(BOOL)hidden;
 
 @end
 
