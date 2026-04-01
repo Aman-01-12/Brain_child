@@ -230,6 +230,16 @@ static CVReturn InterDisplayLinkCallback(CVDisplayLinkRef displayLink,
         return;
     }
 
+    // [FIX] Don't acquire a drawable until the Metal pipelines are compiled.
+    // Presenting an unwritten drawable shows uninitialized GPU memory (pink
+    // flash on Apple Silicon) for the 1–2 frames before async compilation
+    // completes. The display link keeps firing so we'll pick up the next
+    // frame as soon as the pipeline is ready.
+    if (!self.engine.isPipelineReady) {
+        dispatch_semaphore_signal(_inFlightSemaphore);
+        return;
+    }
+
     id<CAMetalDrawable> drawable = [self.metalLayer nextDrawable];
     if (!drawable) {
         dispatch_semaphore_signal(_inFlightSemaphore);

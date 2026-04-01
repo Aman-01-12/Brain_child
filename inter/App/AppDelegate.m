@@ -16,6 +16,9 @@
 #import "InterNetworkStatusView.h"
 #import "InterChatPanel.h"
 #import "InterSpeakerQueuePanel.h"
+#import "InterPollPanel.h"
+#import "InterQAPanel.h"
+#import "InterLobbyPanel.h"
 
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 
@@ -24,7 +27,7 @@
 #import "inter-Swift.h"
 #endif
 
-@interface AppDelegate () <NSWindowDelegate, InterConnectionSetupPanelDelegate, InterParticipantOverlayDelegate, InterChatPanelDelegate, InterSpeakerQueuePanelDelegate, InterMediaWiringDelegate>
+@interface AppDelegate () <NSWindowDelegate, InterConnectionSetupPanelDelegate, InterParticipantOverlayDelegate, InterChatPanelDelegate, InterSpeakerQueuePanelDelegate, InterPollPanelDelegate, InterQAPanelDelegate, InterMediaWiringDelegate, InterModerationDelegate, InterLobbyPanelDelegate>
 @property (nonatomic, strong) NSMutableArray<CapWindow *> *capWindows;
 @property (nonatomic, strong) SecureWindowController *secureController;
 @property (nonatomic, strong) NSWindow *setupWindow;
@@ -50,6 +53,25 @@
 @property (nonatomic, strong, nullable) NSButton *normalChatToggleButton;
 @property (nonatomic, strong, nullable) NSButton *normalHandRaiseButton;
 @property (nonatomic, strong, nullable) NSButton *normalQueueToggleButton;
+
+// [Phase 8.5] Live polls
+@property (nonatomic, strong, nullable) InterPollController *pollController;
+@property (nonatomic, strong, nullable) InterPollPanel *normalPollPanel;
+@property (nonatomic, strong, nullable) NSWindow *normalPollWindow;
+@property (nonatomic, strong, nullable) NSButton *normalPollToggleButton;
+
+// [Phase 8.6] Q&A
+@property (nonatomic, strong, nullable) InterQAController *qaController;
+@property (nonatomic, strong, nullable) InterQAPanel *normalQAPanel;
+@property (nonatomic, strong, nullable) NSWindow *normalQAWindow;
+@property (nonatomic, strong, nullable) NSButton *normalQAToggleButton;
+
+// [Phase 9] Meeting management
+@property (nonatomic, strong, nullable) InterModerationController *moderationController;
+@property (nonatomic, strong, nullable) InterLobbyPanel *normalLobbyPanel;
+@property (nonatomic, strong, nullable) NSWindow *normalLobbyWindow;
+@property (nonatomic, strong, nullable) NSButton *normalLobbyToggleButton;
+@property (nonatomic, strong, nullable) NSButton *normalModerationButton;
 @property (nonatomic, copy, nullable) NSString *normalChatSelectedRecipient;
 @property (nonatomic, assign) BOOL normalShareSystemAudioEnabled;
 @property (nonatomic, assign) BOOL isScreenObserverRegistered;
@@ -115,8 +137,23 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
     // [Phase 8] Create chat controller and speaker queue
     self.chatController = [[InterChatController alloc] init];
     self.speakerQueue = [[InterSpeakerQueue alloc] init];
+
+    // [Phase 8.5] Create poll controller
+    self.pollController = [[InterPollController alloc] init];
+
+    // [Phase 8.6] Create Q&A controller
+    self.qaController = [[InterQAController alloc] init];
+
+    // [Phase 9] Create moderation controller
+    self.moderationController = [[InterModerationController alloc] init];
+    self.moderationController.delegate = self;
+
     if (self.roomController) {
         self.roomController.chatController = self.chatController;
+        self.roomController.pollController = self.pollController;
+        self.roomController.qaController = self.qaController;
+        // Wire moderation controller into chat controller for Phase 9 signal forwarding
+        self.chatController.moderationController = self.moderationController;
     }
 
     [self launchSetupUI];
@@ -150,6 +187,20 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
     [self.chatController reset];
     self.chatController = nil;
     self.speakerQueue = nil;
+
+    // [Phase 8.5] Clean up poll controller
+    [self.pollController detach];
+    [self.pollController reset];
+    self.pollController = nil;
+
+    // [Phase 8.6] Clean up Q&A controller
+    [self.qaController detach];
+    [self.qaController reset];
+    self.qaController = nil;
+
+    // [Phase 9] Clean up moderation controller
+    [self.moderationController detach];
+    self.moderationController = nil;
 
     if (self.roomController) {
         [self.roomController disconnect];
@@ -295,6 +346,39 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
         if (identity.length == 0) identity = [[NSUUID UUID] UUIDString];
         NSString *displayName = self.roomController.localParticipantName;
         [self.chatController attachTo:self.roomController identity:identity displayName:displayName];
+    }
+
+    // [Phase 8.5] Attach poll controller to room
+    if (self.roomController && self.pollController) {
+        NSString *identity = self.roomController.localParticipantIdentity;
+        if (identity.length == 0) identity = [[NSUUID UUID] UUIDString];
+        BOOL isHost = self.roomController.isHost;
+        [self.pollController attachTo:self.roomController identity:identity isHost:isHost];
+    }
+
+    // [Phase 8.6] Attach Q&A controller to room
+    if (self.roomController && self.qaController) {
+        NSString *identity = self.roomController.localParticipantIdentity;
+        if (identity.length == 0) identity = [[NSUUID UUID] UUIDString];
+        NSString *displayName = self.roomController.localParticipantName;
+        BOOL isHost = self.roomController.isHost;
+        [self.qaController attachTo:self.roomController identity:identity displayName:displayName isHost:isHost];
+    }
+
+    // [Phase 9] Attach moderation controller to room
+    if (self.roomController && self.moderationController) {
+        NSString *identity = self.roomController.localParticipantIdentity;
+        if (identity.length == 0) identity = [[NSUUID UUID] UUIDString];
+        NSString *displayName = self.roomController.localParticipantName;
+        NSString *serverBaseURL = self.roomController.tokenServerURL;
+        if (serverBaseURL.length == 0) {
+            NSLog(@"[Phase 9] WARNING: roomController.tokenServerURL is empty — serverBaseURL would default to localhost. "
+                  @"Moderation controller will not be attached. Check token server configuration.");
+            // Do not silently fall back to http://localhost:3000 in a connected room context.
+        } else {
+            NSString *roomCode = self.roomController.roomCode;
+            [self.moderationController attachTo:self.roomController identity:identity displayName:displayName serverURL:serverBaseURL roomCode:roomCode];
+        }
     }
     [self.speakerQueue reset];
 
@@ -574,11 +658,16 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
     if (!error) return @"Unknown error";
 
     NSInteger code = error.code;
-    // InterNetworkErrorCode values from InterNetworkTypes.swift
-    if (code == 2) return @"Invalid room code. Check and try again.";
-    if (code == 3) return @"Room has expired. Ask the host for a new code.";
-    if (code == 4) return @"Token fetch failed. Check token server URL.";
-    if (code == 5) return @"Connection failed. Check server URL and network.";
+    // InterNetworkErrorCode values from InterNetworkTypes.swift (start at 1000)
+    if (code == 1000) return @"Token fetch failed. Check token server URL.";
+    if (code == 1001) return @"Connection failed. Check server URL and network.";
+    if (code == 1005) return @"Server unreachable. Check your network connection.";
+    if (code == 1006) return @"Invalid room code. Check and try again.";
+    if (code == 1007) return @"Room has expired. Ask the host for a new code.";
+    if (code == 1008) return @"Room is full. Try again later.";
+    if (code == 1009) return @"This meeting is locked. Ask the host to unlock it.";
+    if (code == 1010) return @"You are in the waiting room. The host will admit you shortly.";
+    if (code == 1011) return @"This meeting requires a password.";
 
     return error.localizedDescription ?: @"Connection failed.";
 }
@@ -679,6 +768,70 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
     self.chatController.controlDelegate = (id<InterControlSignalDelegate>)self;
     self.chatController.isChatVisible = NO;
 
+    // [Phase 8.5] Poll window (standalone, movable/resizable — Zoom-style)
+    {
+        CGFloat pollW = 320;
+        CGFloat pollH = 480;
+        NSRect mainFrame = self.normalCallWindow.frame;
+        CGFloat pollX = NSMaxX(mainFrame) + 12;
+        CGFloat pollY = NSMaxY(mainFrame) - pollH;
+        NSRect pollRect = NSMakeRect(pollX, pollY, pollW, pollH);
+
+        self.normalPollWindow = [[NSWindow alloc] initWithContentRect:pollRect
+                                                           styleMask:(NSWindowStyleMaskTitled |
+                                                                      NSWindowStyleMaskClosable |
+                                                                      NSWindowStyleMaskResizable |
+                                                                      NSWindowStyleMaskMiniaturizable)
+                                                             backing:NSBackingStoreBuffered
+                                                               defer:NO];
+        self.normalPollWindow.title = @"\U0001F4CA Polls";
+        self.normalPollWindow.minSize = NSMakeSize(280, 320);
+        self.normalPollWindow.releasedWhenClosed = NO;
+        self.normalPollWindow.level = NSFloatingWindowLevel;
+        [self.normalPollWindow setAppearance:[NSAppearance appearanceNamed:NSAppearanceNameDarkAqua]];
+
+        self.normalPollPanel = [[InterPollPanel alloc] initWithFrame:NSMakeRect(0, 0, pollW, pollH)];
+        self.normalPollPanel.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+        self.normalPollPanel.delegate = self;
+        self.normalPollPanel.isHost = self.roomController.isHost;
+        self.normalPollWindow.contentView = self.normalPollPanel;
+    }
+
+    // [Phase 8.5] Wire poll controller delegate
+    self.pollController.delegate = (id<InterPollControllerDelegate>)self;
+
+    // [Phase 8.6] Q&A window (standalone, movable/resizable — Zoom-style)
+    {
+        CGFloat qaW = 320;
+        CGFloat qaH = 480;
+        NSRect mainFrame = self.normalCallWindow.frame;
+        CGFloat qaX = NSMaxX(mainFrame) + 12;
+        CGFloat qaY = NSMaxY(mainFrame) - qaH - 40;
+        NSRect qaRect = NSMakeRect(qaX, qaY, qaW, qaH);
+
+        self.normalQAWindow = [[NSWindow alloc] initWithContentRect:qaRect
+                                                         styleMask:(NSWindowStyleMaskTitled |
+                                                                    NSWindowStyleMaskClosable |
+                                                                    NSWindowStyleMaskResizable |
+                                                                    NSWindowStyleMaskMiniaturizable)
+                                                           backing:NSBackingStoreBuffered
+                                                             defer:NO];
+        self.normalQAWindow.title = @"\u2753 Q&A";
+        self.normalQAWindow.minSize = NSMakeSize(280, 320);
+        self.normalQAWindow.releasedWhenClosed = NO;
+        self.normalQAWindow.level = NSFloatingWindowLevel;
+        [self.normalQAWindow setAppearance:[NSAppearance appearanceNamed:NSAppearanceNameDarkAqua]];
+
+        self.normalQAPanel = [[InterQAPanel alloc] initWithFrame:NSMakeRect(0, 0, qaW, qaH)];
+        self.normalQAPanel.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+        self.normalQAPanel.delegate = self;
+        self.normalQAPanel.isHost = self.roomController.isHost;
+        self.normalQAWindow.contentView = self.normalQAPanel;
+    }
+
+    // [Phase 8.6] Wire Q&A controller delegate
+    self.qaController.delegate = (id<InterQAControllerDelegate>)self;
+
     [self.normalCallWindow makeKeyAndOrderFront:nil];
 }
 
@@ -718,8 +871,33 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
         [weakSelf.normalMediaWiring twoPhaseToggleCamera];
     };
     self.normalControlPanel.microphoneToggleHandler = ^{
+        // If host-muted and NOT currently allowed to speak, raise hand
+        if (weakSelf.normalMediaWiring.isHostMuted && !weakSelf.normalMediaWiring.isAllowedToSpeak) {
+            [weakSelf toggleNormalHandRaise];
+            // Update mic button based on hand state
+            NSString *localId = weakSelf.roomController.localParticipantIdentity;
+            if (localId.length > 0 && [weakSelf.speakerQueue isHandRaisedFor:localId]) {
+                [weakSelf.normalControlPanel setMicrophoneButtonTitle:@"⏳ Waiting..."];
+            } else {
+                [weakSelf.normalControlPanel setMicrophoneButtonTitle:@"✋ Raise Hand to Speak"];
+            }
+            return;
+        }
+
+        // Capture pre-toggle state: if mic is currently ON and host-muted,
+        // the participant is about to turn it OFF — revoke after toggle.
+        BOOL willRevokeAllow = weakSelf.normalMediaWiring.isHostMuted
+                            && weakSelf.normalMediaWiring.isAllowedToSpeak
+                            && !weakSelf.normalMediaWiring.isMicNetworkMuted;
+
         // [2.5.6] [G2] Two-phase microphone toggle via shared wiring controller
         [weakSelf.normalMediaWiring twoPhaseToggleMicrophone];
+
+        // Revoke one-time allow after turning mic off (async mute hasn't
+        // completed yet so we use the pre-toggle snapshot above).
+        if (willRevokeAllow) {
+            [weakSelf.normalMediaWiring revokeAllowToSpeak];
+        }
     };
     self.normalControlPanel.shareToggleHandler = ^{
         [weakSelf toggleNormalSurfaceShare];
@@ -769,6 +947,42 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
         [self.normalQueueToggleButton setTarget:self];
         [self.normalQueueToggleButton setAction:@selector(toggleNormalSpeakerQueue)];
         [view addSubview:self.normalQueueToggleButton];
+    }
+
+    // [Phase 8.5] Poll toggle button
+    CGFloat pollX = self.roomController.isHost ? 520.0 : 420.0;
+    self.normalPollToggleButton = [[NSButton alloc] initWithFrame:NSMakeRect(pollX, 40, 80, 42)];
+    self.normalPollToggleButton.autoresizingMask = NSViewMaxXMargin | NSViewMaxYMargin;
+    [self.normalPollToggleButton setTitle:@"📊 Poll"];
+    [self.normalPollToggleButton setTarget:self];
+    [self.normalPollToggleButton setAction:@selector(toggleNormalPollPanel)];
+    [view addSubview:self.normalPollToggleButton];
+
+    // [Phase 8.6] Q&A toggle button
+    CGFloat qaX = pollX + 90.0;
+    self.normalQAToggleButton = [[NSButton alloc] initWithFrame:NSMakeRect(qaX, 40, 80, 42)];
+    self.normalQAToggleButton.autoresizingMask = NSViewMaxXMargin | NSViewMaxYMargin;
+    [self.normalQAToggleButton setTitle:@"❓ Q&A"];
+    [self.normalQAToggleButton setTarget:self];
+    [self.normalQAToggleButton setAction:@selector(toggleNormalQAPanel)];
+    [view addSubview:self.normalQAToggleButton];
+
+    // [Phase 9] Lobby & moderation buttons (host/co-host only)
+    if (self.roomController.isHost) {
+        CGFloat modX = qaX + 90.0;
+        self.normalLobbyToggleButton = [[NSButton alloc] initWithFrame:NSMakeRect(modX, 40, 90, 42)];
+        self.normalLobbyToggleButton.autoresizingMask = NSViewMaxXMargin | NSViewMaxYMargin;
+        [self.normalLobbyToggleButton setTitle:@"🚪 Lobby"];
+        [self.normalLobbyToggleButton setTarget:self];
+        [self.normalLobbyToggleButton setAction:@selector(toggleNormalLobbyPanel)];
+        [view addSubview:self.normalLobbyToggleButton];
+
+        self.normalModerationButton = [[NSButton alloc] initWithFrame:NSMakeRect(modX + 100, 40, 120, 42)];
+        self.normalModerationButton.autoresizingMask = NSViewMaxXMargin | NSViewMaxYMargin;
+        [self.normalModerationButton setTitle:@"⚙️ Moderate"];
+        [self.normalModerationButton setTarget:self];
+        [self.normalModerationButton setAction:@selector(showModerationMenu:)];
+        [view addSubview:self.normalModerationButton];
     }
 }
 
@@ -1163,6 +1377,12 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
     NSString *localIdentity = self.roomController.localParticipantIdentity;
     if ([identity isEqualToString:localIdentity]) {
         [self.normalHandRaiseButton setTitle:@"✋ Raise"];
+        // If still host-muted AND not allowed to speak, reset mic button.
+        // Skip if isAllowedToSpeak is YES — the host just allowed us and
+        // the lowerHand signal is a companion cleanup, not a deny.
+        if (self.normalMediaWiring.isHostMuted && !self.normalMediaWiring.isAllowedToSpeak) {
+            [self.normalControlPanel setMicrophoneButtonTitle:@"✋ Raise Hand to Speak"];
+        }
     }
 }
 
@@ -1204,6 +1424,19 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
 
 - (void)speakerQueuePanel:(InterSpeakerQueuePanel *)panel didDismissParticipant:(NSString *)identity {
 #pragma unused(panel)
+    // Lower the hand via network so participant gets notified
+    [self.chatController lowerHandForParticipant:identity];
+    [self.speakerQueue removeHandFor:identity];
+    [self.normalSpeakerQueuePanel setEntries:self.speakerQueue.entries];
+    [self.normalRemoteLayout setHandRaised:NO forParticipant:identity];
+}
+
+- (void)speakerQueuePanel:(InterSpeakerQueuePanel *)panel didAllowParticipant:(NSString *)identity {
+#pragma unused(panel)
+    // Send allowToSpeak signal so the participant can unmute
+    [self.moderationController allowToSpeakWithIdentity:identity];
+
+    // Lower the hand via network + remove from queue
     [self.chatController lowerHandForParticipant:identity];
     [self.speakerQueue removeHandFor:identity];
     [self.normalSpeakerQueuePanel setEntries:self.speakerQueue.entries];
@@ -1222,6 +1455,117 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
     [self.normalSpeakerQueuePanel setEntries:self.speakerQueue.entries];
 }
 
+// MARK: Phase 8.5 — Poll Toggle & Delegate
+
+- (void)toggleNormalPollPanel {
+    if (!self.normalPollWindow) return;
+    if (self.normalPollWindow.isVisible) {
+        [self.normalPollWindow orderOut:nil];
+    } else {
+        [self.normalPollWindow makeKeyAndOrderFront:nil];
+    }
+}
+
+- (void)pollPanel:(InterPollPanel *)panel
+    didLaunchPollWithQuestion:(NSString *)question
+              options:(NSArray<NSString *> *)options
+          isAnonymous:(BOOL)isAnonymous
+     allowMultiSelect:(BOOL)allowMultiSelect {
+#pragma unused(panel)
+    [self.pollController launchPollWithQuestion:question
+                                        options:options
+                                    isAnonymous:isAnonymous
+                               allowMultiSelect:allowMultiSelect];
+}
+
+- (void)pollPanelDidEndPoll:(InterPollPanel *)panel {
+#pragma unused(panel)
+    [self.pollController endCurrentPoll];
+}
+
+- (void)pollPanelDidRequestShareResults:(InterPollPanel *)panel {
+#pragma unused(panel)
+    [self.pollController shareResults];
+}
+
+- (void)pollPanel:(InterPollPanel *)panel didSubmitVoteWithIndices:(NSArray<NSNumber *> *)indices {
+#pragma unused(panel)
+    NSMutableArray<NSNumber *> *intArray = [NSMutableArray arrayWithCapacity:indices.count];
+    for (NSNumber *n in indices) {
+        [intArray addObject:@(n.integerValue)];
+    }
+    [self.pollController submitVoteWithOptionIndices:intArray];
+}
+
+// MARK: InterPollControllerDelegate
+
+- (void)pollController:(InterPollController *)controller didLaunchPoll:(InterPollInfo *)poll {
+#pragma unused(controller)
+    [self.normalPollPanel showActivePoll:poll];
+    if (!self.normalPollWindow.isVisible) {
+        [self.normalPollWindow makeKeyAndOrderFront:nil];
+    }
+}
+
+- (void)pollController:(InterPollController *)controller didUpdateResults:(InterPollInfo *)poll {
+#pragma unused(controller)
+    [self.normalPollPanel updateResults:poll];
+}
+
+- (void)pollController:(InterPollController *)controller didEndPoll:(InterPollInfo *)poll {
+#pragma unused(controller)
+    [self.normalPollPanel showEndedPoll:poll];
+}
+
+// MARK: Phase 8.6 — Q&A Toggle & Delegate
+
+- (void)toggleNormalQAPanel {
+    if (!self.normalQAWindow) return;
+    if (self.normalQAWindow.isVisible) {
+        [self.normalQAWindow orderOut:nil];
+        self.qaController.isQAVisible = NO;
+    } else {
+        [self.normalQAWindow makeKeyAndOrderFront:nil];
+        self.qaController.isQAVisible = YES;
+        [self.normalQAPanel setUnreadBadge:0];
+    }
+}
+
+- (void)qaPanel:(InterQAPanel *)panel didSubmitQuestion:(NSString *)text isAnonymous:(BOOL)isAnonymous {
+#pragma unused(panel)
+    [self.qaController submitQuestion:text isAnonymous:isAnonymous];
+}
+
+- (void)qaPanel:(InterQAPanel *)panel didUpvoteQuestion:(NSString *)questionId {
+#pragma unused(panel)
+    [self.qaController upvoteQuestion:questionId];
+}
+
+- (void)qaPanel:(InterQAPanel *)panel didMarkAnswered:(NSString *)questionId {
+#pragma unused(panel)
+    [self.qaController markAnswered:questionId];
+}
+
+- (void)qaPanel:(InterQAPanel *)panel didHighlightQuestion:(NSString *)questionId {
+#pragma unused(panel)
+    [self.qaController highlightQuestion:questionId];
+}
+
+- (void)qaPanel:(InterQAPanel *)panel didDismissQuestion:(NSString *)questionId {
+#pragma unused(panel)
+    [self.qaController dismissQuestion:questionId];
+}
+
+// MARK: InterQAControllerDelegate
+
+- (void)qaController:(InterQAController *)controller didUpdateQuestions:(NSArray<InterQuestionInfo *> *)questions {
+#pragma unused(controller)
+    [self.normalQAPanel setQuestions:questions];
+    if (!self.normalQAWindow.isVisible) {
+        [self.normalQAPanel setUnreadBadge:controller.unreadCount];
+    }
+}
+
 // MARK: InterMediaWiringDelegate (Phase 8 — participant list sync)
 
 - (void)mediaWiringControllerDidChangePresenceState:(NSInteger)state {
@@ -1233,6 +1577,357 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
     if (!self.normalChatPanel || !self.roomController) return;
     NSArray<NSDictionary<NSString *, NSString *> *> *participants = [self.roomController remoteParticipantList];
     [self.normalChatPanel setParticipantList:participants];
+}
+
+// MARK: - Phase 9 — Lobby Panel
+
+- (void)toggleNormalLobbyPanel {
+    if (!self.normalLobbyWindow) {
+        // Create lobby panel next to the control bar
+        CGFloat panelWidth = 280;
+        CGFloat panelHeight = 320;
+        NSRect windowFrame = self.normalCallWindow.frame;
+        CGFloat x = NSMaxX(windowFrame) - panelWidth - 12;
+        CGFloat y = windowFrame.origin.y + 100;
+        self.normalLobbyPanel = [[InterLobbyPanel alloc] initWithFrame:NSMakeRect(0, 0, panelWidth, panelHeight)];
+        self.normalLobbyPanel.delegate = self;
+
+        self.normalLobbyWindow = [[NSWindow alloc] initWithContentRect:NSMakeRect(x, y, panelWidth, panelHeight)
+                                                             styleMask:(NSWindowStyleMaskTitled |
+                                                                        NSWindowStyleMaskClosable |
+                                                                        NSWindowStyleMaskResizable)
+                                                               backing:NSBackingStoreBuffered
+                                                                 defer:NO];
+        self.normalLobbyWindow.title = @"Waiting Room";
+        self.normalLobbyWindow.minSize = NSMakeSize(220, 200);
+        self.normalLobbyWindow.releasedWhenClosed = NO;
+        self.normalLobbyWindow.level = NSFloatingWindowLevel;
+        [self.normalLobbyWindow setAppearance:[NSAppearance appearanceNamed:NSAppearanceNameDarkAqua]];
+        self.normalLobbyWindow.contentView = self.normalLobbyPanel;
+
+        // Populate with any participants who joined the lobby before the panel was opened
+        NSArray<NSDictionary<NSString *, NSString *> *> *waiting = self.moderationController.lobbyWaitingParticipants;
+        for (NSDictionary<NSString *, NSString *> *entry in waiting) {
+            NSString *ident = entry[@"identity"];
+            NSString *name  = entry[@"displayName"];
+            if (ident.length > 0) {
+                [self.normalLobbyPanel addWaitingParticipant:ident displayName:(name ?: ident)];
+            }
+        }
+
+        [self.normalLobbyWindow makeKeyAndOrderFront:nil];
+        return;
+    }
+
+    if (self.normalLobbyWindow.isVisible) {
+        [self.normalLobbyWindow orderOut:nil];
+    } else {
+        [self.normalLobbyWindow makeKeyAndOrderFront:nil];
+    }
+}
+
+// MARK: InterLobbyPanelDelegate
+
+- (void)lobbyPanel:(InterLobbyPanel *)panel didAdmitParticipant:(NSString *)identity displayName:(NSString *)displayName {
+#pragma unused(panel)
+    __weak typeof(self) weakSelf = self;
+    [self.moderationController admitFromLobbyWithIdentity:identity displayName:displayName completion:^(BOOL success, NSError *error) {
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf) return;
+        if (success) {
+            [strongSelf.normalLobbyPanel removeWaitingParticipant:identity];
+        } else {
+            NSLog(@"[Phase 9] Admit failed: %@", error.localizedDescription);
+        }
+    }];
+}
+
+- (void)lobbyPanel:(InterLobbyPanel *)panel didDenyParticipant:(NSString *)identity {
+#pragma unused(panel)
+    __weak typeof(self) weakSelf = self;
+    [self.moderationController denyFromLobbyWithIdentity:identity completion:^(BOOL success, NSError *error) {
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf) return;
+        if (success) {
+            [strongSelf.normalLobbyPanel removeWaitingParticipant:identity];
+        } else {
+            NSLog(@"[Phase 9] Deny failed: %@", error.localizedDescription);
+        }
+    }];
+}
+
+- (void)lobbyPanelDidAdmitAll:(InterLobbyPanel *)panel {
+#pragma unused(panel)
+    __weak typeof(self) weakSelf = self;
+    [self.moderationController admitAllFromLobbyWithCompletion:^(BOOL success, NSInteger count, NSError *error) {
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf) return;
+        if (success) {
+            [strongSelf.normalLobbyPanel clearWaitingList];
+            NSLog(@"[Phase 9] Admitted all: %ld participants", (long)count);
+        } else {
+            NSLog(@"[Phase 9] Admit all failed: %@", error.localizedDescription);
+        }
+    }];
+}
+
+- (void)lobbyPanel:(InterLobbyPanel *)panel didToggleLobbyEnabled:(BOOL)enabled {
+#pragma unused(panel)
+    __weak typeof(self) weakSelf = self;
+    if (enabled) {
+        [self.moderationController enableLobbyWithCompletion:^(BOOL success, NSError *error) {
+            __strong typeof(weakSelf) strongSelf = weakSelf;
+            if (!strongSelf) return;
+            if (!success) {
+                NSLog(@"[Phase 9] Enable lobby failed: %@", error.localizedDescription);
+                strongSelf.normalLobbyPanel.lobbyEnabled = NO;
+            }
+        }];
+    } else {
+        [self.moderationController disableLobbyWithCompletion:^(BOOL success, NSError *error) {
+            __strong typeof(weakSelf) strongSelf = weakSelf;
+            if (!strongSelf) return;
+            if (!success) {
+                NSLog(@"[Phase 9] Disable lobby failed: %@", error.localizedDescription);
+                strongSelf.normalLobbyPanel.lobbyEnabled = YES;
+            }
+        }];
+    }
+}
+
+// MARK: - Phase 9 — Moderation Menu
+
+- (void)showModerationMenu:(NSButton *)sender {
+    NSMenu *menu = [[NSMenu alloc] initWithTitle:@"Moderation"];
+
+    // Mute All / Unmute All
+    if (self.moderationController.isAllMuted) {
+        [menu addItemWithTitle:@"🔊 Unmute All" action:@selector(moderationUnmuteAll) keyEquivalent:@""];
+    } else {
+        [menu addItemWithTitle:@"🔇 Mute All" action:@selector(moderationMuteAll) keyEquivalent:@""];
+    }
+
+    // Disable/Enable Chat
+    if (self.moderationController.isChatDisabled) {
+        [menu addItemWithTitle:@"💬 Enable Chat" action:@selector(moderationEnableChat) keyEquivalent:@""];
+    } else {
+        [menu addItemWithTitle:@"🚫 Disable Chat" action:@selector(moderationDisableChat) keyEquivalent:@""];
+    }
+
+    [menu addItem:[NSMenuItem separatorItem]];
+
+    // Lock/Unlock Meeting
+    if (self.moderationController.isMeetingLocked) {
+        [menu addItemWithTitle:@"🔓 Unlock Meeting" action:@selector(moderationUnlockMeeting) keyEquivalent:@""];
+    } else {
+        [menu addItemWithTitle:@"🔒 Lock Meeting" action:@selector(moderationLockMeeting) keyEquivalent:@""];
+    }
+
+    [menu addItem:[NSMenuItem separatorItem]];
+
+    // Password
+    [menu addItemWithTitle:@"🔑 Set Password…" action:@selector(moderationSetPassword) keyEquivalent:@""];
+    [menu addItemWithTitle:@"🔑 Remove Password" action:@selector(moderationRemovePassword) keyEquivalent:@""];
+
+    [NSMenu popUpContextMenu:menu withEvent:[NSApp currentEvent] forView:sender];
+}
+
+- (void)moderationMuteAll {
+    [self.moderationController muteAllWithCompletion:^(BOOL success, NSInteger count, NSError *error) {
+        if (success) {
+            NSLog(@"[Phase 9] Muted %ld participants", (long)count);
+            // Show "Allow" buttons in the speaker queue for raised hands
+            self.normalSpeakerQueuePanel.showAllowActions = YES;
+        } else {
+            NSLog(@"[Phase 9] Mute all failed: %@", error.localizedDescription);
+        }
+    }];
+}
+
+- (void)moderationUnmuteAll {
+    [self.moderationController unmuteAllWithCompletion:^(BOOL success, NSInteger count, NSError *error) {
+        if (success) {
+            NSLog(@"[Phase 9] Broadcast unmute-all request to participants");
+            // Hide "Allow" buttons — everyone can unmute freely now
+            self.normalSpeakerQueuePanel.showAllowActions = NO;
+        } else {
+            NSLog(@"[Phase 9] Unmute all failed: %@", error.localizedDescription);
+        }
+    }];
+}
+
+- (void)moderationDisableChat {
+    [self.moderationController disableChat];
+}
+
+- (void)moderationEnableChat {
+    [self.moderationController enableChat];
+}
+
+- (void)moderationLockMeeting {
+    [self.moderationController lockMeetingWithCompletion:^(BOOL success, NSError *error) {
+        if (!success) {
+            NSLog(@"[Phase 9] Lock meeting failed: %@", error.localizedDescription);
+        }
+    }];
+}
+
+- (void)moderationUnlockMeeting {
+    [self.moderationController unlockMeetingWithCompletion:^(BOOL success, NSError *error) {
+        if (!success) {
+            NSLog(@"[Phase 9] Unlock meeting failed: %@", error.localizedDescription);
+        }
+    }];
+}
+
+- (void)moderationSetPassword {
+    NSAlert *alert = [[NSAlert alloc] init];
+    alert.messageText = @"Set Meeting Password";
+    alert.informativeText = @"Enter a password for this meeting:";
+    [alert addButtonWithTitle:@"Set"];
+    [alert addButtonWithTitle:@"Cancel"];
+
+    NSSecureTextField *passwordField = [[NSSecureTextField alloc] initWithFrame:NSMakeRect(0, 0, 240, 24)];
+    passwordField.placeholderString = @"Password";
+    alert.accessoryView = passwordField;
+
+    if ([alert runModal] == NSAlertFirstButtonReturn) {
+        NSString *password = passwordField.stringValue;
+        if (password.length > 0) {
+            [self.moderationController setPassword:password completion:^(BOOL success, NSError *error) {
+                if (!success) {
+                    NSLog(@"[Phase 9] Set password failed: %@", error.localizedDescription);
+                }
+            }];
+        }
+    }
+}
+
+- (void)moderationRemovePassword {
+    [self.moderationController removePasswordWithCompletion:^(BOOL success, NSError *error) {
+        if (!success) {
+            NSLog(@"[Phase 9] Remove password failed: %@", error.localizedDescription);
+        }
+    }];
+}
+
+// MARK: InterModerationDelegate
+
+- (void)moderationController:(InterModerationController *)controller chatDisabledStateChanged:(BOOL)isDisabled {
+#pragma unused(controller)
+    if (self.normalChatPanel) {
+        [self.normalChatPanel setChatInputEnabled:!isDisabled];
+        if (isDisabled) {
+            [self.normalChatPanel displaySystemMessage:@"Chat has been disabled by the host."];
+        } else {
+            [self.normalChatPanel displaySystemMessage:@"Chat has been re-enabled."];
+        }
+    }
+}
+
+- (void)moderationController:(InterModerationController *)controller receivedUnmuteRequest:(NSString *)fromIdentity displayName:(NSString *)displayName {
+#pragma unused(controller)
+    NSAlert *alert = [[NSAlert alloc] init];
+    alert.messageText = @"Unmute Request";
+    alert.informativeText = [NSString stringWithFormat:@"%@ is asking you to unmute your microphone.", displayName];
+    [alert addButtonWithTitle:@"Unmute"];
+    [alert addButtonWithTitle:@"Decline"];
+    if ([alert runModal] == NSAlertFirstButtonReturn) {
+        // User accepted — unmute microphone
+        [self.normalMediaWiring toggleMicrophone];
+    }
+}
+
+- (void)moderationControllerReceivedUnmuteAllRequest:(InterModerationController *)controller {
+#pragma unused(controller)
+    NSLog(@"[Phase 9] Host unmuted all — restoring mic toggle ability");
+    [self.normalMediaWiring applyUnmuteAll];
+}
+
+- (void)moderationControllerReceivedMuteAllRequest:(InterModerationController *)controller {
+#pragma unused(controller)
+    NSLog(@"[Phase 9] Host muted all — updating local mic state");
+    [self.normalMediaWiring applyRemoteMicMute];
+}
+
+- (void)moderationController:(InterModerationController *)controller receivedSpeakRequest:(NSString *)fromIdentity displayName:(NSString *)displayName {
+#pragma unused(controller, fromIdentity, displayName)
+    // No-op: speak requests are now handled via the raise-hand flow.
+    // Participants raise their hand when host-muted, and the host sees
+    // "Allow" + "Dismiss" buttons in the speaker queue panel.
+}
+
+- (void)moderationControllerReceivedAllowToSpeak:(InterModerationController *)controller {
+#pragma unused(controller)
+    NSLog(@"[Phase 9] Host allowed us to speak — unmuting mic (one-time grant)");
+    [self.normalMediaWiring applyAllowToSpeak];
+
+    // Reset hand raise button (our hand was lowered by the host)
+    NSString *localIdentity = self.roomController.localParticipantIdentity;
+    if (localIdentity.length > 0 && [self.speakerQueue isHandRaisedFor:localIdentity]) {
+        [self.speakerQueue removeHandFor:localIdentity];
+        [self.normalSpeakerQueuePanel setEntries:self.speakerQueue.entries];
+    }
+    [self.normalHandRaiseButton setTitle:@"✋ Raise"];
+}
+
+- (void)moderationController:(InterModerationController *)controller meetingLockStateChanged:(BOOL)isLocked {
+#pragma unused(controller)
+    NSLog(@"[Phase 9] Meeting %@", isLocked ? @"locked" : @"unlocked");
+}
+
+- (void)moderationController:(InterModerationController *)controller participantSuspendStateChanged:(NSString *)identity isSuspended:(BOOL)isSuspended {
+#pragma unused(controller)
+    if ([identity isEqualToString:self.roomController.localParticipantIdentity]) {
+        // WE were suspended/unsuspended
+        if (self.normalChatPanel) {
+            [self.normalChatPanel setChatInputEnabled:!isSuspended];
+        }
+        if (isSuspended) {
+            NSAlert *alert = [[NSAlert alloc] init];
+            alert.messageText = @"Suspended";
+            alert.informativeText = @"You have been suspended by the host. Your audio, video, and chat have been disabled.";
+            [alert addButtonWithTitle:@"OK"];
+            [alert runModal];
+        }
+    }
+}
+
+- (void)moderationController:(InterModerationController *)controller forceSpotlightOnParticipant:(NSString *)identity {
+#pragma unused(controller)
+    if (self.normalRemoteLayout) {
+        [self.normalRemoteLayout setManualSpotlightTileKey:identity animated:YES];
+    }
+}
+
+- (void)moderationControllerDidClearForceSpotlight:(InterModerationController *)controller {
+#pragma unused(controller)
+    if (self.normalRemoteLayout) {
+        [self.normalRemoteLayout setManualSpotlightTileKey:nil animated:YES];
+    }
+}
+
+- (void)moderationControllerLocalParticipantWasRemoved:(InterModerationController *)controller {
+#pragma unused(controller)
+    NSAlert *alert = [[NSAlert alloc] init];
+    alert.messageText = @"Removed";
+    alert.informativeText = @"You have been removed from the meeting by the host.";
+    [alert addButtonWithTitle:@"OK"];
+    [alert runModal];
+    [self requestExitCurrentMode];
+}
+
+- (void)moderationController:(InterModerationController *)controller participantRoleChanged:(NSString *)identity newRole:(NSString *)newRole {
+#pragma unused(controller)
+    NSLog(@"[Phase 9] Role changed: %@ → %@", identity, newRole);
+    // Could update overlay badges, tile labels, etc. here in the future
+}
+
+- (void)moderationController:(InterModerationController *)controller lobbyParticipantJoined:(NSString *)identity displayName:(NSString *)displayName {
+#pragma unused(controller)
+    if (self.normalLobbyPanel) {
+        [self.normalLobbyPanel addWaitingParticipant:identity displayName:displayName];
+    }
 }
 
 #pragma mark - Diagnostics [3.4.5]
@@ -1334,6 +2029,30 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
     self.normalHandRaiseButton = nil;
     self.normalQueueToggleButton = nil;
 
+    // [Phase 8.5] Tear down poll window
+    if (self.normalPollWindow) {
+        [self.normalPollWindow orderOut:nil];
+        self.normalPollWindow = nil;
+    }
+    self.normalPollPanel = nil;
+    self.normalPollToggleButton = nil;
+
+    // [Phase 8.6] Tear down Q&A window
+    if (self.normalQAWindow) {
+        [self.normalQAWindow orderOut:nil];
+        self.normalQAWindow = nil;
+    }
+    self.normalQAPanel = nil;
+    self.normalQAToggleButton = nil;
+
+    // [Phase 9] Tear down lobby window
+    if (self.normalLobbyWindow) {
+        [self.normalLobbyWindow orderOut:nil];
+        self.normalLobbyWindow = nil;
+    }
+    self.normalLobbyPanel = nil;
+    self.normalLobbyToggleButton = nil;
+
     // [3.2] Tear down remote video layout
     if (self.normalRemoteLayout) {
         [self.normalRemoteLayout teardown];
@@ -1397,6 +2116,10 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
     if (self.normalCallWindow != nil) {
         [self.normalCallWindow orderOut:nil];
     }
+    // Hide standalone panel windows immediately
+    [self.normalPollWindow orderOut:nil];
+    [self.normalQAWindow orderOut:nil];
+    [self.normalLobbyWindow orderOut:nil];
     [self.secureController hideSecureWindow];
 
     // [2.5.7] [G8] Disconnect room on exit. Guarded: skip if nil

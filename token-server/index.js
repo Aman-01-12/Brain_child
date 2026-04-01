@@ -206,14 +206,15 @@ function roomParticipantsKey(code) { return `room:${code}:participants`; }
 function roomRolesKey(code) { return `room:${code}:roles`; }
 function roomLockedKey(code) { return `room:${code}:locked`; }
 function roomLobbyKey(code) { return `room:${code}:lobby`; }
+function roomLobbyNamesKey(code) { return `room:${code}:lobby:names`; }
 function roomSuspendedKey(code) { return `room:${code}:suspended`; }
 
 // ---------------------------------------------------------------------------
 // Phase 9 — Role hierarchy and permission validation (server-side mirror)
 // Matches InterPermissions.swift permission matrix exactly.
 // ---------------------------------------------------------------------------
-const ROLE_HIERARCHY = { 'participant': 0, 'presenter': 1, 'panelist': 2, 'co-host': 3, 'host': 4 };
-const MODERATOR_ROLES = ['host', 'co-host'];
+const ROLE_HIERARCHY = { 'participant': 0, 'presenter': 1, 'panelist': 2, 'co-host': 3, 'host': 4, 'interviewer': 4 };
+const MODERATOR_ROLES = ['host', 'co-host', 'interviewer'];
 
 function isModeratorRole(role) {
   return MODERATOR_ROLES.includes(role);
@@ -262,6 +263,55 @@ async function isParticipant(code, identity) {
 
 async function addParticipant(code, identity) {
   return await redis.sadd(roomParticipantsKey(code), identity);
+}
+
+/// Admit all lobby members for a room: generate tokens, add as participants,
+/// store polling status, then clear lobby keys. Returns the count admitted.
+/// Enforces MAX_PARTICIPANTS_PER_ROOM — excess members get status 'room_full'.
+async function admitAllFromLobby(code, roomData) {
+  const lobbyIdentities = await redis.zrange(roomLobbyKey(code), 0, -1);
+  let admittedCount = 0;
+  let currentCount = await getParticipantCount(code);
+
+  for (const memberIdentity of lobbyIdentities) {
+    // Stop admitting once the room is full
+    if (currentCount >= MAX_PARTICIPANTS_PER_ROOM) {
+      // Mark remaining lobby members as room_full so clients know why
+      const remaining = lobbyIdentities.slice(lobbyIdentities.indexOf(memberIdentity));
+      for (const remainingIdentity of remaining) {
+        await redis.set(`room:${code}:lobby:${remainingIdentity}:status`, 'room_full', 'EX', 300);
+      }
+      break;
+    }
+
+    try {
+      const memberDisplayName = await redis.hget(roomLobbyNamesKey(code), memberIdentity) || memberIdentity;
+      await addParticipant(code, memberIdentity);
+      await redis.hset(roomRolesKey(code), memberIdentity, 'participant');
+
+      // Generate token
+      const metadata = { role: 'participant' };
+      const jwt = await createToken(memberIdentity, memberDisplayName, roomData.roomName, false, metadata);
+
+      // Store admit status for polling
+      await redis.set(`room:${code}:lobby:${memberIdentity}:status`, 'admitted', 'EX', 300);
+      await redis.set(`room:${code}:lobby:${memberIdentity}:token`, jwt, 'EX', 300);
+      await redis.set(`room:${code}:lobby:${memberIdentity}:serverURL`, LIVEKIT_SERVER_URL, 'EX', 300);
+
+      admittedCount++;
+      currentCount++;
+    } catch (e) {
+      console.error(`[warn] Failed to admit lobby member ${memberIdentity}:`, e.message);
+    }
+  }
+
+  // Clear the lobby
+  if (lobbyIdentities.length > 0) {
+    await redis.del(roomLobbyKey(code));
+    await redis.del(roomLobbyNamesKey(code));
+  }
+
+  return admittedCount;
 }
 
 // ---------------------------------------------------------------------------
@@ -315,7 +365,7 @@ app.post('/room/create', async (req, res) => {
     console.log(`[audit] Room created: code=${roomCode} type=${roomType} host=${identity}`);
 
     // Store host role in Redis for server-side validation (Phase 9)
-    await redis.hset(roomRolesKey(roomCode), identity, 'host');
+    await redis.hset(roomRolesKey(roomCode), identity, hostRole);
     await redis.expire(roomRolesKey(roomCode), ROOM_CODE_EXPIRY_SECONDS);
 
     // Persist meeting to PostgreSQL (if user is authenticated)
@@ -411,11 +461,18 @@ app.post('/room/join', async (req, res) => {
     if (!alreadyAdmitted) {
       // Add to lobby waiting room
       const score = Date.now();
-      await redis.zadd(roomLobbyKey(code), score, JSON.stringify({ identity, displayName }));
+      await redis.zadd(roomLobbyKey(code), score, identity);
       await redis.expire(roomLobbyKey(code), ROOM_CODE_EXPIRY_SECONDS);
-      const position = await redis.zrank(roomLobbyKey(code), JSON.stringify({ identity, displayName }));
+      await redis.hset(roomLobbyNamesKey(code), identity, displayName);
+      await redis.expire(roomLobbyNamesKey(code), ROOM_CODE_EXPIRY_SECONDS);
+      const position = await redis.zrank(roomLobbyKey(code), identity);
+
+      // Generate a per-join secret so only the legitimate joiner can poll lobby-status
+      const pollToken = require('crypto').randomBytes(32).toString('hex');
+      await redis.set(`room:${code}:lobby:${identity}:pollToken`, pollToken, 'EX', ROOM_CODE_EXPIRY_SECONDS);
+
       console.log(`[audit] Lobby join: code=${code} identity=${identity} position=${position + 1}`);
-      return res.json({ status: 'waiting', position: (position || 0) + 1 });
+      return res.json({ status: 'waiting', position: (position || 0) + 1, pollToken });
     }
   }
 
@@ -624,6 +681,13 @@ app.post('/room/mute', async (req, res) => {
   const validation = await validateModerator(code, callerIdentity);
   if (!validation.valid) return res.status(403).json({ error: validation.error });
 
+  // Cannot mute someone of equal or higher role
+  const targetRole = await getParticipantRole(code, targetIdentity);
+  const callerRole = validation.role;
+  if (roleLevel(targetRole) >= roleLevel(callerRole)) {
+    return res.status(403).json({ error: 'Cannot mute a participant with equal or higher privileges.' });
+  }
+
   try {
     // Get participant's tracks and find the matching one
     const participant = await roomService.getParticipant(roomData.roomName, targetIdentity);
@@ -669,11 +733,20 @@ app.post('/room/mute-all', async (req, res) => {
 
   try {
     const participants = await roomService.listParticipants(roomData.roomName);
+    const callerRole = validation.role;
     let mutedCount = 0;
+    let skippedCount = 0;
 
     for (const p of participants) {
       // Skip the caller (don't mute yourself)
       if (p.identity === callerIdentity) continue;
+
+      // Skip participants with equal or higher privileges
+      const targetRole = await getParticipantRole(code, p.identity);
+      if (roleLevel(targetRole) >= roleLevel(callerRole)) {
+        skippedCount++;
+        continue;
+      }
 
       const tracks = p.tracks || [];
       const micTrack = tracks.find(t => t.source === TrackSource.MICROPHONE);
@@ -687,7 +760,7 @@ app.post('/room/mute-all', async (req, res) => {
       }
     }
 
-    console.log(`[audit] Mute all: code=${code} muted=${mutedCount} by=${callerIdentity}`);
+    console.log(`[audit] Mute all: code=${code} muted=${mutedCount} skipped=${skippedCount} by=${callerIdentity}`);
     res.json({ success: true, mutedCount });
   } catch (err) {
     console.error(`[error] Mute all failed:`, err.message);
@@ -808,6 +881,13 @@ app.post('/room/suspend', async (req, res) => {
   const validation = await validateModerator(code, callerIdentity);
   if (!validation.valid) return res.status(403).json({ error: validation.error });
 
+  // Cannot suspend someone of equal or higher role
+  const targetRole = await getParticipantRole(code, targetIdentity);
+  const callerRole = validation.role;
+  if (roleLevel(targetRole) >= roleLevel(callerRole)) {
+    return res.status(403).json({ error: 'Cannot suspend a participant with equal or higher privileges.' });
+  }
+
   try {
     // Mute all tracks
     const participant = await roomService.getParticipant(roomData.roomName, targetIdentity);
@@ -904,14 +984,11 @@ app.post('/room/lobby/disable', async (req, res) => {
 
   await redis.hdel(roomKey(code), 'lobbyEnabled');
 
-  // Admit all waiting participants automatically
-  const lobbyMembers = await redis.zrange(roomLobbyKey(code), 0, -1);
-  if (lobbyMembers.length > 0) {
-    await redis.del(roomLobbyKey(code));
-  }
+  // Admit all waiting participants automatically (real admission — tokens + participant records)
+  const admittedCount = await admitAllFromLobby(code, roomData);
 
-  console.log(`[audit] Lobby disabled: code=${code} by=${callerIdentity} (${lobbyMembers.length} auto-admitted)`);
-  res.json({ success: true, autoAdmitted: lobbyMembers.length });
+  console.log(`[audit] Lobby disabled: code=${code} by=${callerIdentity} (${admittedCount} auto-admitted)`);
+  res.json({ success: true, autoAdmitted: admittedCount });
 });
 
 // ---------------------------------------------------------------------------
@@ -934,13 +1011,8 @@ app.post('/room/admit', async (req, res) => {
   if (!validation.valid) return res.status(403).json({ error: validation.error });
 
   // Remove from lobby
-  const lobbyMembers = await redis.zrange(roomLobbyKey(code), 0, -1);
-  const memberEntry = lobbyMembers.find(m => {
-    try { return JSON.parse(m).identity === targetIdentity; } catch { return false; }
-  });
-  if (memberEntry) {
-    await redis.zrem(roomLobbyKey(code), memberEntry);
-  }
+  await redis.zrem(roomLobbyKey(code), targetIdentity);
+  await redis.hdel(roomLobbyNamesKey(code), targetIdentity);
 
   // Add to participants
   await addParticipant(code, targetIdentity);
@@ -979,32 +1051,7 @@ app.post('/room/admit-all', async (req, res) => {
   const validation = await validateModerator(code, callerIdentity);
   if (!validation.valid) return res.status(403).json({ error: validation.error });
 
-  const lobbyMembers = await redis.zrange(roomLobbyKey(code), 0, -1);
-  let admittedCount = 0;
-
-  for (const memberStr of lobbyMembers) {
-    try {
-      const member = JSON.parse(memberStr);
-      await addParticipant(code, member.identity);
-      await redis.hset(roomRolesKey(code), member.identity, 'participant');
-
-      // Generate token
-      const metadata = { role: 'participant' };
-      const jwt = await createToken(member.identity, member.displayName || member.identity, roomData.roomName, false, metadata);
-
-      // Store admit status for polling
-      await redis.set(`room:${code}:lobby:${member.identity}:status`, 'admitted', 'EX', 300);
-      await redis.set(`room:${code}:lobby:${member.identity}:token`, jwt, 'EX', 300);
-      await redis.set(`room:${code}:lobby:${member.identity}:serverURL`, LIVEKIT_SERVER_URL, 'EX', 300);
-
-      admittedCount++;
-    } catch (e) {
-      console.error(`[warn] Failed to admit lobby member:`, e.message);
-    }
-  }
-
-  // Clear the lobby
-  await redis.del(roomLobbyKey(code));
+  const admittedCount = await admitAllFromLobby(code, roomData);
 
   console.log(`[audit] Admit all: code=${code} admitted=${admittedCount} by=${callerIdentity}`);
   res.json({ success: true, admittedCount });
@@ -1030,13 +1077,8 @@ app.post('/room/deny', async (req, res) => {
   if (!validation.valid) return res.status(403).json({ error: validation.error });
 
   // Remove from lobby
-  const lobbyMembers = await redis.zrange(roomLobbyKey(code), 0, -1);
-  const memberEntry = lobbyMembers.find(m => {
-    try { return JSON.parse(m).identity === targetIdentity; } catch { return false; }
-  });
-  if (memberEntry) {
-    await redis.zrem(roomLobbyKey(code), memberEntry);
-  }
+  await redis.zrem(roomLobbyKey(code), targetIdentity);
+  await redis.hdel(roomLobbyNamesKey(code), targetIdentity);
 
   // Store denied status for lobby polling
   await redis.set(`room:${code}:lobby:${targetIdentity}:status`, 'denied', 'EX', 300);
@@ -1053,6 +1095,16 @@ app.get('/room/lobby-status/:code/:identity', async (req, res) => {
   const code = req.params.code.toUpperCase();
   const identity = req.params.identity;
 
+  // Validate per-join pollToken to prevent unauthenticated JWT scraping
+  const pollToken = req.headers['x-poll-token'] || req.query.pollToken;
+  if (!pollToken) {
+    return res.status(401).json({ error: 'pollToken is required' });
+  }
+  const storedPollToken = await redis.get(`room:${code}:lobby:${identity}:pollToken`);
+  if (!storedPollToken || storedPollToken !== pollToken) {
+    return res.status(403).json({ error: 'Invalid pollToken' });
+  }
+
   // Check for admit/deny status
   const status = await redis.get(`room:${code}:lobby:${identity}:status`);
 
@@ -1061,10 +1113,11 @@ app.get('/room/lobby-status/:code/:identity', async (req, res) => {
     const serverURL = await redis.get(`room:${code}:lobby:${identity}:serverURL`);
     const roomData = await getRoomData(code);
 
-    // Clean up lobby status keys
+    // Clean up lobby status keys (including the one-time pollToken)
     await redis.del(`room:${code}:lobby:${identity}:status`);
     await redis.del(`room:${code}:lobby:${identity}:token`);
     await redis.del(`room:${code}:lobby:${identity}:serverURL`);
+    await redis.del(`room:${code}:lobby:${identity}:pollToken`);
 
     return res.json({
       status: 'admitted',
@@ -1077,28 +1130,25 @@ app.get('/room/lobby-status/:code/:identity', async (req, res) => {
 
   if (status === 'denied') {
     await redis.del(`room:${code}:lobby:${identity}:status`);
+    await redis.del(`room:${code}:lobby:${identity}:pollToken`);
     return res.json({ status: 'denied' });
   }
 
-  // Still waiting — calculate position
-  const lobbyMembers = await redis.zrange(roomLobbyKey(code), 0, -1);
-  let position = 0;
-  for (let i = 0; i < lobbyMembers.length; i++) {
-    try {
-      const member = JSON.parse(lobbyMembers[i]);
-      if (member.identity === identity) {
-        position = i + 1;
-        break;
-      }
-    } catch {}
+  if (status === 'room_full') {
+    await redis.del(`room:${code}:lobby:${identity}:status`);
+    await redis.del(`room:${code}:lobby:${identity}:pollToken`);
+    return res.json({ status: 'room_full' });
   }
 
-  if (position === 0) {
+  // Still waiting — calculate position
+  const rank = await redis.zrank(roomLobbyKey(code), identity);
+
+  if (rank === null) {
     // Not in lobby — might have been removed or room expired
     return res.json({ status: 'not_found' });
   }
 
-  res.json({ status: 'waiting', position });
+  res.json({ status: 'waiting', position: rank + 1 });
 });
 
 // ---------------------------------------------------------------------------

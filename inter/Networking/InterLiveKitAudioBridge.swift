@@ -291,6 +291,7 @@ private final class AudioRingBuffer: @unchecked Sendable {
         guard let nextState = micState.nextState(for: .beginMute) else {
             interLogError(InterLog.media, "AudioBridge: invalid mute transition from %{public}@",
                           String(describing: micState))
+            DispatchQueue.main.async { completion() }
             return
         }
         micState = nextState
@@ -316,17 +317,24 @@ private final class AudioRingBuffer: @unchecked Sendable {
     }
 
     /// Begin enabling: caller starts capture device first, then we unmute on first sample.
-    @objc public func beginEnable() {
+    ///
+    /// - Parameter completion: Called on the **main queue** once the track is unmuted
+    ///   (or immediately if the state transition is invalid). Mirrors `beginMute(completion:)`.
+    @objc public func beginEnable(completion: @escaping () -> Void) {
         guard let nextState = micState.nextState(for: .beginEnable) else {
             interLogError(InterLog.media, "AudioBridge: invalid enable transition from %{public}@",
                           String(describing: micState))
+            DispatchQueue.main.async { completion() }
             return
         }
         micState = nextState
 
         // Set up the pending unmute callback — triggered by first appendAudioSampleBuffer
         pendingUnmuteCallback = { [weak self] in
-            guard let track = self?.audioTrack else { return }
+            guard let track = self?.audioTrack else {
+                DispatchQueue.main.async { completion() }
+                return
+            }
             Task {
                 do {
                     try await track.unmute()
@@ -335,6 +343,7 @@ private final class AudioRingBuffer: @unchecked Sendable {
                     interLogError(InterLog.media, "AudioBridge: unmute failed: %{public}@",
                                   error.localizedDescription)
                 }
+                DispatchQueue.main.async { completion() }
             }
         }
 

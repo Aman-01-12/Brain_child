@@ -65,6 +65,10 @@ import LiveKit
     /// Delegate for control signal events (raise hand).
     @objc public weak var controlDelegate: InterControlSignalDelegate?
 
+    /// [Phase 9] Moderation controller — receives Phase 9 control signals
+    /// (disable chat, ask to unmute, suspend, force spotlight, etc.).
+    @objc public weak var moderationController: InterModerationController?
+
     /// All messages in chronological order. Thread-safe read from main queue.
     @objc public private(set) var messages: [InterChatMessageInfo] = []
 
@@ -498,6 +502,15 @@ import LiveKit
                 interLogInfo(InterLog.room, "ChatController: %{public}@ lowered hand", targetId)
                 controlDelegate?.chatController(self, participantDidLowerHand: targetId)
             }
+
+        // Phase 9 — Forward moderation signals to the moderation controller
+        case .disableChat, .enableChat, .askToUnmute, .meetingLocked, .meetingUnlocked,
+             .suspended, .unsuspended, .forceSpotlight, .clearForceSpotlight,
+             .participantRemoved, .roleChanged, .lobbyJoin, .requestUnmuteAll, .requestMuteAll,
+             .requestToSpeak, .allowToSpeak:
+            guard signal.senderIdentity != localIdentity else { return }
+            moderationController?.handleControlSignal(signal)
+
         @unknown default:
             interLogDebug(InterLog.room, "ChatController: unknown control signal type %d", signal.type.rawValue)
         }

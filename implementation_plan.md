@@ -86,22 +86,25 @@ Phase 8: In-Meeting Communication
     ├── 8.1 Public Chat (DataChannel)
     ├── 8.2 Raise Hand + Speaker Queue
     ├── 8.3 Direct Messages (Pro)
-    └── 8.4 Chat Transcript Save (Pro)
+    ├── 8.4 Chat Transcript Save (Pro)
+    ├── 8.5 Live Polls (Pro)
+    └── 8.6 Q&A Board (Pro)
             │
 Phase 9: Meeting Management (Pro)
-    ├── 9.1 Roles & Permissions (co-host, presenter)
-    ├── 9.2 Moderation (Mute All, Disable Chat)
-    └── 9.3 Lobby / Waiting Room
+    ├── 9.1 Roles & Permissions (co-host, panelist, presenter)
+    ├── 9.2 Moderation (Mute All, Ask to Unmute, Lock, Spotlight)
+    ├── 9.3 Lobby / Waiting Room (admit one/all)
+    └── 9.4 Meeting Passwords
             │
 Phase 10: Recording
-    ├── 10.1 Local Recording (composed layout)
+    ├── 10.1 Local Recording (composed layout, pause/resume)
     ├── 10.2 Watermark (Free tier)
     ├── 10.3 Cloud Recording (Pro — LiveKit Egress)
     └── 10.4 Multi-track Recording (Hiring)
             │
 Phase 11: Scheduling & Productivity
     ├── 11.1 Calendar view (EventKit)
-    ├── 11.2 Calendar scheduling (Pro)
+    ├── 11.2 Calendar scheduling (Pro — Apple, Google, Outlook)
     ├── 11.3 Scheduling Links (Pro)
     └── 11.4 Team Management
             │
@@ -314,7 +317,30 @@ Add optional JWT-based user authentication. Existing anonymous flow continues to
 |:-----|:-----|:------|:--------|
 | 8.4.1 | Export chat | `inter/Networking/InterChatController.swift` | `exportTranscript() → URL` writes messages to `.txt` or `.json` file. NSSavePanel for location. |
 
-**Verification gate**: Messages appear for all participants in real-time. Raise hand icon appears on tile. DMs are private. Transcript exports correctly.
+### 8.5 — Live Polls (Pro Tier)
+
+| Step | What | Files | Details |
+|:-----|:-----|:------|:--------|
+| 8.5.1 | Poll data model | `inter/Networking/InterPollController.swift` (NEW) | `InterPoll` struct: id, question, options (array of `InterPollOption` with label + voteCount), createdBy, isAnonymous, allowMultiSelect, status (draft/active/ended). JSON Codable. |
+| 8.5.2 | Poll DataChannel | `inter/Networking/InterPollController.swift` | Topic `"poll"`. Host publishes `{type: "launchPoll", poll}` to all. Participants publish `{type: "vote", pollId, optionIndices}` targeted back to host. Host aggregates and broadcasts `{type: "pollResults", poll}`. |
+| 8.5.3 | Host poll creation UI | `inter/UI/Views/InterPollPanel.h/.m` (NEW) | Create poll form: question text, add/remove options (2–10), anonymous toggle, multi-select toggle. "Launch" button publishes to all. "End Poll" stops voting and broadcasts final results. |
+| 8.5.4 | Participant vote UI | `inter/UI/Views/InterPollPanel.m` | Non-host view: question + radio/checkbox options + "Submit" button. After voting: shows live results bar chart (if host enabled live results) or "Vote submitted" confirmation. |
+| 8.5.5 | Results display | `inter/UI/Views/InterPollPanel.m` | Horizontal bar chart per option with vote count and percentage. Host can "Share Results" to broadcast final tally to all participants. |
+| 8.5.6 | Wire to AppDelegate | `inter/App/AppDelegate.m` | Add poll toggle button (📊) to control bar. Wire `InterPollController` through a centralized `InterDataChannelRouter` (see below). |
+| 8.5.7 | DataChannel router | `inter/Networking/InterDataChannelRouter.swift` (NEW) | Centralized dispatcher that demultiplexes incoming DataChannel messages by `topic` field. Provides `subscribe(topic: String, handler: (Data) → Void)` API. `InterChatController`, `InterPollController`, `InterQAController`, and `InterModerationController` each register a handler during initialization instead of reading the DataChannel directly. Router is owned by `InterRoomController` and wired in `AppDelegate`. **Migration strategy** (atomic cutover to avoid duplicate/dropped messages): **(a)** Add a `useDataChannelRouter` feature flag (Bool, default `false`) to `InterRoomController`. When `false`, the existing direct `handleReceivedData` call-sites remain active. **(b)** Implement a dual-delivery shim inside the router: when compatibility mode is on, incoming DataChannel frames are forwarded to **both** the router's `subscribe` dispatch **and** the original direct handlers; controllers that have migrated must deduplicate (idempotent `handleReceivedData` or guard via "already-routed" flag). **(c)** Migrate controllers one-at-a-time: each controller registers its `subscribe(topic:handler:)` and removes its direct `handleReceivedData` call-site; verify with per-controller unit test that messages arrive exactly once. **(d)** Deterministic cutover step: once all four controllers are migrated, flip `useDataChannelRouter = true`, remove the dual-delivery shim, and delete all direct DataChannel reads from controllers. **(e)** Required tests: subscription registration/unsubscription, dual-delivery delivers to both paths, single-path post-cutover delivers only via router, unknown topic messages are logged and dropped (not crashed). |
+
+### 8.6 — Q&A Board (Pro Tier)
+
+| Step | What | Files | Details |
+|:-----|:-----|:------|:--------|
+| 8.6.1 | Q&A data model | `inter/Networking/InterQAController.swift` (NEW) | `InterQuestion` struct: id, askerIdentity, askerName, text, timestamp, upvoteCount, isAnswered, isHighlighted. JSON Codable. |
+| 8.6.2 | Q&A DataChannel | `inter/Networking/InterQAController.swift` | Topic `"qa"`. Participants submit `askQuestion` via `POST /room/qa/publish` (step 8.6.6) — the server sanitises identity fields before rebroadcasting over DataChannel. Upvotes, markAnswered, highlight, and dismiss remain direct DataChannel publishes (host-only actions or non-sensitive). |
+| 8.6.3 | Q&A UI panel | `inter/UI/Views/InterQAPanel.h/.m` (NEW) | Slide-in panel (like chat). Sorted by upvote count (highest first). Each question shows: asker name, text, upvote button + count, timestamp. Host sees additional: "Highlight" (pins to top), "Mark Answered" (checkmark), "Dismiss" (remove). |
+| 8.6.4 | Participant Q&A input | `inter/UI/Views/InterQAPanel.m` | Text field at bottom: "Ask a question…". Anonymous option toggle (hides asker name from other participants, visible to host). Anonymity is server-enforced (step 8.6.6) — the client sends `isAnonymous: true` but the server strips identity before rebroadcast. |
+| 8.6.5 | Wire to AppDelegate | `inter/App/AppDelegate.m` | Add Q&A toggle button (❓) to control bar. Wire `InterQAController` through `InterDataChannelRouter` (step 8.5.7). |
+| 8.6.6 | Server-side Q&A publish | `token-server/index.js` | `POST /room/qa/publish` — accepts `{roomCode, callerIdentity, question}`. Server validates caller is a room participant, then: **(a)** overwrites `question.askerIdentity` with the authenticated caller identity (ignores client-supplied value); **(b)** if `question.isAnonymous == true`, sets `askerName` to `"Anonymous"` and strips `askerIdentity` from the outgoing payload (host receives the real identity in a separate `hostAskerIdentity` field); **(c)** assigns a server-generated UUID for `question.id` (prevents client-forged IDs); **(d)** rebroadcasts the sanitised message to all room participants via LiveKit `DataPublishOptions(topic: "qa")`. Client `InterQAController.submitQuestion()` calls this endpoint instead of direct DataChannel publish. |
+
+**Verification gate**: Messages appear for all participants in real-time. Raise hand icon appears on tile. DMs are private. Transcript exports correctly. Polls launch and collect votes in real-time, results display correctly. Q&A questions sort by upvotes, host can moderate.
 
 ---
 
@@ -329,29 +355,47 @@ Add optional JWT-based user authentication. Existing anonymous flow continues to
 
 | Step | What | Files | Details |
 |:-----|:-----|:------|:--------|
-| 9.1.1 | Extend JWT metadata | `token-server/index.js` | Metadata: `{role: "host"|"co-host"|"presenter"|"participant"}`. Host can promote via server API call. |
-| 9.1.2 | Permission model | `inter/Networking/InterPermissions.swift` (NEW) | Enum-based permissions: `canMuteOthers`, `canRemoveParticipant`, `canStartRecording`, `canDisableChat`. Derived from role. |
-| 9.1.3 | Server promotion endpoint | `token-server/index.js` | `POST /room/promote` — host sends `{roomCode, targetIdentity, newRole}`. Server updates metadata, issues new token to target. |
-| 9.1.4 | Client role UI | `inter/UI/Views/InterLocalCallControlPanel.m` | Show/hide moderation buttons based on local participant's role. |
+| 9.1.1 | Extend JWT metadata | `token-server/index.js` | Metadata: `{role: "host"|"co-host"|"panelist"|"presenter"|"participant"}`. Host can promote via server API call. **Panelist**: can unmute self and share screen, but cannot moderate others. |
+| 9.1.2 | Permission model | `inter/Networking/InterPermissions.swift` (NEW) | Enum-based permissions: `canMuteOthers`, `canRemoveParticipant`, `canStartRecording`, `canDisableChat`, `canLaunchPolls`, `canForceSpotlight`, `canLockMeeting`, `canAdmitFromLobby`. Derived from role via permission matrix. |
+| 9.1.3 | Server promotion endpoint | `token-server/index.js` | `POST /room/promote` — host sends `{roomCode, targetIdentity, newRole}`. Server updates LiveKit participant metadata, issues new token to target. Validates: only host/co-host can promote. |
+| 9.1.4 | Client role UI | `inter/UI/Views/InterLocalCallControlPanel.m` | Show/hide moderation buttons based on local participant's role. Participant context menu on tiles: "Promote to Co-host", "Make Presenter", "Make Panelist" (host/co-host only). |
+| 9.1.5 | Permission matrix | `inter/Networking/InterPermissions.swift` | Role→permission mapping: **Host/Co-host**: all permissions. **Panelist**: canUnmuteSelf, canShareScreen, canLaunchPolls. **Presenter**: canUnmuteSelf, canShareScreen. **Participant**: canUnmuteSelf (if not hard-muted). |
 
 ### 9.2 — Advanced Moderation
 
 | Step | What | Files | Details |
 |:-----|:-----|:------|:--------|
-| 9.2.1 | Mute All | `token-server/index.js` | `POST /room/mute-all` — uses LiveKit Server API `MutePublishedTrack` for all participants. |
-| 9.2.2 | Disable Chat | `inter/Networking/InterChatController.swift` | Host sends `{type: "disableChat"}` control message. All clients respect it. |
-| 9.2.3 | Remove Participant | `token-server/index.js` | `POST /room/remove` — uses LiveKit Server API `RemoveParticipant`. |
+| 9.2.1 | Mute All / Mute Individual | `token-server/index.js` | `POST /room/mute-all` — uses LiveKit Server API `MutePublishedTrack` for all remote participants (audio). `POST /room/mute` — `{roomCode, targetIdentity, trackSource: "microphone"|"camera"}` — mutes a single participant's specific track. Both server-authoritative via LiveKit admin API. |
+| 9.2.2 | Disable Chat | `inter/Networking/InterChatController.swift` | Host sends `{type: "disableChat"}` control message on DataChannel. All clients respect it — input field disabled, system message displayed. Host sends `{type: "enableChat"}` to restore. |
+| 9.2.3 | Remove Participant | `token-server/index.js` | `POST /room/remove` — uses LiveKit Server API `RemoveParticipant`. Removed participant sees "You have been removed from the meeting" dialog. Cannot rejoin unless re-admitted. |
+| 9.2.4 | Ask to Unmute | `inter/Networking/InterChatController.swift` | Control signal `{type: "askToUnmute", targetIdentity}` on DataChannel. Target client shows modal: "The host is asking you to unmute your microphone" with Accept / Decline buttons. Accept triggers local unmute. No server API needed — P2P via DataChannel. |
+| 9.2.5 | Disable Participant Camera | `token-server/index.js` | Same `POST /room/mute` endpoint with `trackSource: "camera"`. Target participant sees "The host has turned off your camera" notification. Participant can re-enable unless hard-muted. |
+| 9.2.6 | Lock Meeting | `token-server/index.js`, `inter/Networking/InterChatController.swift` | `POST /room/lock` — sets Redis flag `room:{code}:locked = true`. `/room/join` returns 423 (Locked) when flag set. Host toggle in control panel. Control signal `{type: "meetingLocked"}` broadcast notifies existing participants. `POST /room/unlock` clears the flag. |
+| 9.2.7 | Suspend Participant | `token-server/index.js`, `inter/Networking/InterChatController.swift` | `POST /room/suspend` — server hard-mutes all tracks (audio + camera) for target via LiveKit API. Control signal `{type: "suspended", targetIdentity}` disables target's chat input and share controls. Target sees "You have been suspended by the host." Host can unsuspend via `POST /room/unsuspend`. |
+| 9.2.8 | Host-Forced Spotlight | `inter/Networking/InterChatController.swift`, `inter/UI/Views/InterRemoteVideoLayoutManager.m` | Control signal `{type: "forceSpotlight", targetIdentity}` on DataChannel. All clients receive it and override their local `spotlightedParticipantKey` in layout manager. Tile context menu: "Pin for Everyone" (host/co-host only). `{type: "clearForceSpotlight"}` restores local control. Supports multi-pin: `targetIdentities` array for webinar/panel layouts. |
 
 ### 9.3 — Lobby / Waiting Room
 
 | Step | What | Files | Details |
 |:-----|:-----|:------|:--------|
-| 9.3.1 | Server-side lobby | `token-server/index.js` | When lobby enabled, `/room/join` returns `{status: "waiting"}` instead of a token. Host gets notified via DataChannel. |
-| 9.3.2 | Host admit endpoint | `token-server/index.js` | `POST /room/admit` — host sends identity to admit. Server issues token and notifies waiting client. |
-| 9.3.3 | Lobby UI (client) | `inter/UI/Views/InterLobbyView.h/.m` (NEW) | "Please wait, the host will let you in soon." Animated spinner. |
-| 9.3.4 | Host lobby panel | `inter/UI/Views/InterLobbyPanel.h/.m` (NEW) | List of waiting participants. "Admit" / "Deny" buttons. |
+| 9.3.1 | Server-side lobby | `token-server/index.js` | When lobby enabled, `/room/join` returns `{status: "waiting", position: N}` instead of a token. Waiting participants stored in Redis sorted set `room:{code}:lobby` (score = join timestamp). Host notified via DataChannel `{type: "lobbyJoin", identity, displayName}`. |
+| 9.3.2 | Host admit endpoint | `token-server/index.js` | `POST /room/admit` — host sends `{roomCode, identity}`. Server removes from lobby set, issues LiveKit token, and notifies waiting client via polling or SSE. |
+| 9.3.3 | Admit All | `token-server/index.js` | `POST /room/admit-all` — iterates Redis lobby set, issues tokens for all waiting participants, clears the set. Returns count of admitted participants. |
+| 9.3.4 | Deny participant | `token-server/index.js` | `POST /room/deny` — removes participant from lobby set. Client receives denial and shows "The host has denied your request to join." |
+| 9.3.5 | Lobby UI (client) | `inter/UI/Views/InterLobbyView.h/.m` (NEW) | "Please wait, the host will let you in soon." Animated pulsing spinner. Position indicator: "You are #3 in the waiting room." Polls `GET /room/lobby-status/{code}/{identity}` every 3s (or SSE) for admit/deny status. |
+| 9.3.6 | Host lobby panel | `inter/UI/Views/InterLobbyPanel.h/.m` (NEW) | List of waiting participants with join timestamp. Per-participant: "Admit" / "Deny" buttons. Top bar: "Admit All" button (enabled when lobby count > 0). Badge on lobby toggle button showing waiting count. |
+| 9.3.7 | Lobby toggle | `inter/App/AppDelegate.m`, `token-server/index.js` | `POST /room/lobby/enable` and `/room/lobby/disable`. Redis flag `room:{code}:lobbyEnabled`. Host toggle in room settings or control panel. Default: disabled (direct join). |
 
-**Verification gate**: Co-host can mute participants. Lobby holds joiners until admitted. Removed participants are disconnected.
+### 9.4 — Meeting Passwords
+
+| Step | What | Files | Details |
+|:-----|:-----|:------|:--------|
+| 9.4.1 | Server password storage | `token-server/index.js` | `POST /room/create` accepts optional `password` field. Stored as bcrypt hash in Redis Hash `room:{code}` field `passwordHash`. |
+| 9.4.2 | Password validation on join | `token-server/index.js` | `POST /room/join` requires `password` field when room has `passwordHash` set. Returns 401 "Incorrect password" on mismatch. Omitting password when required returns 401 "This meeting requires a password". **Brute-force mitigation** (multi-layer): **(1) Per-requester rate limit**: For authenticated users, track via `ratelimit:pwd-user:{userId}:{roomCode}`; for anonymous, track via `ratelimit:pwd:{roomCode}:{ip}`. Use Redis `INCR` + explicit `EXPIRE` (base window 60s). Thresholds with exponential backoff lockouts: 5 failures → 60s lockout, 10 failures → 300s lockout, 20 failures → 900s lockout. On each threshold breach, `SET` key with new TTL equal to the lockout duration (prevents counter reset during lockout). Return 429 with `Retry-After` header set to remaining lockout TTL. **(2) Per-room global limit**: Secondary key `ratelimit:pwd-room:{roomCode}` with `INCR` + `EXPIRE 60`. Threshold: 50 attempts / 60s across all IPs/users. Return 429 when breached (mitigates distributed attacks). **(3) TTL hygiene**: Every rate-limit key must be created with an explicit `EXPIRE` — no unbounded keys. Counter resets naturally after base window unless in lockout state. |
+| 9.4.3 | Client password UI | `inter/UI/Views/InterConnectionSetupPanel.m` | When `/room/join` returns 401 with password-required flag, show password input field below room code. Re-submit join with password. SecureTextField (dots, not plain text). |
+| 9.4.4 | Host password management | `inter/UI/Views/InterConnectionSetupPanel.m` | Optional password field on host create form. Auto-generate option: 8+ character alphanumeric (default) or 8–10 digit numeric PIN, with optional word-based passphrase (3 random words joined by hyphens). Password shown in room info (copyable alongside room code). |
+
+**Verification gate**: Co-host can mute/unmute-request participants. Individual hard-mute and camera disable work. Lobby holds joiners until admitted (one-by-one or all-at-once). Removed participants are disconnected. Locked meeting rejects new joins. Suspended participant cannot interact. Host-forced spotlight overrides all clients' views. Meeting password blocks unauthorized joins.
 
 ---
 
@@ -368,8 +412,9 @@ Add optional JWT-based user authentication. Existing anonymous flow continues to
 |:-----|:-----|:------|:--------|
 | 10.1.1 | Recording engine | `inter/Media/Recording/InterRecordingEngine.h/.m` (NEW) | `AVAssetWriter` with video (H.264) + audio (AAC) inputs. Accepts `CVPixelBuffer` frames. |
 | 10.1.2 | Composed renderer | `inter/Media/Recording/InterComposedRenderer.h/.m` (NEW) | Metal offscreen render pass. Composites: screen share (main) + active speaker PiP (bottom-right). Outputs CVPixelBuffer at 1080p 30fps. |
-| 10.1.3 | Recording coordinator | `inter/Media/Recording/InterRecordingCoordinator.swift` (NEW) | Orchestrates: start/stop, consent notification (DataChannel broadcast), file management. Host-only permission check. |
-| 10.1.4 | UI controls | `inter/UI/Views/InterLocalCallControlPanel.m` | "Record" button (red dot). Recording indicator. Timer display. |
+| 10.1.3 | Recording coordinator | `inter/Media/Recording/InterRecordingCoordinator.swift` (NEW) | Orchestrates: start/stop/pause/resume, consent notification (DataChannel broadcast `{type: "recordingStarted"}`), file management. Host-only permission check (via `InterPermissions`). |
+| 10.1.4 | UI controls | `inter/UI/Views/InterLocalCallControlPanel.m` | "Record" button (red dot). Recording indicator visible to all participants ("REC" badge). Timer display. |
+| 10.1.5 | Pause / Resume | `inter/Media/Recording/InterRecordingCoordinator.swift` | `pauseRecording()` — stops appending frames to `AVAssetWriter` inputs, stores pause timestamp. `resumeRecording()` — adjusts presentation timestamps (PTS offset = pause duration) so the output file has no gap. UI: record button toggles to "⏸" while paused, timer pauses. DataChannel broadcast `{type: "recordingPaused"}` / `{type: "recordingResumed"}` to update all clients' REC indicator. |
 
 ### 10.2 — Watermark (Free Tier)
 
@@ -404,9 +449,19 @@ Add optional JWT-based user authentication. Existing anonymous flow continues to
 
 EventKit integration for viewing upcoming meetings.
 
-### 11.2 — Calendar Scheduling (Pro)
+### 11.2 — Calendar Scheduling & Sync (Pro)
 
-Create meetings from within the app. Store in PostgreSQL + sync to system calendar.
+Create meetings from within the app. Store in PostgreSQL + sync to calendar providers.
+
+| Step | What | Files | Details |
+|:-----|:-----|:------|:--------|
+| 11.2.1 | Meeting scheduling model | `token-server/migrations/002_scheduling.sql` | `scheduled_meetings` table: id, host_user_id, title, description, scheduled_at (TIMESTAMPTZ), duration_minutes, room_type, password (optional), lobby_enabled, recurrence_rule (iCal RRULE string, nullable), host_timezone (IANA timezone identifier, e.g. `America/New_York`, NOT NULL). **Migration safety note**: `scheduled_meetings` is a brand-new table created in `002_scheduling.sql` — no pre-existing rows, so `NOT NULL` without a default is safe on initial `CREATE TABLE`. The migration SQL must include a comment at the top: `-- ASSERT: scheduled_meetings is a new table (created here). If this migration is ever repurposed to ALTER an existing table, host_timezone must be added as NULLABLE first, backfilled (e.g. SET host_timezone = 'UTC' or derived from users.preferred_timezone via host_user_id), then ALTER COLUMN SET NOT NULL.` All scheduling endpoints accept and return `host_timezone`. Use IANA-aware library (luxon on server, `TimeZone(identifier:)` on client) for DST-correct conversions. |
+| 11.2.2 | Scheduling endpoints | `token-server/index.js` | `POST /meetings/schedule` — creates scheduled meeting, returns meeting link. `GET /meetings/upcoming` — list user's upcoming meetings. `PATCH /meetings/:id` — reschedule/cancel. `DELETE /meetings/:id` — cancel with optional notification. |
+| 11.2.3 | Apple Calendar sync | `inter/App/InterCalendarService.swift` (NEW) | macOS `EventKit` framework. `EKEventStore` access via `requestAccess(to: .event)`. Create `EKEvent` with meeting link in notes/URL field, setting `timeZone` from `host_timezone` (IANA → `TimeZone(identifier:)`). Request calendar access on first use. Bi-directional sync: schedule from app → creates EKEvent; detect external edits via `EKEventStoreChangedNotification` (immediate) + scheduled background polling (every 5 min via `refreshSources()` / `fetchEvents(matching:)`) with `lastSyncToken`/`lastModified` persistence. Generate `.ics` attachments with `VTIMEZONE` component per RFC 5545. |
+| 11.2.4 | Google Calendar sync | `token-server/calendar.js` (NEW) | Google Calendar API v3 via OAuth2. `POST /auth/google/connect` — OAuth flow, store refresh token **encrypted** in `users` table (`google_refresh_token` column, encrypted via AES-256-GCM). Add `encryptToken()`/`decryptToken()` helpers in `token-server/crypto.js` (NEW) with **key-versioned encryption**: **(a) Versioned keys**: Instead of a single `ENCRYPTION_SECRET`, support `ENCRYPTION_SECRET_V1`, `ENCRYPTION_SECRET_V2`, etc. in `.env`. A `ENCRYPTION_ACTIVE_VERSION` env var (e.g. `2`) designates the current write key. `encryptToken(plaintext)` encrypts with the active-version key and prepends a version tag to the ciphertext (format: `v{N}:{iv}:{authTag}:{ciphertext}`). `decryptToken(blob)` parses the version tag, looks up the corresponding key, and decrypts; if no version tag is present (legacy), falls back to `ENCRYPTION_SECRET` (v0). **(b) DB columns**: Migration adds `google_refresh_token TEXT`, `google_token_key_version SMALLINT DEFAULT 1`, `outlook_refresh_token TEXT`, `outlook_token_key_version SMALLINT DEFAULT 1` to `users`. The key-version column is written alongside the encrypted token on every encrypt. **(c) Key rotation migration script** (`token-server/scripts/rotate-encryption-key.js`): Reads all rows with `google_token_key_version < ENCRYPTION_ACTIVE_VERSION` (and likewise for Outlook), decrypts each token with its stored version's key, re-encrypts with the active key, updates both the token and key-version columns. If a key is missing (env var deleted), logs a fatal error and skips that row (does not destroy data). Run via `node scripts/rotate-encryption-key.js` after adding a new key version. **(d) Wipe-and-reauth fallback**: If the old key is irrecoverably lost, a `--wipe` flag on the rotation script sets affected tokens to NULL and sets a `google_reauth_required BOOLEAN DEFAULT false` / `outlook_reauth_required BOOLEAN DEFAULT false` flag; the app prompts users to re-authenticate on next login. **(e) Server startup checks**: On boot, `crypto.js` validates: (1) `ENCRYPTION_ACTIVE_VERSION` is set, (2) the corresponding `ENCRYPTION_SECRET_V{N}` env var exists and is ≥ 32 bytes, (3) all version keys referenced by `*_token_key_version` in the DB are present in env (query on startup). Fails loudly with actionable error message if any check fails. **(f) Documentation**: `.env.example` documents all key vars with comments warning against deletion. README recommends using a secrets manager (AWS Secrets Manager, HashiCorp Vault, or macOS Keychain for dev) instead of bare `.env` values, and mandates backing up keys before rotation. `POST /meetings/:id/sync/google` — creates Google Calendar event with Meet-style link and description, passing `host_timezone` as the event timezone. |
+| 11.2.5 | Outlook Calendar sync | `token-server/calendar.js` | Microsoft Graph API via OAuth2 (Azure AD app registration). `POST /auth/outlook/connect` — OAuth flow, store refresh token **encrypted** using the same key-versioned `encryptToken()`/`decryptToken()` from step 11.2.4 (`outlook_refresh_token` + `outlook_token_key_version` columns). Key rotation, wipe-and-reauth fallback, and startup validation apply identically to Outlook tokens. `POST /meetings/:id/sync/outlook` — creates Outlook event via `POST /me/events`, passing `host_timezone` in the `start`/`end` `timeZone` fields. |
+| 11.2.6 | Meeting invitations | `token-server/index.js` | `POST /meetings/:id/invite` — sends email invitations with meeting link + password (if set) + calendar attachment (.ics file). Uses nodemailer or SendGrid. Invitation includes "Add to Calendar" links for Google/Outlook/Apple. |
+| 11.2.7 | Client scheduling UI | `inter/UI/Views/InterSchedulePanel.h/.m` (NEW) | Schedule meeting form: title, date/time picker, duration, password toggle, lobby toggle, recurrence selector. Calendar provider sync toggles (Apple/Google/Outlook with connection status). Upcoming meetings list with Join/Edit/Cancel actions. |
 
 ### 11.3 — Scheduling Links (Pro)
 
@@ -512,11 +567,11 @@ After these 3, the app has a real backend, real storage, and supports 50 partici
 |:------|:-----|:---------|:-----|:----------------|
 | **6** | Infrastructure Foundation | 2–3 | Low | No |
 | **7** | Scale to 50 | 2 | Medium | Yes (UI) |
-| **8** | In-Meeting Communication | 2 | Low | Yes (new UI) |
-| **9** | Meeting Management | 2–3 | Low | Yes (new UI) |
-| **10** | Recording | 4–5 | Medium-High | Yes (new pipeline) |
-| **11** | Scheduling | 3–4 | Medium | Yes (new UI) |
+| **8** | In-Meeting Communication | 3 | Low | Yes (new UI — chat, polls, Q&A) |
+| **9** | Meeting Management | 3–4 | Medium | Yes (new UI — moderation, lobby, passwords, spotlight) |
+| **10** | Recording | 4–5 | Medium-High | Yes (new pipeline + pause/resume) |
+| **11** | Scheduling | 4–5 | Medium-High | Yes (new UI + OAuth for Google/Outlook) |
 | **12** | Hiring Features | 5–6 | High | Yes (new UI + web) |
 | **13** | AI & Enhancement | 3–4 | Medium | Yes (new processing) |
 | **14** | Branding | 1 | Low | Yes (UI) |
-| **Total** | | **~25–32 sessions** | | |
+| **Total** | | **~28–36 sessions** | | |

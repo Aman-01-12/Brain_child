@@ -1,7 +1,7 @@
 # LiveKit Integration — Implementation Plan
 
-> **Status**: Phase 0–5A complete. Phase 6 (Infrastructure Foundation) complete — Redis migration, PostgreSQL schema, auth middleware. Phase 7 (Scale to 50 Participants) complete — cap raised, adaptive grid, pagination, selective subscription, active speaker highlight. Phase 8 (In-Meeting Communication) complete — public chat via DataChannel, DMs, raise hand + speaker queue, chat transcript export. Code-quality audit (session 8) — 9 fixes across Swift, Node.js, and implementation plan (threading, completion callbacks, lobby caps, plan hardening). 138 tests passing. See `implementation_plan.md` for Phases 9–14 roadmap.  
-> **Last updated**: 1 April 2026 (session 8 — code-quality audit)  
+> **Status**: Phase 0–5A complete. Phase 6 (Infrastructure Foundation) complete — Redis migration, PostgreSQL schema, auth middleware. Phase 7 (Scale to 50 Participants) complete — cap raised, adaptive grid, pagination, selective subscription, active speaker highlight. Phase 8 (In-Meeting Communication) complete — public chat via DataChannel, DMs, raise hand + speaker queue, chat transcript export. Post-Phase 8 hardening complete — queue UI polish, mic/camera coupling fix, dismiss-all, active speaker debounce. Phase 8.5 (Live Polls) complete — poll controller, poll panel, DataChannel topic routing. Phase 8.6 (Q&A Board) complete — Q&A controller, Q&A panel, upvote/highlight/answered/dismiss moderation. Phase 9 (Meeting Management) complete — roles & permissions, moderation controls (mute/remove/lock/suspend/spotlight), lobby/waiting room, meeting passwords. 138 tests passing. See `implementation_plan.md` for Phases 10–14 roadmap.  
+> **Last updated**: 31 March 2026 (session 9)  
 > **Tracking**: Changes logged in `work_done.md`. Long-term plan in `implementation_plan.md`.
 
 ---
@@ -1013,37 +1013,202 @@ LiveKit SFU handles all media forwarding — no transcoding.
 
 ---
 
-## Code-Quality & Security Audit — Session 8 (1 April 2026) ✅ COMPLETE
+## Phase 7 — Scale to 50 Participants ✅ COMPLETE
 
-> Systematic audit across Swift, Node.js, and implementation plan.
-> 12 findings reviewed, 9 unique fixes applied, 3 confirmed already resolved.
+> **Completed**: 26 March 2026  
+> **Detailed plan**: See `implementation_plan.md` (Phase 7)  
+> **Tests**: 138/138 passing after all changes
 
-### Audit — Phase 1 (Networking Layer)
+### 7.1: Raise Participant Cap ✅ DONE
+- [x] 7.1.1 — `MAX_PARTICIPANTS_PER_ROOM = 50` in token-server
+- [x] 7.1.2 — `InterMaxParticipantsPerRoom = 50` in InterNetworkTypes.swift
+- [x] 7.1.3 — `maxParticipants` property on `InterRoomConfiguration` (default 50)
 
-- [x] AUD.1.1 — `InterLiveKitAudioBridge.swift`: Fixed `beginMute(completion:)` to call `DispatchQueue.main.async { completion() }` on invalid state transition guard-else, matching `beginEnable` behaviour. Previously silently returned without invoking completion.
+**Files**: `token-server/index.js`, `InterNetworkTypes.swift`
 
-### Audit — Phase 8 (In-Meeting Communication)
+### 7.2: Selective Subscription ✅ DONE
+- [x] 7.2.1 — Enabled `adaptiveStream: true` and `dynacast: true` in RoomOptions
+- [x] 7.2.2 — `setTrackVisibility(_:forParticipant:source:)` in InterLiveKitSubscriber — enables/disables remote track subscriptions based on tile visibility
 
-- [x] AUD.8.1 — `InterQAController.swift`: Added `pendingQuestionIds.formIntersection(validIds)` in `handleSyncState` alongside existing `localUpvotes` and `upvoteRecords` pruning. Stale pending-question IDs could previously accumulate across sync cycles.
-- [x] AUD.8.2 — `implementation_plan.md` step 8.5.7: Added DataChannel router migration strategy — feature flag, dual-delivery shim, per-controller migration, deterministic cutover, test coverage requirements.
-- [x] AUD.8.3 — `implementation_plan.md` steps 8.6.2/8.6.4/8.6.6: Added Q&A server-side publish enforcement via `POST /room/qa/publish` endpoint spec. Server strips anonymous flag based on room setting.
+**Files**: `InterRoomController.swift`, `InterLiveKitSubscriber.swift`
 
-### Audit — Phase 9 (Moderation & Security)
+### 7.3: Adaptive Grid Layout ✅ DONE
+- [x] 7.3.1 — Dynamic grid sizing: 1→1×1, 2→2×1, 3-4→2×2, 5-6→3×2, 7-9→3×3, 10-12→4×3, 13-16→4×4, 17-20→5×4, 21-25→5×5
+- [x] 7.3.2 — Pagination: max 25 tiles per page, ◀/▶ buttons, arrow shortcuts, page indicator
+- [x] 7.3.3 — Tile recycling pool (up to 10 reusable views)
+- [x] 7.3.4 — Dynamic quality: dimensions based on grid count (1280×720 for ≤4, 640×360 for ≤9, 480×270 for ≤16, 320×180 for 17-25), filmstrip 320×180, spotlight 1280×720
 
-- [x] AUD.9.1 — `InterModerationController.swift`: Moved `lobbyWaitingParticipants` mutations (`.removeAll()` / `.remove(at:)`) into `completeOnMain` closures for `admitFromLobby`, `admitAllFromLobby`, and `denyFromLobby`. Prevents data-race from URLSession delegate queue.
-- [x] AUD.9.2 — `token-server/index.js`: `admitAllFromLobby` now enforces `MAX_PARTICIPANTS_PER_ROOM` — reads count via `getParticipantCount(code)`, increments per admission, breaks when full, sets `room_full` status for remaining lobby members.
-- [x] AUD.9.3 — `token-server/index.js`: Added explicit `room_full` handler in `/room/lobby-status/:code/:identity` endpoint between `denied` check and `zrank` fallback. Cleans up Redis keys, returns `{ status: 'room_full' }`.
-- [x] AUD.9.4 — `implementation_plan.md` step 9.4.2: Added password brute-force mitigation spec — per-requester exponential backoff, per-room global limit, TTL hygiene.
+**Files**: `InterRemoteVideoLayoutManager.h`, `InterRemoteVideoLayoutManager.m`, `InterLiveKitSubscriber.swift`
 
-### Audit — Phase 11 (Scheduling & OAuth)
+### 7.4: Active Speaker Highlight ✅ DONE
+- [x] 7.4.1 — Green border highlight in both grid and stage+filmstrip modes
+- [x] 7.4.2 — Auto-spotlight: active speaker promoted to main stage (3s revert delay)
 
-- [x] AUD.11.1 — `implementation_plan.md` step 11.2.1: Added migration safety note — `NOT NULL DEFAULT 'UTC'` on `host_timezone` is safe because `scheduled_meetings` is a new table with no pre-existing rows.
-- [x] AUD.11.2 — `implementation_plan.md` steps 11.2.4/11.2.5: Added key-versioned encryption spec for OAuth refresh tokens — `ENCRYPTION_SECRET_V1`/`V2` rotation system, version tags in ciphertext, rotation script, wipe-and-reauth fallback, server startup checks, secrets manager recommendation.
-
-### Confirmed Already Fixed (No Change Needed)
-
-- [x] AUD.DUP.1 — `admitAllFromLobby` threading (duplicate of AUD.9.1 — already covered by the same `completeOnMain` fix)
-- [x] AUD.DUP.2 — `denyFromLobby` threading (duplicate of AUD.9.1 — already covered by the same `completeOnMain` fix)
+**Files**: `InterRemoteVideoLayoutManager.m`
 
 ---
 
+## Phase 8 — In-Meeting Communication ✅ COMPLETE
+
+> **Completed**: 27 March 2026  
+> **Detailed plan**: See `implementation_plan.md` (Phase 8)  
+> **Tests**: 138/138 passing after all changes
+
+### 8.1: Public Chat ✅ DONE
+- [x] 8.1.1 — Chat message model: `InterChatMessage` (Codable) + `InterChatMessageInfo` (@objc wrapper for ObjC UI)
+- [x] 8.1.2 — Chat data channel: `InterChatController` with `room.localParticipant.publish(data:)` on topic `"chat"`. Receives via `didReceiveData`. 500 message cap. Deduplication by message ID.
+- [x] 8.1.3 — Chat UI panel: `InterChatPanel.h/.m` — 300px slide-in from right, dark theme, NSScrollView + NSTableView, colored headers (blue=own, purple=DM, gray=system), red unread badge, ⌘+Shift+C toggle
+- [x] 8.1.4 — Wired to AppDelegate: chat panel as full-height overlay, InterChatController lifecycle (attach/detach/reset), chat toggle button (💬)
+- [ ] 8.1.5 — Wire to SecureWindowController (deferred — data flows via AppDelegate, UI deferred to future)
+
+### 8.2: Raise Hand + Speaker Queue ✅ DONE
+- [x] 8.2.1 — Hand raise via DataChannel: `InterControlSignal` on topic `"control"`. raiseHand / lowerHand types.
+- [x] 8.2.2 — Speaker queue model: `InterSpeakerQueue.swift` — chronological entries, KVO-observable count, deduplication via `raisedIdentities` set
+- [x] 8.2.3 — Hand raise UI: ✋ badge on participant tiles (top-left, 24×24, dark background, rounded)
+- [x] 8.2.4 — Host queue panel: `InterSpeakerQueuePanel.h/.m` — position badges (#1, #2…), display name, Dismiss per entry, Dismiss All button, close button
+
+### 8.3: Direct Messages (Pro Tier) ✅ DONE
+- [x] 8.3.1 — Targeted data publish: `participant.publish(data:destinationIdentities:)` for DMs
+- [x] 8.3.2 — DM UI: NSPopUpButton recipient selector ("Everyone" + per-participant DM targets), purple header for DMs
+
+### 8.4: Chat Transcript Save (Pro Tier) ✅ DONE
+- [x] 8.4.1 — Export: `exportTranscriptJSON()` / `exportTranscriptText()` — NSSavePanel for location, writes to caches directory
+
+**Files created**: `InterChatMessage.swift`, `InterChatController.swift`, `InterSpeakerQueue.swift`, `InterChatPanel.h/.m`, `InterSpeakerQueuePanel.h/.m`  
+**Files modified**: `InterRoomController.swift`, `InterRemoteVideoLayoutManager.h/.m`, `AppDelegate.m`, `SecureWindowController.m`
+
+---
+
+## Post-Phase 8: Bug Fixes & Polish (30 March 2026)
+
+### PF.10 — Queue Panel UI Polish ✅ DONE
+- [x] PF.10.1 — Repositioned speaker queue panel from y=22 to y=90 (was covering the button bar)
+- [x] PF.10.2 — Added xmark close button in queue panel header
+- [x] PF.10.3 — Fixed chat panel hitTest: coordinate conversion — was converting directly to container-local coords, now properly converts through self's coordinate system so close and export buttons receive clicks
+
+**Files**: `InterSpeakerQueuePanel.m`, `InterChatPanel.m`, `AppDelegate.m`
+
+### PF.11 — Mic Toggle / Camera Coupling Fix ✅ DONE
+- [x] PF.11.1 — Root cause: shared AVCaptureSession's `beginConfiguration`/`commitConfiguration` momentarily pauses ALL outputs (including video) when audio inputs are modified
+- [x] PF.11.2 — Fix: When connected to LiveKit, `twoPhaseToggleMicrophone` only mutes/unmutes the LiveKit audio track without touching AVCaptureSession. Added `isMicNetworkMuted` property.
+- [x] PF.11.3 — Audio input selection stores preference without session reconfiguration when connected. Added `storePreferredAudioDeviceID:` method.
+
+**Files**: `InterMediaWiringController.h/.m`, `InterLocalMediaController.h/.m`, `AppDelegate.m`
+
+### PF.12 — Speaker Queue "Dismiss All" ✅ DONE
+- [x] PF.12.1 — Added `speakerQueuePanelDidDismissAll:` delegate method
+- [x] PF.12.2 — Added "Dismiss All" button in queue panel (hidden when empty, shown when entries exist)
+- [x] PF.12.3 — AppDelegate handler iterates all entries sending `lowerHand` signals, then calls `reset()`
+
+**Files**: `InterSpeakerQueuePanel.h/.m`, `AppDelegate.m`
+
+### PF.13 — Active Speaker Green Border Debounce ✅ DONE
+- [x] PF.13.1 — Root cause: LiveKit server-side VAD sends `active: false` during brief audio dips (breaths, between words), causing immediate border removal
+- [x] PF.13.2 — Fix: Added 1-second debounce timer (`DispatchWorkItem`) in `didUpdateSpeakingParticipants`. New speaker → immediate update + cancel pending clear. No speaker → delay clear by 1s. Timer cancelled on disconnect.
+- [x] PF.13.3 — Added `activeSpeakerClearWork` and `activeSpeakerClearDelay` properties
+
+**Files**: `InterRoomController.swift`
+
+---
+## Phase 8.5 — Live Polls ✅ COMPLETE (31 March 2026)
+
+> **Goal**: Host can launch polls; participants vote; results broadcast in real-time via DataChannel.
+
+### 8.5.1 — InterPollController.swift ✅ DONE
+- [x] 8.5.1.1 — `InterPollStatus` enum, `InterPollOption` struct, `InterPoll` Codable struct
+- [x] 8.5.1.2 — `InterPollMessage` private envelope: launchPoll, vote, pollResults, endPoll
+- [x] 8.5.1.3 — `InterPollInfo` ObjC wrapper with `votePercentage(at:)`
+- [x] 8.5.1.4 — `InterPollControllerDelegate` protocol
+- [x] 8.5.1.5 — Host actions: launchPoll, endCurrentPoll, shareResults
+- [x] 8.5.1.6 — Participant: submitVote with double-vote prevention
+- [x] 8.5.1.7 — Vote aggregation via voteRecords; poll history capped at 20
+
+### 8.5.2 — InterPollPanel.h/.m ✅ DONE
+- [x] 8.5.2.1 — Create form, active vote view, results bar chart
+- [x] 8.5.2.2 — Host controls: share results, end poll, new poll
+- [x] 8.5.2.3 — Slide-in 300pt dark panel with hitTest passthrough
+
+### 8.5.3 — Wiring ✅ DONE
+- [x] 8.5.3.1 — InterRoomController: pollController weak ref + DataChannel "poll" routing
+- [x] 8.5.3.2 — AppDelegate: create/attach/teardown + 📊 Poll button + delegate bridge
+
+**Files**: `InterPollController.swift`, `InterPollPanel.h/.m`, `InterRoomController.swift`, `AppDelegate.m`
+
+---
+
+## Phase 8.6 — Q&A Board ✅ COMPLETE (31 March 2026)
+
+> **Goal**: Participants submit questions; host moderates. Upvoting sorts by relevance.
+
+### 8.6.1 — InterQAController.swift ✅ DONE
+- [x] 8.6.1.1 — `InterQuestion` Codable struct, `InterQAMessage` envelope
+- [x] 8.6.1.2 — `InterQuestionInfo` ObjC wrapper with displayName + formattedTime
+- [x] 8.6.1.3 — Participant: submitQuestion, upvoteQuestion (double-upvote prevention)
+- [x] 8.6.1.4 — Host: markAnswered, highlightQuestion, dismissQuestion
+- [x] 8.6.1.5 — Sorting: highlighted → upvotes desc → timestamp; max 200 questions
+
+### 8.6.2 — InterQAPanel.h/.m ✅ DONE
+- [x] 8.6.2.1 — NSTableView question list with highlight/answered colors
+- [x] 8.6.2.2 — Upvote buttons, host moderation actions (📌/✅/✕)
+- [x] 8.6.2.3 — Input area with anonymous toggle, unread badge (red, caps 99+)
+- [x] 8.6.2.4 — Slide-in 300pt dark panel with hitTest passthrough
+
+### 8.6.3 — Wiring ✅ DONE
+- [x] 8.6.3.1 — InterRoomController: qaController weak ref + DataChannel "qa" routing
+- [x] 8.6.3.2 — AppDelegate: create/attach/teardown + ❓ Q&A button + delegate bridge
+
+**Files**: `InterQAController.swift`, `InterQAPanel.h/.m`, `InterRoomController.swift`, `AppDelegate.m`
+
+---
+
+## Phase 9 — Meeting Management ✅ COMPLETE (31 March 2026)
+
+> **Goal**: Host & co-host tools — roles, moderation (mute/remove/lock/suspend/spotlight), lobby/waiting room, meeting passwords.
+
+### 9.1 — Roles & Permissions ✅ DONE
+- [x] 9.1.1 — Token server: role stored in Redis, included in JWT metadata on create/join
+- [x] 9.1.2 — `InterPermissions.swift`: `InterParticipantRole` (5 roles, Comparable), `InterPermission` (14 permissions), `InterPermissionMatrix` with per-role sets, `InterRoleInfo` ObjC wrapper, `InterParticipantMetadata` parser
+- [x] 9.1.3 — POST /room/promote: server validates role hierarchy, updates LiveKit metadata via RoomServiceClient
+- [x] 9.1.4 — AppDelegate: moderationController creation, attach/detach, host-only 🚪 Lobby + ⚙️ Moderate buttons
+
+### 9.2 — Moderation Controls ✅ DONE
+- [x] 9.2.1 — Mute individual (POST /room/mute) + Mute all (POST /room/mute-all) via RoomServiceClient.mutePublishedTrack
+- [x] 9.2.2 — Disable/enable chat: DataChannel signals (disableChat=10, enableChat=11), ChatPanel setChatInputEnabled:
+- [x] 9.2.3 — Remove participant (POST /room/remove) via RoomServiceClient.removeParticipant + participantRemoved signal
+- [x] 9.2.4 — Ask to unmute: DataChannel signal (askToUnmute=12) with accept/decline alert
+- [x] 9.2.5 — Disable camera: uses /room/mute with trackSource=camera
+- [x] 9.2.6 — Lock/unlock meeting (POST /room/lock, /room/unlock) + Redis lock key + meetingLocked/meetingUnlocked signals
+- [x] 9.2.7 — Suspend/unsuspend participant (POST /room/suspend, /room/unsuspend) — disables audio+video+chat
+- [x] 9.2.8 — Host-forced spotlight: DataChannel signals (forceSpotlight=17, clearForceSpotlight=18) + layout manager integration
+
+### 9.3 — Lobby / Waiting Room ✅ DONE
+- [x] 9.3.1 — Server: POST /room/lobby/enable, /lobby/disable, /room/admit, /room/admit-all, /room/deny, GET /room/lobby-status
+- [x] 9.3.2 — Join flow: server returns {status:"waiting"} when lobby enabled, host receives lobbyJoin signal
+- [x] 9.3.3 — `InterLobbyPanel.h/.m`: NSTableView with admit/deny per participant, Admit All, lobby toggle, waiting count
+- [x] 9.3.4 — AppDelegate: InterLobbyPanelDelegate (admit, deny, admitAll, toggleEnabled), toggleNormalLobbyPanel
+
+### 9.4 — Meeting Passwords ✅ DONE
+- [x] 9.4.1 — Server: POST /room/password (set or remove), bcrypt hashing
+- [x] 9.4.2 — Join flow: 401 if password required and not supplied / wrong
+- [x] 9.4.3 — AppDelegate: moderationSetPassword (NSSecureTextField alert), moderationRemovePassword
+
+### 9.5 — Control Signal Extensions ✅ DONE
+- [x] 9.5.1 — 12 new InterControlSignalType cases (10-21) in InterChatMessage.swift
+- [x] 9.5.2 — InterControlSignal: added `extraData: [String: String]?` for flexible payloads
+- [x] 9.5.3 — InterChatController: forwards Phase 9 signal types to moderationController
+- [x] 9.5.4 — InterModerationController: handleControlSignal dispatch for all 12 types
+
+### 9.6 — InterModerationController.swift ✅ DONE
+- [x] 9.6.1 — InterModerationDelegate protocol (12 delegate methods)
+- [x] 9.6.2 — HTTP API: 15 server endpoints (promote, mute, mute-all, remove, lock, unlock, suspend, unsuspend, lobby enable/disable, admit, admit-all, deny, password)
+- [x] 9.6.3 — DataChannel sending: disableChat, enableChat, askToUnmute, locked/unlocked, suspended/unsuspended, forceSpotlight, clearSpotlight, participantRemoved, roleChanged, lobbyJoin
+- [x] 9.6.4 — Permission-gated: every action checks InterPermissionMatrix before proceeding
+
+### 9.7 — AppDelegate Delegate Implementations ✅ DONE
+- [x] 9.7.1 — InterModerationDelegate: chatDisabledStateChanged, receivedUnmuteRequest, meetingLockStateChanged, participantSuspendStateChanged, forceSpotlight, clearForceSpotlight, localParticipantWasRemoved, participantRoleChanged, lobbyParticipantJoined
+- [x] 9.7.2 — Moderation menu: NSMenu popup with Mute All, Disable/Enable Chat, Lock/Unlock, Set Password, Remove Password
+- [x] 9.7.3 — InterChatPanel: setChatInputEnabled: + displaySystemMessage: (Phase 9 additions)
+
+**Files**: `InterPermissions.swift`, `InterModerationController.swift`, `InterLobbyPanel.h/.m`, `InterChatMessage.swift`, `InterChatController.swift`, `InterChatPanel.h/.m`, `InterRoomController.swift`, `AppDelegate.m`, `token-server/index.js`
+
+---

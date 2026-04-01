@@ -220,6 +220,17 @@
     self.microphoneButton.title = enabled ? @"Turn Mic Off" : @"Turn Mic On";
 }
 
+- (void)setMicrophoneButtonTitle:(nullable NSString *)title {
+    if (title) {
+        self.microphoneButton.title = title;
+    } else {
+        // Reset to default based on current mic state
+        BOOL micOn = [self.microphoneButton.title isEqualToString:@"Turn Mic Off"]
+                  || self.microphoneButton.state == NSControlStateValueOn;
+        self.microphoneButton.title = micOn ? @"Turn Mic Off" : @"Turn Mic On";
+    }
+}
+
 - (void)setSharingEnabled:(BOOL)enabled {
     if (self.shareButtonActive == enabled) {
         return;

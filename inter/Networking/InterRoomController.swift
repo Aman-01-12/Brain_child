@@ -77,6 +77,12 @@ import LiveKit
     /// and wired in before connect. The room controller forwards DataChannel data to it.
     @objc public weak var chatController: InterChatController?
 
+    /// [Phase 8.5] Live-poll controller. Wired in by the caller before connect.
+    @objc public weak var pollController: InterPollController?
+
+    /// [Phase 8.6] Q&A controller. Wired in by the caller before connect.
+    @objc public weak var qaController: InterQAController?
+
     /// The local participant's identity string (ObjC-safe accessor).
     @objc public var localParticipantIdentity: String {
         return room?.localParticipant.identity?.stringValue ?? ""
@@ -90,6 +96,12 @@ import LiveKit
     /// Whether the local participant is the host (room creator).
     @objc public var isHost: Bool {
         return configuration?.isHost ?? false
+    }
+
+    /// [Phase 9] Token server base URL (e.g. "http://localhost:3000").
+    /// Exposed for the moderation controller to make HTTP calls.
+    @objc public var tokenServerURL: String {
+        return configuration?.tokenServerURL ?? ""
     }
 
     // MARK: - Private Properties
@@ -770,7 +782,14 @@ extension InterRoomController: RoomDelegate {
                       data.count, topic, senderIdentity ?? "server")
 
         DispatchQueue.main.async {
-            self.chatController?.handleReceivedData(data, topic: topic, participant: senderIdentity)
+            switch topic {
+            case "poll":
+                self.pollController?.handleReceivedData(data, senderIdentity: senderIdentity)
+            case "qa":
+                self.qaController?.handleReceivedData(data, senderIdentity: senderIdentity)
+            default:
+                self.chatController?.handleReceivedData(data, topic: topic, participant: senderIdentity)
+            }
         }
     }
 }

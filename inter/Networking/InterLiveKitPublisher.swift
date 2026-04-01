@@ -424,13 +424,44 @@ import LiveKit
     @objc public func unmuteMicrophoneTrack() {
         if let bridge = audioBridge {
             // Surface share path
-            bridge.beginEnable()
+            bridge.beginEnable(completion: {})
         } else if let track = microphoneTrack ?? microphonePublication?.track as? LocalAudioTrack {
             // Normal call path — unmute the track directly
             Task {
                 try? await track.unmute()
                 interLogInfo(InterLog.media, "Publisher: mic track unmuted")
             }
+        }
+    }
+
+    /// Force-unmute the microphone track with a completion callback.
+    ///
+    /// Handles the race condition where the server has muted the track
+    /// (via `mutePublishedTrack`) but the LiveKit SDK hasn't yet processed
+    /// the WebSocket mute notification. In that case `track.isMuted` is
+    /// still `false` and a plain `track.unmute()` is a no-op.
+    ///
+    /// Strategy: if the SDK doesn't yet reflect the muted state, explicitly
+    /// mute first to synchronize, then unmute. The completion fires on the
+    /// main queue once the track is truly unmuted.
+    @objc public func forceUnmuteMicrophoneTrack(completion: @escaping () -> Void) {
+        if let bridge = audioBridge {
+            bridge.beginEnable(completion: completion)
+        } else if let track = microphoneTrack ?? microphonePublication?.track as? LocalAudioTrack {
+            Task {
+                // If the SDK hasn't processed the server-side mute yet,
+                // track.isMuted is false and unmute() would silently
+                // return. Force the track into a muted state first.
+                if !track.isMuted {
+                    try? await track.mute()
+                    interLogInfo(InterLog.media, "Publisher: force-muted mic to sync with server state")
+                }
+                try? await track.unmute()
+                interLogInfo(InterLog.media, "Publisher: mic track force-unmuted (isMuted=%d)", track.isMuted ? 1 : 0)
+                DispatchQueue.main.async { completion() }
+            }
+        } else {
+            DispatchQueue.main.async { completion() }
         }
     }
 

@@ -227,8 +227,27 @@ private struct TokenCacheEntry {
         ) { [weak self] result in
             switch result {
             case .success(let data):
-                guard let json = self?.parseJSON(data),
-                      let roomName = json["roomName"] as? String,
+                guard let json = self?.parseJSON(data) else {
+                    let error = InterNetworkErrorCode.tokenFetchFailed.error(
+                        message: "Malformed response from /room/join"
+                    )
+                    interLogError(InterLog.networking, "Token: /room/join malformed response (not JSON)")
+                    self?.completeOnMain { completion(nil, error) }
+                    return
+                }
+
+                // Phase 9.3 — Lobby/waiting room response
+                if let status = json["status"] as? String, status == "waiting" {
+                    let position = json["position"] as? Int ?? 0
+                    let error = InterNetworkErrorCode.lobbyWaiting.error(
+                        message: "You are in the waiting room (position \(position)). The host will admit you shortly."
+                    )
+                    interLogInfo(InterLog.networking, "Token: /room/join → lobby waiting (position=%d)", position)
+                    self?.completeOnMain { completion(nil, error) }
+                    return
+                }
+
+                guard let roomName = json["roomName"] as? String,
                       let token = json["token"] as? String,
                       let wsURL = json["serverURL"] as? String else {
                     let error = InterNetworkErrorCode.tokenFetchFailed.error(
@@ -427,6 +446,26 @@ private struct TokenCacheEntry {
                 )
                 completion(.failure(error))
                 return
+            }
+
+            if statusCode == 423 {
+                let error = InterNetworkErrorCode.meetingLocked.error(
+                    message: "This meeting is locked. No new participants can join."
+                )
+                completion(.failure(error))
+                return
+            }
+
+            if statusCode == 401 {
+                let bodyStr = String(data: data, encoding: .utf8) ?? ""
+                let isPasswordRequired = bodyStr.contains("passwordRequired")
+                if isPasswordRequired {
+                    let error = InterNetworkErrorCode.passwordRequired.error(
+                        message: "This meeting requires a password"
+                    )
+                    completion(.failure(error))
+                    return
+                }
             }
 
             if (400..<500).contains(statusCode) {

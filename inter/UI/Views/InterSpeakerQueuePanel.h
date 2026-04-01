@@ -12,16 +12,23 @@ NS_ASSUME_NONNULL_BEGIN
 - (void)speakerQueuePanel:(InterSpeakerQueuePanel *)panel didDismissParticipant:(NSString *)identity;
 /// Host dismissed all raised hands at once.
 - (void)speakerQueuePanelDidDismissAll:(InterSpeakerQueuePanel *)panel;
+/// Host allowed a participant to speak (unmute after host mute-all).
+- (void)speakerQueuePanel:(InterSpeakerQueuePanel *)panel didAllowParticipant:(NSString *)identity;
 @end
 
 /// [Phase 8.2.4] Host-facing raised-hand queue panel.
 ///
 /// Shows an ordered list of participants who raised their hand.
 /// Each entry displays: queue position, display name, raised time.
-/// Host can dismiss entries.
+/// Host can dismiss entries. When the host has muted all, an "Allow"
+/// button appears so the host can grant speak permission per participant.
 @interface InterSpeakerQueuePanel : NSView <NSTableViewDataSource, NSTableViewDelegate>
 
 @property (nonatomic, weak, nullable) id<InterSpeakerQueuePanelDelegate> delegate;
+
+/// When YES, each row shows an "Allow" button alongside "Dismiss".
+/// Set to YES when the host has muted all participants.
+@property (nonatomic, assign) BOOL showAllowActions;
 
 /// Update the queue entries. Reloads the table view.
 - (void)setEntries:(NSArray<InterRaisedHandEntry *> *)entries;
