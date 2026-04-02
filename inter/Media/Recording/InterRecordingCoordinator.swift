@@ -25,10 +25,13 @@
 // ============================================================================
 
 import Foundation
+import AVFoundation
 import CoreMedia
 import CoreVideo
+import AppKit
 import os.log
 import Atomics
+import LiveKit
 
 // MARK: - Recording State
 
@@ -81,12 +84,25 @@ import Atomics
     /// Delegate for state, duration, and completion callbacks.
     @objc public weak var delegate: InterRecordingCoordinatorDelegate?
 
+    /// Maximum recording duration before issuing a warning notification (seconds).
+    private static let oneHourWarningThreshold: TimeInterval = 3600
+
     /// Whether recording is in a state that accepts user actions.
     @objc public var canPause: Bool { state == .recording }
     @objc public var canResume: Bool { state == .paused }
     @objc public var canStop: Bool {
         let s = state
         return s == .recording || s == .paused
+    }
+
+    /// Whether a local recording is active (used for edge-case auto-stop).
+    /// Thread-safe: reads both `_state` and `_outputURL` under `_stateLock`.
+    @objc public var isLocalRecordingActive: Bool {
+        os_unfair_lock_lock(&_stateLock)
+        let s = _state
+        let hasOutput = _outputURL != nil
+        os_unfair_lock_unlock(&_stateLock)
+        return (s == .recording || s == .paused) && hasOutput
     }
 
     // -----------------------------------------------------------------------
@@ -131,19 +147,49 @@ import Atomics
     private weak var subscriber: InterLiveKitSubscriber?
     private weak var localMediaController: InterLocalMediaController?
 
-    /// Audio capture: ring buffer + conversion queue + drain timer.
-    private var audioRingBuffer: AudioRecordingRingBuffer?
-    private var audioDrainTimer: DispatchSourceTimer?
-    private let audioConversionQueue = DispatchQueue(label: "inter.recording.audio.conversion",
-                                                      qos: .userInitiated)
-    /// Pre-allocated interleave scratch buffer (allocated once, deallocated on teardown).
-    private var interleaveBuffer: UnsafeMutablePointer<Float>?
+    /// Local participant identity — captured at recording start for thread-safe access.
+    private var _localParticipantIdentity: String?
+
+    /// [Gap #14] Extracted audio capture subsystem — owns the tap, ring buffer, and drain.
+    private lazy var audioCapture = InterRecordingAudioCapture(coordinatorQueue: coordinatorQueue)
 
     /// Output file URL for the current recording.
-    private var outputURL: URL?
+    /// Guarded by `_stateLock` for cross-thread reads (e.g. `isLocalRecordingActive`).
+    /// All mutations happen on `coordinatorQueue` *and* acquire `_stateLock`.
+    private var _outputURL: URL?
 
     /// The user's tier string (for watermark decision).
     private var userTier: String = "free"
+
+    /// Disk space monitor timer — fires every 30s during local recording.
+    private var diskSpaceTimer: DispatchSourceTimer?
+
+    /// Whether the 1-hour warning has already been posted for the current session.
+    private var _hasPostedOneHourWarning = false
+
+    /// Disk space thresholds (bytes).
+    private static let diskSpaceWarningThreshold: UInt64  = 2_000_000_000  // 2 GB — warn user
+    private static let diskSpaceCriticalThreshold: UInt64 =   500_000_000  //  500 MB — auto-stop
+
+    /// [Phase 10] Chat controller used to broadcast recording state changes
+    /// over the control DataChannel for consent notification.
+    @objc public weak var chatController: InterChatController?
+
+    /// [Phase 10] The local participant's identity string. Set by AppDelegate
+    /// after room connect so the coordinator knows which active speaker is local.
+    @objc public var localParticipantIdentity: String? {
+        get {
+            os_unfair_lock_lock(&_stateLock)
+            let id = _localParticipantIdentity
+            os_unfair_lock_unlock(&_stateLock)
+            return id
+        }
+        set {
+            os_unfair_lock_lock(&_stateLock)
+            _localParticipantIdentity = newValue
+            os_unfair_lock_unlock(&_stateLock)
+        }
+    }
 
     /// Log category for recording.
     private static let log = OSLog(subsystem: "com.secure.inter.network", category: "recording")
@@ -157,11 +203,14 @@ import Atomics
     }
 
     deinit {
+        // [Gap #14] Audio capture is now self-contained; stop() tears down the tap,
+        // ring buffer, and drain timer safely.
+        audioCapture.stop()
+
         renderTimer?.cancel()
         durationTimer?.cancel()
-        audioDrainTimer?.cancel()
+        diskSpaceTimer?.cancel()
         _speakerDebounceTimer?.cancel()
-        interleaveBuffer?.deallocate()
     }
 
     // -----------------------------------------------------------------------
@@ -308,20 +357,27 @@ import Atomics
     /// composed renderer during recording.
     @objc public func didReceiveRemoteCameraFrame(_ pixelBuffer: CVPixelBuffer,
                                                    fromParticipant participantId: String) {
-        // Fast path: no queue hop for frame delivery — composedRenderer is thread-safe.
-        guard state == .recording || state == .paused else { return }
-        guard let renderer = composedRenderer else { return }
+        // Snapshot all coordinatorQueue-guarded state in one sync hop before
+        // calling any renderer methods. The sync block does only value copies —
+        // no I/O, no locks — so it completes in microseconds. Renderer calls
+        // happen outside the sync so the queue is never held during rendering.
+        let snapshot: (renderer: InterComposedRenderer, activeId: String?, secondaryId: String?)?
+        snapshot = coordinatorQueue.sync {
+            guard _state == .recording || _state == .paused,
+                  let renderer = composedRenderer else { return nil }
+            let activeId = _activeSpeakerId
+            let secondaryId: String? = _recentSpeakers.count >= 2
+                ? _recentSpeakers.first(where: { $0 != activeId })
+                : nil
+            return (renderer, activeId, secondaryId)
+        }
+        guard let (renderer, activeId, secondaryId) = snapshot else { return }
 
-        if participantId == _activeSpeakerId {
+        if participantId == activeId {
             renderer.updateActiveSpeakerFrame(pixelBuffer, identity: participantId)
         }
-
-        // Check if this is the secondary speaker
-        if _recentSpeakers.count >= 2 {
-            let secondaryId = _recentSpeakers.first(where: { $0 != _activeSpeakerId })
-            if participantId == secondaryId {
-                renderer.updateSecondarySpeakerFrame(pixelBuffer, identity: participantId)
-            }
+        if let secId = secondaryId, participantId == secId {
+            renderer.updateSecondarySpeakerFrame(pixelBuffer, identity: participantId)
         }
     }
 
@@ -360,8 +416,8 @@ import Atomics
         switch (from, to) {
         case (.idle, .starting),
              (.starting, .recording), (.starting, .failed),
-             (.recording, .paused), (.recording, .stopping),
-             (.paused, .recording), (.paused, .stopping),
+             (.recording, .paused), (.recording, .stopping), (.recording, .failed),
+             (.paused, .recording), (.paused, .stopping), (.paused, .failed),
              (.stopping, .finalized), (.stopping, .failed),
              (.finalized, .idle), (.failed, .idle):
             return true
@@ -391,6 +447,26 @@ import Atomics
         transitionTo(.starting)
         _pendingStop = false
 
+        // Pre-check: verify sufficient disk space before starting
+        let availableSpace = Self.availableDiskSpaceBytes()
+        if availableSpace < Self.diskSpaceCriticalThreshold {
+            interLogError(InterRecordingCoordinator.log,
+                          "Recording: insufficient disk space (%llu MB free)", availableSpace / 1_000_000)
+            transitionTo(.failed)
+            let delegateRef = delegate
+            DispatchQueue.main.async {
+                let error = NSError(domain: "inter.recording", code: -10,
+                                    userInfo: [NSLocalizedDescriptionKey:
+                                        "Not enough disk space to start recording. At least 500 MB is required."])
+                delegateRef?.recordingDidComplete(outputURL: nil, error: error)
+            }
+            return
+        }
+        if availableSpace < Self.diskSpaceWarningThreshold {
+            interLogWarning(InterRecordingCoordinator.log,
+                            "Recording: low disk space warning (%llu MB free)", availableSpace / 1_000_000)
+        }
+
         self.surfaceShareController = screenShareSource
         self.subscriber = subscriber
         self.localMediaController = localMediaController
@@ -398,7 +474,9 @@ import Atomics
 
         // 1. Generate output URL in ~/Documents/Inter Recordings/
         let outputURL = Self.generateOutputURL()
-        self.outputURL = outputURL
+        os_unfair_lock_lock(&_stateLock)
+        self._outputURL = outputURL
+        os_unfair_lock_unlock(&_stateLock)
 
         // 2. Create recording engine
         let engine = InterRecordingEngine(
@@ -420,6 +498,7 @@ import Atomics
         )
         renderer.watermarkEnabled = (userTier.lowercased() == "free")
         renderer.delegate = self
+        renderer.designatedRenderQueue = coordinatorQueue
         self.composedRenderer = renderer
 
         // 4. Create recording sink (for screen share frames + audio from surface share)
@@ -449,16 +528,28 @@ import Atomics
             screenShareSource.addLive(sink)
         }
 
-        // 7. Install audio capture tap
-        _installAudioTap()
+        // 7. Wire subscriber's recording frame delegate for remote camera frames
+        subscriber.recordingFrameDelegate = self
 
-        // 8. Start 30fps render timer
+        // 8. Install local camera frame observer (for when local user is active speaker)
+        _installLocalCameraObserver()
+
+        // 9. Install audio capture (extracted subsystem — Gap #14)
+        audioCapture.onSampleBuffer = { [weak self] sampleBuffer in
+            self?.recordingEngine?.appendAudioSampleBuffer(sampleBuffer)
+        }
+        audioCapture.start()
+
+        // 10. Start 30fps render timer
         _startRenderTimer()
 
-        // 9. Start 1-second duration timer
+        // 11. Start 1-second duration timer
         _startDurationTimer()
 
-        // 10. Check pending stop
+        // 12. Start disk space monitor (30-second interval)
+        _startDiskSpaceMonitor()
+
+        // 11. Check pending stop
         if _pendingStop {
             _pendingStop = false
             transitionTo(.recording)
@@ -468,8 +559,19 @@ import Atomics
 
         transitionTo(.recording)
 
+        // Persist state for crash recovery
+        _persistRecordingState()
+
+        let cc = chatController
+        DispatchQueue.main.async {
+            cc?.broadcastRecordingSignal(type: .recordingStarted)
+            // [Gap #8] Play a system chime so the user has audible confirmation.
+            NSSound.beep()
+        }
+
         interLogInfo(InterRecordingCoordinator.log,
                      "Recording: started at %{public}@", outputURL.lastPathComponent)
+        // Note: `outputURL` here is the local constant from generateOutputURL(), not the ivar.
     }
 
     // -----------------------------------------------------------------------
@@ -482,6 +584,8 @@ import Atomics
 
         recordingEngine?.pauseRecording()
         transitionTo(.paused)
+        let cc = chatController
+        DispatchQueue.main.async { cc?.broadcastRecordingSignal(type: .recordingPaused) }
     }
 
     private func _resumeRecording() {
@@ -490,6 +594,8 @@ import Atomics
 
         recordingEngine?.resumeRecording()
         transitionTo(.recording)
+        let cc = chatController
+        DispatchQueue.main.async { cc?.broadcastRecordingSignal(type: .recordingResumed) }
     }
 
     private func _stopRecording() {
@@ -506,28 +612,44 @@ import Atomics
         guard _state == .recording || _state == .paused else { return }
 
         transitionTo(.stopping)
+        _hasPostedOneHourWarning = false
+        let cc = chatController
+        DispatchQueue.main.async {
+            cc?.broadcastRecordingSignal(type: .recordingStopped)
+            // [Gap #8] Play a system chime on recording stop.
+            NSSound.beep()
+        }
 
         // 1. Stop timers
         renderTimer?.cancel()
         renderTimer = nil
         durationTimer?.cancel()
         durationTimer = nil
+        diskSpaceTimer?.cancel()
+        diskSpaceTimer = nil
 
-        // 2. Remove audio tap
-        _removeAudioTap()
+        // 2. Remove audio capture (extracted subsystem — Gap #14)
+        audioCapture.stop()
 
-        // 3. Remove recording sink from surface share controller
+        // 3. Remove local camera observer
+        _removeLocalCameraObserver()
+
+        // 4. Remove subscriber recording delegate
+        subscriber?.recordingFrameDelegate = nil
+
+        // 5. Remove recording sink from surface share controller
         if let sink = recordingSink {
             surfaceShareController?.removeLive(sink)
         }
 
         // 4. Finalize the recording engine
-        let capturedURL = outputURL
+        let capturedURL = _outputURL
         let delegateRef = delegate
         recordingEngine?.stopRecording { [weak self] (url, error) in
             guard let self = self else { return }
             self.coordinatorQueue.async {
                 self._teardownPipeline()
+                self._clearRecordingState()
 
                 if let error = error {
                     interLogError(InterRecordingCoordinator.log,
@@ -561,10 +683,11 @@ import Atomics
 
         renderTimer?.cancel()
         renderTimer = nil
+        diskSpaceTimer?.cancel()
+        diskSpaceTimer = nil
         durationTimer?.cancel()
         durationTimer = nil
-        audioDrainTimer?.cancel()
-        audioDrainTimer = nil
+        // [Gap #14] audioDrainTimer is owned by InterRecordingAudioCapture; stop() handles it.
         _speakerDebounceTimer?.cancel()
         _speakerDebounceTimer = nil
 
@@ -572,8 +695,10 @@ import Atomics
         composedRenderer = nil
         recordingEngine = nil
         recordingSink = nil
-        audioRingBuffer = nil
-        outputURL = nil
+        // [Gap #14] audioRingBuffer is owned by InterRecordingAudioCapture.
+        os_unfair_lock_lock(&_stateLock)
+        _outputURL = nil
+        os_unfair_lock_unlock(&_stateLock)
 
         _activeSpeakerId = nil
         _pendingSpeakerId = nil
@@ -633,173 +758,251 @@ import Atomics
             DispatchQueue.main.async {
                 delegateRef?.recordingDurationDidUpdate(duration)
             }
+
+            // [Gap #5] Warn user once when recording exceeds 1 hour
+            if !self._hasPostedOneHourWarning && duration >= Self.oneHourWarningThreshold {
+                self._hasPostedOneHourWarning = true
+                interLogInfo(InterRecordingCoordinator.log,
+                             "Recording: duration exceeded 1 hour — posting warning")
+                DispatchQueue.main.async {
+                    NotificationCenter.default.post(
+                        name: NSNotification.Name("InterRecordingOneHourWarning"),
+                        object: nil,
+                        userInfo: ["duration": duration]
+                    )
+                }
+            }
         }
         durationTimer = timer
         timer.resume()
     }
 
-    // -----------------------------------------------------------------------
-    // MARK: - Audio Capture
+    // --------Disk Space Monitor (30-second interval, coordinatorQueue)
     // -----------------------------------------------------------------------
 
-    private func _installAudioTap() {
+    /// Start a periodic disk space check on coordinatorQueue.
+    /// Per §6 of recording_architecture.md:
+    ///  - Warn at < 2 GB free
+    ///  - Auto-stop with error at < 500 MB free
+    private func _startDiskSpaceMonitor() {
         dispatchPrecondition(condition: .onQueue(coordinatorQueue))
 
-        // Create ring buffer: 500ms at 48kHz stereo
-        let ringBuffer = AudioRecordingRingBuffer(frameDuration: 0.5,
-                                                   sampleRate: 48000,
-                                                   channels: 2)
-        self.audioRingBuffer = ringBuffer
+        let timer = DispatchSource.makeTimerSource(queue: coordinatorQueue)
+        timer.schedule(deadline: .now() + 30.0, repeating: 30.0, leeway: .seconds(2))
+        timer.setEventHandler { [weak self] in
+            guard let self = self else { return }
+            guard self._state == .recording || self._state == .paused else { return }
 
-        // Pre-allocate interleave scratch buffer: max 4096 frames × 2 channels
-        let scratchSize = 4096 * 2
-        let scratch = UnsafeMutablePointer<Float>.allocate(capacity: scratchSize)
-        scratch.initialize(repeating: 0, count: scratchSize)
-        self.interleaveBuffer = scratch
+            let available = Self.availableDiskSpaceBytes()
 
-        // Install tap on the audio engine output node.
-        // The tap callback runs on a real-time audio thread — MUST NOT lock, alloc, or log.
-        if let outputNode = InterAudioEngineAccess.outputNode() {
-            let format = outputNode.outputFormat(forBus: 0)
-            outputNode.installTap(onBus: 0, bufferSize: 4096, format: format) {
-                [weak ringBuffer, scratch] (buffer, _) in
-                guard let ringBuffer = ringBuffer else { return }
-                guard let floatData = buffer.floatChannelData else { return }
+            if available < Self.diskSpaceCriticalThreshold {
+                // Critical — auto-stop recording immediately
+                interLogError(InterRecordingCoordinator.log,
+                              "Recording: auto-stopping — disk space critical (%llu MB free)",
+                              available / 1_000_000)
+                // Transition through stop so the file is finalized properly
+                self._stopRecording()
 
-                let frameCount = Int(buffer.frameLength)
-                let channelCount = Int(buffer.format.channelCount)
-                let clampedChannels = min(channelCount, 2)
-                let interleavedCount = frameCount * clampedChannels
+                let delegateRef = self.delegate
+                DispatchQueue.main.async {
+                    // Post a notification so the UI can show an alert
+                    NotificationCenter.default.post(
+                        name: NSNotification.Name("InterRecordingDiskSpaceCritical"),
+                        object: nil,
+                        userInfo: ["availableMB": available / 1_000_000]
+                    )
+                    let _ = delegateRef // suppress unused warning
+                }
+            } else if available < Self.diskSpaceWarningThreshold {
+                interLogWarning(InterRecordingCoordinator.log,
+                                "Recording: low disk space warning (%llu MB free)", available / 1_000_000)
+                DispatchQueue.main.async {
+                    NotificationCenter.default.post(
+                        name: NSNotification.Name("InterRecordingDiskSpaceLow"),
+                        object: nil,
+                        userInfo: ["availableMB": available / 1_000_000]
+                    )
+                }
+            }
+        }
+        diskSpaceTimer = timer
+        timer.resume()
+    }
 
-                // Interleave: [L0, R0, L1, R1, ...] from separate channel arrays
-                for frame in 0..<frameCount {
-                    for ch in 0..<clampedChannels {
-                        scratch[frame * clampedChannels + ch] = floatData[ch][frame]
+    /// Returns the available disk space in bytes on the volume containing the documents directory.
+    @objc public static func availableDiskSpaceBytes() -> UInt64 {
+        let documentsURL = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
+        do {
+            let values = try documentsURL.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
+            if let available = values.volumeAvailableCapacityForImportantUsage {
+                return UInt64(max(0, available))
+            }
+        } catch {
+            // Fallback: try the older key
+        }
+        do {
+            let values = try documentsURL.resourceValues(forKeys: [.volumeAvailableCapacityKey])
+            if let available = values.volumeAvailableCapacity {
+                return UInt64(max(0, available))
+            }
+        } catch {
+            interLogError(log, "Recording: failed to check disk space — %{public}@", error.localizedDescription)
+        }
+        return UInt64.max // If we can't determine, don't block recording
+    }
+
+    // -----------------------------------------------------------------------
+    // MARK: - Room Disconnect Auto-Stop (Phase 10D)
+    // -----------------------------------------------------------------------
+
+    /// Called when the LiveKit room disconnects or is destroyed.
+    /// Automatically stops any active local or cloud recording.
+    ///
+    /// This should be called by `InterRoomController` or `InterCallSessionCoordinator`
+    /// when a room disconnect event is received.
+    @objc public func handleRoomDisconnect(serverURL: String?, roomCode: String?, callerIdentity: String?) {
+        coordinatorQueue.async { [weak self] in
+            guard let self = self else { return }
+
+            // Auto-stop local recording if active
+            if self._state == .recording || self._state == .paused {
+                interLogInfo(InterRecordingCoordinator.log,
+                             "Recording: auto-stopping local recording due to room disconnect")
+                self._stopRecording()
+            }
+
+            // Auto-stop cloud recording if active
+            if let egressId = self._cloudEgressId, !egressId.isEmpty,
+               let serverURL = serverURL, let roomCode = roomCode, let callerIdentity = callerIdentity {
+                interLogInfo(InterRecordingCoordinator.log,
+                             "Recording: auto-stopping cloud recording due to room disconnect")
+                // Fire-and-forget cloud stop — the session will be cleaned up server-side
+                // even if this request fails (via Egress webhooks or timeout)
+                self.stopCloudRecording(serverURL: serverURL,
+                                        roomCode: roomCode,
+                                        callerIdentity: callerIdentity,
+                                        egressId: egressId) { _, _ in
+                    // Best-effort — ignore result
+                }
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // MARK: - Orphaned File Cleanup (Phase 10D)
+    // -----------------------------------------------------------------------
+
+    /// Scan for orphaned recording files on app launch and clean them up.
+    /// Per §6 of recording_architecture.md:
+    ///  - Detect orphaned .tmp files (from interrupted AVAssetWriter)
+    ///  - Detect incomplete .mp4 files that might be corrupt
+    ///
+    /// Should be called once from AppDelegate at startup.
+    @objc public static func cleanOrphanedRecordingFiles() {
+        let fm = FileManager.default
+        guard let documentsURL = fm.urls(for: .documentDirectory, in: .userDomainMask).first else { return }
+        let recordingsDir = documentsURL.appendingPathComponent("Inter Recordings", isDirectory: true)
+
+        guard fm.fileExists(atPath: recordingsDir.path) else { return }
+
+        do {
+            let contents = try fm.contentsOfDirectory(at: recordingsDir,
+                                                       includingPropertiesForKeys: [.fileSizeKey, .creationDateKey],
+                                                       options: [.skipsHiddenFiles])
+
+            for fileURL in contents {
+                let ext = fileURL.pathExtension.lowercased()
+
+                // Remove .tmp files — these are from interrupted AVAssetWriter sessions
+                if ext == "tmp" {
+                    interLogInfo(log, "Recording: removing orphaned temp file: %{public}@",
+                                 fileURL.lastPathComponent)
+                    try? fm.removeItem(at: fileURL)
+                    continue
+                }
+
+                // Check for very small .mp4 files (< 1 KB) — likely corrupt/incomplete
+                if ext == "mp4" {
+                    let resourceValues = try fileURL.resourceValues(forKeys: [.fileSizeKey])
+                    if let size = resourceValues.fileSize, size < 1024 {
+                        interLogInfo(log, "Recording: removing corrupt recording (< 1 KB): %{public}@",
+                                     fileURL.lastPathComponent)
+                        try? fm.removeItem(at: fileURL)
                     }
                 }
-
-                ringBuffer.write(scratch, count: interleavedCount)
             }
+        } catch {
+            interLogError(log, "Recording: failed to scan for orphaned files — %{public}@",
+                          error.localizedDescription)
         }
 
-        // Drain timer: 10ms interval on non-RT queue
-        let drain = DispatchSource.makeTimerSource(queue: audioConversionQueue)
-        drain.schedule(deadline: .now(), repeating: .milliseconds(10))
-        drain.setEventHandler { [weak self, weak ringBuffer] in
-            guard let self = self, let ringBuffer = ringBuffer else { return }
-            guard let engine = self.recordingEngine else { return }
-
-            // 10ms @ 48kHz stereo = 480 frames × 2 channels = 960 samples
-            let drainCount = 960
-            var samples = [Float](repeating: 0, count: drainCount)
-            let read = ringBuffer.read(into: &samples, count: drainCount)
-            if read > 0 {
-                if let sampleBuffer = self._convertFloatsToCMSampleBuffer(samples, count: read) {
-                    engine.appendAudioSampleBuffer(sampleBuffer)
-                }
-            }
-        }
-        audioDrainTimer = drain
-        drain.resume()
-    }
-
-    private func _removeAudioTap() {
-        audioDrainTimer?.cancel()
-        audioDrainTimer = nil
-
-        if let outputNode = InterAudioEngineAccess.outputNode() {
-            outputNode.removeTap(onBus: 0)
-        }
-
-        audioRingBuffer?.reset()
-        audioRingBuffer = nil
-
-        if let scratch = interleaveBuffer {
-            scratch.deallocate()
-            interleaveBuffer = nil
+        // Also check for orphaned state file
+        let stateURL = Self.recordingStateFileURL()
+        if fm.fileExists(atPath: stateURL.path) {
+            interLogInfo(log, "Recording: removing orphaned recording state file (app crashed during recording)")
+            try? fm.removeItem(at: stateURL)
         }
     }
 
-    /// Convert interleaved Float32 samples to a CMSampleBuffer for AVAssetWriter.
-    private func _convertFloatsToCMSampleBuffer(_ samples: [Float], count: Int) -> CMSampleBuffer? {
-        let channelCount: UInt32 = 2
-        let sampleRate: Float64 = 48000.0
-        let frameCount = count / Int(channelCount)
+    /// URL for the recording state persistence file.
+    /// Per §18 of recording_architecture.md — persist state before starting,
+    /// remove after clean stop. Presence on launch = crash during recording.
+    private static func recordingStateFileURL() -> URL {
+        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+        let interDir = appSupport.appendingPathComponent("inter", isDirectory: true)
+        try? FileManager.default.createDirectory(at: interDir, withIntermediateDirectories: true)
+        return interDir.appendingPathComponent("recording_state.json")
+    }
 
-        // Audio stream basic description for Float32 interleaved
-        var asbd = AudioStreamBasicDescription(
-            mSampleRate: sampleRate,
-            mFormatID: kAudioFormatLinearPCM,
-            mFormatFlags: kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked,
-            mBytesPerPacket: UInt32(MemoryLayout<Float>.size) * channelCount,
-            mFramesPerPacket: 1,
-            mBytesPerFrame: UInt32(MemoryLayout<Float>.size) * channelCount,
-            mChannelsPerFrame: channelCount,
-            mBitsPerChannel: UInt32(MemoryLayout<Float>.size * 8),
-            mReserved: 0
-        )
+    /// Persist minimal recording state (output path, start timestamp) so crash
+    /// recovery can detect orphaned files. Called at recording start, removed at stop.
+    private func _persistRecordingState() {
+        guard let url = _outputURL else { return }
+        let state: [String: String] = [
+            "outputPath": url.path,
+            "startedAt": ISO8601DateFormatter().string(from: Date())
+        ]
+        if let data = try? JSONSerialization.data(withJSONObject: state) {
+            try? data.write(to: Self.recordingStateFileURL())
+        }
+    }
 
-        var formatDescription: CMAudioFormatDescription?
-        let fmtStatus = CMAudioFormatDescriptionCreate(
-            allocator: kCFAllocatorDefault,
-            asbd: &asbd,
-            layoutSize: 0,
-            layout: nil,
-            magicCookieSize: 0,
-            magicCookie: nil,
-            extensions: nil,
-            formatDescriptionOut: &formatDescription
-        )
-        guard fmtStatus == noErr, let fmt = formatDescription else { return nil }
+    /// Remove the recording state file after a clean stop/finalize.
+    private func _clearRecordingState() {
+        try? FileManager.default.removeItem(at: Self.recordingStateFileURL())
+    }
 
-        let dataSize = count * MemoryLayout<Float>.size
-        var blockBuffer: CMBlockBuffer?
-        let blockStatus = CMBlockBufferCreateWithMemoryBlock(
-            allocator: kCFAllocatorDefault,
-            memoryBlock: nil,
-            blockLength: dataSize,
-            blockAllocator: kCFAllocatorDefault,
-            customBlockSource: nil,
-            offsetToData: 0,
-            dataLength: dataSize,
-            flags: 0,
-            blockBufferOut: &blockBuffer
-        )
-        guard blockStatus == kCMBlockBufferNoErr, let block = blockBuffer else { return nil }
+    // -----------------------------------------------------------------------
+    // MARK: - ---------------------------------------------------------------
+    // MARK: - Local Camera Frame Observer (Phase 10)
+    // -----------------------------------------------------------------------
 
-        let copyStatus = CMBlockBufferReplaceDataBytes(
-            with: samples,
-            blockBuffer: block,
-            offsetIntoDestination: 0,
-            dataLength: dataSize
-        )
-        guard copyStatus == kCMBlockBufferNoErr else { return nil }
+    /// Install a recording frame observer on the local media controller.
+    /// When the local user is the active speaker, their camera frames are
+    /// forwarded to the composed renderer as the active speaker PiP source.
+    private func _installLocalCameraObserver() {
+        guard let lmc = localMediaController else { return }
 
-        var sampleBuffer: CMSampleBuffer?
-        let timing = CMSampleTimingInfo(
-            duration: CMTimeMake(value: Int64(frameCount), timescale: Int32(sampleRate)),
-            presentationTimeStamp: CMTimeMakeWithSeconds(CACurrentMediaTime(), preferredTimescale: Int32(sampleRate)),
-            decodeTimeStamp: .invalid
-        )
+        // Snapshot _localParticipantIdentity once under _stateLock at install time.
+        // The closure captures this immutable constant so it never races with
+        // concurrent writes to _localParticipantIdentity on other threads.
+        os_unfair_lock_lock(&_stateLock)
+        let capturedIdentity = _localParticipantIdentity ?? ""
+        os_unfair_lock_unlock(&_stateLock)
 
-        var timingInfo = timing
-        let sbStatus = CMSampleBufferCreate(
-            allocator: kCFAllocatorDefault,
-            dataBuffer: block,
-            dataReady: true,
-            makeDataReadyCallback: nil,
-            refcon: nil,
-            formatDescription: fmt,
-            sampleCount: CMItemCount(frameCount),
-            sampleTimingEntryCount: 1,
-            sampleTimingArray: &timingInfo,
-            sampleSizeEntryCount: 0,
-            sampleSizeArray: nil,
-            sampleBufferOut: &sampleBuffer
-        )
-        guard sbStatus == noErr else { return nil }
+        guard !capturedIdentity.isEmpty else { return }
 
-        return sampleBuffer
+        lmc.recordingFrameObserver = { [weak self] pixelBuffer in
+            guard let self = self else { return }
+            // Forward to didReceiveRemoteCameraFrame which handles active/secondary
+            // speaker routing. Identity was snapshotted under _stateLock at install time.
+            self.didReceiveRemoteCameraFrame(pixelBuffer, fromParticipant: capturedIdentity)
+        }
+    }
+
+    /// Remove the recording frame observer from the local media controller.
+    private func _removeLocalCameraObserver() {
+        localMediaController?.recordingFrameObserver = nil
     }
 
     // -----------------------------------------------------------------------
@@ -904,6 +1107,267 @@ import Atomics
 
         return recordingsDir.appendingPathComponent(filename)
     }
+
+    // -----------------------------------------------------------------------
+    // MARK: - Cloud Recording (Phase 10C)
+    // -----------------------------------------------------------------------
+
+    /// Track the active cloud egress ID so we can poll/stop/display status.
+    private var _cloudEgressId: String?
+    private var _cloudRecordingSessionId: String?
+
+    /// Thread-safe accessor for the active cloud egress ID.
+    @objc public var cloudEgressId: String? {
+        os_unfair_lock_lock(&_stateLock)
+        let id = _cloudEgressId
+        os_unfair_lock_unlock(&_stateLock)
+        return id
+    }
+
+    /// Thread-safe accessor for the active cloud recording session ID.
+    @objc public var cloudRecordingSessionId: String? {
+        os_unfair_lock_lock(&_stateLock)
+        let id = _cloudRecordingSessionId
+        os_unfair_lock_unlock(&_stateLock)
+        return id
+    }
+
+    /// Start a cloud (Egress-based) recording via the token server.
+    ///
+    /// Calls `POST /room/record/start` on the token server.
+    /// The actual recording is handled server-side by LiveKit Egress —
+    /// this client only tracks its state.
+    ///
+    /// - Parameters:
+    ///   - serverURL: Base URL of the token server (e.g. "http://localhost:3000").
+    ///   - roomCode: The 6-character room code.
+    ///   - callerIdentity: The identity of the user initiating the recording.
+    ///   - estimatedDurationMinutes: Expected recording duration for quota checks.
+    ///   - mode: Recording mode — "cloud_composed" (default) or "multi_track".
+    ///   - completion: Called on the main queue with (egressId, sessionId, error).
+    @objc public func startCloudRecording(
+        serverURL: String,
+        roomCode: String,
+        callerIdentity: String,
+        estimatedDurationMinutes: Int = 60,
+        mode: String = "cloud_composed",
+        completion: @escaping (String?, String?, NSError?) -> Void
+    ) {
+        let body: [String: Any] = [
+            "roomCode": roomCode,
+            "callerIdentity": callerIdentity,
+            "mode": mode,
+            "estimatedDurationMinutes": estimatedDurationMinutes
+        ]
+
+        interLogInfo(InterRecordingCoordinator.log, "Cloud recording: starting (code=***, mode=%{public}@)", mode)
+
+        _performTokenServerRequest(
+            url: "\(serverURL)/room/record/start",
+            body: body
+        ) { [weak self] result in
+            switch result {
+            case .success(let json):
+                guard let egressId = json["egressId"] as? String,
+                      let sessionId = json["recordingSessionId"] as? String else {
+                    let error = NSError(domain: "InterRecording", code: -1,
+                                        userInfo: [NSLocalizedDescriptionKey: "Malformed response from /room/record/start"])
+                    interLogError(InterRecordingCoordinator.log, "Cloud recording: malformed start response")
+                    DispatchQueue.main.async { completion(nil, nil, error) }
+                    return
+                }
+
+                // Track egress state
+                if let self = self {
+                    os_unfair_lock_lock(&self._stateLock)
+                    self._cloudEgressId = egressId
+                    self._cloudRecordingSessionId = sessionId
+                    os_unfair_lock_unlock(&self._stateLock)
+                }
+
+                // Notify consent via DataChannel
+                self?.chatController?.broadcastRecordingSignal(type: .recordingStarted)
+
+                interLogInfo(InterRecordingCoordinator.log, "Cloud recording: started (egress=%{public}@)", egressId)
+                DispatchQueue.main.async { completion(egressId, sessionId, nil) }
+
+            case .failure(let error):
+                interLogError(InterRecordingCoordinator.log, "Cloud recording: start failed — %{public}@", error.localizedDescription)
+                DispatchQueue.main.async { completion(nil, nil, error) }
+            }
+        }
+    }
+
+    /// Stop a cloud (Egress-based) recording via the token server.
+    ///
+    /// Calls `POST /room/record/stop` on the token server.
+    ///
+    /// - Parameters:
+    ///   - serverURL: Base URL of the token server.
+    ///   - roomCode: The 6-character room code.
+    ///   - callerIdentity: The identity of the user stopping the recording.
+    ///   - egressId: The egress ID returned from `startCloudRecording`.
+    ///   - completion: Called on the main queue with (success, error).
+    @objc public func stopCloudRecording(
+        serverURL: String,
+        roomCode: String,
+        callerIdentity: String,
+        egressId: String,
+        completion: @escaping (Bool, NSError?) -> Void
+    ) {
+        let body: [String: Any] = [
+            "roomCode": roomCode,
+            "callerIdentity": callerIdentity,
+            "egressId": egressId
+        ]
+
+        interLogInfo(InterRecordingCoordinator.log, "Cloud recording: stopping (egress=%{public}@)", egressId)
+
+        _performTokenServerRequest(
+            url: "\(serverURL)/room/record/stop",
+            body: body
+        ) { [weak self] result in
+            switch result {
+            case .success:
+                // Clear egress state
+                if let self = self {
+                    os_unfair_lock_lock(&self._stateLock)
+                    self._cloudEgressId = nil
+                    self._cloudRecordingSessionId = nil
+                    os_unfair_lock_unlock(&self._stateLock)
+                }
+
+                // Notify consent via DataChannel
+                self?.chatController?.broadcastRecordingSignal(type: .recordingStopped)
+
+                interLogInfo(InterRecordingCoordinator.log, "Cloud recording: stop initiated")
+                DispatchQueue.main.async { completion(true, nil) }
+
+            case .failure(let error):
+                interLogError(InterRecordingCoordinator.log, "Cloud recording: stop failed — %{public}@", error.localizedDescription)
+                DispatchQueue.main.async { completion(false, error) }
+            }
+        }
+    }
+
+    /// Query the recording status for a room.
+    ///
+    /// Calls `GET /room/record/status/:code` on the token server.
+    ///
+    /// - Parameters:
+    ///   - serverURL: Base URL of the token server.
+    ///   - roomCode: The 6-character room code.
+    ///   - completion: Called on the main queue with (isRecording, egressId, mode, error).
+    @objc public func queryCloudRecordingStatus(
+        serverURL: String,
+        roomCode: String,
+        completion: @escaping (Bool, String?, String?, NSError?) -> Void
+    ) {
+        guard let url = URL(string: "\(serverURL)/room/record/status/\(roomCode)") else {
+            let error = NSError(domain: "InterRecording", code: -1,
+                                userInfo: [NSLocalizedDescriptionKey: "Invalid server URL"])
+            DispatchQueue.main.async { completion(false, nil, nil, error) }
+            return
+        }
+
+        let config = URLSessionConfiguration.default
+        config.timeoutIntervalForRequest = 10.0
+        let session = URLSession(configuration: config)
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+
+        let task = session.dataTask(with: request) { data, response, error in
+            if let error = error {
+                let nsError = error as NSError
+                DispatchQueue.main.async { completion(false, nil, nil, nsError) }
+                return
+            }
+            guard let data = data,
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                DispatchQueue.main.async { completion(false, nil, nil, nil) }
+                return
+            }
+
+            let isRecording = json["recording"] as? Bool ?? false
+            let egressId = json["egressId"] as? String
+            let mode = json["mode"] as? String
+
+            DispatchQueue.main.async { completion(isRecording, egressId, mode, nil) }
+        }
+        task.resume()
+    }
+
+    // MARK: - Private: Token Server HTTP (Cloud Recording)
+
+    /// Perform a POST request to the token server for cloud recording operations.
+    /// Parses the JSON response and returns it via the completion handler.
+    private func _performTokenServerRequest(
+        url urlString: String,
+        body: [String: Any],
+        completion: @escaping (Result<[String: Any], NSError>) -> Void
+    ) {
+        guard let url = URL(string: urlString) else {
+            let error = NSError(domain: "InterRecording", code: -1,
+                                userInfo: [NSLocalizedDescriptionKey: "Invalid URL: \(urlString)"])
+            completion(.failure(error))
+            return
+        }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+
+        do {
+            request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        } catch {
+            let nsError = NSError(domain: "InterRecording", code: -2,
+                                  userInfo: [NSLocalizedDescriptionKey: "Failed to serialize request body",
+                                             NSUnderlyingErrorKey: error])
+            completion(.failure(nsError))
+            return
+        }
+
+        let config = URLSessionConfiguration.default
+        config.timeoutIntervalForRequest = 10.0
+        config.timeoutIntervalForResource = 15.0
+        let session = URLSession(configuration: config)
+
+        let task = session.dataTask(with: request) { data, response, error in
+            if let error = error {
+                let nsError = NSError(domain: "InterRecording", code: -3,
+                                      userInfo: [NSLocalizedDescriptionKey: "Network error: \(error.localizedDescription)",
+                                                 NSUnderlyingErrorKey: error])
+                completion(.failure(nsError))
+                return
+            }
+
+            guard let httpResponse = response as? HTTPURLResponse,
+                  let data = data else {
+                let nsError = NSError(domain: "InterRecording", code: -4,
+                                      userInfo: [NSLocalizedDescriptionKey: "No response from server"])
+                completion(.failure(nsError))
+                return
+            }
+
+            guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                let nsError = NSError(domain: "InterRecording", code: -5,
+                                      userInfo: [NSLocalizedDescriptionKey: "Malformed JSON response"])
+                completion(.failure(nsError))
+                return
+            }
+
+            if (200..<300).contains(httpResponse.statusCode) {
+                completion(.success(json))
+            } else {
+                let serverMessage = json["error"] as? String ?? "Server error \(httpResponse.statusCode)"
+                let nsError = NSError(domain: "InterRecording", code: httpResponse.statusCode,
+                                      userInfo: [NSLocalizedDescriptionKey: serverMessage])
+                completion(.failure(nsError))
+            }
+        }
+        task.resume()
+    }
 }
 
 // MARK: - InterRecordingEngineDelegate
@@ -932,7 +1396,7 @@ extension InterRecordingCoordinator: InterRecordingEngineDelegate {
             self.renderTimer = nil
             self.durationTimer?.cancel()
             self.durationTimer = nil
-            self._removeAudioTap()
+            self.audioCapture.stop()
 
             if let sink = self.recordingSink {
                 self.surfaceShareController?.removeLive(sink)
@@ -961,74 +1425,120 @@ extension InterRecordingCoordinator: InterComposedRendererDelegate {
     }
 }
 
-// MARK: - Audio Recording Ring Buffer (Lock-free SPSC)
+// MARK: - InterRemoteTrackRenderer (Phase 10 — recording frame observation)
 
-/// Lock-free single-producer single-consumer ring buffer for recording audio capture.
-/// Same design as the existing `AudioRingBuffer` in `InterLiveKitAudioBridge.swift`,
-/// using ManagedAtomic for wait-free head/tail cursors.
-///
-/// Writer: real-time audio thread (tap callback) — MUST NOT lock/alloc/log.
-/// Reader: audioConversionQueue (10ms drain timer) — converts to CMSampleBuffer.
-private final class AudioRecordingRingBuffer: @unchecked Sendable {
-    private let capacity: Int
-    private let buffer: UnsafeMutablePointer<Float>
-    private let _head = ManagedAtomic<UInt64>(0)
-    private let _tail = ManagedAtomic<UInt64>(0)
+extension InterRecordingCoordinator: InterRemoteTrackRenderer {
 
-    init(frameDuration: TimeInterval, sampleRate: Int, channels: Int) {
-        self.capacity = Int(frameDuration * Double(sampleRate)) * channels
-        self.buffer = .allocate(capacity: capacity)
-        buffer.initialize(repeating: 0, count: capacity)
+    public func didReceiveRemoteScreenShareFrame(_ pixelBuffer: CVPixelBuffer, fromParticipant participantId: String) {
+        // Screen share frames come through InterRecordingSink via InterSurfaceShareController,
+        // not through the subscriber. This method is intentionally a no-op.
     }
 
-    deinit {
-        buffer.deallocate()
-    }
-
-    func write(_ samples: UnsafePointer<Float>, count: Int) {
-        let h = _head.load(ordering: .relaxed)
-        for i in 0..<count {
-            let idx = Int((h &+ UInt64(i)) % UInt64(capacity))
-            buffer[idx] = samples[i]
+    public func remoteTrackDidMute(_ kind: InterTrackKind, forParticipant participantId: String) {
+        if kind == .camera {
+            participantCameraDidChange(participantId, isMuted: true)
         }
-        _head.store(h &+ UInt64(count), ordering: .releasing)
     }
 
-    func read(into destination: inout [Float], count: Int) -> Int {
-        let h = _head.load(ordering: .acquiring)
-        let t = _tail.load(ordering: .relaxed)
-        let available = Int(h &- t)
-        let toRead = min(count, available)
-
-        for i in 0..<toRead {
-            let idx = Int((t &+ UInt64(i)) % UInt64(capacity))
-            destination[i] = buffer[idx]
+    public func remoteTrackDidUnmute(_ kind: InterTrackKind, forParticipant participantId: String) {
+        if kind == .camera {
+            participantCameraDidChange(participantId, isMuted: false)
         }
-        if toRead < count {
-            for i in toRead..<count {
-                destination[i] = 0
-            }
-        }
-        _tail.store(t &+ UInt64(toRead), ordering: .releasing)
-        return toRead
     }
 
-    func reset() {
-        _head.store(0, ordering: .relaxed)
-        _tail.store(0, ordering: .relaxed)
+    public func remoteTrackDidEnd(_ kind: InterTrackKind, forParticipant participantId: String) {
+        if kind == .camera {
+            participantDidLeave(participantId)
+        }
     }
 }
+
+// Note: InterleaveBuffer, AudioRecordingRingBuffer, and the audio tap/_convertFloatsToCMSampleBuffer
+// have been extracted to InterRecordingAudioCapture.swift as part of Gap #14 refactoring.
 
 // MARK: - Audio Engine Access Helper
 
-/// Helper to access the shared AVAudioEngine output node for tap installation.
-/// Encapsulated here so the coordinator doesn't depend on AudioManager internals.
-@objc class InterAudioEngineAccess: NSObject {
+/// Singleton AudioEngineObserver that captures the live AVAudioEngine via LiveKit callbacks.
+///
+/// LiveKit's AudioManager does not expose the AVAudioEngine directly. Instead, it drives an
+/// AudioEngineObserver chain whose callbacks each receive the real engine instance. This class
+/// inserts itself as the first link of that chain (forwarding every call to the default mixer
+/// observer) so it can stash a weak reference to the engine for tap installation.
+///
+/// IMPORTANT: `InterAudioEngineAccess.register()` must be called once at app startup —
+/// before any room connects — so that `engineWillStart` fires and the engine ref is captured.
+final class InterAudioEngineAccess: NSObject, AudioEngineObserver {
 
-    /// Returns the output node of the shared audio engine, or nil if unavailable.
-    @objc static func outputNode() -> AVAudioOutputNode? {
-        // Access through LiveKit's AudioManager shared engine.
-        // The engine is started by LiveKit when a room is connected.
-        return AVAudioEngine().outputNode
+    // MARK: - Singleton
+
+    static let shared = InterAudioEngineAccess()
+    private override init() { super.init() }
+
+    // MARK: - AudioEngineObserver chain
+
+    /// Next observer in the chain; set to AudioManager.shared.mixer by register().
+    var next: (any AudioEngineObserver)?
+
+    // Weakly stored engine — non-nil while LiveKit's AVAudioEngine is running.
+    // AudioEngineObserver docs say "Do not retain the engine object", hence weak.
+    private weak var _engine: AVAudioEngine?
+
+    // MARK: - Public API
+
+    /// Register as head of the AudioManager engine-observer chain.
+    /// Must be called once at app startup before any room connection.
+    @objc static func register() {
+        shared.next = AudioManager.shared.mixer
+        AudioManager.shared.set(engineObservers: [shared])
+    }
+
+    /// Returns the main mixer node of LiveKit's running AVAudioEngine, or nil if unavailable.
+    ///
+    /// `AVAudioEngine.mainMixerNode` (an `AVAudioMixerNode`) is the correct tapping point:
+    /// it combines all connected sources (local mic, remote participants routed through
+    /// LiveKit's graph) and feeds into the hardware output node.  `installTap(onBus:)` is
+    /// only supported on mixer/input nodes — calling it on `engine.outputNode`
+    /// (`AVAudioOutputNode`) throws "required condition is false: _isInput".
+    @objc static func outputNode() -> AVAudioMixerNode? {
+        guard AudioManager.shared.isEngineRunning, let engine = shared._engine else { return nil }
+        return engine.mainMixerNode
+    }
+
+    /// [Gap #6] Optional closure invoked when the AVAudioEngine restarts
+    /// (engineDidStop followed by engineWillStart). The recording coordinator
+    /// sets this during recording so it can re-install the audio tap.
+    var onEngineRestart: (() -> Void)?
+
+    /// Whether we saw an engine stop without a subsequent start yet.
+    private var _awaitingRestart = false
+
+    // MARK: - AudioEngineObserver (only the lifecycle callbacks that need engine capture)
+
+    func engineWillStart(_ engine: AVAudioEngine, isPlayoutEnabled: Bool, isRecordingEnabled: Bool) -> Int {
+        _engine = engine
+        // [Gap #6] If this start follows a stop, notify the coordinator to re-install the tap.
+        if _awaitingRestart {
+            _awaitingRestart = false
+            onEngineRestart?()
+        }
+        return next?.engineWillStart(engine, isPlayoutEnabled: isPlayoutEnabled, isRecordingEnabled: isRecordingEnabled) ?? 0
+    }
+
+    func engineDidStop(_ engine: AVAudioEngine, isPlayoutEnabled: Bool, isRecordingEnabled: Bool) -> Int {
+        _engine = nil
+        // [Gap #6] Mark that a restart is needed if onEngineRestart is set.
+        if onEngineRestart != nil {
+            _awaitingRestart = true
+        }
+        return next?.engineDidStop(engine, isPlayoutEnabled: isPlayoutEnabled, isRecordingEnabled: isRecordingEnabled) ?? 0
+    }
+
+    func engineWillRelease(_ engine: AVAudioEngine) -> Int {
+        _engine = nil
+        return next?.engineWillRelease(engine) ?? 0
     }
 }
+
+// Opt-out of strict Sendable checking: _engine is only written on the LiveKit audio thread
+// via the observer callbacks, which LiveKit serialises internally.
+extension InterAudioEngineAccess: @unchecked Sendable {}

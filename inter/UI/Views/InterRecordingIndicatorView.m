@@ -102,8 +102,10 @@ static const CGFloat kRecViewHeight = 28.0;
     _timeLabel.frame = NSMakeRect(x, midY - timeSize.height / 2.0, timeSize.width, timeSize.height);
     x += timeSize.width + kRecHorizontalPadding;
 
-    // Set own intrinsic size
+    // Set own intrinsic size and notify Auto Layout of the change so parent
+    // views update their constraints (e.g. when the label switches "REC"↔"PAUSED").
     [self setFrameSize:NSMakeSize(x, kRecViewHeight)];
+    [self invalidateIntrinsicContentSize];
 }
 
 - (NSSize)intrinsicContentSize {

@@ -68,6 +68,11 @@ import LiveKit
     /// Delegate receiving decoded remote frames.
     @objc public weak var trackRenderer: InterRemoteTrackRenderer?
 
+    /// [Phase 10] Secondary delegate for recording frame observation.
+    /// When non-nil, receives the same remote camera frames as `trackRenderer`.
+    /// Used by the recording coordinator to feed frames to the composed renderer.
+    @objc public weak var recordingFrameDelegate: InterRemoteTrackRenderer?
+
     /// The pixel format of the last received camera frame. [G3]
     @objc public private(set) var detectedCameraFormat: OSType = 0
 
@@ -262,6 +267,8 @@ extension InterLiveKitSubscriber: RoomDelegate {
                                             format & 0xFF))
                     }
                     self?.trackRenderer?.didReceiveRemoteCameraFrame(pixelBuffer, fromParticipant: participantId)
+                    // [Phase 10] Forward to recording frame delegate
+                    self?.recordingFrameDelegate?.didReceiveRemoteCameraFrame(pixelBuffer, fromParticipant: participantId)
                 }
                 self.cameraRenderers[participantId] = renderer
                 self.cameraTracks[participantId] = videoTrack
@@ -318,9 +325,11 @@ extension InterLiveKitSubscriber: RoomDelegate {
         case .camera:
             cleanUpTrack(source: .camera, participantId: participantId)
             trackRenderer?.remoteTrackDidEnd(.camera, forParticipant: participantId)
+            recordingFrameDelegate?.remoteTrackDidEnd(.camera, forParticipant: participantId)
         case .screenShareVideo:
             cleanUpTrack(source: .screenShareVideo, participantId: participantId)
             trackRenderer?.remoteTrackDidEnd(.screenShare, forParticipant: participantId)
+            recordingFrameDelegate?.remoteTrackDidEnd(.screenShare, forParticipant: participantId)
         default:
             break
         }
@@ -346,8 +355,10 @@ extension InterLiveKitSubscriber: RoomDelegate {
         case .camera:
             if muted {
                 trackRenderer?.remoteTrackDidMute(.camera, forParticipant: participantId)
+                recordingFrameDelegate?.remoteTrackDidMute(.camera, forParticipant: participantId)
             } else {
                 trackRenderer?.remoteTrackDidUnmute(.camera, forParticipant: participantId)
+                recordingFrameDelegate?.remoteTrackDidUnmute(.camera, forParticipant: participantId)
             }
         case .microphone:
             if muted {

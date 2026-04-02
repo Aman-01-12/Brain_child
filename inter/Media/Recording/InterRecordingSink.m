@@ -62,17 +62,19 @@ static os_log_t InterRecordingSinkLog(void) {
 - (void)appendVideoFrame:(InterShareVideoFrame *)frame {
     if (!frame) return;
 
+    // Hold _sinkLock across both the _isActive check and the renderer update.
+    // This prevents a stop racing between the check and the call, which would
+    // deliver a frame to the renderer after stopWithCompletion: has already
+    // cleared it.
     os_unfair_lock_lock(&_sinkLock);
     BOOL active = _isActive;
-    os_unfair_lock_unlock(&_sinkLock);
-
-    if (!active) return;
-
-    // Feed the screen share frame to the composed renderer.
-    InterComposedRenderer *renderer = self.composedRenderer;
-    if (renderer) {
-        [renderer updateScreenShareFrame:frame.pixelBuffer];
+    if (active) {
+        InterComposedRenderer *renderer = self.composedRenderer;
+        if (renderer) {
+            [renderer updateScreenShareFrame:frame.pixelBuffer];
+        }
     }
+    os_unfair_lock_unlock(&_sinkLock);
 }
 
 - (void)appendAudioSampleBuffer:(CMSampleBufferRef)sampleBuffer {
@@ -92,17 +94,19 @@ static os_log_t InterRecordingSinkLog(void) {
 }
 
 - (void)stopWithCompletion:(dispatch_block_t)completion {
+    // Set _isActive = NO and clear the renderer atomically under _sinkLock.
+    // Holding the lock across both operations ensures that any concurrent
+    // appendVideoFrame: that already passed the _isActive check (and is waiting
+    // for the lock) will see _isActive = NO and skip its renderer update.
     os_unfair_lock_lock(&_sinkLock);
     _isActive = NO;
-    os_unfair_lock_unlock(&_sinkLock);
-
-    os_log_info(InterRecordingSinkLog(), "Recording sink stopped.");
-
-    // Clear the screen share source on the renderer so layout recalculates.
     InterComposedRenderer *renderer = self.composedRenderer;
     if (renderer) {
         [renderer updateScreenShareFrame:NULL];
     }
+    os_unfair_lock_unlock(&_sinkLock);
+
+    os_log_info(InterRecordingSinkLog(), "Recording sink stopped.");
 
     if (completion) {
         completion();

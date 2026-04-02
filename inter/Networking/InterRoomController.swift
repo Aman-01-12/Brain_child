@@ -83,6 +83,10 @@ import LiveKit
     /// [Phase 8.6] Q&A controller. Wired in by the caller before connect.
     @objc public weak var qaController: InterQAController?
 
+    /// [Phase 10] Recording coordinator. Wired in by the caller before connect.
+    /// Room controller forwards disconnect events so recording can auto-stop.
+    @objc public weak var recordingCoordinator: InterRecordingCoordinator?
+
     /// The local participant's identity string (ObjC-safe accessor).
     @objc public var localParticipantIdentity: String {
         return room?.localParticipant.identity?.stringValue ?? ""
@@ -723,6 +727,21 @@ extension InterRoomController: RoomDelegate {
             interLogInfo(InterLog.networking, "RoomController: disconnected cleanly")
             self.setConnectionState(.disconnected)
         }
+
+        // [Phase 10] Auto-stop recording on room disconnect.
+        // Snapshot configuration and roomCode here (before the async dispatch) to avoid
+        // a race with disconnect(reason:), which clears configuration = nil synchronously
+        // on the main thread and may execute before the async block below runs.
+        let capturedServerURL = self.configuration?.tokenServerURL
+        let capturedCode = self.roomCode.isEmpty ? nil : self.roomCode
+        let capturedIdentity = self.configuration?.participantIdentity
+        DispatchQueue.main.async {
+            self.recordingCoordinator?.handleRoomDisconnect(
+                serverURL: capturedServerURL,
+                roomCode: capturedCode,
+                callerIdentity: capturedIdentity
+            )
+        }
     }
 
     // MARK: Participant Events [G6]
@@ -747,6 +766,11 @@ extension InterRoomController: RoomDelegate {
         let identity = remoteSpeaker?.identity?.stringValue ?? ""
 
         DispatchQueue.main.async {
+            // [Phase 10] Forward active speaker change to recording coordinator.
+            // Must run on the main thread — weak reference reads and the coordinator's
+            // own threading contract both require main-queue access here.
+            self.recordingCoordinator?.activeSpeakerDidChange(identity)
+
             // Cancel any pending "clear speaker" timer.
             self.activeSpeakerClearWork?.cancel()
             self.activeSpeakerClearWork = nil

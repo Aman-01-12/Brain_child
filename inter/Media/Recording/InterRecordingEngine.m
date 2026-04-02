@@ -27,7 +27,9 @@ static os_log_t InterRecordingEngineLog(void) {
 @end
 
 @implementation InterRecordingEngine {
-    // AVAssetWriter graph — only accessed on _recordingQueue.
+    // AVAssetWriter graph — confined to _recordingQueue exclusively.
+    // Never accessed outside _recordingQueue after startRecording returns;
+    // use _isActive (below) for cross-thread recording-state queries.
     AVAssetWriter *_assetWriter;
     AVAssetWriterInput *_videoInput;
     AVAssetWriterInput *_audioInput;
@@ -40,12 +42,17 @@ static os_log_t InterRecordingEngineLog(void) {
     // Hold time < 100ns — only scalar reads/writes, never blocking calls inside.
     os_unfair_lock _engineLock;
 
-    // Guarded by _engineLock — read from _recordingQueue, written from coordinator.
+    // Guarded by _engineLock — readable from any thread.
+    BOOL _isActive;    // YES from a successful startRecording until the writer is torn down.
     BOOL _isPaused;
     BOOL _isStopping;
-    CMTime _totalPauseDuration;  // Accumulated pause time to subtract from PTS.
-    CMTime _pauseStartTime;      // When current pause began (kCMTimeInvalid if not paused).
-    BOOL _sessionStarted;        // Whether startSession has been called on the writer.
+    CMTime _totalPauseDuration;    // Accumulated pause time to subtract from PTS.
+    CMTime _pauseStartTime;        // When current pause began (kCMTimeInvalid if not paused).
+    BOOL _sessionStarted;          // Whether startSession has been called on the writer.
+    // Cross-thread snapshot of _lastVideoPTS for recordedDuration. _lastVideoPTS itself
+    // is _recordingQueue-confined; this copy is written on _recordingQueue under
+    // _engineLock so recordedDuration can read it safely from any thread.
+    CMTime _lastVideoPTSSnapshot;
 
     // Monotonic PTS enforcement — only accessed on _recordingQueue.
     CMTime _lastVideoPTS;
@@ -78,6 +85,7 @@ static os_log_t InterRecordingEngineLog(void) {
                                             DISPATCH_QUEUE_SERIAL);
 
     _engineLock = OS_UNFAIR_LOCK_INIT;
+    _isActive = NO;
     _isPaused = NO;
     _isStopping = NO;
     _totalPauseDuration = kCMTimeZero;
@@ -86,6 +94,7 @@ static os_log_t InterRecordingEngineLog(void) {
 
     _lastVideoPTS = kCMTimeInvalid;
     _lastAudioPTS = kCMTimeInvalid;
+    _lastVideoPTSSnapshot = kCMTimeInvalid;
 
     _droppedVideoFrames = 0;
     _droppedAudioSamples = 0;
@@ -98,8 +107,10 @@ static os_log_t InterRecordingEngineLog(void) {
 // ---------------------------------------------------------------------------
 
 - (BOOL)isRecording {
+    // _assetWriter is _recordingQueue-confined; use the lock-guarded _isActive flag
+    // so this getter is safe to call from any thread without crossing that boundary.
     os_unfair_lock_lock(&_engineLock);
-    BOOL recording = (_assetWriter != nil) && !_isStopping;
+    BOOL recording = _isActive && !_isStopping;
     os_unfair_lock_unlock(&_engineLock);
     return recording;
 }
@@ -113,7 +124,8 @@ static os_log_t InterRecordingEngineLog(void) {
 
 - (CMTime)recordedDuration {
     os_unfair_lock_lock(&_engineLock);
-    CMTime lastPTS = _lastVideoPTS;
+    // _lastVideoPTS is _recordingQueue-confined; read the lock-guarded snapshot instead.
+    CMTime lastPTS = _lastVideoPTSSnapshot;
     CMTime pauseDuration = _totalPauseDuration;
     os_unfair_lock_unlock(&_engineLock);
 
@@ -137,96 +149,144 @@ static os_log_t InterRecordingEngineLog(void) {
 // ---------------------------------------------------------------------------
 
 - (BOOL)startRecording {
-    NSError *error = nil;
+    __block BOOL success = NO;
 
-    // Remove any pre-existing file at the output URL.
-    [[NSFileManager defaultManager] removeItemAtURL:_outputURL error:nil];
+    // All writer-graph construction runs synchronously on _recordingQueue.
+    // This ensures _assetWriter, _videoInput, _audioInput, and _pixelBufferAdaptor
+    // are fully initialised and committed to the queue before any append block
+    // dispatched concurrently can run — eliminating the data race between setup
+    // (historically on the caller thread) and the ivar reads inside the append methods.
+    dispatch_sync(_recordingQueue, ^{
+        NSError *error = nil;
 
-    _assetWriter = [[AVAssetWriter alloc] initWithURL:_outputURL
-                                             fileType:AVFileTypeMPEG4
-                                                error:&error];
-    if (!_assetWriter) {
-        os_log_error(InterRecordingEngineLog(),
-                     "Failed to create AVAssetWriter: %{public}@", error.localizedDescription);
-        return NO;
+        // Cleanup helper — called at every failure path to leave ivars in a
+        // consistent nil/reset state so a subsequent startRecording call sees
+        // a clean writer graph rather than stale partially-constructed objects.
+        // If the writer has already called startWriting, cancelWriting is issued
+        // so AVFoundation can release its internal resources before we nil it.
+        void (^cleanupWriterGraph)(void) = ^{
+            if (self->_assetWriter) {
+                if (self->_assetWriter.status == AVAssetWriterStatusWriting) {
+                    [self->_assetWriter cancelWriting];
+                }
+                self->_assetWriter = nil;
+            }
+            self->_videoInput          = nil;
+            self->_audioInput          = nil;
+            self->_pixelBufferAdaptor  = nil;
+            self->_sessionStarted      = NO;
+            os_unfair_lock_lock(&self->_engineLock);
+            self->_isActive = NO;
+            os_unfair_lock_unlock(&self->_engineLock);
+        };
+
+        // Remove any pre-existing file at the output URL.
+        [[NSFileManager defaultManager] removeItemAtURL:self->_outputURL error:nil];
+
+        self->_assetWriter = [[AVAssetWriter alloc] initWithURL:self->_outputURL
+                                                       fileType:AVFileTypeMPEG4
+                                                          error:&error];
+        if (!self->_assetWriter) {
+            os_log_error(InterRecordingEngineLog(),
+                         "Failed to create AVAssetWriter: %{public}@", error.localizedDescription);
+            cleanupWriterGraph();
+            return;
+        }
+
+        // [Gap #7] Move the moov atom to the front of the file for faster playback start.
+        self->_assetWriter.shouldOptimizeForNetworkUse = YES;
+
+        // ----- Video Input -----
+        NSDictionary *videoCompressionProps = @{
+            AVVideoAverageBitRateKey: @(4500000),            // 4.5 Mbps
+            AVVideoMaxKeyFrameIntervalKey: @(self->_frameRate * 2), // Keyframe every 2 seconds
+            AVVideoProfileLevelKey: AVVideoProfileLevelH264Main41,
+        };
+
+        NSDictionary *videoSettings = @{
+            AVVideoCodecKey: AVVideoCodecTypeH264,
+            AVVideoWidthKey: @((int)self->_videoSize.width),
+            AVVideoHeightKey: @((int)self->_videoSize.height),
+            AVVideoCompressionPropertiesKey: videoCompressionProps,
+        };
+
+        self->_videoInput = [[AVAssetWriterInput alloc] initWithMediaType:AVMediaTypeVideo
+                                                          outputSettings:videoSettings];
+        self->_videoInput.expectsMediaDataInRealTime = YES;
+
+        NSDictionary *sourcePixelBufferAttrs = @{
+            (id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA),
+            (id)kCVPixelBufferWidthKey: @((int)self->_videoSize.width),
+            (id)kCVPixelBufferHeightKey: @((int)self->_videoSize.height),
+            (id)kCVPixelBufferMetalCompatibilityKey: @YES,
+        };
+
+        self->_pixelBufferAdaptor =
+            [[AVAssetWriterInputPixelBufferAdaptor alloc] initWithAssetWriterInput:self->_videoInput
+                                                      sourcePixelBufferAttributes:sourcePixelBufferAttrs];
+
+        if ([self->_assetWriter canAddInput:self->_videoInput]) {
+            [self->_assetWriter addInput:self->_videoInput];
+        } else {
+            os_log_error(InterRecordingEngineLog(), "Cannot add video input to asset writer.");
+            cleanupWriterGraph();
+            return;
+        }
+
+        // ----- Audio Input -----
+        AudioChannelLayout channelLayout = {0};
+        channelLayout.mChannelLayoutTag = (self->_audioChannels == 1)
+            ? kAudioChannelLayoutTag_Mono
+            : kAudioChannelLayoutTag_Stereo;
+
+        NSDictionary *audioSettings = @{
+            AVFormatIDKey: @(kAudioFormatMPEG4AAC),
+            AVSampleRateKey: @(self->_audioSampleRate),
+            AVNumberOfChannelsKey: @(self->_audioChannels),
+            AVEncoderBitRateKey: @(128000),  // 128 kbps
+            AVChannelLayoutKey: [NSData dataWithBytes:&channelLayout
+                                               length:sizeof(channelLayout)],
+        };
+
+        self->_audioInput = [[AVAssetWriterInput alloc] initWithMediaType:AVMediaTypeAudio
+                                                          outputSettings:audioSettings];
+        self->_audioInput.expectsMediaDataInRealTime = YES;
+
+        if ([self->_assetWriter canAddInput:self->_audioInput]) {
+            [self->_assetWriter addInput:self->_audioInput];
+        } else {
+            os_log_error(InterRecordingEngineLog(), "Cannot add audio input to asset writer.");
+            cleanupWriterGraph();
+            return;
+        }
+
+        // ----- Start writing -----
+        if (![self->_assetWriter startWriting]) {
+            os_log_error(InterRecordingEngineLog(),
+                         "startWriting failed: %{public}@",
+                         self->_assetWriter.error.localizedDescription);
+            cleanupWriterGraph();
+            return;
+        }
+
+        // Signal to cross-thread callers (e.g. isRecording) that the writer is live.
+        // Set inside the sync block so _isActive flips only after the entire writer
+        // graph is committed to _recordingQueue.
+        os_unfair_lock_lock(&self->_engineLock);
+        self->_isActive = YES;
+        os_unfair_lock_unlock(&self->_engineLock);
+
+        success = YES;
+    });
+
+    if (success) {
+        os_log_info(InterRecordingEngineLog(),
+                    "Recording started: %{public}@ (%dx%d @ %dfps)",
+                    _outputURL.lastPathComponent,
+                    (int)_videoSize.width, (int)_videoSize.height, _frameRate);
     }
 
-    // ----- Video Input -----
-    NSDictionary *videoCompressionProps = @{
-        AVVideoAverageBitRateKey: @(4500000),            // 4.5 Mbps
-        AVVideoMaxKeyFrameIntervalKey: @(_frameRate * 2), // Keyframe every 2 seconds
-        AVVideoProfileLevelKey: AVVideoProfileLevelH264Main41,
-    };
-
-    NSDictionary *videoSettings = @{
-        AVVideoCodecKey: AVVideoCodecTypeH264,
-        AVVideoWidthKey: @((int)_videoSize.width),
-        AVVideoHeightKey: @((int)_videoSize.height),
-        AVVideoCompressionPropertiesKey: videoCompressionProps,
-    };
-
-    _videoInput = [[AVAssetWriterInput alloc] initWithMediaType:AVMediaTypeVideo
-                                                outputSettings:videoSettings];
-    _videoInput.expectsMediaDataInRealTime = YES;
-
-    NSDictionary *sourcePixelBufferAttrs = @{
-        (id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA),
-        (id)kCVPixelBufferWidthKey: @((int)_videoSize.width),
-        (id)kCVPixelBufferHeightKey: @((int)_videoSize.height),
-        (id)kCVPixelBufferMetalCompatibilityKey: @YES,
-    };
-
-    _pixelBufferAdaptor =
-        [[AVAssetWriterInputPixelBufferAdaptor alloc] initWithAssetWriterInput:_videoInput
-                                                  sourcePixelBufferAttributes:sourcePixelBufferAttrs];
-
-    if ([_assetWriter canAddInput:_videoInput]) {
-        [_assetWriter addInput:_videoInput];
-    } else {
-        os_log_error(InterRecordingEngineLog(), "Cannot add video input to asset writer.");
-        return NO;
-    }
-
-    // ----- Audio Input -----
-    AudioChannelLayout channelLayout = {0};
-    channelLayout.mChannelLayoutTag = (_audioChannels == 1)
-        ? kAudioChannelLayoutTag_Mono
-        : kAudioChannelLayoutTag_Stereo;
-
-    NSDictionary *audioSettings = @{
-        AVFormatIDKey: @(kAudioFormatMPEG4AAC),
-        AVSampleRateKey: @(_audioSampleRate),
-        AVNumberOfChannelsKey: @(_audioChannels),
-        AVEncoderBitRateKey: @(128000),  // 128 kbps
-        AVChannelLayoutKey: [NSData dataWithBytes:&channelLayout
-                                           length:sizeof(channelLayout)],
-    };
-
-    _audioInput = [[AVAssetWriterInput alloc] initWithMediaType:AVMediaTypeAudio
-                                                outputSettings:audioSettings];
-    _audioInput.expectsMediaDataInRealTime = YES;
-
-    if ([_assetWriter canAddInput:_audioInput]) {
-        [_assetWriter addInput:_audioInput];
-    } else {
-        os_log_error(InterRecordingEngineLog(), "Cannot add audio input to asset writer.");
-        return NO;
-    }
-
-    // ----- Start writing -----
-    if (![_assetWriter startWriting]) {
-        os_log_error(InterRecordingEngineLog(),
-                     "startWriting failed: %{public}@",
-                     _assetWriter.error.localizedDescription);
-        return NO;
-    }
-
-    os_log_info(InterRecordingEngineLog(),
-                "Recording started: %{public}@ (%dx%d @ %dfps)",
-                _outputURL.lastPathComponent,
-                (int)_videoSize.width, (int)_videoSize.height, _frameRate);
-
-    return YES;
+    return success;
 }
 
 // ---------------------------------------------------------------------------
@@ -302,6 +362,10 @@ static os_log_t InterRecordingEngineLog(void) {
                                       withPresentationTime:adjustedPTS];
     if (appended) {
         _lastVideoPTS = adjustedPTS;
+        // Mirror to the lock-guarded snapshot so recordedDuration can read from any thread.
+        os_unfair_lock_lock(&_engineLock);
+        _lastVideoPTSSnapshot = adjustedPTS;
+        os_unfair_lock_unlock(&_engineLock);
     } else {
         _droppedVideoFrames++;
         os_log_error(InterRecordingEngineLog(), "appendPixelBuffer failed (status: %ld)",
@@ -393,6 +457,10 @@ static os_log_t InterRecordingEngineLog(void) {
         _droppedAudioSamples++;
         os_log_error(InterRecordingEngineLog(),
                      "Failed to create adjusted audio sample buffer (OSStatus: %d)", (int)status);
+        id<InterRecordingEngineDelegate> delegate = self.delegate;
+        if ([delegate respondsToSelector:@selector(recordingEngineDidDropAudioSample:)]) {
+            [delegate recordingEngineDidDropAudioSample:_droppedAudioSamples];
+        }
         return;
     }
 
@@ -476,6 +544,12 @@ static os_log_t InterRecordingEngineLog(void) {
                 NSError *writerError = self->_assetWriter.error;
                 NSURL *url = writerError ? nil : self->_outputURL;
 
+                // Clear _isActive before invoking the completion so that any
+                // isRecording call made from within completion sees NO.
+                os_unfair_lock_lock(&self->_engineLock);
+                self->_isActive = NO;
+                os_unfair_lock_unlock(&self->_engineLock);
+
                 if (writerError) {
                     os_log_error(InterRecordingEngineLog(),
                                  "finishWriting failed: %{public}@",
@@ -496,6 +570,9 @@ static os_log_t InterRecordingEngineLog(void) {
                          "Writer not in writing state at stop (status: %ld, error: %{public}@).",
                          (long)self->_assetWriter.status,
                          writerError.localizedDescription);
+            os_unfair_lock_lock(&self->_engineLock);
+            self->_isActive = NO;
+            os_unfair_lock_unlock(&self->_engineLock);
             if (completion) completion(nil, writerError);
         }
     });
@@ -511,6 +588,10 @@ static os_log_t InterRecordingEngineLog(void) {
         NSError *error = _assetWriter.error;
         os_log_error(InterRecordingEngineLog(),
                      "AVAssetWriter failed: %{public}@", error.localizedDescription);
+        // Mark not-active so isRecording returns NO even before stopRecording is called.
+        os_unfair_lock_lock(&_engineLock);
+        _isActive = NO;
+        os_unfair_lock_unlock(&_engineLock);
         id<InterRecordingEngineDelegate> delegate = self.delegate;
         if ([delegate respondsToSelector:@selector(recordingEngineDidFailWithError:)]) {
             [delegate recordingEngineDidFailWithError:error];

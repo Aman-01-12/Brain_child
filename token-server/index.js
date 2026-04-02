@@ -2,6 +2,7 @@
 // Token Server for Inter — LiveKit Integration
 // Phase 6.1 [G6.1] — Redis-backed
 // Phase 9 [G9] — Meeting management: roles, moderation, lobby, passwords
+// Phase 10C [G10.3] — Cloud recording via LiveKit Egress
 //
 // Endpoints:
 //   POST /room/create  — Host creates a room, gets a 6-char code + JWT
@@ -27,6 +28,16 @@
 //   GET  /room/lobby-status/:code/:identity — Check lobby status (polling)
 //   POST /room/password    — Set/change meeting password
 //
+// Phase 10C Endpoints:
+//   POST /room/record/start  — Start cloud recording (Egress API)
+//   POST /room/record/stop   — Stop cloud recording
+//   GET  /room/record/status/:code — Get recording status
+//   GET  /recordings          — List user's recordings
+//   GET  /recordings/:id      — Get recording details
+//   GET  /recordings/:id/download — Get presigned download URL
+//   DELETE /recordings/:id    — Delete a recording
+//   POST /webhooks/egress     — Egress webhook (LiveKit → token-server)
+//
 // STORAGE:
 //   Room data  → Redis Hash  `room:{CODE}`  (TTL 24h, auto-expires)
 //   Participants → Redis Set `room:{CODE}:participants`  (TTL 24h)
@@ -49,7 +60,9 @@
 require('dotenv').config();
 
 const express = require('express');
-const { AccessToken, RoomServiceClient, TrackSource } = require('livekit-server-sdk');
+const { AccessToken, RoomServiceClient, TrackSource, EgressClient,
+        EncodedFileOutput, EncodingOptionsPreset,
+        WebhookReceiver } = require('livekit-server-sdk');
 const bcrypt = require('bcryptjs');
 const redis = require('./redis');
 const db = require('./db');
@@ -78,6 +91,41 @@ const MAX_PARTICIPANTS_PER_ROOM = 50; // Phase 7: scaled from 4 to 50
 // Used for: mute tracks, remove participants, update metadata.
 // ---------------------------------------------------------------------------
 const roomService = new RoomServiceClient(LIVEKIT_HTTP_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET);
+
+// ---------------------------------------------------------------------------
+// LiveKit Egress Client — for cloud recording (Phase 10C)
+// ---------------------------------------------------------------------------
+const egressClient = new EgressClient(LIVEKIT_HTTP_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET);
+
+// Webhook receiver — validates X-Livekit-Signature on incoming Egress events
+const webhookReceiver = new WebhookReceiver(LIVEKIT_API_KEY, LIVEKIT_API_SECRET);
+
+// ---------------------------------------------------------------------------
+// Recording Configuration (Phase 10C)
+// ---------------------------------------------------------------------------
+const VALID_TIERS = ['free', 'pro', 'hiring'];
+
+function getValidatedTier(rawTier) {
+  if (typeof rawTier === 'string' && VALID_TIERS.includes(rawTier)) return rawTier;
+  return 'free';
+}
+
+// Recording quotas (minutes) — configurable via env vars
+const RECORDING_QUOTAS = {
+  free: 0,
+  pro: parseInt(process.env.RECORDING_QUOTA_PRO || '600', 10),       // 10 hours
+  hiring: parseInt(process.env.RECORDING_QUOTA_HIRING || '1200', 10), // 20 hours
+};
+
+// S3 bucket for cloud recordings (configurable via env var)
+const S3_RECORDINGS_BUCKET = process.env.S3_RECORDINGS_BUCKET || 'inter-recordings';
+const AWS_REGION = process.env.AWS_REGION || 'us-east-1';
+
+// AWS SDK v3 — hoisted to module level so the client is created once and
+// reused across requests (avoids per-request connection pool overhead).
+const { S3Client, GetObjectCommand, DeleteObjectCommand, PutObjectCommand } = require('@aws-sdk/client-s3');
+const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
+const s3Client = new S3Client({ region: AWS_REGION });
 
 // ---------------------------------------------------------------------------
 // Rate limiting — Redis INCR + EXPIRE (10 req/min per identity)
@@ -1181,6 +1229,761 @@ app.post('/room/password', async (req, res) => {
     await redis.hset(roomKey(code), 'passwordHash', hash);
     console.log(`[audit] Password set: code=${code} by=${callerIdentity}`);
     res.json({ success: true, hasPassword: true });
+  }
+});
+
+// ===========================================================================
+// PHASE 10C — CLOUD RECORDING ENDPOINTS
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// Helper: check if caller is host or co-host in the LiveKit room right now.
+// Queries LiveKit RoomService participant metadata.
+// ---------------------------------------------------------------------------
+async function isHostOrCoHostInRoom(userId, roomName) {
+  try {
+    const participants = await roomService.listParticipants(roomName);
+    for (const p of participants) {
+      if (p.identity !== String(userId)) continue;
+      const meta = p.metadata ? JSON.parse(p.metadata) : {};
+      if (meta.role === 'host' || meta.role === 'co-host') return true;
+    }
+  } catch {
+    // If query fails (room closed, etc.), deny by default
+  }
+  return false;
+}
+
+// ---------------------------------------------------------------------------
+// Helper: check recording quota for a user.
+// Returns { allowed, used, quota, remainingMinutes }.
+// ---------------------------------------------------------------------------
+async function checkRecordingQuota(userId, tier) {
+  const validatedTier = getValidatedTier(tier);
+  const quota = RECORDING_QUOTAS[validatedTier] || 0;
+  if (quota === 0) {
+    return { allowed: false, used: 0, quota: 0, remainingMinutes: 0, reason: 'Cloud recording not available on free tier' };
+  }
+
+  const result = await db.query(
+    'SELECT recording_minutes_used FROM users WHERE id = $1',
+    [userId]
+  );
+  if (result.rows.length === 0) {
+    return { allowed: false, used: 0, quota, remainingMinutes: 0, reason: 'User not found' };
+  }
+
+  const used = result.rows[0].recording_minutes_used || 0;
+  const remaining = quota - used;
+
+  if (remaining <= 0) {
+    return { allowed: false, used, quota, remainingMinutes: 0, reason: 'Recording quota exceeded' };
+  }
+
+  return { allowed: true, used, quota, remainingMinutes: remaining };
+}
+
+// ---------------------------------------------------------------------------
+// POST /room/record/start — Start cloud recording (Egress API)
+// Body: { roomCode, callerIdentity, mode?, estimatedDurationMinutes? }
+// mode: "cloud_composed" (default) | "multi_track"
+// Requires: auth + pro tier + host/co-host role
+// Returns: { success, egressId, recordingSessionId }
+// ---------------------------------------------------------------------------
+app.post('/room/record/start', auth.requireAuth, auth.requireTier('pro'), async (req, res) => {
+  const { roomCode, callerIdentity, mode, estimatedDurationMinutes } = req.body;
+
+  if (!roomCode || !callerIdentity) {
+    return res.status(400).json({ error: 'roomCode and callerIdentity are required' });
+  }
+
+  const code = roomCode.toUpperCase();
+  const roomData = await getRoomData(code);
+  if (!roomData) return res.status(404).json({ error: 'Invalid or expired room code' });
+
+  // Validate caller is a moderator (host/co-host)
+  const validation = await validateModerator(code, callerIdentity);
+  if (!validation.valid) return res.status(403).json({ error: validation.error });
+
+  // Validate estimated duration
+  const rawEstimate = estimatedDurationMinutes;
+  if (
+    rawEstimate === undefined || rawEstimate === null ||
+    typeof rawEstimate !== 'number' || !Number.isFinite(rawEstimate) || rawEstimate <= 0
+  ) {
+    return res.status(400).json({
+      error: 'estimatedDurationMinutes is required and must be a positive number',
+    });
+  }
+  const estimatedMinutes = Math.ceil(rawEstimate);
+
+  // Check quota
+  const quotaCheck = await checkRecordingQuota(req.user.userId, req.user.tier);
+  if (!quotaCheck.allowed) {
+    return res.status(403).json({ error: quotaCheck.reason, quota: quotaCheck });
+  }
+  if (quotaCheck.remainingMinutes < estimatedMinutes) {
+    return res.status(403).json({
+      error: `Estimated duration (${estimatedMinutes}m) exceeds remaining quota (${quotaCheck.remainingMinutes}m)`,
+      quota: quotaCheck,
+    });
+  }
+
+  // Check for existing active recording in this room (prevent double-start)
+  const existingResult = await db.query(
+    `SELECT id FROM recording_sessions WHERE room_name = $1 AND status = 'active'`,
+    [roomData.roomName]
+  );
+  if (existingResult.rows.length > 0) {
+    return res.status(409).json({ error: 'A recording is already active in this room' });
+  }
+
+  // [Gap #9] Acquire a Redis distributed lock to prevent concurrent start attempts.
+  // SET NX EX 30 → lock expires after 30 s even if the holder crashes.
+  const lockKey = `recording:lock:${roomData.roomName}`;
+  const lockAcquired = await redis.set(lockKey, callerIdentity, 'EX', 30, 'NX');
+  if (!lockAcquired) {
+    return res.status(409).json({ error: 'Another recording start is already in progress for this room' });
+  }
+
+  const validatedTier = getValidatedTier(req.user.tier);
+  const recordingMode = mode === 'multi_track' ? 'multi_track' : 'cloud_composed';
+
+  try {
+    let egressInfo;
+
+    if (recordingMode === 'cloud_composed') {
+      // Room Composite Egress — single composed video with speaker layout
+      const fileOutput = new EncodedFileOutput({
+        filepath: `recordings/${validatedTier}/${roomData.roomName}/{time}.mp4`,
+        output: {
+          case: 's3',
+          value: {
+            bucket: S3_RECORDINGS_BUCKET,
+            region: AWS_REGION,
+            // accessKey and secret intentionally omitted — resolved by IAM role
+          },
+        },
+      });
+
+      egressInfo = await egressClient.startRoomCompositeEgress(roomData.roomName, {
+        file: fileOutput,
+        layout: 'speaker',
+        preset: EncodingOptionsPreset.H264_1080P_30,
+      });
+    } else {
+      // Multi-track: start per-participant egress (Phase 10D)
+      const participants = await roomService.listParticipants(roomData.roomName);
+      const egressIds = [];
+      for (const p of participants) {
+        try {
+          const fileOutput = new EncodedFileOutput({
+            filepath: `recordings/${validatedTier}/${roomData.roomName}/multitrack/{publisher_identity}-{time}.mp4`,
+            output: {
+              case: 's3',
+              value: {
+                bucket: S3_RECORDINGS_BUCKET,
+                region: AWS_REGION,
+              },
+            },
+          });
+
+          const pInfo = await egressClient.startParticipantEgress(roomData.roomName, p.identity, {
+            file: fileOutput,
+            preset: EncodingOptionsPreset.H264_1080P_30,
+            screenShare: true,
+          });
+          egressIds.push({
+            participantIdentity: p.identity,
+            participantName: p.name || p.identity,
+            egressId: pInfo.egressId,
+          });
+        } catch (pErr) {
+          console.warn(`[warn] Failed to start egress for participant ${p.identity}: ${pErr.message}`);
+        }
+      }
+      if (egressIds.length === 0) {
+        return res.status(500).json({ error: 'Failed to start egress for any participant' });
+      }
+      // Use the first egress ID as the primary reference on the session
+      egressInfo = { egressId: egressIds[0].egressId, _multiTrackEgressIds: egressIds };
+    }
+
+    // Helper: stop all started egresses to avoid orphans when a downstream operation fails.
+    // Used in the catch block below. Errors from individual stops are logged and swallowed
+    // so the original error can propagate cleanly.
+    const stopStartedEgresses = async () => {
+      const toStop = egressInfo && egressInfo._multiTrackEgressIds
+        ? egressInfo._multiTrackEgressIds.map(t => t.egressId)
+        : egressInfo ? [egressInfo.egressId] : [];
+      for (const eid of toStop) {
+        try {
+          await egressClient.stopEgress(eid);
+          console.log(`[cleanup] Stopped orphaned egress ${eid} after DB failure`);
+        } catch (stopErr) {
+          console.warn(`[warn] Failed to stop orphaned egress ${eid}: ${stopErr.message}`);
+        }
+      }
+    };
+
+    // Record in DB — wrapped so that any failure here triggers egress cleanup.
+    let sessionId;
+    try {
+      const sessionResult = await db.query(
+        `INSERT INTO recording_sessions (user_id, room_name, room_code, egress_id, recording_mode, watermarked, status)
+         VALUES ($1, $2, $3, $4, $5, $6, 'active')
+         RETURNING id`,
+        [req.user.userId, roomData.roomName, code, egressInfo.egressId, recordingMode, validatedTier === 'free']
+      );
+      sessionId = sessionResult.rows[0].id;
+
+      // For multi-track, insert per-participant track records
+      if (recordingMode === 'multi_track' && egressInfo._multiTrackEgressIds) {
+        for (const track of egressInfo._multiTrackEgressIds) {
+          await db.query(
+            `INSERT INTO recording_tracks (session_id, participant_identity, participant_name, egress_id, status)
+             VALUES ($1, $2, $3, $4, 'active')`,
+            [sessionId, track.participantIdentity, track.participantName, track.egressId]
+          );
+        }
+      }
+    } catch (dbErr) {
+      // DB insert failed — stop all egresses that were successfully started so they don't run untracked.
+      console.error(`[error] DB insert failed after starting egress(es); stopping orphaned egresses:`, dbErr.message);
+      await stopStartedEgresses();
+      return res.status(500).json({ error: 'Failed to persist recording session: ' + dbErr.message });
+    }
+
+    // Update room metadata to indicate recording is active
+    try {
+      const existingMeta = await redis.hget(roomKey(code), 'metadata');
+      const meta = existingMeta ? JSON.parse(existingMeta) : {};
+      meta.recording = true;
+      meta.recordingMode = recordingMode;
+      meta.recordingSessionId = sessionId;
+      await redis.hset(roomKey(code), 'metadata', JSON.stringify(meta));
+    } catch (metaErr) {
+      console.warn(`[warn] Failed to update room metadata for recording: ${metaErr.message}`);
+    }
+
+    console.log(`[audit] Recording started: code=${code} mode=${recordingMode} egress=${egressInfo.egressId} by=${callerIdentity}`);
+    res.json({ success: true, egressId: egressInfo.egressId, recordingSessionId: sessionId });
+  } catch (err) {
+    console.error(`[error] Start recording failed:`, err.message);
+    // Check if egress service is unavailable
+    if (err.message && err.message.includes('UNAVAILABLE')) {
+      return res.status(503).json({ error: 'LiveKit Egress service is not available. Ensure egress is running.' });
+    }
+    res.status(500).json({ error: 'Failed to start recording: ' + err.message });
+  } finally {
+    // [Gap #9] Release the distributed lock atomically — only if we still own it.
+    // A plain DEL would delete a lock re-acquired by another process if our 30s TTL
+    // expired during a slow egress/DB operation. The Lua script atomically checks
+    // that the stored value still matches callerIdentity before deleting.
+    const releaseLua = `
+      if redis.call('GET', KEYS[1]) == ARGV[1] then
+        return redis.call('DEL', KEYS[1])
+      else
+        return 0
+      end
+    `;
+    await redis.eval(releaseLua, 1, lockKey, callerIdentity).catch((err) => {
+      console.warn(`[warn] Failed to release recording lock for ${lockKey}: ${err.message}`);
+    });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// POST /room/record/stop — Stop cloud recording
+// Body: { roomCode, callerIdentity, egressId }
+// Requires: auth + host/co-host role
+// Returns: { success, message }
+// ---------------------------------------------------------------------------
+app.post('/room/record/stop', auth.requireAuth, async (req, res) => {
+  const { roomCode, callerIdentity, egressId } = req.body;
+
+  if (!roomCode || !callerIdentity || !egressId) {
+    return res.status(400).json({ error: 'roomCode, callerIdentity, and egressId are required' });
+  }
+
+  const code = roomCode.toUpperCase();
+  const roomData = await getRoomData(code);
+  if (!roomData) return res.status(404).json({ error: 'Invalid or expired room code' });
+
+  // Validate caller is a moderator
+  const validation = await validateModerator(code, callerIdentity);
+  if (!validation.valid) return res.status(403).json({ error: validation.error });
+
+  // Verify the egress belongs to this room
+  const sessionResult = await db.query(
+    `SELECT user_id, room_name FROM recording_sessions WHERE egress_id = $1 AND status IN ('active', 'finalizing')`,
+    [egressId]
+  );
+  if (sessionResult.rows.length === 0) {
+    return res.status(404).json({ error: 'Recording session not found' });
+  }
+  const session = sessionResult.rows[0];
+  if (session.room_name !== roomData.roomName) {
+    return res.status(403).json({ error: 'Not authorized to stop this recording' });
+  }
+
+  try {
+    // Check if this is a multi-track session — need to stop all participant egresses
+    const tracksResult = await db.query(
+      `SELECT egress_id FROM recording_tracks WHERE session_id = (
+         SELECT id FROM recording_sessions WHERE egress_id = $1
+       ) AND status = 'active'`,
+      [egressId]
+    );
+
+    if (tracksResult.rows.length > 0) {
+      // Multi-track: stop all participant egresses
+      for (const track of tracksResult.rows) {
+        try {
+          await egressClient.stopEgress(track.egress_id);
+        } catch (trackErr) {
+          console.warn(`[warn] Failed to stop track egress ${track.egress_id}: ${trackErr.message}`);
+        }
+      }
+      await db.query(
+        `UPDATE recording_tracks SET status = 'finalizing'
+         WHERE session_id = (SELECT id FROM recording_sessions WHERE egress_id = $1) AND status = 'active'`,
+        [egressId]
+      );
+    } else {
+      // Single egress (cloud_composed): stop the one egress
+      await egressClient.stopEgress(egressId);
+    }
+
+    // Mark session as finalizing — webhook will complete the rest
+    await db.query(
+      `UPDATE recording_sessions SET status = 'finalizing' WHERE egress_id = $1`,
+      [egressId]
+    );
+
+    // Clear recording metadata on the room
+    try {
+      const existingMeta = await redis.hget(roomKey(code), 'metadata');
+      const meta = existingMeta ? JSON.parse(existingMeta) : {};
+      meta.recording = false;
+      delete meta.recordingMode;
+      delete meta.recordingSessionId;
+      await redis.hset(roomKey(code), 'metadata', JSON.stringify(meta));
+    } catch (metaErr) {
+      console.warn(`[warn] Failed to clear room recording metadata: ${metaErr.message}`);
+    }
+
+    console.log(`[audit] Recording stop initiated: code=${code} egress=${egressId} by=${callerIdentity}`);
+    res.json({ success: true, message: 'Recording stop initiated; file will be available shortly' });
+  } catch (err) {
+    console.error(`[error] Stop recording failed:`, err.message);
+    res.status(500).json({ error: 'Failed to stop recording: ' + err.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// GET /room/record/status/:code — Get recording status for a room
+// Returns: { recording, mode, egressId, sessionId, startedAt }
+// ---------------------------------------------------------------------------
+app.get('/room/record/status/:code', async (req, res) => {
+  const code = req.params.code.toUpperCase();
+  const roomData = await getRoomData(code);
+  if (!roomData) return res.status(404).json({ error: 'Invalid or expired room code' });
+
+  const result = await db.query(
+    `SELECT id, egress_id, recording_mode, started_at, status
+     FROM recording_sessions
+     WHERE room_name = $1 AND status IN ('active', 'finalizing')
+     ORDER BY started_at DESC LIMIT 1`,
+    [roomData.roomName]
+  );
+
+  if (result.rows.length === 0) {
+    return res.json({ recording: false });
+  }
+
+  const session = result.rows[0];
+  res.json({
+    recording: session.status === 'active',
+    mode: session.recording_mode,
+    egressId: session.egress_id,
+    sessionId: session.id,
+    startedAt: session.started_at,
+    status: session.status,
+  });
+});
+
+// ---------------------------------------------------------------------------
+// GET /recordings — List user's recordings
+// Query: ?limit=20&offset=0
+// Requires: auth
+// Returns: { recordings: [...], total }
+// ---------------------------------------------------------------------------
+app.get('/recordings', auth.requireAuth, async (req, res) => {
+  const limit = Math.min(parseInt(req.query.limit || '20', 10), 100);
+  const offset = parseInt(req.query.offset || '0', 10);
+
+  try {
+    const countResult = await db.query(
+      `SELECT COUNT(*) FROM recording_sessions WHERE user_id = $1 AND status IN ('completed', 'failed')`,
+      [req.user.userId]
+    );
+    const total = parseInt(countResult.rows[0].count, 10);
+
+    const result = await db.query(
+      `SELECT id, room_name, room_code, recording_mode, started_at, ended_at,
+              duration_seconds, file_size_bytes, watermarked, status
+       FROM recording_sessions
+       WHERE user_id = $1 AND status IN ('completed', 'failed')
+       ORDER BY created_at DESC
+       LIMIT $2 OFFSET $3`,
+      [req.user.userId, limit, offset]
+    );
+
+    res.json({ recordings: result.rows, total });
+  } catch (err) {
+    console.error(`[error] List recordings failed:`, err.message);
+    res.status(500).json({ error: 'Failed to list recordings' });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// GET /recordings/:id — Get recording details
+// Requires: auth (owner only)
+// Returns: full recording session data
+// ---------------------------------------------------------------------------
+app.get('/recordings/:id', auth.requireAuth, async (req, res) => {
+  const result = await db.query(
+    `SELECT * FROM recording_sessions WHERE id = $1`,
+    [req.params.id]
+  );
+
+  if (result.rows.length === 0) return res.status(404).json({ error: 'Recording not found' });
+
+  const session = result.rows[0];
+  if (session.user_id !== req.user.userId) {
+    return res.status(403).json({ error: 'Not authorized to view this recording' });
+  }
+
+  res.json(session);
+});
+
+// ---------------------------------------------------------------------------
+// GET /recordings/:id/download — Get presigned download URL
+// Requires: auth (owner only)
+// Returns: { url, expiresInSeconds }
+// ---------------------------------------------------------------------------
+app.get('/recordings/:id/download', auth.requireAuth, async (req, res) => {
+  const result = await db.query(
+    `SELECT storage_url, user_id FROM recording_sessions WHERE id = $1 AND status = 'completed'`,
+    [req.params.id]
+  );
+
+  if (result.rows.length === 0) return res.status(404).json({ error: 'Recording not found' });
+
+  const session = result.rows[0];
+  if (session.user_id !== req.user.userId) {
+    return res.status(403).json({ error: 'Not authorized to download this recording' });
+  }
+
+  if (!session.storage_url) {
+    return res.status(404).json({ error: 'Recording file not available (local recording or still processing)' });
+  }
+
+  // Resolve S3 key from storage_url — handles absolute URLs and relative paths.
+  let s3Key;
+  try {
+    s3Key = new URL(session.storage_url).pathname.slice(1);
+  } catch (_urlErr) {
+    if (!session.storage_url.includes('://')) {
+      // Relative path (e.g. "recordings/abc.mp4" or "/recordings/abc.mp4") — trim leading slashes.
+      s3Key = session.storage_url.replace(/^\/+/, '');
+      console.warn(`[warn] storage_url for recording ${req.params.id} is not an absolute URL` +
+        ` ("${session.storage_url}"); derived s3Key="${s3Key}" by trimming leading slashes`);
+    } else {
+      console.error(`[error] Malformed storage_url for recording ${req.params.id}:` +
+        ` "${session.storage_url}" — ${_urlErr.message}`);
+      return res.status(400).json({ error: 'Recording has an invalid storage URL' });
+    }
+  }
+
+  try {
+    // Generate a presigned URL using the module-level shared S3 client.
+    const command = new GetObjectCommand({ Bucket: S3_RECORDINGS_BUCKET, Key: s3Key });
+    const presignedUrl = await getSignedUrl(s3Client, command, { expiresIn: 900 });
+
+    // Audit log
+    await db.query(
+      `INSERT INTO recording_download_audit (session_id, user_id, ip_address)
+       VALUES ($1, $2, $3)`,
+      [req.params.id, req.user.userId, req.ip]
+    );
+
+    res.json({ url: presignedUrl, expiresInSeconds: 900 });
+  } catch (err) {
+    console.error(`[error] Download URL generation failed for recording ${req.params.id}:`, err.message);
+    res.status(500).json({ error: 'Failed to generate download URL' });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// DELETE /recordings/:id — Delete a recording
+// Requires: auth (owner only)
+// Returns: { success }
+// ---------------------------------------------------------------------------
+app.delete('/recordings/:id', auth.requireAuth, async (req, res) => {
+  const result = await db.query(
+    `SELECT id, user_id, storage_url FROM recording_sessions WHERE id = $1`,
+    [req.params.id]
+  );
+
+  if (result.rows.length === 0) return res.status(404).json({ error: 'Recording not found' });
+
+  const session = result.rows[0];
+  if (session.user_id !== req.user.userId) {
+    return res.status(403).json({ error: 'Not authorized to delete this recording' });
+  }
+
+  // [Gap #11] Delete the recording file from S3 before removing the DB row.
+  if (session.storage_url) {
+    // Resolve S3 key — handles absolute URLs and relative paths.
+    let s3Key;
+    try {
+      s3Key = new URL(session.storage_url).pathname.slice(1);
+    } catch (_urlErr) {
+      if (!session.storage_url.includes('://')) {
+        // Relative path — derive key by trimming leading slashes.
+        s3Key = session.storage_url.replace(/^\/+/, '');
+        console.warn(`[warn] storage_url for recording ${req.params.id} is not an absolute URL` +
+          ` ("${session.storage_url}"); derived s3Key="${s3Key}" by trimming leading slashes`);
+      } else {
+        console.error(`[error] Malformed storage_url for recording ${req.params.id}:` +
+          ` "${session.storage_url}" — ${_urlErr.message}; skipping S3 deletion`);
+        s3Key = null;
+      }
+    }
+
+    if (s3Key) {
+      try {
+        await s3Client.send(new DeleteObjectCommand({ Bucket: S3_RECORDINGS_BUCKET, Key: s3Key }));
+        console.log(`[audit] S3 object deleted: key=${s3Key}`);
+      } catch (s3Err) {
+        console.error(`[warn] Failed to delete S3 object for recording ${req.params.id}:`, s3Err.message);
+        // Continue with DB deletion even if S3 delete fails — orphaned objects
+        // can be cleaned up by S3 lifecycle rules.
+      }
+    }
+  }
+
+  await db.query(`DELETE FROM recording_sessions WHERE id = $1`, [req.params.id]);
+
+  console.log(`[audit] Recording deleted: id=${req.params.id} by=${req.user.userId}`);
+  res.json({ success: true });
+});
+
+// ---------------------------------------------------------------------------
+// POST /webhooks/egress — LiveKit Egress webhook handler
+// Receives EgressInfo events as recording progresses.
+// Validates X-Livekit-Signature header.
+// ---------------------------------------------------------------------------
+app.post('/webhooks/egress', express.raw({ type: 'application/webhook+json' }), async (req, res) => {
+  let event;
+  try {
+    event = await webhookReceiver.receive(req.body, req.get('Authorization'));
+  } catch (err) {
+    console.error(`[warn] Invalid egress webhook signature:`, err.message);
+    return res.status(400).json({ error: 'Invalid webhook signature' });
+  }
+
+  const egressInfo = event.egressInfo;
+  if (!egressInfo) {
+    // Not an egress event — could be a room or participant event
+    return res.status(200).json({ ignored: true });
+  }
+
+  const { egressId, status } = egressInfo;
+  console.log(`[egress-webhook] egressId=${egressId} status=${status}`);
+
+  try {
+    if (status === 'EGRESS_ENDING' || status === 2) {
+      // Egress is shutting down — mark as finalizing (idempotent)
+      await db.query(
+        `UPDATE recording_sessions SET status = 'finalizing' WHERE egress_id = $1 AND status = 'active'`,
+        [egressId]
+      );
+      // Also check if this is a multi-track participant egress
+      await db.query(
+        `UPDATE recording_tracks SET status = 'finalizing' WHERE egress_id = $1 AND status = 'active'`,
+        [egressId]
+      );
+
+    } else if (status === 'EGRESS_COMPLETE' || status === 3) {
+      // File is fully written and uploaded
+      const fileResults = egressInfo.fileResults || egressInfo.file_results || [];
+      const storageUrl = fileResults.length > 0 ? (fileResults[0].location || fileResults[0].download_url || null) : null;
+      const fileSizeBytes = fileResults.length > 0 ? (fileResults[0].size || null) : null;
+
+      // Calculate duration from egress timestamps (nanoseconds).
+      // BigInt() throws for floats and non-numeric strings, so we coerce to a
+      // safe integer string first and catch any remaining edge cases.
+      let durationSeconds = null;
+      const startedAt = egressInfo.startedAt || egressInfo.started_at;
+      const endedAt   = egressInfo.endedAt   || egressInfo.ended_at;
+      if (startedAt && endedAt) {
+        try {
+          // Convert to integer (handles both Number and numeric-string inputs;
+          // Math.trunc drops any fractional part that would cause BigInt to throw).
+          const startNs = BigInt(Math.trunc(Number(startedAt)));
+          const endNs   = BigInt(Math.trunc(Number(endedAt)));
+          durationSeconds = Math.max(0, Math.floor(Number(endNs - startNs) / 1e9));
+        } catch (tsErr) {
+          console.error(
+            `[warn] Could not compute duration for egress ${egressId}:` +
+            ` startedAt=${startedAt} endedAt=${endedAt} — ${tsErr.message}; defaulting to 0`
+          );
+          durationSeconds = 0;
+        }
+      }
+
+      // Check if this egress belongs to a multi-track participant track
+      const trackResult = await db.query(
+        `UPDATE recording_tracks
+         SET status = 'completed', storage_url = $1, duration_seconds = $2, file_size_bytes = $3
+         WHERE egress_id = $4
+         RETURNING session_id, participant_identity`,
+        [storageUrl, durationSeconds, fileSizeBytes, egressId]
+      );
+
+      if (trackResult.rows.length > 0) {
+        // This is a multi-track participant egress — check if all tracks are done
+        const sessionId = trackResult.rows[0].session_id;
+        const pendingResult = await db.query(
+          `SELECT COUNT(*) FROM recording_tracks WHERE session_id = $1 AND status NOT IN ('completed', 'failed')`,
+          [sessionId]
+        );
+        const pendingCount = parseInt(pendingResult.rows[0].count, 10);
+
+        if (pendingCount === 0) {
+          // All tracks complete — generate manifest and finalize session
+          const allTracks = await db.query(
+            `SELECT participant_identity, participant_name, storage_url, duration_seconds, has_screen_share
+             FROM recording_tracks WHERE session_id = $1 AND status = 'completed'`,
+            [sessionId]
+          );
+
+          const sessionInfo = await db.query(
+            `SELECT room_name, started_at FROM recording_sessions WHERE id = $1`,
+            [sessionId]
+          );
+
+          // Calculate total duration as max of all track durations
+          const maxDuration = allTracks.rows.reduce((max, t) => Math.max(max, t.duration_seconds || 0), 0);
+
+          // Generate manifest JSON (uploaded to S3 alongside tracks)
+          const manifest = {
+            roomName: sessionInfo.rows[0]?.room_name || 'unknown',
+            recordingMode: 'multi_track',
+            startedAt: sessionInfo.rows[0]?.started_at || new Date().toISOString(),
+            endedAt: new Date().toISOString(),
+            tracks: allTracks.rows.map(t => ({
+              participantIdentity: t.participant_identity,
+              participantName: t.participant_name,
+              videoUrl: t.storage_url,
+              duration: t.duration_seconds,
+              hasScreenShare: t.has_screen_share || false,
+            })),
+          };
+
+          // Derive the S3 key for the manifest (same prefix as the first track).
+          // Guard against allTracks.rows being empty (shouldn't happen, but be safe).
+          const firstTrackUrl = allTracks.rows[0]?.storage_url || null;
+          const manifestKey = firstTrackUrl
+            ? firstTrackUrl.replace(/\/[^/]+$/, '/manifest.json')
+            : `recordings/${sessionId}/manifest.json`;
+
+          // Upload the manifest JSON to S3 before finalizing the session.
+          // Failure here is surfaced as an exception so the outer try/catch marks
+          // the session as failed rather than writing a dangling manifest_url.
+          await s3Client.send(new PutObjectCommand({
+            Bucket: S3_RECORDINGS_BUCKET,
+            Key: manifestKey,
+            Body: JSON.stringify(manifest, null, 2),
+            ContentType: 'application/json',
+          }));
+          console.log(`[audit] Manifest uploaded: key=${manifestKey} sessionId=${sessionId}`);
+
+          // Build the canonical S3 URL stored in manifest_url.
+          const manifestUrl = `https://${S3_RECORDINGS_BUCKET}.s3.${AWS_REGION}.amazonaws.com/${manifestKey}`;
+
+          // Finalize the parent session
+          const sessionResult2 = await db.query(
+            `UPDATE recording_sessions
+             SET status = 'completed', ended_at = NOW(),
+                 duration_seconds = $1, manifest_url = $2
+             WHERE id = $3
+             RETURNING user_id`,
+            [maxDuration, manifestUrl, sessionId]
+          );
+
+          // Update metering
+          if (sessionResult2.rows.length > 0 && maxDuration > 0) {
+            const { user_id: userId } = sessionResult2.rows[0];
+            await db.query(
+              `UPDATE users SET recording_minutes_used = recording_minutes_used + $1 WHERE id = $2`,
+              [Math.ceil(maxDuration / 60), userId]
+            );
+          }
+
+          console.log(`[egress-webhook] Multi-track recording completed: session=${sessionId} tracks=${allTracks.rows.length} duration=${maxDuration}s`);
+          console.log(`[egress-webhook] Manifest: ${JSON.stringify(manifest)}`);
+        }
+      } else {
+        // Single egress (cloud_composed) — update session directly
+        const sessionResult = await db.query(
+          `UPDATE recording_sessions
+           SET status = 'completed', ended_at = NOW(),
+               duration_seconds = $1, storage_url = $2, file_size_bytes = $3
+           WHERE egress_id = $4
+           RETURNING user_id`,
+          [durationSeconds, storageUrl, fileSizeBytes, egressId]
+        );
+
+        // Update metering on the user
+        if (sessionResult.rows.length > 0 && durationSeconds !== null && durationSeconds > 0) {
+          const { user_id: userId } = sessionResult.rows[0];
+          await db.query(
+            `UPDATE users SET recording_minutes_used = recording_minutes_used + $1 WHERE id = $2`,
+            [Math.ceil(durationSeconds / 60), userId]
+          );
+        }
+
+        console.log(`[egress-webhook] Recording completed: egress=${egressId} duration=${durationSeconds}s url=${storageUrl}`);
+      }
+
+    } else if (status === 'EGRESS_FAILED' || status === 4) {
+      // Recording failed
+      const egressError = egressInfo.error || egressInfo.error_message || 'Unknown error';
+      // Check if this is a multi-track participant egress
+      const failedTrack = await db.query(
+        `UPDATE recording_tracks SET status = 'failed' WHERE egress_id = $1 RETURNING session_id`,
+        [egressId]
+      );
+      // Also try the main session
+      await db.query(
+        `UPDATE recording_sessions SET status = 'failed', ended_at = NOW() WHERE egress_id = $1`,
+        [egressId]
+      );
+      console.error(`[egress-webhook] Recording failed: egress=${egressId} error=${egressError}`);
+    }
+
+    // ACK only after all processing succeeds — LiveKit will retry on non-2xx.
+    res.status(200).json({ received: true });
+  } catch (err) {
+    console.error(`[error] Webhook processing failed for egress=${egressId}:`, err.message);
+    console.error(err.stack);
+    // Return 5xx so LiveKit retries the delivery on transient failures
+    // (DB unavailable, S3 upload error, etc.).
+    res.status(500).json({ error: 'processing_failed' });
   }
 });
 

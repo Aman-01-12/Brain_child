@@ -172,6 +172,7 @@
 - (void)addLiveSink:(id<InterShareSink>)sink {
     if (!sink) return;
 
+    BOOL didAddSink = NO;
     BOOL currentlySharing = NO;
     InterShareSessionConfiguration *configurationSnapshot = nil;
 
@@ -180,16 +181,17 @@
     if (![mutable containsObject:sink]) {
         [mutable addObject:sink];
         _sinks = [mutable copy];
-    }
-    currentlySharing = self.sharing;
-    if (currentlySharing) {
-        configurationSnapshot = [self.configuration copy];
+        didAddSink = YES;
+        currentlySharing = self.sharing;
+        if (currentlySharing) {
+            configurationSnapshot = [self.configuration copy];
+        }
     }
     os_unfair_lock_unlock(&_stateLock);
 
-    // If sharing is already active, start the newly added sink with the
-    // current configuration so it begins receiving frames immediately.
-    if (currentlySharing && configurationSnapshot) {
+    // Only start the sink if it was newly added and sharing is already active,
+    // so it begins receiving frames immediately.
+    if (didAddSink && currentlySharing && configurationSnapshot) {
         [sink startWithConfiguration:configurationSnapshot completion:^(BOOL active, NSString * _Nullable statusText) {
 #pragma unused(active, statusText)
         }];

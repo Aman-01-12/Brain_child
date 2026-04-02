@@ -52,6 +52,12 @@ typedef NS_ENUM(NSInteger, InterComposedLayout) {
 /// Delegate for layout change notifications.
 @property (nonatomic, weak) id<InterComposedRendererDelegate> delegate;
 
+/// The serial queue from which `renderComposedFrame` MUST be called.
+/// When non-nil, `renderComposedFrame` asserts (debug builds only) that the
+/// caller is running on this queue, enforcing the single-queue contract
+/// documented on that method.
+@property (nonatomic, nullable) dispatch_queue_t designatedRenderQueue;
+
 /// Designated initializer.
 ///
 /// @param device        Metal device (from MetalRenderEngine.sharedEngine.device).
@@ -82,14 +88,23 @@ typedef NS_ENUM(NSInteger, InterComposedLayout) {
 
 /// Generate (or return cached) placeholder frame for an audio-only participant.
 /// Thread-safe — caches per identity. Dark background with the participant's name.
+///
+/// Ownership: the returned CVPixelBufferRef is **not owned by the caller**.
+/// It is borrowed from the internal per-identity cache, which retains sole
+/// responsibility for its lifetime. Do NOT call CFRelease, CVPixelBufferRelease,
+/// or CFBridgingRelease on the returned value.
 - (CVPixelBufferRef _Nonnull)placeholderFrameForIdentity:(NSString *)identity;
 
 /// Render one composed frame from the current video sources.
 ///
 /// Returns an IOSurface-backed CVPixelBuffer from the internal triple-buffer pool.
 /// The GPU has completed rendering before this method returns (waitUntilCompleted).
-///
 /// Must be called from the render timer serial queue only.
+///
+/// Ownership: the returned CVPixelBufferRef is **not owned by the caller**.
+/// It is borrowed from the internal triple-buffer pool, which manages its
+/// lifetime and GPU fence. Do NOT call CFRelease, CVPixelBufferRelease, or
+/// CFBridgingRelease on the returned value.
 - (CVPixelBufferRef _Nullable)renderComposedFrame;
 
 /// Release all Metal resources and pixel buffer pool. Called during teardown.

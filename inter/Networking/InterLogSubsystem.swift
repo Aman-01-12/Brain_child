@@ -86,6 +86,19 @@ func interLogDebug(_ log: OSLog, _ message: StaticString, _ args: CVarArg...) {
     }
 }
 
+/// Log at warning level (maps to os_log .default — between info and error).
+/// Use for recoverable issues that deserve attention (e.g. low disk space).
+@usableFromInline
+func interLogWarning(_ log: OSLog, _ message: StaticString, _ args: CVarArg...) {
+    switch args.count {
+    case 0: os_log(message, log: log, type: .default)
+    case 1: os_log(message, log: log, type: .default, args[0])
+    case 2: os_log(message, log: log, type: .default, args[0], args[1])
+    case 3: os_log(message, log: log, type: .default, args[0], args[1], args[2])
+    default: os_log(message, log: log, type: .default, args[0], args[1], args[2], args[3])
+    }
+}
+
 /// Log at fault level. Use for conditions that should never happen (programming errors).
 @usableFromInline
 func interLogFault(_ log: OSLog, _ message: StaticString, _ args: CVarArg...) {

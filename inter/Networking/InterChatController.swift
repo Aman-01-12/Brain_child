@@ -53,6 +53,20 @@ import LiveKit
                               participantDidLowerHand identity: String)
 }
 
+// Phase 10 — Recording consent notification delegate
+/// Implemented by AppDelegate (or any coordinator) to react to recording state
+/// broadcasts sent by the host over the control DataChannel.
+@objc public protocol InterRecordingSignalDelegate: AnyObject {
+    /// The host started recording. Show the REC indicator.
+    @objc func recordingDidStart()
+    /// The host paused recording. Update the indicator to PAUSED.
+    @objc func recordingDidPause()
+    /// The host resumed recording after a pause.
+    @objc func recordingDidResume()
+    /// The host stopped recording. Hide the REC indicator.
+    @objc func recordingDidStop()
+}
+
 // MARK: - InterChatController
 
 @objc public class InterChatController: NSObject {
@@ -68,6 +82,9 @@ import LiveKit
     /// [Phase 9] Moderation controller — receives Phase 9 control signals
     /// (disable chat, ask to unmute, suspend, force spotlight, etc.).
     @objc public weak var moderationController: InterModerationController?
+
+    /// [Phase 10] Delegate for recording consent signals broadcast by the host.
+    @objc public weak var recordingDelegate: (any InterRecordingSignalDelegate)?
 
     /// All messages in chronological order. Thread-safe read from main queue.
     @objc public private(set) var messages: [InterChatMessageInfo] = []
@@ -293,6 +310,14 @@ import LiveKit
         controlDelegate?.chatController(self, participantDidLowerHand: identity)
     }
 
+    // MARK: - Recording Signals (Phase 10)
+
+    /// Broadcast a recording state change over the control DataChannel.
+    /// Call this from `InterRecordingCoordinator` whenever the recording state transitions.
+    @objc public func broadcastRecordingSignal(type: InterControlSignalType) {
+        sendControlSignal(type: type)
+    }
+
     // MARK: - Receive Data (called by InterRoomController delegate)
 
     /// Handle incoming data from LiveKit DataChannel.
@@ -510,6 +535,24 @@ import LiveKit
              .requestToSpeak, .allowToSpeak:
             guard signal.senderIdentity != localIdentity else { return }
             moderationController?.handleControlSignal(signal)
+
+        // Phase 10 — Recording consent signals (host → all participants)
+        case .recordingStarted:
+            guard signal.senderIdentity != localIdentity else { return }
+            interLogInfo(InterLog.room, "ChatController: remote recording started by %{public}@", signal.senderName)
+            recordingDelegate?.recordingDidStart()
+        case .recordingPaused:
+            guard signal.senderIdentity != localIdentity else { return }
+            interLogInfo(InterLog.room, "ChatController: remote recording paused")
+            recordingDelegate?.recordingDidPause()
+        case .recordingResumed:
+            guard signal.senderIdentity != localIdentity else { return }
+            interLogInfo(InterLog.room, "ChatController: remote recording resumed")
+            recordingDelegate?.recordingDidResume()
+        case .recordingStopped:
+            guard signal.senderIdentity != localIdentity else { return }
+            interLogInfo(InterLog.room, "ChatController: remote recording stopped")
+            recordingDelegate?.recordingDidStop()
 
         @unknown default:
             interLogDebug(InterLog.room, "ChatController: unknown control signal type %d", signal.type.rawValue)

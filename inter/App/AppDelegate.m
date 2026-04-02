@@ -19,6 +19,7 @@
 #import "InterPollPanel.h"
 #import "InterQAPanel.h"
 #import "InterLobbyPanel.h"
+#import "InterRecordingIndicatorView.h"
 
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 
@@ -27,7 +28,7 @@
 #import "inter-Swift.h"
 #endif
 
-@interface AppDelegate () <NSWindowDelegate, InterConnectionSetupPanelDelegate, InterParticipantOverlayDelegate, InterChatPanelDelegate, InterSpeakerQueuePanelDelegate, InterPollPanelDelegate, InterQAPanelDelegate, InterMediaWiringDelegate, InterModerationDelegate, InterLobbyPanelDelegate>
+@interface AppDelegate () <NSWindowDelegate, InterConnectionSetupPanelDelegate, InterParticipantOverlayDelegate, InterChatPanelDelegate, InterSpeakerQueuePanelDelegate, InterPollPanelDelegate, InterQAPanelDelegate, InterMediaWiringDelegate, InterModerationDelegate, InterLobbyPanelDelegate, InterRecordingCoordinatorDelegate, InterRecordingSignalDelegate>
 @property (nonatomic, strong) NSMutableArray<CapWindow *> *capWindows;
 @property (nonatomic, strong) SecureWindowController *secureController;
 @property (nonatomic, strong) NSWindow *setupWindow;
@@ -78,6 +79,10 @@
 @property (nonatomic, assign) BOOL isShowingExternalDisplayAlert;
 @property (nonatomic, weak) NSWindow *fullScreenExitPendingWindow;
 
+// [Phase 10] Recording
+@property (nonatomic, strong, nullable) InterRecordingCoordinator *normalRecordingCoordinator;
+@property (nonatomic, strong, nullable) InterRecordingIndicatorView *normalRecordingIndicatorView;
+
 // [2.5.2] Room controller — persists across mode transitions [G4]
 @property (nonatomic, strong, nullable) InterRoomController *roomController;
 
@@ -118,6 +123,10 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
 }
 
 - (void)applicationDidFinishLaunching:(NSNotification *)aNotification {
+    // [Finding 11] Register InterAudioEngineAccess as the head of LiveKit's engine-observer
+    // chain BEFORE any room connects so engineWillStart fires and the engine ref is captured.
+    [InterAudioEngineAccess register];
+
     self.sessionCoordinator = [[InterCallSessionCoordinator alloc] init];
 
     // [2.5.2] Create room controller. [G8] If this fails, app continues as local-only
@@ -148,10 +157,16 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
     self.moderationController = [[InterModerationController alloc] init];
     self.moderationController.delegate = self;
 
+    // [Phase 10] Create recording coordinator
+    self.normalRecordingCoordinator = [[InterRecordingCoordinator alloc] init];
+    self.normalRecordingCoordinator.delegate = self;
+
     if (self.roomController) {
         self.roomController.chatController = self.chatController;
         self.roomController.pollController = self.pollController;
         self.roomController.qaController = self.qaController;
+        // [Phase 10] Wire recording coordinator for room disconnect auto-stop
+        self.roomController.recordingCoordinator = self.normalRecordingCoordinator;
         // Wire moderation controller into chat controller for Phase 9 signal forwarding
         self.chatController.moderationController = self.moderationController;
     }
@@ -201,6 +216,12 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
     // [Phase 9] Clean up moderation controller
     [self.moderationController detach];
     self.moderationController = nil;
+
+    // [Phase 10] Stop any active recording
+    if (self.normalRecordingCoordinator.canStop) {
+        [self.normalRecordingCoordinator stopRecording];
+    }
+    self.normalRecordingCoordinator = nil;
 
     if (self.roomController) {
         [self.roomController disconnect];
@@ -768,6 +789,18 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
     self.chatController.controlDelegate = (id<InterControlSignalDelegate>)self;
     self.chatController.isChatVisible = NO;
 
+    // [Phase 10] Wire recording coordinator to chat controller for consent broadcasts
+    self.normalRecordingCoordinator.chatController = self.chatController;
+    self.normalRecordingCoordinator.localParticipantIdentity = self.roomController.localParticipantIdentity;
+    self.chatController.recordingDelegate = (id<InterRecordingSignalDelegate>)self;
+
+    // [Phase 10] REC indicator badge — shown to ALL participants (host drives it; others get DataChannel signal)
+    self.normalRecordingIndicatorView = [[InterRecordingIndicatorView alloc] initWithFrame:
+        NSMakeRect(view.bounds.size.width - 210.0, view.bounds.size.height - 40.0, 200.0, 28.0)];
+    self.normalRecordingIndicatorView.autoresizingMask = NSViewMinXMargin | NSViewMinYMargin;
+    self.normalRecordingIndicatorView.indicatorActive = NO;
+    [view addSubview:self.normalRecordingIndicatorView];
+
     // [Phase 8.5] Poll window (standalone, movable/resizable — Zoom-style)
     {
         CGFloat pollW = 320;
@@ -910,6 +943,12 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
     };
     self.normalControlPanel.shareSystemAudioChangedHandler = ^(BOOL enabled) {
         [weakSelf handleNormalShareSystemAudioChanged:enabled];
+    };
+
+    // [Phase 10] Record toggle — visible to host/co-host only
+    [self.normalControlPanel setRecordingButtonHidden:!self.roomController.isHost];
+    self.normalControlPanel.recordToggleHandler = ^{
+        [weakSelf handleRecordToggle];
     };
 
     // [3.4.4] Network quality signal bars in the control panel
@@ -1930,6 +1969,74 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
     }
 }
 
+#pragma mark - Recording (Phase 10)
+
+- (void)handleRecordToggle {
+    InterRecordingCoordinator *coordinator = self.normalRecordingCoordinator;
+    if (!coordinator) return;
+    InterRecordingState state = coordinator.state;
+    if (state == InterRecordingStateIdle || state == InterRecordingStateFinalized) {
+        if (!self.normalMediaController || !self.normalSurfaceShareController) return;
+        NSString *tier = @"free"; // Phase 10C: read from auth profile
+        [coordinator startLocalRecordingWithScreenShareSource:self.normalSurfaceShareController
+                                                   subscriber:self.roomController.subscriber
+                                          localMediaController:self.normalMediaController
+                                                     userTier:tier];
+    } else if (state == InterRecordingStateRecording) {
+        [coordinator pauseRecording];
+    } else if (state == InterRecordingStatePaused) {
+        [coordinator stopRecording];
+    }
+}
+
+#pragma mark - InterRecordingCoordinatorDelegate (Phase 10)
+
+- (void)recordingStateDidChange:(InterRecordingState)state {
+    BOOL active = (state == InterRecordingStateRecording);
+    BOOL paused = (state == InterRecordingStatePaused);
+    [self.normalControlPanel setRecordingActive:(active || paused)];
+    self.normalRecordingIndicatorView.indicatorActive = (active || paused);
+    self.normalRecordingIndicatorView.indicatorPaused = paused;
+    if (state == InterRecordingStateIdle || state == InterRecordingStateFinalized) {
+        [self.normalRecordingIndicatorView setElapsedDuration:0];
+    }
+}
+
+- (void)recordingDidCompleteWithOutputURL:(NSURL *)outputURL error:(NSError *)error {
+    if (error) {
+        NSAlert *alert = [NSAlert alertWithError:error];
+        [alert runModal];
+    } else if (outputURL) {
+        [[NSWorkspace sharedWorkspace] activateFileViewerSelectingURLs:@[outputURL]];
+    }
+    [self.normalControlPanel setRecordingActive:NO];
+    self.normalRecordingIndicatorView.indicatorActive = NO;
+}
+
+- (void)recordingDurationDidUpdate:(NSTimeInterval)duration {
+    [self.normalRecordingIndicatorView setElapsedDuration:duration];
+}
+
+#pragma mark - InterRecordingSignalDelegate (Phase 10)
+
+- (void)recordingDidStart {
+    self.normalRecordingIndicatorView.indicatorActive = YES;
+    self.normalRecordingIndicatorView.indicatorPaused = NO;
+}
+
+- (void)recordingDidPause {
+    self.normalRecordingIndicatorView.indicatorPaused = YES;
+}
+
+- (void)recordingDidResume {
+    self.normalRecordingIndicatorView.indicatorPaused = NO;
+}
+
+- (void)recordingDidStop {
+    self.normalRecordingIndicatorView.indicatorActive = NO;
+    [self.normalRecordingIndicatorView setElapsedDuration:0];
+}
+
 #pragma mark - Diagnostics [3.4.5]
 
 /// [B1] Trampoline: gesture recognizer target must be self; forward to wiring controller.
@@ -1993,6 +2100,19 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
 }
 
 - (void)teardownActiveWindows {
+    // [Phase 10] Stop recording and clean up indicator before tearing down media sources
+    if (self.normalRecordingCoordinator.canStop) {
+        [self.normalRecordingCoordinator stopRecording];
+    }
+    if (self.normalControlPanel) {
+        self.normalControlPanel.recordToggleHandler = nil;
+    }
+    if (self.normalRecordingIndicatorView) {
+        [self.normalRecordingIndicatorView removeFromSuperview];
+        self.normalRecordingIndicatorView = nil;
+    }
+    self.chatController.recordingDelegate = nil;
+
     if (self.normalControlPanel) {
         self.normalControlPanel.cameraToggleHandler = nil;
         self.normalControlPanel.microphoneToggleHandler = nil;

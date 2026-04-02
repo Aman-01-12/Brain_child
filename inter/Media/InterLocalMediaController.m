@@ -1,6 +1,6 @@
 #import "InterLocalMediaController.h"
 
-@interface InterLocalMediaController () <AVCaptureAudioDataOutputSampleBufferDelegate>
+@interface InterLocalMediaController () <AVCaptureAudioDataOutputSampleBufferDelegate, AVCaptureVideoDataOutputSampleBufferDelegate>
 @property (atomic, assign, readwrite, getter=isConfigured) BOOL configured;
 @property (atomic, assign, readwrite, getter=isRunning) BOOL running;
 @property (atomic, assign, readwrite, getter=isCameraEnabled) BOOL cameraEnabled;
@@ -28,6 +28,10 @@ static const void *InterLocalMediaSessionQueueKey = &InterLocalMediaSessionQueue
     AVCaptureDeviceInput *_videoInput;
     AVCaptureDeviceInput *_audioInput;
     AVCaptureAudioDataOutput *_audioDataOutput;
+
+    // [Phase 10] Video data output for recording frame observer
+    AVCaptureVideoDataOutput *_videoDataOutput;
+    dispatch_queue_t _videoFrameOutputQueue;
 
     __weak NSView *_previewHostView;
     AVCaptureVideoPreviewLayer *_previewLayer;
@@ -71,6 +75,8 @@ static const void *InterLocalMediaSessionQueueKey = &InterLocalMediaSessionQueue
                                                     DISPATCH_QUEUE_SERIAL);
     _audioSampleCallbackQueue = dispatch_queue_create("secure.inter.media.local.audio.callback",
                                                       DISPATCH_QUEUE_SERIAL);
+    _videoFrameOutputQueue = dispatch_queue_create("secure.inter.media.local.video.recording",
+                                                   DISPATCH_QUEUE_SERIAL);
     dispatch_queue_set_specific(_sessionQueue,
                                 InterLocalMediaSessionQueueKey,
                                 (void *)InterLocalMediaSessionQueueKey,
@@ -821,7 +827,23 @@ static const void *InterLocalMediaSessionQueueKey = &InterLocalMediaSessionQueue
 didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
        fromConnection:(AVCaptureConnection *)connection {
 #pragma unused(connection)
-    if (output != _audioDataOutput || !sampleBuffer || self.isShuttingDown) {
+    if (!sampleBuffer || self.isShuttingDown) {
+        return;
+    }
+
+    // [Phase 10] Video data output → recording frame observer
+    if (output == _videoDataOutput) {
+        CVPixelBufferRef pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer);
+        if (!pixelBuffer) return;
+        InterLocalMediaVideoFrameObserver observer = self.recordingFrameObserver;
+        if (observer) {
+            observer(pixelBuffer);
+        }
+        return;
+    }
+
+    // Audio data output → audio sample buffer handler
+    if (output != _audioDataOutput) {
         return;
     }
 
@@ -846,6 +868,57 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
 
         CFRelease(sampleBuffer);
     });
+}
+
+#pragma mark - Recording Frame Observer (Phase 10)
+
+- (void)setRecordingFrameObserver:(InterLocalMediaVideoFrameObserver)recordingFrameObserver {
+    InterLocalMediaVideoFrameObserver copiedObserver = [recordingFrameObserver copy];
+
+    dispatch_async(_sessionQueue, ^{
+        // Assign on _sessionQueue so the write is serialized with
+        // _addVideoDataOutputLocked / _removeVideoDataOutputLocked.
+        // The property is atomic so the getter on _videoFrameOutputQueue
+        // returns a safely-published pointer.
+        self->_recordingFrameObserver = copiedObserver;
+        if (copiedObserver) {
+            [self _addVideoDataOutputLocked];
+        } else {
+            [self _removeVideoDataOutputLocked];
+        }
+    });
+}
+
+/// Add AVCaptureVideoDataOutput to capture session for recording.
+- (void)_addVideoDataOutputLocked {
+    if (_videoDataOutput || !_session) return;
+
+    AVCaptureVideoDataOutput *videoOutput = [[AVCaptureVideoDataOutput alloc] init];
+    videoOutput.videoSettings = @{
+        (id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA),
+    };
+    videoOutput.alwaysDiscardsLateVideoFrames = YES;
+    [videoOutput setSampleBufferDelegate:self queue:_videoFrameOutputQueue];
+
+    [_session beginConfiguration];
+    if ([_session canAddOutput:videoOutput]) {
+        [_session addOutput:videoOutput];
+        _videoDataOutput = videoOutput;
+    }
+    [_session commitConfiguration];
+}
+
+/// Remove video data output from capture session.
+- (void)_removeVideoDataOutputLocked {
+    if (!_videoDataOutput || !_session) return;
+
+    [_videoDataOutput setSampleBufferDelegate:nil queue:NULL];
+    [_session beginConfiguration];
+    if ([_session.outputs containsObject:_videoDataOutput]) {
+        [_session removeOutput:_videoDataOutput];
+    }
+    [_session commitConfiguration];
+    _videoDataOutput = nil;
 }
 
 - (AVCaptureDevice *)preferredVideoDevice {

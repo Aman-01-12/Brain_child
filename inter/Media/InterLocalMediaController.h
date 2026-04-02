@@ -6,6 +6,7 @@ NS_ASSUME_NONNULL_BEGIN
 
 typedef void (^InterLocalMediaPrepareCompletion)(BOOL success, NSString * _Nullable failureReason);
 typedef void (^InterLocalMediaAudioSampleBufferHandler)(CMSampleBufferRef sampleBuffer);
+typedef void (^InterLocalMediaVideoFrameObserver)(CVPixelBufferRef pixelBuffer);
 
 @interface InterLocalMediaController : NSObject
 
@@ -15,6 +16,14 @@ typedef void (^InterLocalMediaAudioSampleBufferHandler)(CMSampleBufferRef sample
 @property (atomic, readonly, getter=isMicrophoneEnabled) BOOL microphoneEnabled;
 @property (nonatomic, copy, nullable) InterLocalMediaAudioSampleBufferHandler audioSampleBufferHandler;
 @property (nonatomic, copy, nullable) dispatch_block_t audioInputOptionsChangedHandler;
+
+/// [Phase 10] Observer block for local camera video frames (CVPixelBuffer).
+/// When non-nil, an AVCaptureVideoDataOutput is added to the capture session
+/// to deliver BGRA pixel buffers. Used by the recording coordinator when the
+/// local user is the active speaker (camera PiP in composed recording).
+/// Set to nil to stop video frame delivery and remove the data output.
+/// Atomic: written on _sessionQueue, read on _videoFrameOutputQueue.
+@property (atomic, copy, nullable) InterLocalMediaVideoFrameObserver recordingFrameObserver;
 
 /// The underlying AVCaptureSession. Callers MUST use sessionQueue for all
 /// session-related work. Callers MUST NOT call startRunning/stopRunning.

@@ -105,13 +105,13 @@
     [self addSubview:self.shareStatusLabel];
 
     self.audioInputLabel = [NSTextField labelWithString:@"Microphone Source"];
-    self.audioInputLabel.frame = NSMakeRect(16, 196, self.bounds.size.width - 32, 16);
+    self.audioInputLabel.frame = NSMakeRect(16, 228, self.bounds.size.width - 32, 16);
     self.audioInputLabel.autoresizingMask = NSViewWidthSizable | NSViewMaxYMargin;
     self.audioInputLabel.font = [NSFont systemFontOfSize:11];
     self.audioInputLabel.textColor = [NSColor colorWithWhite:0.85 alpha:1.0];
     [self addSubview:self.audioInputLabel];
 
-    self.audioInputPopUpButton = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(16, 166, self.bounds.size.width - 32, 26)
+    self.audioInputPopUpButton = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(16, 198, self.bounds.size.width - 32, 26)
                                                              pullsDown:NO];
     self.audioInputPopUpButton.autoresizingMask = NSViewWidthSizable | NSViewMaxYMargin;
     [self.audioInputPopUpButton setTarget:self];
@@ -119,13 +119,13 @@
     [self addSubview:self.audioInputPopUpButton];
 
     self.shareModeLabel = [NSTextField labelWithString:@"Share Source"];
-    self.shareModeLabel.frame = NSMakeRect(16, 146, 120, 18);
+    self.shareModeLabel.frame = NSMakeRect(16, 178, 120, 18);
     self.shareModeLabel.autoresizingMask = NSViewMaxXMargin | NSViewMaxYMargin;
     self.shareModeLabel.font = [NSFont systemFontOfSize:11];
     self.shareModeLabel.textColor = [NSColor colorWithWhite:0.85 alpha:1.0];
     [self addSubview:self.shareModeLabel];
 
-    self.shareModePopUpButton = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(16, 118, self.bounds.size.width - 32, 26)
+    self.shareModePopUpButton = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(16, 150, self.bounds.size.width - 32, 26)
                                                             pullsDown:NO];
     self.shareModePopUpButton.autoresizingMask = NSViewWidthSizable | NSViewMaxYMargin;
     [self.shareModePopUpButton addItemWithTitle:@"Share This App"];
@@ -141,13 +141,13 @@
     [self addSubview:self.shareModePopUpButton];
 
     self.interviewToolLabel = [NSTextField labelWithString:@"Interview Tool"];
-    self.interviewToolLabel.frame = NSMakeRect(16, 146, 140, 18);
+    self.interviewToolLabel.frame = NSMakeRect(16, 178, 140, 18);
     self.interviewToolLabel.autoresizingMask = NSViewMaxXMargin | NSViewMaxYMargin;
     self.interviewToolLabel.font = [NSFont systemFontOfSize:11];
     self.interviewToolLabel.textColor = [NSColor colorWithWhite:0.85 alpha:1.0];
     [self addSubview:self.interviewToolLabel];
 
-    self.interviewToolSegmentedControl = [[NSSegmentedControl alloc] initWithFrame:NSMakeRect(16, 118, self.bounds.size.width - 32, 26)];
+    self.interviewToolSegmentedControl = [[NSSegmentedControl alloc] initWithFrame:NSMakeRect(16, 150, self.bounds.size.width - 32, 26)];
     self.interviewToolSegmentedControl.autoresizingMask = NSViewWidthSizable | NSViewMaxYMargin;
     self.interviewToolSegmentedControl.segmentCount = 3;
     [self.interviewToolSegmentedControl setLabel:@"Off" forSegment:0];
@@ -167,14 +167,14 @@
     [self.shareSystemAudioButton setAction:@selector(handleShareSystemAudioToggle:)];
     [self addSubview:self.shareSystemAudioButton];
 
-    self.cameraButton = [[NSButton alloc] initWithFrame:NSMakeRect(16, 86, self.bounds.size.width - 32, 30)];
+    self.cameraButton = [[NSButton alloc] initWithFrame:NSMakeRect(16, 118, self.bounds.size.width - 32, 30)];
     self.cameraButton.autoresizingMask = NSViewWidthSizable | NSViewMaxYMargin;
     [self.cameraButton setTitle:@"Turn Camera On"];
     [self.cameraButton setTarget:self];
     [self.cameraButton setAction:@selector(handleCameraToggle:)];
     [self addSubview:self.cameraButton];
 
-    self.microphoneButton = [[NSButton alloc] initWithFrame:NSMakeRect(16, 54, self.bounds.size.width - 32, 30)];
+    self.microphoneButton = [[NSButton alloc] initWithFrame:NSMakeRect(16, 86, self.bounds.size.width - 32, 30)];
     self.microphoneButton.autoresizingMask = NSViewWidthSizable | NSViewMaxYMargin;
     [self.microphoneButton setTitle:@"Turn Mic On"];
     [self.microphoneButton setTarget:self];

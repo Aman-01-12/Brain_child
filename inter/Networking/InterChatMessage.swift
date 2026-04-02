@@ -69,6 +69,16 @@ import Foundation
     case requestToSpeak = 24
     /// Host allows a participant to unmute and speak.
     case allowToSpeak = 25
+
+    // Phase 10 — Recording consent notification signals
+    /// A host/co-host has started recording. All participants receive this to show the REC indicator.
+    case recordingStarted = 26
+    /// Recording has been paused by the host/co-host.
+    case recordingPaused = 27
+    /// Recording has been resumed after a pause.
+    case recordingResumed = 28
+    /// Recording has been stopped. Participants should hide the REC indicator.
+    case recordingStopped = 29
 }
 
 // MARK: - Chat Message

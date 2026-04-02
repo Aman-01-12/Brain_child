@@ -152,7 +152,7 @@ typedef struct {
 
     _placeholderCache = [NSMutableDictionary dictionary];
     _ciContext = [CIContext contextWithMTLDevice:device
-                                        options:@{kCIContextWorkingColorSpace: (__bridge id)CGColorSpaceCreateWithName(kCGColorSpaceSRGB)}];
+                                        options:@{kCIContextWorkingColorSpace: (__bridge_transfer id)CGColorSpaceCreateWithName(kCGColorSpaceSRGB)}];
 
     // Create texture cache.
     CVReturn result = CVMetalTextureCacheCreate(kCFAllocatorDefault, NULL,
@@ -428,14 +428,17 @@ typedef struct {
 
     CVPixelBufferUnlockBaseAddress(buffer, 0);
 
-    // Cache the placeholder (retained by the dictionary).
+    // Transfer ownership of buffer to the cache. __bridge_transfer hands the +1
+    // retain from CVPixelBufferCreate to ARC, so the dictionary becomes the sole
+    // owner. No manual CVPixelBufferRelease is needed for this buffer.
+    // Retrieve the raw pointer in the same lock scope so there is no window
+    // between store and read.
+    CVPixelBufferRef cached = NULL;
     @synchronized (_placeholderCache) {
-        _placeholderCache[identity] = (__bridge id)buffer;
+        _placeholderCache[identity] = (__bridge_transfer id)buffer;
+        cached = (__bridge CVPixelBufferRef)_placeholderCache[identity];
     }
-
-    // The dictionary retains via __bridge — we return without releasing.
-    // The buffer is owned by the cache and will be released on invalidate.
-    return buffer;
+    return cached;
 }
 
 // ---------------------------------------------------------------------------
@@ -443,6 +446,11 @@ typedef struct {
 // ---------------------------------------------------------------------------
 
 - (CVPixelBufferRef)renderComposedFrame {
+#if DEBUG
+    if (self.designatedRenderQueue) {
+        dispatch_assert_queue(self.designatedRenderQueue);
+    }
+#endif
     if (_invalidated || !_opaquePipelineState) return NULL;
 
     // ---- 1. Snapshot frame state under lock ----

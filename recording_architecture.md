@@ -43,15 +43,15 @@
 
 ### Recording Modes
 
-**Mode 1 —Dynamic — adapts to available sources (see §5 Dynamic Layout Modes):
+**Mode 1 — Dynamic** — adapts to available sources (see §5 Dynamic Layout Modes):
   - Screen share + active speaker PiP (when screen share is active)
   - Camera-only fullscreen (single camera, no screen share)
   - Side-by-side cameras (two cameras, no screen share)
-  - Idle frame (no video sources, audio-only recording
-- Layout: Screen share (main area) + active speaker PiP (bottom-right corner)
-- Output: Single composed MP4 file (H.264 + AAC)
-- Free tier: watermarked. Pro/Hiring: no watermark
-- Save: locally (all tiers) or cloud (Pro/Hiring)
+  - Idle frame (no video sources, audio-only recording)
+  - Layout: Screen share (main area) + active speaker PiP (bottom-right corner)
+  - Output: Single composed MP4 file (H.264 + AAC)
+  - Free tier: watermarked. Pro/Hiring: no watermark
+  - Save: locally (all tiers) or cloud (Pro/Hiring)
 
 **Mode 2 — "Record Each Participant as Separate Track" (Hiring only)**
 - Each participant gets separate video (.mp4) + audio (.m4a) files
@@ -862,15 +862,16 @@ private let audioRingBuffer = AudioRingBuffer(frameDuration: 0.5, sampleRate: 48
 private let audioConversionQueue = DispatchQueue(label: "inter.recording.audio.conversion",
                                                   qos: .userInitiated)
 
-// Pre-allocated interleaving scratch buffer — sized for the tap's bufferSize.
-// Allocated ONCE at init (not on the RT thread). The tap callback uses this to
-// interleave non-interleaved AVAudioPCMBuffer channel pointers into the format
-// expected by AudioRingBuffer ([L0, R0, L1, R1, ...]).
-// Max capacity: bufferSize (4096) × channelCount (2) = 8192 floats.
-private let interleaveBuffer: UnsafeMutablePointer<Float> = .allocate(capacity: 4096 * 2)
+// Pre-allocated interleaving scratch buffer — sized from the actual tap format at
+// install time (bufferSize × channelCount). Allocated ONCE before installTap, on a
+// non-RT thread. Never reallocated on the RT thread.
+// If outputNode has N channels, capacity = 4096 × N floats.
+let tapChannelCount = max(1, Int(format.channelCount))   // query BEFORE installTap
+let interleaveBuffer: UnsafeMutablePointer<Float> = .allocate(capacity: 4096 * tapChannelCount)
+interleaveBuffer.initialize(repeating: 0, count: 4096 * tapChannelCount)
 
 // Install tap — callback runs on real-time audio thread
-let outputNode = AudioManager.shared.engine.outputNode
+let outputNode = InterAudioEngineAccess.outputNode()!
 let format = outputNode.outputFormat(forBus: 0)
 outputNode.installTap(onBus: 0, bufferSize: 4096, format: format) { [weak self] buffer, time in
     guard let self = self else { return }
@@ -884,12 +885,17 @@ outputNode.installTap(onBus: 0, bufferSize: 4096, format: format) { [weak self] 
     guard let floatData = buffer.floatChannelData else { return }
     let frameCount = Int(buffer.frameLength)
     let channelCount = Int(buffer.format.channelCount)
-    let interleavedCount = frameCount * channelCount
+    let clampedChannels = min(channelCount, tapChannelCount)
+    let interleavedCount = frameCount * clampedChannels
+
+    // Bounds guard: the OS can occasionally deliver a larger-than-requested buffer.
+    // Reject it rather than writing past the pre-allocated capacity.
+    guard interleavedCount <= 4096 * tapChannelCount else { return }
 
     // Interleave: [L0, R0, L1, R1, ...] from separate [L0, L1, ...] + [R0, R1, ...] arrays
     for frame in 0..<frameCount {
-        for ch in 0..<channelCount {
-            self.interleaveBuffer[frame * channelCount + ch] = floatData[ch][frame]
+        for ch in 0..<clampedChannels {
+            self.interleaveBuffer[frame * clampedChannels + ch] = floatData[ch][frame]
         }
     }
 
@@ -1130,13 +1136,36 @@ const egressClient = new EgressClient(
     process.env.LIVEKIT_API_SECRET
 );
 
+// Allowlist of valid tier values. Any value from req.user.tier that is not in
+// this set is coerced to 'free' to prevent S3 path traversal.
+const VALID_TIERS = ['free', 'pro', 'hiring'];
+
+function getValidatedTier(rawTier) {
+    if (typeof rawTier === 'string' && VALID_TIERS.includes(rawTier)) {
+        return rawTier;
+    }
+    return 'free'; // safe default
+}
+
+// Retention thresholds — read from env so they can be changed without a deploy.
+// Defaults match the S3 lifecycle rules when the env vars are absent.
+const RETENTION_DAYS = {
+    free:    parseInt(process.env.FREE_RETENTION_DAYS    ?? '30',  10),
+    pro:     parseInt(process.env.PRO_RETENTION_DAYS     ?? '180', 10),
+    hiring:  parseInt(process.env.HIRING_RETENTION_DAYS  ?? '365', 10),
+};
+
 // Start cloud recording
-async function startCloudRecording(roomName, userId) {
+async function startCloudRecording(roomName, tier) {
+    // Validate and normalise the caller's tier so untrusted input can never
+    // inject path separators ('/', '..') into the S3 key.
+    const validatedTier = getValidatedTier(tier);
+
     // S3Upload with no accessKey/secret: the livekit-server-sdk delegates to the
     // AWS SDK default credential provider chain (instance profile → IRSA → env vars).
     // Long-lived static keys MUST NOT be set here — use the IAM role on the host.
     const fileOutput = new EncodedFileOutput({
-        filepath: `recordings/${roomName}/{time}.mp4`,
+        filepath: `recordings/${validatedTier}/${roomName}/{time}.mp4`,
         output: {
             case: 's3',
             value: new S3Upload({
@@ -1160,6 +1189,26 @@ async function startCloudRecording(roomName, userId) {
 async function stopCloudRecording(egressId) {
     const info = await egressClient.stopEgress(egressId);
     return info; // includes fileResults with S3 URL
+}
+
+// Returns true if userId is currently a host or co-host participant in roomName.
+// Queries the LiveKit RoomService for live participant metadata — the JWT role claim
+// alone is not sufficient here because we need to confirm the participant is actually
+// present in this specific room with an elevated role.
+async function isHostOrCoHost(userId, roomName) {
+    try {
+        const participants = await roomServiceClient.listParticipants(roomName);
+        for (const p of participants) {
+            // Participant identity is set to userId at token-grant time.
+            if (p.identity !== String(userId)) continue;
+            // Role is stored in participant metadata as JSON: { role: "host"|"co-host"|... }
+            const meta = p.metadata ? JSON.parse(p.metadata) : {};
+            if (meta.role === 'host' || meta.role === 'co-host') return true;
+        }
+    } catch {
+        // If the LiveKit query fails (e.g. room already closed), deny by default.
+    }
+    return false;
 }
 ```
 
@@ -1208,15 +1257,22 @@ Quota enforcement:
 // Before starting cloud recording
 const user = await db.query('SELECT recording_minutes_used, recording_quota_minutes FROM users WHERE id = $1', [userId]);
 
-// Estimate how many minutes this session will consume.
-// Callers may pass an explicit `estimatedDurationMinutes`; if omitted,
-// derive from the requested [startTime, endTime] window; fall back to 0
-// so the check still guards against an already-exceeded quota.
-const estimatedDurationMinutes =
-    req.body.estimatedDurationMinutes ??
-    (req.body.endTime && req.body.startTime
-        ? Math.ceil((new Date(req.body.endTime) - new Date(req.body.startTime)) / 60000)
-        : 0);
+// Cloud recordings MUST supply an explicit estimatedDurationMinutes so quota
+// enforcement is never bypassed by an omitted or zero value.
+// Reject immediately if the field is absent or not a positive finite number.
+const rawEstimate = req.body.estimatedDurationMinutes;
+if (
+    rawEstimate === undefined ||
+    rawEstimate === null ||
+    typeof rawEstimate !== 'number' ||
+    !Number.isFinite(rawEstimate) ||
+    rawEstimate <= 0
+) {
+    return res.status(400).json({
+        error: 'estimatedDurationMinutes is required and must be a positive number',
+    });
+}
+const estimatedDurationMinutes = Math.ceil(rawEstimate);
 
 if (user.recording_minutes_used + estimatedDurationMinutes > user.recording_quota_minutes) {
     return res.status(403).json({ error: 'Recording quota exceeded' });
@@ -1557,7 +1613,7 @@ app.post('/room/record/start', requireAuth, requireRole('host', 'co-host'), asyn
     // 2. Start egress
     let egressInfo;
     if (mode === 'cloud_composed') {
-        egressInfo = await startCloudRecording(roomName);
+        egressInfo = await startCloudRecording(roomName, req.user.tier);
     } else if (mode === 'multi_track') {
         egressInfo = await startMultiTrackRecording(roomName, await getRoomParticipants(roomName));
     }
@@ -1582,10 +1638,12 @@ app.post('/room/record/start', requireAuth, requireRole('host', 'co-host'), asyn
 app.post('/room/record/stop', requireAuth, requireRole('host', 'co-host'), async (req, res) => {
     const { roomName, egressId } = req.body;
 
-    // Authorization: load the session record and verify the caller owns it.
-    // requireRole confirmed the user is a host/co-host, but that only gates role
-    // membership — we must also confirm this egressId belongs to the caller's room
-    // and was started by (or on behalf of) this user, to prevent cross-room tampering.
+    // Authorization: load the session record and verify the caller is allowed to stop it.
+    // requireRole confirmed the user is a host/co-host in the JWT, but we must also confirm:
+    //   (a) This egressId actually belongs to the stated roomName (cross-room tamper prevention).
+    //   (b) The caller is EITHER the original starter OR a current host/co-host in that room.
+    //       The strict original-starter-only check was too restrictive — it prevented a
+    //       co-host from stopping a recording someone else started in the same room.
     const sessionResult = await db.query(
         `SELECT user_id, room_name FROM recording_sessions WHERE egress_id = $1 AND status = 'active'`,
         [egressId]
@@ -1594,9 +1652,16 @@ app.post('/room/record/stop', requireAuth, requireRole('host', 'co-host'), async
         return res.status(404).json({ error: 'Recording session not found' });
     }
     const session = sessionResult.rows[0];
+
+    // Hard block: the egressId must belong to the room the caller claims — always enforced.
+    if (session.room_name !== roomName) {
+        return res.status(403).json({ error: 'Not authorized to stop this recording' });
+    }
+
+    // Soft check: caller owns the session OR is a host/co-host in that room right now.
     const callerOwnsSession = session.user_id === req.user.id;
-    const callerRoomMatches = session.room_name === roomName;
-    if (!callerOwnsSession || !callerRoomMatches) {
+    const callerIsHostOrCoHost = await isHostOrCoHost(req.user.id, roomName);
+    if (!callerOwnsSession && !callerIsHostOrCoHost) {
         // 403 — do not call stopEgress, do not touch DB or metadata
         return res.status(403).json({ error: 'Not authorized to stop this recording' });
     }
@@ -1660,6 +1725,11 @@ app.post('/webhooks/egress', express.raw({ type: 'application/webhook+json' }), 
         const durationSeconds = startedAt && endedAt
             ? Number((BigInt(endedAt) - BigInt(startedAt)) / 1_000_000_000n)
             : null;
+        
+        // Guard against clock skew or out-of-order events
+        if (durationSeconds !== null && durationSeconds < 0) {
+            durationSeconds = 0;
+        }
 
         // Fetch the owner so we can update metering
         const sessionResult = await db.query(
@@ -1887,16 +1957,25 @@ Configure via `aws s3api put-bucket-lifecycle-configuration`. Three tiers keyed 
 }
 ```
 
-**Tier routing**: `startCloudRecording` must include the user's tier in the S3 key prefix so lifecycle rules apply correctly — change the `filepath` template in the Egress config:
+**Tier routing**: `startCloudRecording` must include the user's tier in the S3 key prefix so lifecycle rules apply correctly. The tier is validated against a strict allowlist before use — never interpolated raw — to prevent path traversal:
 
 ```javascript
-filepath: `recordings/${req.user.tier}/${roomName}/{time}.mp4`,
+// Allowlist validation (see getValidatedTier above)
+const validatedTier = getValidatedTier(req.user.tier); // 'free' | 'pro' | 'hiring'
+
+filepath: `recordings/${validatedTier}/${roomName}/{time}.mp4`,
 // → recordings/free/roomName/timestamp.mp4
 // → recordings/pro/roomName/timestamp.mp4
 // → recordings/hiring/roomName/timestamp.mp4
 ```
 
-The N-day thresholds above are defaults; expose them as environment variables (`FREE_RETENTION_DAYS`, `PRO_RETENTION_DAYS`, `HIRING_RETENTION_DAYS`) so they can be adjusted without a code deploy.
+Retention thresholds are read from environment variables so they can be adjusted without a code deploy; they must match the S3 lifecycle rule `Days` values:
+
+```
+FREE_RETENTION_DAYS=30
+PRO_RETENTION_DAYS=180
+HIRING_RETENTION_DAYS=365
+```
 
 ### Recording Lifecycle
 

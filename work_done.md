@@ -1058,3 +1058,95 @@ Token TTL was already configured at 6 hours in `token-server/index.js` (`TOKEN_T
 > Phase 8.5 live polls complete. Phase 8.6 Q&A board complete.
 > Phase 9 meeting management complete (roles, moderation, lobby, passwords).
 > Post-Phase 9 hard-mute / raise-hand-to-speak system complete.
+> Phase 10A–10C recording complete (engine, coordinator, watermark, cloud recording).
+> Phase 10D multi-track + edge cases + polish complete.
+
+---
+
+## [2026-04-01] — Phase 10D: Multi-Track + Edge Cases + Polish
+
+**Phase**: 10D from recording_architecture.md §17
+
+**Files changed**:
+
+### Server-side (token-server)
+- **`token-server/migrations/003_multitrack_tracks.sql`** — NEW: `recording_tracks` table (per-participant egress tracking: id, session_id FK, participant_identity/name, egress_id, storage_url, duration_seconds, file_size_bytes, has_screen_share, status, created_at). Added `manifest_url TEXT` column to `recording_sessions`. Indexes on session_id and egress_id.
+- **`token-server/index.js`** — MODIFIED:
+  - `POST /room/record/start` multi-track: per-participant error handling (try/catch per egress, logs warning, continues), stores track records in `recording_tracks` table after session creation.
+  - `POST /room/record/stop`: detects multi-track sessions (queries `recording_tracks`), stops ALL participant egresses individually (per-track error handling), marks all tracks as `finalizing`. Falls back to single `stopEgress(egressId)` for cloud_composed mode.
+  - Webhook `EGRESS_COMPLETE`: detects per-track completion via `recording_tracks` lookup, checks if all tracks done, generates manifest JSON (`{roomName, recordingMode, startedAt, endedAt, tracks: [...]}`), calculates `maxDuration` across all tracks, updates parent `recording_sessions` with `status='completed'`, `manifest_url`, `duration_seconds`. Metering uses `Math.ceil(maxDuration / 60)` minutes.
+  - Webhook `EGRESS_FAILED`: also updates `recording_tracks` status.
+  - Webhook `EGRESS_ENDING`: marks both `recording_sessions` AND `recording_tracks` as finalizing.
+
+### Client-side (recording UI panels)
+- **`inter/UI/Views/InterRecordingListPanel.h`** — NEW: Recording list panel header. `InterRecordingListEntry` model class (recordingId, roomName, roomCode, recordingMode, status, startedAt, endedAt, durationSeconds, fileSizeBytes, watermarked). `InterRecordingListPanelDelegate` protocol (didRequestDownload, didRequestDelete, didRequestOpenLocal).
+- **`inter/UI/Views/InterRecordingListPanel.m`** — NEW (~320 lines): NSTableView-based recording list panel. Dark theme (0.12 alpha bg, 0.18 alpha cells, white text). Badges: LOCAL (blue), CLOUD (green), MULTI (purple), FAILED (red). Subtitle: date + MM:SS duration + byte size + watermark indicator. Actions: Open (local), Download (cloud), Delete (with NSAlert confirmation). Local scan: `~/Documents/Inter Recordings/` for .mp4 files.
+- **`inter/UI/Views/InterRecordingConsentPanel.h`** — NEW: Consent panel header for new joiners. `InterRecordingConsentPanelDelegate` protocol (didAccept, didDecline). `showConsentForMode:` and `dismiss` methods.
+- **`inter/UI/Views/InterRecordingConsentPanel.m`** — NEW (~175 lines): Modal semi-transparent overlay with dark dialog box. Red recording icon (`record.circle.fill` SF Symbol). Title, body text explaining recording, mode-specific description (local/cloud/multi-track). "Continue & Accept" (Enter key) and "Leave Meeting" buttons. Animated show/dismiss (0.25s/0.2s fade).
+
+### Client-side (edge case handling)
+- **`inter/Media/Recording/InterRecordingCoordinator.swift`** — MODIFIED:
+  - Disk space pre-check: rejects `startLocalRecording` if < 500 MB free, warns if < 2 GB free.
+  - Disk space monitor: 30-second `DispatchSourceTimer` during recording, auto-stops at < 500 MB with `InterRecordingDiskSpaceCritical` notification, warns at < 2 GB with `InterRecordingDiskSpaceLow` notification.
+  - Room disconnect auto-stop: `handleRoomDisconnect(serverURL:roomCode:callerIdentity:)` — auto-stops local recording and fire-and-forget stops cloud recording when room disconnects.
+  - Orphaned file cleanup: `cleanOrphanedRecordingFiles()` static method — removes `.tmp` files and corrupt `.mp4` files (< 1 KB) from `~/Documents/Inter Recordings/`. Detects orphaned `recording_state.json` from crash during recording.
+  - Recording state persistence: `_persistRecordingState()` writes minimal state JSON before recording starts, `_clearRecordingState()` removes it after clean finalize.
+  - `isLocalRecordingActive` computed property for external use.
+  - `availableDiskSpaceBytes()` static helper using `volumeAvailableCapacityForImportantUsageKey`.
+
+### Logging
+- **`inter/Networking/InterLogSubsystem.swift`** — Added `interLogWarning()` function (maps to `os_log .default` type — between info and error).
+
+### Tests
+- **`interTests/InterRecordingCoordinatorTests.swift`** — NEW: Phase 10D.7 comprehensive tests:
+  - State machine: initial idle, canPause/canResume/canStop guards, isLocalRecordingActive guard.
+  - Disk space: `availableDiskSpaceBytes()` returns non-zero and reasonable (> 100 MB) values.
+  - Orphaned cleanup: removes .tmp files, removes corrupt .mp4 (< 1 KB), preserves valid .mp4 (> 1 KB), handles missing directory.
+  - Room disconnect: no-op when idle.
+  - Concurrency: 1000 concurrent state/property reads, 1000 concurrent cloudEgressId reads (os_unfair_lock safety).
+  - Double-action prevention: stop/pause/resume when idle are no-ops.
+
+**Why**: Phase 10D completes the recording system with multi-track per-participant egress tracking, manifest generation for post-processing, recording management UI, new-joiner consent dialog (GDPR/privacy), disk space monitoring (auto-stop at critical levels), orphaned file cleanup (crash recovery), and room disconnect auto-stop (edge case safety).
+
+**Build**: BUILD SUCCEEDED (Xcode 16, Debug, arm64). Token server loads successfully.
+
+---
+
+## [1 April 2026] — Recording Architecture Gap Fixes (14 gaps)
+
+**Phase**: Post-10D audit — all 14 gaps identified in recording architecture review
+**Files changed**:
+
+### Swift / ObjC (client)
+- **`inter/Media/InterLocalMediaController.h`** — Gap #2: Added `InterLocalMediaVideoFrameObserver` typedef; added `recordingFrameObserver` property.
+- **`inter/Media/InterLocalMediaController.m`** — Gap #2: Added `AVCaptureVideoDataOutput` on-demand install/remove in custom setter; added `_addVideoDataOutputLocked`/`_removeVideoDataOutputLocked` helpers.
+- **`inter/Networking/InterLiveKitSubscriber.swift`** — Gap #3: Added `recordingFrameDelegate` (weak `InterRemoteTrackRenderer?`); forwards camera frames, mute/unmute, and track-end events.
+- **`inter/Networking/InterRoomController.swift`** — Gap #4: Added `recordingCoordinator` weak property; disconnect handler calls `recordingCoordinator?.handleRoomDisconnect`; active-speaker changes forwarded.
+- **`inter/App/AppDelegate.m`** — Gap #4: Wires `roomController.recordingCoordinator` and sets `localParticipantIdentity` after room connect.
+- **`inter/Media/Recording/InterRecordingCoordinator.swift`** — Gaps #1–#6, #8, #14:
+  - Gap #1: Already handled (coordinator internally calls `screenShareSource.addLive(sink)`).
+  - Gap #2/#3: `InterRemoteTrackRenderer` conformance + `_installLocalCameraObserver`/`_removeLocalCameraObserver`.
+  - Gap #5: 1-hour warning in duration timer — posts `InterRecordingOneHourWarning` notification (once per session); resets on stop.
+  - Gap #6: Subscribes to `InterAudioEngineAccess.onEngineRestart` to re-install audio tap after engine restarts.
+  - Gap #8: `NSSound.beep()` on recording start and stop (dispatched to main thread).
+  - Gap #14: Extracted `_installAudioTap`, `_removeAudioTap`, `_convertFloatsToCMSampleBuffer`, `InterleaveBuffer`, and `AudioRecordingRingBuffer` to `InterRecordingAudioCapture.swift`. Replaced all call sites with `audioCapture.start()`/`audioCapture.stop()`.
+  - Added `import AppKit` for `NSSound`.
+  - Added `_hasPostedOneHourWarning` and `oneHourWarningThreshold` private state.
+  - Added `InterAudioEngineAccess.onEngineRestart` + `_awaitingRestart` for Gap #6.
+- **`inter/Media/Recording/InterRecordingAudioCapture.swift`** — NEW (Gap #14): Self-contained audio capture subsystem encapsulating tap, ring buffer, drain timer, and Float32→CMSampleBuffer conversion. Also handles engine-restart recovery internally.
+- **`inter/Media/Recording/InterRecordingEngine.m`** — Gap #7: Set `_assetWriter.shouldOptimizeForNetworkUse = YES` for fast playback start (moov atom at front).
+
+### Token server
+- **`token-server/index.js`** — Gaps #9–#11:
+  - Gap #9: Distributed Redis lock (`SET NX EX 30` on `recording:lock:<roomName>`) before Egress API call; released in `finally` block.
+  - Gap #10: Real presigned URL generation using `@aws-sdk/client-s3` + `@aws-sdk/s3-request-presigner` (15-min expiry, `GetObjectCommand`). Replaces placeholder `storage_url` passthrough.
+  - Gap #11: `DeleteObjectCommand` via `@aws-sdk/client-s3` in `DELETE /recordings/:id` before DB row removal; continues to DB delete even if S3 fails (orphaned objects cleaned by lifecycle rules).
+- **`token-server/package.json`** — Added `@aws-sdk/client-s3 ^3.750.0` and `@aws-sdk/s3-request-presigner ^3.750.0`.
+
+### Tests
+- **`interTests/InterRecordingEngineTests.swift`** — NEW (Gap #12): Tests for lifecycle, PTS monotonicity, pause/resume, stop drain gate, concurrent append, delegate drop callbacks.
+- **`interTests/InterComposedRendererTests.swift`** — NEW (Gap #13): Tests for layout selection (all 5 layouts), thread-safe concurrent frame updates, placeholder caching, watermark toggle, delegate layout-change callback, invalidate lifecycle.
+
+**Why**: Recording architecture audit identified 14 gaps between `recording_architecture.md` spec and actual implementation. All gaps are now closed.
+
+**Build**: BUILD SUCCEEDED (Xcode 16, Debug, arm64). Token server loads. AWS SDK installed.
