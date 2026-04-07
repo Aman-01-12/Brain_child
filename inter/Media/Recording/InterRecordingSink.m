@@ -30,7 +30,13 @@ static os_log_t InterRecordingSinkLog(void) {
     if (!self) return nil;
 
     _sinkLock = OS_UNFAIR_LOCK_INIT;
-    _isActive = NO;
+    // Start active immediately. The recording coordinator manages this sink's
+    // lifecycle — it is only created during _startLocalRecording and torn down
+    // during _teardownPipeline. Starting active eliminates a timing window:
+    // addLiveSink: called during startPending (before sharing=YES) would add
+    // the sink to the frame routing array but skip startWithConfiguration:,
+    // leaving _isActive=NO and silently dropping every screen share frame.
+    _isActive = YES;
 
     return self;
 }
@@ -78,19 +84,16 @@ static os_log_t InterRecordingSinkLog(void) {
 }
 
 - (void)appendAudioSampleBuffer:(CMSampleBufferRef)sampleBuffer {
-    if (!sampleBuffer) return;
-
-    os_unfair_lock_lock(&_sinkLock);
-    BOOL active = _isActive;
-    os_unfair_lock_unlock(&_sinkLock);
-
-    if (!active) return;
-
-    // Feed audio to the recording engine.
-    InterRecordingEngine *engine = self.recordingEngine;
-    if (engine) {
-        [engine appendAudioSampleBuffer:sampleBuffer];
-    }
+    // Screen share system audio is NOT forwarded to the recording engine.
+    // The recording pipeline already captures mic + remote participant audio
+    // via InterRecordingAudioCapture (LiveKit AudioRenderer). Feeding screen
+    // share audio into the same AVAssetWriterInput causes PTS interleaving
+    // between two independent clock domains, which either drops samples
+    // (monotonic enforcement) or puts the AVAssetWriter into a failed state
+    // when timestamps regress — crashing the recording mid-session.
+    //
+    // If system audio mixing is needed in the future, it should be routed
+    // through InterRecordingAudioCapture's mix engine, not double-fed here.
 }
 
 - (void)stopWithCompletion:(dispatch_block_t)completion {

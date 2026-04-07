@@ -109,6 +109,12 @@ typedef struct {
     NSString *_secondarySpeakerIdentity;
     InterComposedLayout _currentLayout;
 
+    // Grid participant state — guarded by _frameLock.
+    // Maps participant identity → CVPixelBufferRef (retained via __bridge_retained id).
+    NSMutableDictionary<NSString *, id> *_gridFrames;
+    // Ordered list of participant identities for deterministic grid rendering.
+    NSArray<NSString *> *_gridParticipantOrder;
+
     // Triple-buffer pool — only accessed on the render queue.
     CVPixelBufferRef _poolBuffers[3];
     dispatch_semaphore_t _poolSemaphores[3];
@@ -151,6 +157,8 @@ typedef struct {
     _invalidated = NO;
 
     _placeholderCache = [NSMutableDictionary dictionary];
+    _gridFrames = [NSMutableDictionary dictionary];
+    _gridParticipantOrder = @[];
     _ciContext = [CIContext contextWithMTLDevice:device
                                         options:@{kCIContextWorkingColorSpace: (__bridge_transfer id)CGColorSpaceCreateWithName(kCGColorSpaceSRGB)}];
 
@@ -183,6 +191,8 @@ typedef struct {
     if (_screenSharePixelBuffer) { CVBufferRelease(_screenSharePixelBuffer); _screenSharePixelBuffer = NULL; }
     if (_activeSpeakerPixelBuffer) { CVBufferRelease(_activeSpeakerPixelBuffer); _activeSpeakerPixelBuffer = NULL; }
     if (_secondarySpeakerPixelBuffer) { CVBufferRelease(_secondarySpeakerPixelBuffer); _secondarySpeakerPixelBuffer = NULL; }
+    [_gridFrames removeAllObjects];
+    _gridParticipantOrder = @[];
     os_unfair_lock_unlock(&_frameLock);
 
     for (NSInteger i = 0; i < kPoolBufferCount; i++) {
@@ -315,25 +325,75 @@ typedef struct {
     os_unfair_lock_unlock(&_frameLock);
 }
 
+// ---------------------------------------------------------------------------
+// MARK: - Grid Participant Updates (Thread-Safe)
+// ---------------------------------------------------------------------------
+
+- (void)updateParticipantFrame:(CVPixelBufferRef)pixelBuffer
+                      identity:(NSString *)identity {
+    if (!identity) return;
+
+    os_unfair_lock_lock(&_frameLock);
+    if (pixelBuffer) {
+        // Store retained pixel buffer via ARC bridge. The old value (if any) is
+        // released automatically by ARC when the dictionary entry is replaced.
+        _gridFrames[identity] = (__bridge_transfer id)(CVBufferRetain(pixelBuffer));
+    } else {
+        [_gridFrames removeObjectForKey:identity];
+    }
+    [self _recalculateLayoutLocked];
+    os_unfair_lock_unlock(&_frameLock);
+}
+
+- (void)removeParticipant:(NSString *)identity {
+    if (!identity) return;
+
+    os_unfair_lock_lock(&_frameLock);
+    [_gridFrames removeObjectForKey:identity];
+    NSMutableArray *order = [_gridParticipantOrder mutableCopy];
+    [order removeObject:identity];
+    _gridParticipantOrder = [order copy];
+    [self _recalculateLayoutLocked];
+    os_unfair_lock_unlock(&_frameLock);
+}
+
+- (void)setParticipantOrder:(NSArray<NSString *> *)identities {
+    os_unfair_lock_lock(&_frameLock);
+    _gridParticipantOrder = [identities copy];
+    [self _recalculateLayoutLocked];
+    os_unfair_lock_unlock(&_frameLock);
+}
+
 /// Recompute current layout based on which sources are non-NULL.
 /// MUST be called while holding _frameLock.
 - (void)_recalculateLayoutLocked {
     InterComposedLayout oldLayout = _currentLayout;
 
     BOOL hasScreen = (_screenSharePixelBuffer != NULL);
-    BOOL hasPrimary = (_activeSpeakerPixelBuffer != NULL);
-    BOOL hasSecondary = (_secondarySpeakerPixelBuffer != NULL);
+    // Count grid participants that have a frame (or will get a placeholder).
+    NSUInteger gridCount = _gridParticipantOrder.count;
 
-    if (hasScreen && hasPrimary) {
-        _currentLayout = InterComposedLayoutScreenSharePiP;
+    if (hasScreen && gridCount > 0) {
+        // Screen share + participants → filmstrip sidebar layout.
+        _currentLayout = InterComposedLayoutScreenShareFilmstrip;
     } else if (hasScreen) {
+        // Screen share only — no camera participants available.
         _currentLayout = InterComposedLayoutScreenShareOnly;
-    } else if (hasPrimary && hasSecondary) {
-        _currentLayout = InterComposedLayoutCameraSideBySide;
-    } else if (hasPrimary) {
-        _currentLayout = InterComposedLayoutCameraOnlyFull;
+    } else if (gridCount >= 3) {
+        // 3+ cameras — NxM grid.
+        _currentLayout = InterComposedLayoutGrid;
     } else {
-        _currentLayout = InterComposedLayoutIdle;
+        // 0–2 cameras — use legacy active/secondary speaker logic.
+        BOOL hasPrimary = (_activeSpeakerPixelBuffer != NULL);
+        BOOL hasSecondary = (_secondarySpeakerPixelBuffer != NULL);
+
+        if (hasPrimary && hasSecondary) {
+            _currentLayout = InterComposedLayoutCameraSideBySide;
+        } else if (hasPrimary) {
+            _currentLayout = InterComposedLayoutCameraOnlyFull;
+        } else {
+            _currentLayout = InterComposedLayoutIdle;
+        }
     }
 
     if (_currentLayout != oldLayout) {
@@ -458,12 +518,31 @@ typedef struct {
     CVPixelBufferRef activeSpeaker = NULL;
     CVPixelBufferRef secondarySpeaker = NULL;
     InterComposedLayout layout;
+    // Grid snapshot: ordered list of (identity, pixelBuffer) pairs.
+    NSArray<NSString *> *gridOrder = nil;
+    NSMutableArray *gridBuffers = nil;  // Parallel array of retained CVPixelBufferRef via ARC id.
 
     os_unfair_lock_lock(&_frameLock);
     screenShare    = _screenSharePixelBuffer    ? CVBufferRetain(_screenSharePixelBuffer)    : NULL;
     activeSpeaker  = _activeSpeakerPixelBuffer  ? CVBufferRetain(_activeSpeakerPixelBuffer)  : NULL;
     secondarySpeaker = _secondarySpeakerPixelBuffer ? CVBufferRetain(_secondarySpeakerPixelBuffer) : NULL;
     layout = _currentLayout;
+
+    if (layout == InterComposedLayoutGrid || layout == InterComposedLayoutScreenShareFilmstrip) {
+        gridOrder = [_gridParticipantOrder copy];
+        gridBuffers = [NSMutableArray arrayWithCapacity:gridOrder.count];
+        for (NSString *identity in gridOrder) {
+            id frame = _gridFrames[identity];
+            if (frame) {
+                // Retain the pixel buffer for rendering outside the lock.
+                CVPixelBufferRef pb = (__bridge CVPixelBufferRef)frame;
+                [gridBuffers addObject:(__bridge_transfer id)CVBufferRetain(pb)];
+            } else {
+                // Will use placeholder — mark with NSNull sentinel.
+                [gridBuffers addObject:[NSNull null]];
+            }
+        }
+    }
     os_unfair_lock_unlock(&_frameLock);
 
     // ---- 2. Acquire pool slot ----
@@ -516,7 +595,9 @@ typedef struct {
                     encoder:encoder
                 screenShare:screenShare
               activeSpeaker:activeSpeaker
-           secondarySpeaker:secondarySpeaker];
+           secondarySpeaker:secondarySpeaker
+                  gridOrder:gridOrder
+                gridBuffers:gridBuffers];
 
         // Watermark overlay (drawn last, with alpha blending).
         if (self.watermarkEnabled) {
@@ -541,6 +622,7 @@ typedef struct {
     if (screenShare) CVBufferRelease(screenShare);
     if (activeSpeaker) CVBufferRelease(activeSpeaker);
     if (secondarySpeaker) CVBufferRelease(secondarySpeaker);
+    // gridBuffers is ARC-managed; it will be released automatically when it goes out of scope.
 
     // Return the pool buffer — caller (recording engine) reads the pixel data.
     // The buffer is NOT released; it stays in the pool for rotation.
@@ -550,6 +632,7 @@ cleanup:
     if (screenShare) CVBufferRelease(screenShare);
     if (activeSpeaker) CVBufferRelease(activeSpeaker);
     if (secondarySpeaker) CVBufferRelease(secondarySpeaker);
+    // gridBuffers is ARC-managed.
     return NULL;
 }
 
@@ -562,12 +645,13 @@ cleanup:
                encoder:(id<MTLRenderCommandEncoder>)encoder
            screenShare:(CVPixelBufferRef)screenShare
          activeSpeaker:(CVPixelBufferRef)activeSpeaker
-      secondarySpeaker:(CVPixelBufferRef)secondarySpeaker {
+      secondarySpeaker:(CVPixelBufferRef)secondarySpeaker
+             gridOrder:(NSArray<NSString *> *)gridOrder
+           gridBuffers:(NSArray *)gridBuffers {
 
     switch (layout) {
         case InterComposedLayoutIdle:
             // Clear color already set to dark; nothing else to draw.
-            // A future enhancement could render "Recording..." text here.
             break;
 
         case InterComposedLayoutCameraOnlyFull:
@@ -630,6 +714,158 @@ cleanup:
                                               size:(simd_float2){2, 2}];
             }
             break;
+
+        case InterComposedLayoutGrid:
+            [self _encodeGridLayout:encoder
+                          gridOrder:gridOrder
+                        gridBuffers:gridBuffers];
+            break;
+
+        case InterComposedLayoutScreenShareFilmstrip:
+            [self _encodeScreenShareFilmstripLayout:encoder
+                                        screenShare:screenShare
+                                          gridOrder:gridOrder
+                                        gridBuffers:gridBuffers];
+            break;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MARK: - Grid Layout Encoding (NxM)
+// ---------------------------------------------------------------------------
+
+/// Calculate grid dimensions (cols, rows) for a given count, optimized for 16:9 output.
+static void InterGridDimensions(NSUInteger count, NSUInteger *outCols, NSUInteger *outRows) {
+    // Optimal grid for 16:9: prefer wider rectangles.
+    if (count <= 1) { *outCols = 1; *outRows = 1; }
+    else if (count <= 2) { *outCols = 2; *outRows = 1; }
+    else if (count <= 4) { *outCols = 2; *outRows = 2; }
+    else if (count <= 6) { *outCols = 3; *outRows = 2; }
+    else if (count <= 9) { *outCols = 3; *outRows = 3; }
+    else if (count <= 12) { *outCols = 4; *outRows = 3; }
+    else if (count <= 16) { *outCols = 4; *outRows = 4; }
+    else if (count <= 20) { *outCols = 5; *outRows = 4; }
+    else if (count <= 25) { *outCols = 5; *outRows = 5; }
+    else { // 26+: dynamic calculation
+        NSUInteger cols = (NSUInteger)ceil(sqrt((double)count * 16.0 / 9.0));
+        NSUInteger rows = (NSUInteger)ceil((double)count / (double)cols);
+        *outCols = cols;
+        *outRows = rows;
+    }
+}
+
+/// Encode an NxM grid of participant camera frames (or placeholders).
+- (void)_encodeGridLayout:(id<MTLRenderCommandEncoder>)encoder
+                gridOrder:(NSArray<NSString *> *)gridOrder
+              gridBuffers:(NSArray *)gridBuffers {
+    NSUInteger count = gridOrder.count;
+    if (count == 0) return;
+
+    NSUInteger cols, rows;
+    InterGridDimensions(count, &cols, &rows);
+
+    // Each cell in NDC: total width = 2.0 (-1..1), total height = 2.0 (-1..1).
+    // Add 1px gap between cells: gap in NDC.
+    CGFloat gapPixels = 2.0;
+    CGFloat gapNDCx = (gapPixels / _outputSize.width) * 2.0;
+    CGFloat gapNDCy = (gapPixels / _outputSize.height) * 2.0;
+
+    CGFloat totalGapX = gapNDCx * (CGFloat)(cols - 1);
+    CGFloat totalGapY = gapNDCy * (CGFloat)(rows - 1);
+
+    CGFloat cellW = (2.0 - totalGapX) / (CGFloat)cols;
+    CGFloat cellH = (2.0 - totalGapY) / (CGFloat)rows;
+
+    for (NSUInteger i = 0; i < count; i++) {
+        NSUInteger col = i % cols;
+        NSUInteger row = i / cols;
+
+        // NDC origin: bottom-left is (-1, -1), top-left is (-1, 1).
+        // Row 0 = top of screen → NDC y = 1 - cellH.
+        CGFloat originX = -1.0 + (CGFloat)col * (cellW + gapNDCx);
+        CGFloat originY = 1.0 - (CGFloat)(row + 1) * cellH - (CGFloat)row * gapNDCy;
+
+        // Center the last row if it's not full.
+        NSUInteger lastRowStart = (rows - 1) * cols;
+        if (i >= lastRowStart) {
+            NSUInteger lastRowCount = count - lastRowStart;
+            if (lastRowCount < cols) {
+                CGFloat emptySpace = (CGFloat)(cols - lastRowCount) * (cellW + gapNDCx);
+                originX += emptySpace / 2.0;
+            }
+        }
+
+        id bufferObj = gridBuffers[i];
+        CVPixelBufferRef pb = NULL;
+        if (bufferObj != [NSNull null]) {
+            pb = (__bridge CVPixelBufferRef)bufferObj;
+        } else {
+            // Use placeholder for this participant.
+            pb = [self placeholderFrameForIdentity:gridOrder[i]];
+        }
+
+        if (pb) {
+            [self _encodeTextureFromPixelBuffer:pb
+                                       encoder:encoder
+                                        origin:(simd_float2){(float)originX, (float)originY}
+                                          size:(simd_float2){(float)cellW, (float)cellH}];
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MARK: - Screen Share + Filmstrip Layout
+// ---------------------------------------------------------------------------
+
+static const CGFloat kFilmstripWidthRatio = 0.20;  // Filmstrip takes 20% of width.
+
+/// Encode screen share (main stage, 80% width) + participant filmstrip (right 20%).
+- (void)_encodeScreenShareFilmstripLayout:(id<MTLRenderCommandEncoder>)encoder
+                              screenShare:(CVPixelBufferRef)screenShare
+                                gridOrder:(NSArray<NSString *> *)gridOrder
+                              gridBuffers:(NSArray *)gridBuffers {
+    // Screen share occupies the left 80% of the frame.
+    CGFloat stageW = 2.0 * (1.0 - kFilmstripWidthRatio);  // In NDC.
+    if (screenShare) {
+        [self _encodeTextureFromPixelBuffer:screenShare
+                                   encoder:encoder
+                                    origin:(simd_float2){-1.0, -1.0}
+                                      size:(simd_float2){(float)stageW, 2.0}];
+    }
+
+    // Filmstrip: right 20%, stacked vertically.
+    NSUInteger count = gridOrder.count;
+    if (count == 0) return;
+
+    CGFloat filmstripX = -1.0 + stageW;
+    CGFloat filmstripW = 2.0 * kFilmstripWidthRatio;  // NDC width.
+
+    // Gap between filmstrip tiles.
+    CGFloat gapPixels = 2.0;
+    CGFloat gapNDCy = (gapPixels / _outputSize.height) * 2.0;
+
+    // Cap visible tiles to avoid impossibly small thumbnails.
+    NSUInteger maxVisible = MIN(count, 6);
+    CGFloat totalGap = gapNDCy * (CGFloat)(maxVisible - 1);
+    CGFloat tileH = (2.0 - totalGap) / (CGFloat)maxVisible;
+
+    for (NSUInteger i = 0; i < maxVisible; i++) {
+        CGFloat originY = 1.0 - (CGFloat)(i + 1) * tileH - (CGFloat)i * gapNDCy;
+
+        id bufferObj = gridBuffers[i];
+        CVPixelBufferRef pb = NULL;
+        if (bufferObj != [NSNull null]) {
+            pb = (__bridge CVPixelBufferRef)bufferObj;
+        } else {
+            pb = [self placeholderFrameForIdentity:gridOrder[i]];
+        }
+
+        if (pb) {
+            [self _encodeTextureFromPixelBuffer:pb
+                                       encoder:encoder
+                                        origin:(simd_float2){(float)filmstripX, (float)originY}
+                                          size:(simd_float2){(float)filmstripW, (float)tileH}];
+        }
     }
 }
 

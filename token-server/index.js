@@ -71,6 +71,21 @@ const auth = require('./auth');
 const app = express();
 app.use(express.json());
 
+// ---------------------------------------------------------------------------
+// Security response headers — applied to every response
+// ---------------------------------------------------------------------------
+app.use((_req, res, next) => {
+  // Instruct browsers/clients to never connect over plain HTTP
+  res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+  // Never cache any response — all endpoints return auth-sensitive data
+  res.setHeader('Cache-Control', 'no-store');
+  // Prevent MIME sniffing
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  // Disallow embedding in iframes
+  res.setHeader('X-Frame-Options', 'DENY');
+  next();
+});
+
 // Apply optional auth middleware globally — attaches req.user if Bearer token present
 app.use(auth.authenticateToken);
 
@@ -134,6 +149,36 @@ const s3Client = new S3Client({ region: AWS_REGION });
 // ---------------------------------------------------------------------------
 const RATE_LIMIT_MAX = 10;
 const RATE_LIMIT_WINDOW_SECONDS = 60;
+
+// ---------------------------------------------------------------------------
+// Auth endpoint rate limiter — protects /auth/login and /auth/register
+// Keyed on email (per-account lockout) to prevent credential stuffing.
+// Stricter window than room rate limits: 10 attempts per 15 min per email.
+// Redis failure is non-blocking — logs error and allows request through.
+// ---------------------------------------------------------------------------
+async function rateLimitAuth(req, res, next) {
+  const email = req.body?.email;
+  const identifier = email
+    ? `ratelimit:auth:${email.toLowerCase().trim()}`
+    : `ratelimit:auth:ip:${req.ip}`;
+
+  try {
+    const count = await redis.incr(identifier);
+    if (count === 1) await redis.expire(identifier, 900); // 15-min window
+
+    if (count > 10) {
+      const ttl = await redis.ttl(identifier);
+      res.setHeader('Retry-After', String(ttl > 0 ? ttl : 900));
+      return res.status(429).json({
+        error: 'Too many authentication attempts. Please try again later.',
+      });
+    }
+  } catch (redisErr) {
+    // Redis unavailability must not block legitimate logins
+    console.error('[auth rate limit] Redis error:', redisErr.message);
+  }
+  next();
+}
 
 async function checkRateLimit(identity) {
   const key = `ratelimit:${identity}`;
@@ -200,7 +245,7 @@ async function createToken(identity, displayName, roomName, isHost, metadata = n
 // Body: { email, password, displayName }
 // Returns: { user, token }
 // ---------------------------------------------------------------------------
-app.post('/auth/register', async (req, res) => {
+app.post('/auth/register', rateLimitAuth, async (req, res) => {
   const { email, password, displayName } = req.body;
 
   try {
@@ -212,6 +257,8 @@ app.post('/auth/register', async (req, res) => {
                  : err.message.includes('required') ? 400
                  : err.message.includes('at least') ? 400
                  : 500;
+    // Only return known business-level messages — 500s go to global error handler
+    if (status === 500) throw err;
     res.status(status).json({ error: err.message });
   }
 });
@@ -221,7 +268,7 @@ app.post('/auth/register', async (req, res) => {
 // Body: { email, password }
 // Returns: { user, token }
 // ---------------------------------------------------------------------------
-app.post('/auth/login', async (req, res) => {
+app.post('/auth/login', rateLimitAuth, async (req, res) => {
   const { email, password } = req.body;
 
   try {
@@ -232,6 +279,7 @@ app.post('/auth/login', async (req, res) => {
     const status = err.message.includes('Invalid') ? 401
                  : err.message.includes('required') ? 400
                  : 500;
+    if (status === 500) throw err;
     res.status(status).json({ error: err.message });
   }
 });
@@ -1895,11 +1943,24 @@ app.post('/webhooks/egress', express.raw({ type: 'application/webhook+json' }), 
           };
 
           // Derive the S3 key for the manifest (same prefix as the first track).
-          // Guard against allTracks.rows being empty (shouldn't happen, but be safe).
+          // firstTrackUrl may be an absolute URL or a relative path; we need a
+          // bare S3 key (no scheme/host) for PutObjectCommand.
           const firstTrackUrl = allTracks.rows[0]?.storage_url || null;
-          const manifestKey = firstTrackUrl
-            ? firstTrackUrl.replace(/\/[^/]+$/, '/manifest.json')
-            : `recordings/${sessionId}/manifest.json`;
+          let manifestKey;
+          if (firstTrackUrl) {
+            let trackPath;
+            try {
+              // Absolute URL — extract the pathname and strip the leading '/'.
+              trackPath = new URL(firstTrackUrl).pathname.slice(1);
+            } catch {
+              // Relative path already — just trim leading slashes.
+              trackPath = firstTrackUrl.replace(/^\/+/, '');
+            }
+            // Replace the final filename segment with manifest.json.
+            manifestKey = trackPath.replace(/\/[^/]+$/, '/manifest.json');
+          } else {
+            manifestKey = `recordings/${sessionId}/manifest.json`;
+          }
 
           // Upload the manifest JSON to S3 before finalizing the session.
           // Failure here is surfaced as an exception so the outer try/catch marks
@@ -2025,9 +2086,23 @@ app.get('/health', async (req, res) => {
 // ---------------------------------------------------------------------------
 // Start
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Global error handler — MUST be the last app.use() before app.listen
+// Catches any error thrown from route handlers (throw err pattern above).
+// Returns a safe, opaque message — never leaks DB errors, stack traces, or paths.
+// ---------------------------------------------------------------------------
+app.use((err, req, res, _next) => {
+  const requestId = require('crypto').randomUUID();
+  console.error(`[error] requestId=${requestId} path=${req.path} err=${err.message}`);
+  res.status(500).json({
+    error: 'An internal error occurred',
+    requestId, // returned for support lookup — never the stack trace
+  });
+});
+
 app.listen(PORT, () => {
   console.log(`[token-server] Running on http://localhost:${PORT}`);
-  console.log(`[token-server] LiveKit API Key: ${LIVEKIT_API_KEY}`);
+  // NOTE: API key intentionally NOT logged — would persist in log aggregators
   console.log(`[token-server] Redis: ${process.env.REDIS_URL || 'redis://localhost:6379'}`);
   console.log(`[token-server] Endpoints: POST /room/create, /room/join, /token/refresh, /auth/register, /auth/login | GET /room/info/:code, /auth/me, /health`);
 });

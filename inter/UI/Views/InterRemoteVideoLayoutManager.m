@@ -375,6 +375,18 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
                                                    displayName:[self displayNameForTileKey:key]];
     tile.spotlightTarget = self;
     tile.spotlightAction = @selector(handleTileClicked:);
+
+    // Apply active speaker highlight immediately if this new tile matches the
+    // current speaker. Fixes a race where setActiveSpeakerIdentity: fires before
+    // the tile exists (e.g. KVO initial on mode entry while the remote participant
+    // is already speaking). Without this, the green border never appears until the
+    // speaker briefly pauses and resumes (triggering a value change).
+    if (![key isEqualToString:kScreenShareTileKey] &&
+        _activeSpeakerIdentity.length > 0 &&
+        [key isEqualToString:_activeSpeakerIdentity]) {
+        tile.isSpeaking = YES;
+    }
+
     self.tileViews[key] = tile;
     return tile;
 }
@@ -639,6 +651,7 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
             InterRemoteVideoTileView *tile = [self tileForKey:pid videoView:camView];
             tile.nameLabel.hidden = YES; // no label in full-view mode
             tile.layer.cornerRadius = 0;
+            tile.isSpeaking = [pid isEqualToString:self.activeSpeakerIdentity];
             [self addSubview:tile positioned:NSWindowBelow relativeTo:self.participantOverlay];
             tile.hidden = NO;
             camView.hidden = NO;
@@ -704,6 +717,9 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
     InterRemoteVideoTileView *tile = [self tileForKey:spotlightKey videoView:spotlightVideoView];
     tile.nameLabel.hidden = YES;
     tile.layer.cornerRadius = 8.0;
+    if (![spotlightKey isEqualToString:kScreenShareTileKey]) {
+        tile.isSpeaking = [spotlightKey isEqualToString:self.activeSpeakerIdentity];
+    }
     [self addSubview:tile positioned:NSWindowBelow relativeTo:self.participantOverlay];
     tile.hidden = NO;
     spotlightVideoView.hidden = NO;
@@ -751,6 +767,9 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
         InterRemoteVideoTileView *stageTile = [self tileForKey:spotlightKey videoView:spotlightVideoView];
         stageTile.nameLabel.hidden = NO;
         stageTile.layer.cornerRadius = 8.0;
+        if (![spotlightKey isEqualToString:kScreenShareTileKey]) {
+            stageTile.isSpeaking = [spotlightKey isEqualToString:self.activeSpeakerIdentity];
+        }
         [self addSubview:stageTile positioned:NSWindowBelow relativeTo:self.filmstripScrollView];
         stageTile.hidden = NO;
         spotlightVideoView.hidden = NO;

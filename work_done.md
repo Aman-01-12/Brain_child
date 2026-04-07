@@ -1150,3 +1150,177 @@ Token TTL was already configured at 6 hours in `token-server/index.js` (`TOKEN_T
 **Why**: Recording architecture audit identified 14 gaps between `recording_architecture.md` spec and actual implementation. All gaps are now closed.
 
 **Build**: BUILD SUCCEEDED (Xcode 16, Debug, arm64). Token server loads. AWS SDK installed.
+
+---
+
+## [1 April 2026] — Recording Flow: Grid Layout, Host-Priority Screen Share, Multi-Participant
+
+**Phase**: Recording Flow Requirements — Grid layout, screen-share-aware start, host priority, filmstrip, edge cases
+**Files changed**:
+- `inter/Media/Recording/InterComposedRenderer.h` — Added 2 new layout enum values: `InterComposedLayoutGrid` (NxM grid for 3+ cameras without screen share) and `InterComposedLayoutScreenShareFilmstrip` (screen share main stage + vertical camera filmstrip sidebar). Added 3 new public methods: `updateParticipantFrame:identity:` (thread-safe per-participant frame update for grid), `removeParticipant:` (removes participant from grid and participant order), `setParticipantOrder:` (sets ordered identity list for deterministic grid rendering).
+- `inter/Media/Recording/InterComposedRenderer.m` — Added grid frame storage: `_gridFrames` (NSMutableDictionary mapping identity→CVPixelBufferRef via ARC bridge) and `_gridParticipantOrder` (ordered NSArray). Updated `_recalculateLayoutLocked` to choose Grid when 3+ participants and no screen share, ScreenShareFilmstrip when screen share + any participants. Added `InterGridDimensions()` function computing optimal NxM grid for 16:9 (2×1 through 5×5, dynamic for 26+). Added `_encodeGridLayout:` rendering NxM cells with 2px gap and centered last row for odd counts. Added `_encodeScreenShareFilmstripLayout:` rendering screen share at 80% width + vertical filmstrip at right 20% (max 6 visible tiles). Updated `renderComposedFrame` to snapshot grid state under `_frameLock` and pass to `_encodeLayout:`. Updated `_encodeLayout:` signature with `gridOrder`/`gridBuffers` params and switch cases for new layouts. Grid cleanup in `invalidate`.
+- `inter/Media/Recording/InterRecordingCoordinator.swift` — Major additions for multi-participant recording:
+  - New private properties: `_allParticipants` (ordered by join time), `_useGridLayout` (bool, true when 3+), `_hostIdentity` (for screen share priority), `_activeScreenShareIdentity` (who is sharing).
+  - New public property: `hostIdentity` (thread-safe getter/setter via `_stateLock`).
+  - New public method: `participantDidJoin(_:)` — adds to tracking, re-evaluates grid mode.
+  - Updated `startLocalRecording` to accept `existingParticipants` array for mid-call recording start — seeds `_allParticipants` and evaluates grid mode from initial state.
+  - Added `_updateLayoutMode()` — switches between grid and active/secondary speaker modes. On transition TO grid: clears legacy frames, sets participant order, seeds placeholders. On transition FROM grid: clears all grid frames, re-seeds active speaker.
+  - Updated `didReceiveRemoteCameraFrame` to route to `updateParticipantFrame:identity:` in grid mode vs legacy active/secondary speaker in 1-2 participant mode.
+  - Updated `participantCameraDidChange` to update placeholder in grid mode or active speaker mode accordingly.
+  - Updated `participantDidLeave` to remove from `_allParticipants`, remove from grid renderer, re-evaluate layout mode, and handle screen share cleanup if the leaving participant was sharing.
+  - Updated `screenShareDidChange` to accept optional `participantId` for host-priority: if host is sharing, non-host shares are rejected; if host starts sharing, non-host share is replaced; screen share stop only clears if the stopping participant matches active sharer.
+  - Updated `_teardownPipeline` to clear all new tracking state.
+
+**Why**: Recording previously supported max 2 camera sources (active + secondary speaker). The requirements demand N-participant grid layout, screen-share-aware recording initiation, host-priority screen share, filmstrip view during screen share, and proper edge case handling for participant join/leave mid-recording.
+
+**Key design decisions**:
+- Grid threshold at 3 participants — below that, existing side-by-side or fullscreen layouts are used (no disruption to 1:1 or 2-person calls).
+- Grid rendering uses `InterGridDimensions()` for optimal 16:9 cell arrangement (e.g., 2×2 for 4, 3×2 for 6, 3×3 for 9).
+- Last row of odd grids is horizontally centered for visual balance.
+- Filmstrip sidebar shows max 6 participant thumbnails to avoid impossibly small tiles.
+- Host-priority screen share: host's share always takes precedence. If host starts sharing while non-host is active, the non-host share is replaced. Non-host cannot override host's active share.
+- All grid frame storage uses ARC-bridged CVPixelBuffer references in NSDictionary for memory safety.
+- Layout mode transitions are logged for debugging.
+
+---
+
+## [3 April 2026] — Recording Flow: Build Error Fixes (Post-Implementation)
+
+**Files changed**: `InterRecordingCoordinator.swift`
+
+**Why**: Six compiler errors introduced during the recording flow implementation prevented the build from succeeding.
+
+**Fixes applied**:
+1. **Garbled `_startLocalRecording` signature** — extra characters left in the method name; corrected to valid Objective-C selector.
+2. **Missing `//` comment prefix** — a loose text fragment was uncommented; wrapped in a line comment.
+3. **Extra `}`** — a spurious closing brace caused mismatched scope; removed.
+4. **`@objc` on method with default-value parameters** — Swift default parameters are not representable in Objective-C; removed `@objc` attribute from the affected overload.
+5. **Delegate method name mismatch** — `screenShareDidChange(isActive:)` was being called where the delegate expected `screenShareDidChangeWithIsActive:`; corrected to match the declared protocol.
+6. **Missing `subscriber.recordingFrameDelegate = self`** — the coordinator was not registered as the subscriber's frame delegate; assignment added inside `_startLocalRecording`.
+
+**Build**: BUILD SUCCEEDED after all six fixes.
+
+---
+
+## [3 April 2026] — Recording Fix: Black Screen (Active Speaker Not Seeded at Start)
+
+**Files changed**: `InterRecordingCoordinator.swift`
+
+**Why**: Recordings started with a completely black output. The coordinator's `_activeSpeakerId` was never initialised before frames arrived, so every incoming camera frame was dropped by the `[identity isEqualToString:_activeSpeakerId]` guard.
+
+**Root cause**: `_startLocalRecording` set up the pipeline but did not assign an initial active speaker. `activeSpeakerDidChange` only fired on *changes* — the first participant who was already speaking before recording started never triggered it.
+
+**Fixes applied**:
+- `_startLocalRecording` now seeds `_activeSpeakerId` with the first participant identity in `existingParticipants` (or the local participant as fallback) immediately after pipeline setup.
+- Added a **late-bootstrap fallback** inside `didReceiveRemoteCameraFrame`: if `_activeSpeakerId` is still `nil` when the first frame arrives, the arriving frame's identity is accepted and used as the active speaker — ensuring the recorder recovers even if seeding was skipped.
+
+**Build**: BUILD SUCCEEDED.
+
+---
+
+## [4 April 2026] — Recording Fix: Frozen Duplicate Frame (Phantom Active Speaker from Empty Identity)
+
+**Files changed**: `InterRecordingCoordinator.swift`
+
+**Why**: After a speaker transition the recording would show a frozen duplicate of the previous speaker — the same frame repeated until the call ended. The root cause was that `activeSpeakerDidChange` was called with an empty string `""` (LiveKit emits this when no one is actively speaking), which was being accepted as a valid identity change.
+
+**Root cause**: The phantom identity `""` passed the `isEqualToString:_activeSpeakerId` inequality check, so `_activeSpeakerId` was set to `""`. Subsequent frames from the real speaker were all dropped. The renderer kept displaying the last-valid frame — appearing frozen.
+
+**Fixes applied (6 coordinated changes)**:
+1. **Empty identity guard in `activeSpeakerDidChange`** — early-return when `identity.length == 0`; empty string is no longer promoted to active speaker.
+2. **Stale secondary buffer clearing in `_acceptSpeakerSwitch`** — when promoting a new active speaker, the old secondary slot is explicitly cleared to prevent stale frames from bleeding through.
+3. **Auto-promote in `activeSpeakerDidChange`** — if `_activeSpeakerId` is currently empty/nil when a valid identity arrives, skip the transition animation and pin the speaker immediately.
+4. **`if/else if` chain in `didReceiveRemoteCameraFrame`** — replaced nested ifs that allowed both active and secondary paths to fire simultaneously; ensures a frame is routed to exactly one slot.
+5. **`participantDidJoin` auto-fill** — if no active speaker is set when a participant joins and the pipeline is running, that participant is immediately seeded as the active speaker.
+6. **`participantDidLeave` cleanup** — if the leaving participant was the active speaker, `_activeSpeakerId` is cleared and the next available participant is promoted.
+
+**Build**: BUILD SUCCEEDED.
+
+---
+
+## [4 April 2026] — Recording Fix: Screen Share Not Recorded Mid-Session
+
+**Files changed**: `AppDelegate.m`, `InterRecordingSink.m`, `InterRecordingCoordinator.swift`
+
+**Why**: Screen share video was absent from recordings started after a screen share was already in progress. Three separate gaps combined to produce the symptom.
+
+**Root causes and fixes**:
+
+1. **`screenShareDidChange` had zero callers** — the method existed on the coordinator but was never invoked. Fixed by wiring it from `AppDelegate.m`:
+   - `screenShareDidStop` → `[self.normalRecordingCoordinator screenShareDidChangeWithIsActive:NO]`
+   - `screenShareDidStart` → `[self.normalRecordingCoordinator screenShareDidChangeWithIsActive:YES]`
+
+2. **`InterRecordingSink` was inactive at init** — `_isActive` defaulted to `NO`; the sink would only become active after a separate `start` message, creating a timing window where the pipeline was live but the sink silently discarded frames. Fixed by setting `_isActive = YES` in the designated initialiser.
+
+3. **Remote screen share frames not forwarded by coordinator** — `didReceiveRemoteScreenShareFrame:fromParticipant:` was not implemented in the recording path; frames arrived at the subscriber but were never handed to the composed renderer. Added the method to forward frames to `[_composedRenderer updateScreenShareFrame:identity:]`.
+
+**Build**: BUILD SUCCEEDED.
+
+---
+
+## [5 April 2026] — Recording Fix: Audio Not Recorded
+
+**Files changed**: `InterRecordingAudioCapture.swift`
+
+**Why**: Recorded files contained video but were completely silent. Three independent bugs in the audio tap subsystem caused all audio samples to be discarded.
+
+**Root causes and fixes**:
+
+1. **Silent tap failure when AVAudioEngine not yet running** — `installTap` was called once during `start()`, before the engine had started. If the engine was not running at that moment the tap silently failed — no error, no audio. Fixed by:
+   - `start()` calls a new `_attemptTapInstall()` helper immediately.
+   - If the install fails, a 500 ms repeating `DispatchSourceTimer` (`tapRetryTimer`) retries until the engine is running and the tap succeeds.
+   - `stop()` cancels `tapRetryTimer` and calls `_teardownTap()`.
+
+2. **Hardcoded 48 000 Hz / 2-channel format mismatch** — the drain loop and `convertFloatsToCMSampleBuffer` used hardcoded `48000.0` sample rate and `2` channels. If the mixer node was running at a different format (e.g., 44 100 Hz mono) the buffer sizing and CMSampleBuffer construction were wrong and the audio writer rejected every buffer. Fixed by:
+   - `_attemptTapInstall()` queries `mixerNode.outputFormat(forBus: 0)` and stores the actual values in `tapSampleRate` and `tapChannelCount`.
+   - Ring buffer is sized to `tapSampleRate` (not a hardcoded constant).
+   - `convertFloatsToCMSampleBuffer` uses `tapSampleRate` / `tapChannelCount` for all calculations.
+
+3. **`floatChannelData` nil guard discarding all audio** — the tap callback unwrapped `audioBufferList.mBuffers` as Float32 and returned early when the pointer was nil, which happened for non-Float32 mixer formats. Added an **Int16 fallback path**: if the Float32 interpretation yields a nil pointer, the code reinterprets the buffer as Int16 samples and converts them to Float32 before writing to the ring buffer.
+
+**New properties added to `InterRecordingAudioCapture`**: `tapSampleRate`, `tapChannelCount`, `tapInstalled`, `tapRetryTimer`.  
+**New helpers**: `_attemptTapInstall()`, `_teardownTap()`.
+
+**Build**: BUILD SUCCEEDED.
+
+**Notes**: InterRecordingSink unchanged — it only forwards screen share frames via `updateScreenShareFrame:`, which is layout-agnostic. The renderer's `_recalculateLayoutLocked` handles switching between Grid/Filmstrip/ScreenShareOnly based on the presence of screen share + grid participant count.
+
+---
+
+## [5 April 2026] — Recording Fix: Audio Rewrite (LiveKit AudioRenderer)
+
+**Files changed**:
+- `inter/Media/Recording/InterRecordingAudioCapture.swift` — Complete rewrite (~300 → ~400 lines, new architecture).
+- `inter/Media/Recording/InterRecordingCoordinator.swift` — Removed unused `import Atomics`.
+
+**Why**: The previous audio capture approach tapped `AVAudioEngine.mainMixerNode` via `installTap(onBus:)`. On macOS, LiveKit routes audio through WebRTC's `audioDeviceModule` (CoreAudio HAL), **not** through `AVAudioEngine`. Remote participant audio never flows through the main mixer node — the tap captured silence.
+
+**Root cause**: LiveKit's macOS audio path bypasses AVAudioEngine entirely. The `installTap` approach that worked conceptually for local audio was fundamentally wrong for capturing remote participant audio.
+
+**Fix — new architecture** (mirrors LiveKit's `AudioMixRecorder` pattern):
+1. **Private `AVAudioEngine` in manual-rendering mode** (`.realtime`, 48 kHz stereo) provides an offline mix bus.
+2. **Two `AVAudioPlayerNode` instances** (local mic + combined remote) connected to the mixer.
+3. **`RecordingAudioSource`** — private class conforming to `AudioRenderer` protocol. Receives PCM buffers from LiveKit and schedules them into the player nodes. Includes lazy `AVAudioConverter` for format mismatches.
+4. **Registration**: `AudioManager.shared.add(localAudioRenderer:)` and `AudioManager.shared.add(remoteAudioRenderer:)`.
+5. **Render timer** (~21.3 ms interval) calls `engine.manualRenderingBlock`, interleaves Float32 output, and wraps it in a `CMSampleBuffer` for `InterRecordingEngine.appendAudioSampleBuffer()`.
+
+**Removed**: `import Atomics`, ring buffer, interleave buffer, tap retry logic, `InterAudioEngineAccess` dependency (class still exists but is no longer needed by audio capture).
+
+**Public interface unchanged**: `init(coordinatorQueue:)`, `onSampleBuffer`, `start()`, `stop()`.
+
+**Build**: BUILD SUCCEEDED.
+
+---
+
+## [5 April 2026] — Active Speaker Border Fix for Joining Participants
+
+**Files changed**:
+- `inter/App/InterMediaWiringController.m` — Added custom `setRemoteLayout:` setter.
+
+**Why**: The green active-speaker border was missing "from the participants side" — specifically, when a participant joined a normal call where the host was already speaking.
+
+**Root cause**: In `AppDelegate.m`, `[normalMediaWiring setupRoomControllerKVO]` runs at launch (line 144), but `normalMediaWiring.remoteLayout` is only set later when the call window is created (`launchNormalCallWindow`, line 749). Between room connection and window creation, any `activeSpeakerIdentity` KVO change is received by the wiring controller but forwarded to a nil `remoteLayout` — the identity is silently dropped. Since the speaker hasn't changed (still talking), no new KVO fires after the layout is wired, and the green border never appears until the speaker pauses and resumes.
+
+**Fix**: Added a custom `setRemoteLayout:` setter in `InterMediaWiringController.m` that immediately pushes the current `roomController.activeSpeakerIdentity` to the newly assigned layout manager. This ensures any speaker identity that was "missed" during the nil-layout window is synced as soon as the layout becomes available.
+
+**Build**: BUILD SUCCEEDED.

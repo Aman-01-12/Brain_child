@@ -30,7 +30,6 @@ import CoreMedia
 import CoreVideo
 import AppKit
 import os.log
-import Atomics
 import LiveKit
 
 // MARK: - Recording State
@@ -140,6 +139,23 @@ import LiveKit
     /// Recent speakers list for secondary speaker selection (ordered by last-active).
     private var _recentSpeakers: [String] = []
 
+    /// All participants currently in the call — ordered by join time.
+    /// Used for grid layout when 3+ participants are present.
+    private var _allParticipants: [String] = []
+
+    /// Whether to use grid layout mode (3+ participants with cameras).
+    /// When true, frames are routed to composedRenderer.updateParticipantFrame
+    /// instead of the active/secondary speaker pair.
+    private var _useGridLayout: Bool = false
+
+    /// Host participant identity for screen share priority.
+    /// When multiple participants screen share, the host's share takes precedence.
+    private var _hostIdentity: String?
+
+    /// Identity of the participant currently screen sharing in the recording.
+    /// Tracked for host-priority screen share switching.
+    private var _activeScreenShareIdentity: String?
+
     /// Weak reference to the surface share controller for sink insertion/removal.
     private weak var surfaceShareController: InterSurfaceShareController?
 
@@ -191,6 +207,22 @@ import LiveKit
         }
     }
 
+    /// The host participant identity — set at room creation.
+    /// Used for host-priority screen share selection.
+    @objc public var hostIdentity: String? {
+        get {
+            os_unfair_lock_lock(&_stateLock)
+            let id = _hostIdentity
+            os_unfair_lock_unlock(&_stateLock)
+            return id
+        }
+        set {
+            os_unfair_lock_lock(&_stateLock)
+            _hostIdentity = newValue
+            os_unfair_lock_unlock(&_stateLock)
+        }
+    }
+
     /// Log category for recording.
     private static let log = OSLog(subsystem: "com.secure.inter.network", category: "recording")
 
@@ -237,20 +269,40 @@ import LiveKit
     ///   - subscriber: The LiveKit subscriber (for remote frame observation).
     ///   - localMediaController: The local media controller (for local camera frames).
     ///   - userTier: The user's subscription tier ("free", "pro", "hiring").
+    ///   - existingParticipants: Identities of participants already in the call at
+    ///     recording start time. Pass an empty array if none are present.
     @objc public func startLocalRecording(
         screenShareSource: InterSurfaceShareController,
         subscriber: InterLiveKitSubscriber,
         localMediaController: InterLocalMediaController,
-        userTier: String
+        userTier: String,
+        existingParticipants: [String]
     ) {
         coordinatorQueue.async { [weak self] in
             self?._startLocalRecording(
                 screenShareSource: screenShareSource,
                 subscriber: subscriber,
                 localMediaController: localMediaController,
-                userTier: userTier
+                userTier: userTier,
+                existingParticipants: existingParticipants
             )
         }
+    }
+
+    /// Convenience overload — starts recording without pre-existing participants.
+    @objc public func startLocalRecording(
+        screenShareSource: InterSurfaceShareController,
+        subscriber: InterLiveKitSubscriber,
+        localMediaController: InterLocalMediaController,
+        userTier: String
+    ) {
+        startLocalRecording(
+            screenShareSource: screenShareSource,
+            subscriber: subscriber,
+            localMediaController: localMediaController,
+            userTier: userTier,
+            existingParticipants: []
+        )
     }
 
     // -----------------------------------------------------------------------
@@ -284,6 +336,13 @@ import LiveKit
 
     /// Called when the active speaker changes. Applies a 2-second debounce hold.
     @objc public func activeSpeakerDidChange(_ participantId: String) {
+        // Guard: ignore empty identity strings. InterRoomController sends ""
+        // when no remote participant is speaking (e.g. 1-person call or brief
+        // silence). Accepting an empty string as the active speaker would
+        // orphan the active speaker slot — no one sends frames for identity
+        // "", so the active buffer freezes while real frames are diverted
+        // to the secondary slot, producing a frozen duplicate in the recording.
+        guard !participantId.isEmpty else { return }
         coordinatorQueue.async { [weak self] in
             self?._handleActiveSpeakerChange(participantId)
         }
@@ -298,11 +357,46 @@ import LiveKit
             if isMuted {
                 // Generate placeholder for camera-muted participant
                 let placeholder = renderer.placeholderFrame(forIdentity: participantId).takeUnretainedValue()
-                if self._activeSpeakerId == participantId {
+                if self._useGridLayout {
+                    renderer.updateParticipantFrame(placeholder, identity: participantId)
+                } else if self._activeSpeakerId == participantId {
                     renderer.updateActiveSpeakerFrame(placeholder, identity: participantId)
+                } else {
+                    // Check if this participant is the current secondary speaker.
+                    // If so, show their placeholder instead of a frozen last frame.
+                    let secondaryId = self._recentSpeakers.count >= 2
+                        ? self._recentSpeakers.first(where: { $0 != self._activeSpeakerId })
+                        : nil
+                    if secondaryId == participantId {
+                        renderer.updateSecondarySpeakerFrame(placeholder, identity: participantId)
+                    }
                 }
             }
             // When camera unmutes, the next frame delivery will naturally update the renderer.
+        }
+    }
+
+    /// Called when a new participant joins mid-recording — adds to grid tracking.
+    @objc public func participantDidJoin(_ participantId: String) {
+        coordinatorQueue.async { [weak self] in
+            guard let self = self, self._state == .recording || self._state == .paused else { return }
+            guard !participantId.isEmpty else { return }
+
+            // Add to all-participants list if not already present.
+            if !self._allParticipants.contains(participantId) {
+                self._allParticipants.append(participantId)
+            }
+
+            // Also register in _recentSpeakers immediately so their camera
+            // frames are routable as the secondary speaker in non-grid mode.
+            // Without this, frames from newly-joined participants are silently
+            // dropped until activeSpeakerDidChange fires for them.
+            if !self._recentSpeakers.contains(participantId) {
+                self._recentSpeakers.append(participantId)
+            }
+
+            // Re-evaluate grid vs. active/secondary layout.
+            self._updateLayoutMode()
         }
     }
 
@@ -311,41 +405,102 @@ import LiveKit
         coordinatorQueue.async { [weak self] in
             guard let self = self, self._state == .recording || self._state == .paused else { return }
 
-            // Remove from recent speakers
+            // Remove from all tracking lists.
             self._recentSpeakers.removeAll { $0 == participantId }
+            self._allParticipants.removeAll { $0 == participantId }
 
-            // If they were the active speaker, clear the frame
-            if self._activeSpeakerId == participantId {
-                self._activeSpeakerId = nil
-                self.composedRenderer?.updateActiveSpeakerFrame(nil, identity: nil)
+            if self._useGridLayout {
+                // Remove from grid renderer.
+                self.composedRenderer?.removeParticipant(participantId)
+                // Re-evaluate layout mode (may drop back to side-by-side or full).
+                self._updateLayoutMode()
+            } else {
+                // Active/secondary speaker path.
+                if self._activeSpeakerId == participantId {
+                    self._activeSpeakerId = nil
+                    self.composedRenderer?.updateActiveSpeakerFrame(nil, identity: nil)
 
-                // Promote next recent speaker if available
-                if let next = self._recentSpeakers.first {
-                    self._handleActiveSpeakerChange(next)
+                    // Promote next recent speaker if available
+                    if let next = self._recentSpeakers.first {
+                        self._handleActiveSpeakerChange(next)
+                    }
+                }
+
+                // Clear the secondary buffer if no valid secondary remains
+                // after this participant left. Prevents a frozen stale frame.
+                let remainingSecondary = self._recentSpeakers.first(where: { $0 != self._activeSpeakerId })
+                if remainingSecondary == nil {
+                    self.composedRenderer?.updateSecondarySpeakerFrame(nil, identity: nil)
                 }
             }
-        }
-    }
 
-    /// Called when screen share starts/stops mid-recording.
-    @objc public func screenShareDidChange(isActive: Bool) {
-        coordinatorQueue.async { [weak self] in
-            guard let self = self, self._state == .recording || self._state == .paused else { return }
-
-            if isActive {
-                // Recording sink will be added when sinks dispatch frames.
-                // If sharing is already in progress, addLiveSink handles it.
-                if let sink = self.recordingSink {
-                    self.surfaceShareController?.addLive(sink)
-                }
-            } else {
-                // Screen share stopped — remove recording sink and clear source
+            // If the leaving participant was screen sharing, clear it.
+            if self._activeScreenShareIdentity == participantId {
+                self._activeScreenShareIdentity = nil
                 if let sink = self.recordingSink {
                     self.surfaceShareController?.removeLive(sink)
                 }
                 self.composedRenderer?.updateScreenShareFrame(nil)
             }
         }
+    }
+
+    /// Called when screen share starts/stops mid-recording.
+    /// @param isActive Whether screen sharing is currently active.
+    /// @param participantId Identity of the participant who started/stopped sharing.
+    ///        Pass nil for backward compatibility (defaults to accepting any share).
+    @objc public func screenShareDidChange(isActive: Bool, participantId: String?) {
+        coordinatorQueue.async { [weak self] in
+            guard let self = self, self._state == .recording || self._state == .paused else { return }
+
+            if isActive {
+                // Host-priority: if a non-host starts sharing while a host is already sharing, ignore it.
+                if let hostId = self._hostIdentity,
+                   let activeShareId = self._activeScreenShareIdentity,
+                   activeShareId == hostId,
+                   participantId != hostId {
+                    interLogInfo(InterRecordingCoordinator.log,
+                                 "Recording: ignoring non-host screen share (host has priority)")
+                    return
+                }
+
+                // Host-priority: if host starts sharing while a non-host is sharing, switch to host's.
+                if let hostId = self._hostIdentity,
+                   participantId == hostId,
+                   let currentShareId = self._activeScreenShareIdentity,
+                   currentShareId != hostId {
+                    interLogInfo(InterRecordingCoordinator.log,
+                                 "Recording: switching to host screen share (host priority)")
+                    // Remove the current non-host share sink; it will be replaced.
+                    if let sink = self.recordingSink {
+                        self.surfaceShareController?.removeLive(sink)
+                    }
+                    self.composedRenderer?.updateScreenShareFrame(nil)
+                }
+
+                self._activeScreenShareIdentity = participantId
+
+                // Recording sink will be added when sinks dispatch frames.
+                if let sink = self.recordingSink {
+                    self.surfaceShareController?.addLive(sink)
+                }
+            } else {
+                // Only clear if the stopping participant is the one currently sharing.
+                if participantId == nil || participantId == self._activeScreenShareIdentity {
+                    self._activeScreenShareIdentity = nil
+                    // Screen share stopped — remove recording sink and clear source
+                    if let sink = self.recordingSink {
+                        self.surfaceShareController?.removeLive(sink)
+                    }
+                    self.composedRenderer?.updateScreenShareFrame(nil)
+                }
+            }
+        }
+    }
+
+    /// Convenience overload — screen share change without a specific participant ID.
+    @objc public func screenShareDidChange(isActive: Bool) {
+        screenShareDidChange(isActive: isActive, participantId: nil)
     }
 
     // -----------------------------------------------------------------------
@@ -361,7 +516,7 @@ import LiveKit
         // calling any renderer methods. The sync block does only value copies —
         // no I/O, no locks — so it completes in microseconds. Renderer calls
         // happen outside the sync so the queue is never held during rendering.
-        let snapshot: (renderer: InterComposedRenderer, activeId: String?, secondaryId: String?)?
+        let snapshot: (renderer: InterComposedRenderer, activeId: String?, secondaryId: String?, useGrid: Bool)?
         snapshot = coordinatorQueue.sync {
             guard _state == .recording || _state == .paused,
                   let renderer = composedRenderer else { return nil }
@@ -369,15 +524,106 @@ import LiveKit
             let secondaryId: String? = _recentSpeakers.count >= 2
                 ? _recentSpeakers.first(where: { $0 != activeId })
                 : nil
-            return (renderer, activeId, secondaryId)
+            return (renderer, activeId, secondaryId, _useGridLayout)
         }
-        guard let (renderer, activeId, secondaryId) = snapshot else { return }
+        guard let (renderer, activeId, secondaryId, useGrid) = snapshot else { return }
 
-        if participantId == activeId {
-            renderer.updateActiveSpeakerFrame(pixelBuffer, identity: participantId)
+        if useGrid {
+            // Grid mode: route all frames to grid participant storage.
+            renderer.updateParticipantFrame(pixelBuffer, identity: participantId)
+        } else {
+            // Active/secondary speaker mode.
+            //
+            // Late-bootstrap guard: if _activeSpeakerId is still nil when the first
+            // frame arrives (e.g. activeSpeakerDidChange hasn't fired yet), accept
+            // the frame unconditionally and self-promote the sender. This is a
+            // belt-and-suspenders fallback; the primary seeding happens in
+            // _startLocalRecording. Without this, a race at recording start would
+            // cause frames to be dropped until the next speaker event.
+            if activeId == nil || participantId == activeId {
+                renderer.updateActiveSpeakerFrame(pixelBuffer, identity: participantId)
+                if activeId == nil {
+                    coordinatorQueue.async { [weak self] in
+                        guard let self = self, self._activeSpeakerId == nil else { return }
+                        self._activeSpeakerId = participantId
+                        if !self._recentSpeakers.contains(participantId) {
+                            self._recentSpeakers.insert(participantId, at: 0)
+                        }
+                        self._activeSpeakerHoldUntil = CFAbsoluteTimeGetCurrent() + 2.0
+                    }
+                }
+            } else if let secId = secondaryId, participantId == secId {
+                renderer.updateSecondarySpeakerFrame(pixelBuffer, identity: participantId)
+            } else if secondaryId == nil {
+                // No designated secondary yet — auto-promote this participant
+                // so their camera is visible immediately in a 2-person call.
+                // Without this, frames from newly-joined participants are
+                // silently dropped until activeSpeakerDidChange fires.
+                renderer.updateSecondarySpeakerFrame(pixelBuffer, identity: participantId)
+                coordinatorQueue.async { [weak self] in
+                    guard let self = self else { return }
+                    if !self._recentSpeakers.contains(participantId) {
+                        self._recentSpeakers.append(participantId)
+                    }
+                }
+            }
+            // else: participant is neither active nor secondary — frame dropped.
+            // This only happens in 3+ non-grid mode which shouldn't occur
+            // since grid kicks in at 3 participants.
         }
-        if let secId = secondaryId, participantId == secId {
-            renderer.updateSecondarySpeakerFrame(pixelBuffer, identity: participantId)
+    }
+
+    // -----------------------------------------------------------------------
+    // MARK: - Layout Mode Management (coordinatorQueue)
+    // -----------------------------------------------------------------------
+
+    /// Re-evaluate whether to use grid layout vs. active/secondary speaker layout.
+    /// Called when participants join/leave. Must run on coordinatorQueue.
+    private func _updateLayoutMode() {
+        dispatchPrecondition(condition: .onQueue(coordinatorQueue))
+        guard let renderer = composedRenderer else { return }
+
+        let previousGridMode = _useGridLayout
+        // Switch to grid when 3+ participants are in the call.
+        _useGridLayout = _allParticipants.count >= 3
+
+        if _useGridLayout != previousGridMode {
+            if _useGridLayout {
+                // Transitioning TO grid mode.
+                interLogInfo(InterRecordingCoordinator.log,
+                             "Recording: switching to grid layout (%lu participants)",
+                             UInt(truncating: _allParticipants.count as NSNumber))
+
+                // Clear legacy active/secondary speaker frames from renderer.
+                renderer.updateActiveSpeakerFrame(nil, identity: nil)
+                renderer.updateSecondarySpeakerFrame(nil, identity: nil)
+
+                // Set participant order and seed placeholders for all participants.
+                renderer.setParticipantOrder(_allParticipants)
+                for participantId in _allParticipants {
+                    let placeholder = renderer.placeholderFrame(forIdentity: participantId).takeUnretainedValue()
+                    renderer.updateParticipantFrame(placeholder, identity: participantId)
+                }
+            } else {
+                // Transitioning FROM grid mode back to active/secondary speaker.
+                interLogInfo(InterRecordingCoordinator.log,
+                             "Recording: switching from grid to active speaker layout (%lu participants)",
+                             UInt(truncating: _allParticipants.count as NSNumber))
+
+                // Clear all grid participant frames.
+                for participantId in _allParticipants {
+                    renderer.removeParticipant(participantId)
+                }
+
+                // Re-seed active speaker from recent speakers.
+                if let active = _activeSpeakerId {
+                    let placeholder = renderer.placeholderFrame(forIdentity: active).takeUnretainedValue()
+                    renderer.updateActiveSpeakerFrame(placeholder, identity: active)
+                }
+            }
+        } else if _useGridLayout {
+            // Grid mode still active — just update the participant order.
+            renderer.setParticipantOrder(_allParticipants)
         }
     }
 
@@ -434,7 +680,8 @@ import LiveKit
         screenShareSource: InterSurfaceShareController,
         subscriber: InterLiveKitSubscriber,
         localMediaController: InterLocalMediaController,
-        userTier: String
+        userTier: String,
+        existingParticipants: [String]
     ) {
         dispatchPrecondition(condition: .onQueue(coordinatorQueue))
 
@@ -526,30 +773,67 @@ import LiveKit
         // 6. If screen share is active, insert the recording sink into the live pipeline
         if screenShareSource.isSharing {
             screenShareSource.addLive(sink)
+            _activeScreenShareIdentity = nil  // Will be set by screenShareDidChange if needed
         }
 
-        // 7. Wire subscriber's recording frame delegate for remote camera frames
+        // 7. Populate with existing participants already in the call.
+        _allParticipants = []
+        if let localId = _localParticipantIdentity, !localId.isEmpty {
+            _allParticipants.append(localId)
+        }
+        for pid in existingParticipants {
+            if !_allParticipants.contains(pid) {
+                _allParticipants.append(pid)
+            }
+        }
+        // Evaluate whether grid mode is needed from the start.
+        _useGridLayout = _allParticipants.count >= 3
+        if _useGridLayout {
+            renderer.setParticipantOrder(_allParticipants)
+            for participantId in _allParticipants {
+                let placeholder = renderer.placeholderFrame(forIdentity: participantId).takeUnretainedValue()
+                renderer.updateParticipantFrame(placeholder, identity: participantId)
+            }
+        } else {
+            // Bootstrap active speaker so the first camera frames are immediately
+            // routed. Without this, _activeSpeakerId stays nil until
+            // activeSpeakerDidChange fires — which may fire late or never in a
+            // 1-person call — causing every frame to be silently dropped and
+            // leaving the recording with an entirely black video track.
+            if let firstParticipant = _allParticipants.first {
+                _activeSpeakerId = firstParticipant
+                _recentSpeakers = _allParticipants   // seeds secondary speaker too
+                _activeSpeakerHoldUntil = CFAbsoluteTimeGetCurrent() + 2.0
+            }
+        }
+
+        // 8. Set subscriber recording frame delegate
         subscriber.recordingFrameDelegate = self
 
-        // 8. Install local camera frame observer (for when local user is active speaker)
+        // Note: remote participants are added via participantDidJoin() calls
+        // from the subscriber during the recording lifecycle. The coordinator
+        // will receive participantDidJoin for all existing participants
+        // shortly after subscriber.recordingFrameDelegate is set.
+
+        // 9. Install local camera frame observer (for when local user is active speaker)
         _installLocalCameraObserver()
 
-        // 9. Install audio capture (extracted subsystem — Gap #14)
+        // 10. Install audio capture (extracted subsystem — Gap #14)
         audioCapture.onSampleBuffer = { [weak self] sampleBuffer in
             self?.recordingEngine?.appendAudioSampleBuffer(sampleBuffer)
         }
         audioCapture.start()
 
-        // 10. Start 30fps render timer
+        // 11. Start 30fps render timer
         _startRenderTimer()
 
-        // 11. Start 1-second duration timer
+        // 12. Start 1-second duration timer
         _startDurationTimer()
 
-        // 12. Start disk space monitor (30-second interval)
+        // 13. Start disk space monitor (30-second interval)
         _startDiskSpaceMonitor()
 
-        // 11. Check pending stop
+        // 14. Check pending stop
         if _pendingStop {
             _pendingStop = false
             transitionTo(.recording)
@@ -704,6 +988,9 @@ import LiveKit
         _pendingSpeakerId = nil
         _recentSpeakers.removeAll()
         _activeSpeakerHoldUntil = 0
+        _allParticipants.removeAll()
+        _useGridLayout = false
+        _activeScreenShareIdentity = nil
 
         surfaceShareController = nil
         subscriber = nil
@@ -1078,10 +1365,14 @@ import LiveKit
         _activeSpeakerId = participantId
         _activeSpeakerHoldUntil = CFAbsoluteTimeGetCurrent() + 2.0
 
-        // Previous speaker becomes secondary (if we have > 1 participant)
-        if let prev = previousSpeaker, prev != participantId {
-            // The secondary speaker frame will be updated on next frame delivery
-            // via didReceiveRemoteCameraFrame
+        // After switching, check whether a valid secondary speaker still exists.
+        // _recentSpeakers was already updated by _handleActiveSpeakerChange before
+        // this method is called, so the new secondary is deterministic.
+        let newSecondaryId = _recentSpeakers.first(where: { $0 != participantId })
+        if newSecondaryId == nil {
+            // No valid secondary — clear the renderer's buffer so a stale frame
+            // from a prior secondary doesn't persist as a frozen duplicate.
+            composedRenderer?.updateSecondarySpeakerFrame(nil, identity: nil)
         }
 
         interLogDebug(InterRecordingCoordinator.log,
@@ -1430,8 +1721,30 @@ extension InterRecordingCoordinator: InterComposedRendererDelegate {
 extension InterRecordingCoordinator: InterRemoteTrackRenderer {
 
     public func didReceiveRemoteScreenShareFrame(_ pixelBuffer: CVPixelBuffer, fromParticipant participantId: String) {
-        // Screen share frames come through InterRecordingSink via InterSurfaceShareController,
-        // not through the subscriber. This method is intentionally a no-op.
+        // Remote participant's screen share frames arrive here via the subscriber.
+        // Forward them to the composed renderer so they appear in the recording.
+        // (Local screen share frames come through InterRecordingSink via
+        // InterSurfaceShareController instead.)
+        guard !participantId.isEmpty else { return }
+        let snapshot: (renderer: InterComposedRenderer, shouldAccept: Bool)?
+        snapshot = coordinatorQueue.sync {
+            guard _state == .recording || _state == .paused,
+                  let renderer = composedRenderer else { return nil }
+            // Only accept if no active screen share is set (first come) or if
+            // this is the currently tracked screen sharer.
+            let accept = (_activeScreenShareIdentity == nil ||
+                          _activeScreenShareIdentity == participantId)
+            return (renderer, accept)
+        }
+        guard let (renderer, shouldAccept) = snapshot, shouldAccept else { return }
+        renderer.updateScreenShareFrame(pixelBuffer)
+        // Track the active screen share identity if not yet set.
+        if _activeScreenShareIdentity == nil {
+            coordinatorQueue.async { [weak self] in
+                guard let self = self, self._activeScreenShareIdentity == nil else { return }
+                self._activeScreenShareIdentity = participantId
+            }
+        }
     }
 
     public func remoteTrackDidMute(_ kind: InterTrackKind, forParticipant participantId: String) {

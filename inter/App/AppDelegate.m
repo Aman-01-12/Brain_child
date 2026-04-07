@@ -1207,6 +1207,9 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
         self.normalSurfaceShareController.networkPublishSink = nil;
         [self.normalControlPanel setShareStartPending:self.normalSurfaceShareController.isStartPending];
         [self.normalControlPanel setSharingEnabled:self.normalSurfaceShareController.isSharing];
+
+        // [Phase 10] Notify recording coordinator that screen share stopped.
+        [self.normalRecordingCoordinator screenShareDidChangeWithIsActive:NO];
         return;
     }
 
@@ -1268,6 +1271,11 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
     // Don't optimistically read isSharing here — it may be YES momentarily
     // before an async permission error resets it. The statusHandler will
     // sync the button state when the capture actually succeeds or fails.
+
+    // [Phase 10] Notify recording coordinator that screen share started so it
+    // can insert its sink into the live pipeline. Without this, screen shares
+    // started *during* recording produce no frames in the recording output.
+    [self.normalRecordingCoordinator screenShareDidChangeWithIsActive:YES];
 }
 
 #pragma mark - Network Wiring [2.5]

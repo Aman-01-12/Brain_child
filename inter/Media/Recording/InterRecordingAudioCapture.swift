@@ -4,26 +4,36 @@
 //
 // Phase 10 — Gap #14: Extracted audio capture subsystem.
 //
-// Owns the audio tap on AVAudioEngine's output node, the lock-free ring buffer,
-// the interleave scratch wrapper, the 10ms drain timer, and the Float32→
-// CMSampleBuffer conversion. The coordinator simply calls start(engine:) /
-// stop() and receives CMSampleBuffers via the callback.
+// Captures both local (microphone) and remote (participant) audio using
+// LiveKit's AudioRenderer protocol.  On macOS, LiveKit routes audio through
+// WebRTC's audioDeviceModule (CoreAudio HAL), so the previous approach of
+// tapping AVAudioEngine's mainMixerNode captured nothing.
+//
+// Architecture (mirrors LiveKit's AudioMixRecorder pattern):
+//   1. A private AVAudioEngine in manual-rendering mode provides an offline
+//      mix bus.
+//   2. Two AVAudioPlayerNode instances (local + remote) are connected to the
+//      mixer.
+//   3. RecordingAudioSource objects conform to AudioRenderer and schedule
+//      incoming PCM into the player nodes.
+//   4. A periodic timer calls the engine's manualRenderingBlock, interleaves
+//      the Float32 output, and wraps it in a CMSampleBuffer for the recording
+//      engine.
 //
 // THREADING:
-//   - start/stop must be called from the coordinator's serial queue.
-//   - The tap callback runs on a real-time audio thread (must not lock/alloc/log).
-//   - The drain timer fires on `audioConversionQueue` (non-RT).
-//   - The engine-restart handler dispatches back to the caller-provided queue.
+//   - start / stop must be called from the coordinator's serial queue.
+//   - AudioRenderer.render(pcmBuffer:) is called on LiveKit's audio thread.
+//   - The drain timer fires on coordinatorQueue.
 //
 // ISOLATION INVARIANT [G8]:
-//   If removed, the coordinator loses audio capture but video recording still works.
+//   If removed, the coordinator loses audio capture but video recording
+//   still works.
 // ============================================================================
 
 import Foundation
 import AVFoundation
 import CoreMedia
 import os.log
-import Atomics
 import LiveKit
 
 // MARK: - InterRecordingAudioCapture
@@ -33,342 +43,367 @@ import LiveKit
 /// Usage:
 /// ```
 /// let capture = InterRecordingAudioCapture(coordinatorQueue: queue)
-/// capture.onSampleBuffer = { sampleBuffer in engine.appendAudioSampleBuffer(sampleBuffer) }
+/// capture.onSampleBuffer = { sb in engine.appendAudioSampleBuffer(sb) }
 /// capture.start()
-/// // ... recording ...
+/// // … recording …
 /// capture.stop()
 /// ```
 final class InterRecordingAudioCapture {
 
-    // MARK: - Configuration
+    // MARK: - Public Interface
 
-    /// Called on `audioConversionQueue` with each drained CMSampleBuffer.
-    ///
-    /// **Threading contract**: Must be set on `coordinatorQueue` *before*
-    /// calling `start()` and must not be mutated until after `stop()` returns.
-    /// The `start()` → `DispatchSource.resume()` path provides the
-    /// happens-before guarantee that the drain timer sees the assigned value.
+    /// Called on `coordinatorQueue` with each mixed CMSampleBuffer.
     var onSampleBuffer: ((CMSampleBuffer) -> Void)?
 
-    // MARK: - Private Properties
+    // MARK: - Configuration
 
-    /// The serial queue on which start/stop must be called (coordinator's queue).
     private let coordinatorQueue: DispatchQueue
 
-    /// Ring buffer: 500ms at 48kHz stereo.
-    private var audioRingBuffer: AudioCaptureRingBuffer?
+    /// 48 kHz stereo Float32 – matches InterRecordingEngine's audio input.
+    private let processingFormat: AVAudioFormat
 
-    /// Drain timer: 10ms interval on `audioConversionQueue`.
-    private var audioDrainTimer: DispatchSourceTimer?
+    /// Frames per render call.  1024 / 48 000 ≈ 21.3 ms.
+    private let renderFrameCount: AVAudioFrameCount = 1024
 
-    /// Conversion queue (non-RT).
-    private let audioConversionQueue = DispatchQueue(
-        label: "inter.recording.audio.conversion",
-        qos: .userInitiated
+    // MARK: - Engine & Nodes
+
+    private var engine: AVAudioEngine?
+    private var localPlayerNode: AVAudioPlayerNode?
+    private var remotePlayerNode: AVAudioPlayerNode?
+
+    // MARK: - LiveKit Sources
+
+    private var localSource: RecordingAudioSource?
+    private var remoteSource: RecordingAudioSource?
+
+    // MARK: - Timer
+
+    private var renderTimer: DispatchSourceTimer?
+
+    // MARK: - Logging
+
+    private static let log = OSLog(
+        subsystem: "com.inter.app",
+        category: "RecordingAudioCapture"
     )
-
-    /// Managed scratch buffer wrapper for the interleave tap callback.
-    private var interleaveBuffer: AudioCaptureInterleaveBuffer?
-
-    /// Logging.
-    private static let log = OSLog(subsystem: "com.secure.inter.network", category: "audioCapture")
 
     // MARK: - Init
 
     init(coordinatorQueue: DispatchQueue) {
         self.coordinatorQueue = coordinatorQueue
+        self.processingFormat = AVAudioFormat(
+            standardFormatWithSampleRate: 48_000,
+            channels: 2
+        )!
     }
 
-    deinit {
-        stop()
-    }
+    // MARK: - Start
 
-    // MARK: - Public API
-
-    /// Install the audio tap and start draining samples.
-    /// Must be called on `coordinatorQueue`.
-    /// Safe to call when already running — tears down existing resources first.
     func start() {
         dispatchPrecondition(condition: .onQueue(coordinatorQueue))
 
-        // Guard against double-start: clean up any existing tap, timer, and
-        // buffers so we don't leak resources or orphan an audio tap.
-        if audioRingBuffer != nil || audioDrainTimer != nil {
-            stop()
+        guard engine == nil else {
+            os_log(.info, log: Self.log, "Audio capture already started")
+            return
         }
 
-        let ringBuffer = AudioCaptureRingBuffer(frameDuration: 0.5,
-                                                 sampleRate: 48000,
-                                                 channels: 2)
-        self.audioRingBuffer = ringBuffer
+        do {
+            let eng = AVAudioEngine()
 
-        // Install tap on the engine's main mixer node — the last node before the hardware
-        // output that accumulates all sources. Only mixer/input nodes support installTap;
-        // tapping AVAudioOutputNode directly throws "_isInput".
-        if let mixerNode = InterAudioEngineAccess.outputNode() {
-            let format = mixerNode.outputFormat(forBus: 0)
-            let tapChannelCount = max(1, Int(format.channelCount))
-            let tapCapacity = 4096 * tapChannelCount
-            let scratchWrapper = AudioCaptureInterleaveBuffer(capacity: tapCapacity)
-            self.interleaveBuffer = scratchWrapper
+            // ---- Manual rendering mode ----
+            try eng.enableManualRenderingMode(
+                .realtime,
+                format: processingFormat,
+                maximumFrameCount: renderFrameCount
+            )
 
-            mixerNode.installTap(onBus: 0, bufferSize: 4096, format: format) {
-                [weak ringBuffer, scratchWrapper] (buffer, _) in
-                guard scratchWrapper.isActive else { return }
-                guard let ringBuffer = ringBuffer else { return }
-                guard let floatData = buffer.floatChannelData else { return }
+            // ---- Player nodes ----
+            let localPlayer  = AVAudioPlayerNode()
+            let remotePlayer = AVAudioPlayerNode()
 
-                let frameCount = Int(buffer.frameLength)
-                let channelCount = Int(buffer.format.channelCount)
-                let clampedChannels = min(channelCount, tapChannelCount)
-                let interleavedCount = frameCount * clampedChannels
+            eng.attach(localPlayer)
+            eng.attach(remotePlayer)
 
-                guard interleavedCount <= scratchWrapper.capacity else { return }
+            eng.connect(localPlayer,        to: eng.mainMixerNode, format: processingFormat)
+            eng.connect(remotePlayer,       to: eng.mainMixerNode, format: processingFormat)
+            eng.connect(eng.mainMixerNode,  to: eng.outputNode,    format: processingFormat)
 
-                let scratch = scratchWrapper.pointer
-                for frame in 0..<frameCount {
-                    for ch in 0..<clampedChannels {
-                        scratch[frame * clampedChannels + ch] = floatData[ch][frame]
-                    }
-                }
-                ringBuffer.write(scratch, count: interleavedCount)
-            }
-        }
+            try eng.start()
+            localPlayer.play()
+            remotePlayer.play()
 
-        // Drain timer: 10ms interval
-        let drain = DispatchSource.makeTimerSource(queue: audioConversionQueue)
-        drain.schedule(deadline: .now(), repeating: .milliseconds(10))
-        drain.setEventHandler { [weak self, weak ringBuffer] in
-            guard let self = self, let ringBuffer = ringBuffer else { return }
+            self.engine           = eng
+            self.localPlayerNode  = localPlayer
+            self.remotePlayerNode = remotePlayer
 
-            let dropped = ringBuffer.exchangeOverflowCount()
-            if dropped > 0 {
-                os_log(.error, log: Self.log,
-                       "Recording: audio ring buffer overflow — %llu write(s) dropped since last drain",
-                       dropped)
-            }
+            // ---- AudioRenderer sources ----
+            let localSrc  = RecordingAudioSource(playerNode: localPlayer,  targetFormat: processingFormat)
+            let remoteSrc = RecordingAudioSource(playerNode: remotePlayer, targetFormat: processingFormat)
+            self.localSource  = localSrc
+            self.remoteSource = remoteSrc
 
-            let drainCount = 960  // 10ms @ 48kHz stereo
-            var samples = [Float](repeating: 0, count: drainCount)
-            let read = ringBuffer.read(into: &samples, count: drainCount)
-            if read > 0 {
-                if let sampleBuffer = self.convertFloatsToCMSampleBuffer(samples, count: read) {
-                    self.onSampleBuffer?(sampleBuffer)
-                }
-            }
-        }
-        audioDrainTimer = drain
-        drain.resume()
+            AudioManager.shared.add(localAudioRenderer:  localSrc)
+            AudioManager.shared.add(remoteAudioRenderer: remoteSrc)
 
-        // Engine-restart recovery: re-install tap if the AVAudioEngine restarts.
-        InterAudioEngineAccess.shared.onEngineRestart = { [weak self] in
-            guard let self = self else { return }
-            self.coordinatorQueue.async {
-                os_log(.info, log: Self.log,
-                       "Recording: AVAudioEngine restarted — re-installing audio tap")
-                self.stop()
-                self.start()
-            }
+            // ---- Render timer ----
+            startRenderTimer()
+
+            os_log(.info, log: Self.log, "Audio capture started (LiveKit AudioRenderer)")
+
+        } catch {
+            os_log(
+                .error, log: Self.log,
+                "Failed to start audio capture: %{public}@",
+                error.localizedDescription
+            )
+            teardown()
         }
     }
 
-    /// Remove the audio tap and cancel the drain timer.
-    /// May be called from `coordinatorQueue` or `deinit`.
+    // MARK: - Stop
+
     func stop() {
-        InterAudioEngineAccess.shared.onEngineRestart = nil
+        teardown()
+        os_log(.info, log: Self.log, "Audio capture stopped")
+    }
 
-        audioDrainTimer?.cancel()
-        audioDrainTimer = nil
+    // MARK: - Teardown
 
-        if let mixerNode = InterAudioEngineAccess.outputNode() {
-            mixerNode.removeTap(onBus: 0)
+    private func teardown() {
+        renderTimer?.cancel()
+        renderTimer = nil
+
+        if let src = localSource  { AudioManager.shared.remove(localAudioRenderer:  src) }
+        if let src = remoteSource { AudioManager.shared.remove(remoteAudioRenderer: src) }
+        localSource  = nil
+        remoteSource = nil
+
+        localPlayerNode?.stop()
+        remotePlayerNode?.stop()
+        localPlayerNode  = nil
+        remotePlayerNode = nil
+
+        engine?.stop()
+        engine?.reset()
+        engine = nil
+    }
+
+    // MARK: - Render Timer
+
+    private func startRenderTimer() {
+        let timer = DispatchSource.makeTimerSource(queue: coordinatorQueue)
+        let intervalNs = UInt64(
+            Double(renderFrameCount) / processingFormat.sampleRate * 1_000_000_000
+        )
+        timer.schedule(
+            deadline: .now(),
+            repeating: .nanoseconds(Int(intervalNs))
+        )
+        timer.setEventHandler { [weak self] in
+            self?.renderAndDeliver()
         }
-
-        interleaveBuffer?.invalidate()
-        interleaveBuffer = nil
-
-        audioRingBuffer?.reset()
-        audioRingBuffer = nil
+        self.renderTimer = timer
+        timer.resume()
     }
 
-    // MARK: - Float32 → CMSampleBuffer Conversion
+    // MARK: - Manual Render
 
-    private func convertFloatsToCMSampleBuffer(_ samples: [Float], count: Int) -> CMSampleBuffer? {
-        let channelCount: UInt32 = 2
-        let sampleRate: Float64 = 48000.0
-        let frameCount = count / Int(channelCount)
+    private func renderAndDeliver() {
+        guard let engine = engine else { return }
 
-        var asbd = AudioStreamBasicDescription(
-            mSampleRate: sampleRate,
-            mFormatID: kAudioFormatLinearPCM,
-            mFormatFlags: kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked,
-            mBytesPerPacket: UInt32(MemoryLayout<Float>.size) * channelCount,
-            mFramesPerPacket: 1,
-            mBytesPerFrame: UInt32(MemoryLayout<Float>.size) * channelCount,
-            mChannelsPerFrame: channelCount,
-            mBitsPerChannel: UInt32(MemoryLayout<Float>.size * 8),
-            mReserved: 0
+        guard let buffer = AVAudioPCMBuffer(
+            pcmFormat: engine.manualRenderingFormat,
+            frameCapacity: renderFrameCount
+        ) else { return }
+
+        // Pre-set frameLength so the AudioBufferList data sizes are correct.
+        buffer.frameLength = renderFrameCount
+
+        let status = engine.manualRenderingBlock(
+            renderFrameCount,
+            buffer.mutableAudioBufferList,
+            nil
         )
 
-        var formatDescription: CMAudioFormatDescription?
-        let fmtStatus = CMAudioFormatDescriptionCreate(
-            allocator: kCFAllocatorDefault,
-            asbd: &asbd,
-            layoutSize: 0,
-            layout: nil,
-            magicCookieSize: 0,
-            magicCookie: nil,
-            extensions: nil,
-            formatDescriptionOut: &formatDescription
-        )
-        guard fmtStatus == noErr, let fmt = formatDescription else { return nil }
+        guard status == .success, buffer.frameLength > 0 else { return }
 
-        let dataSize = count * MemoryLayout<Float>.size
-        var blockBuffer: CMBlockBuffer?
-        let blockStatus = CMBlockBufferCreateWithMemoryBlock(
-            allocator: kCFAllocatorDefault,
-            memoryBlock: nil,
-            blockLength: dataSize,
-            blockAllocator: kCFAllocatorDefault,
-            customBlockSource: nil,
-            offsetToData: 0,
-            dataLength: dataSize,
-            flags: 0,
-            blockBufferOut: &blockBuffer
-        )
-        guard blockStatus == kCMBlockBufferNoErr, let block = blockBuffer else { return nil }
-
-        let copyStatus = CMBlockBufferReplaceDataBytes(
-            with: samples,
-            blockBuffer: block,
-            offsetIntoDestination: 0,
-            dataLength: dataSize
-        )
-        guard copyStatus == kCMBlockBufferNoErr else { return nil }
-
-        var sampleBuffer: CMSampleBuffer?
-        let timing = CMSampleTimingInfo(
-            duration: CMTimeMake(value: Int64(frameCount), timescale: Int32(sampleRate)),
-            presentationTimeStamp: CMTimeMakeWithSeconds(CACurrentMediaTime(), preferredTimescale: Int32(sampleRate)),
-            decodeTimeStamp: .invalid
-        )
-
-        var timingInfo = timing
-        let sbStatus = CMSampleBufferCreate(
-            allocator: kCFAllocatorDefault,
-            dataBuffer: block,
-            dataReady: true,
-            makeDataReadyCallback: nil,
-            refcon: nil,
-            formatDescription: fmt,
-            sampleCount: CMItemCount(frameCount),
-            sampleTimingEntryCount: 1,
-            sampleTimingArray: &timingInfo,
-            sampleSizeEntryCount: 0,
-            sampleSizeArray: nil,
-            sampleBufferOut: &sampleBuffer
-        )
-        guard sbStatus == noErr else { return nil }
-
-        return sampleBuffer
-    }
-}
-
-// MARK: - Interleave Buffer (Managed Scratch Wrapper)
-
-/// Reference-counted wrapper for the interleave scratch buffer used by the audio tap.
-/// See InterRecordingCoordinator.swift for the full safety contract documentation.
-private final class AudioCaptureInterleaveBuffer: @unchecked Sendable {
-    let pointer: UnsafeMutablePointer<Float>
-    let capacity: Int
-    private let _isActive = ManagedAtomic<Bool>(true)
-
-    var isActive: Bool { _isActive.load(ordering: .acquiring) }
-
-    init(capacity: Int) {
-        self.capacity = capacity
-        self.pointer = .allocate(capacity: capacity)
-        self.pointer.initialize(repeating: 0, count: capacity)
-    }
-
-    func invalidate() {
-        _isActive.store(false, ordering: .releasing)
-    }
-
-    deinit {
-        pointer.deallocate()
-    }
-}
-
-// MARK: - Audio Capture Ring Buffer (Lock-free SPSC)
-
-/// Lock-free single-producer single-consumer ring buffer for recording audio capture.
-/// See InterRecordingCoordinator.swift for the full atomic-ordering rationale.
-private final class AudioCaptureRingBuffer: @unchecked Sendable {
-    private let capacity: Int
-    private let buffer: UnsafeMutablePointer<Float>
-    private let _head = ManagedAtomic<UInt64>(0)
-    private let _tail = ManagedAtomic<UInt64>(0)
-    private let _overflowCount = ManagedAtomic<UInt64>(0)
-
-    var overflowCount: UInt64 { _overflowCount.load(ordering: .relaxed) }
-
-    /// Atomically read and reset the overflow counter.
-    /// Returns the number of overflows since the last call.
-    func exchangeOverflowCount() -> UInt64 {
-        return _overflowCount.exchange(0, ordering: .relaxed)
-    }
-
-    init(frameDuration: TimeInterval, sampleRate: Int, channels: Int) {
-        self.capacity = Int(frameDuration * Double(sampleRate)) * channels
-        self.buffer = .allocate(capacity: capacity)
-        buffer.initialize(repeating: 0, count: capacity)
-    }
-
-    deinit {
-        buffer.deallocate()
-    }
-
-    @discardableResult
-    func write(_ samples: UnsafePointer<Float>, count: Int) -> Bool {
-        let h = _head.load(ordering: .relaxed)
-        let t = _tail.load(ordering: .acquiring)
-        let used = Int(h &- t)
-        let free = capacity - used
-        guard count <= free else {
-            _overflowCount.wrappingIncrement(ordering: .relaxed)
-            return false
+        if let sb = makeCMSampleBuffer(from: buffer) {
+            onSampleBuffer?(sb)
         }
-        for i in 0..<count {
-            let idx = Int((h &+ UInt64(i)) % UInt64(capacity))
-            buffer[idx] = samples[i]
-        }
-        _head.store(h &+ UInt64(count), ordering: .releasing)
-        return true
     }
 
-    func read(into destination: inout [Float], count: Int) -> Int {
-        let h = _head.load(ordering: .acquiring)
-        let t = _tail.load(ordering: .relaxed)
-        let available = Int(h &- t)
-        let toRead = min(count, available)
+    // MARK: - CMSampleBuffer Conversion
 
-        for i in 0..<toRead {
-            let idx = Int((t &+ UInt64(i)) % UInt64(capacity))
-            destination[i] = buffer[idx]
-        }
-        if toRead < count {
-            for i in toRead..<count {
-                destination[i] = 0
+    /// Converts a non-interleaved Float32 AVAudioPCMBuffer into an
+    /// interleaved Float32 CMSampleBuffer suitable for AVAssetWriter.
+    private func makeCMSampleBuffer(from pcm: AVAudioPCMBuffer) -> CMSampleBuffer? {
+        let frameCount = Int(pcm.frameLength)
+        let channels   = Int(processingFormat.channelCount)
+        guard let floatData = pcm.floatChannelData, frameCount > 0 else { return nil }
+
+        // ---- Interleave ----
+        let sampleCount = frameCount * channels
+        let byteSize    = sampleCount * MemoryLayout<Float>.size
+
+        var interleaved = [Float](repeating: 0, count: sampleCount)
+        for f in 0..<frameCount {
+            for ch in 0..<channels {
+                interleaved[f * channels + ch] = floatData[ch][f]
             }
         }
-        _tail.store(t &+ UInt64(toRead), ordering: .releasing)
-        return toRead
+
+        // ---- ASBD: interleaved Float32 PCM ----
+        var asbd = AudioStreamBasicDescription(
+            mSampleRate:       processingFormat.sampleRate,
+            mFormatID:         kAudioFormatLinearPCM,
+            mFormatFlags:      kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked,
+            mBytesPerPacket:   UInt32(channels * MemoryLayout<Float>.size),
+            mFramesPerPacket:  1,
+            mBytesPerFrame:    UInt32(channels * MemoryLayout<Float>.size),
+            mChannelsPerFrame: UInt32(channels),
+            mBitsPerChannel:   UInt32(MemoryLayout<Float>.size * 8),
+            mReserved:         0
+        )
+
+        // ---- Format description ----
+        var fmtDesc: CMAudioFormatDescription?
+        guard CMAudioFormatDescriptionCreate(
+            allocator:            kCFAllocatorDefault,
+            asbd:                 &asbd,
+            layoutSize:           0,
+            layout:               nil,
+            magicCookieSize:      0,
+            magicCookie:          nil,
+            extensions:           nil,
+            formatDescriptionOut: &fmtDesc
+        ) == noErr, let fmt = fmtDesc else { return nil }
+
+        // ---- Timing ----
+        let pts = CMTime(
+            seconds: CACurrentMediaTime(),
+            preferredTimescale: 48_000
+        )
+        var timing = CMSampleTimingInfo(
+            duration:                CMTime(
+                value:     CMTimeValue(frameCount),
+                timescale: CMTimeScale(processingFormat.sampleRate)
+            ),
+            presentationTimeStamp:  pts,
+            decodeTimeStamp:        .invalid
+        )
+
+        // ---- Block buffer ----
+        var blockBuf: CMBlockBuffer?
+        guard CMBlockBufferCreateWithMemoryBlock(
+            allocator:       kCFAllocatorDefault,
+            memoryBlock:     nil,
+            blockLength:     byteSize,
+            blockAllocator:  kCFAllocatorDefault,
+            customBlockSource: nil,
+            offsetToData:    0,
+            dataLength:      byteSize,
+            flags:           0,
+            blockBufferOut:  &blockBuf
+        ) == kCMBlockBufferNoErr, let bb = blockBuf else { return nil }
+
+        guard interleaved.withUnsafeBytes({ ptr in
+            CMBlockBufferReplaceDataBytes(
+                with:                 ptr.baseAddress!,
+                blockBuffer:          bb,
+                offsetIntoDestination: 0,
+                dataLength:           byteSize
+            )
+        }) == kCMBlockBufferNoErr else { return nil }
+
+        // ---- Sample buffer ----
+        var sampleBuf: CMSampleBuffer?
+        guard CMSampleBufferCreate(
+            allocator:              kCFAllocatorDefault,
+            dataBuffer:             bb,
+            dataReady:              true,
+            makeDataReadyCallback:  nil,
+            refcon:                 nil,
+            formatDescription:      fmt,
+            sampleCount:            frameCount,
+            sampleTimingEntryCount: 1,
+            sampleTimingArray:      &timing,
+            sampleSizeEntryCount:   0,
+            sampleSizeArray:        nil,
+            sampleBufferOut:        &sampleBuf
+        ) == noErr else { return nil }
+
+        return sampleBuf
+    }
+}
+
+// MARK: - RecordingAudioSource
+
+/// Bridges LiveKit's `AudioRenderer` protocol to an `AVAudioPlayerNode`.
+///
+/// Each instance receives PCM buffers from LiveKit (local mic or combined
+/// remote) and schedules them into its player node.  If the incoming format
+/// doesn't match the mix engine's processing format, a lazy `AVAudioConverter`
+/// handles resampling / channel mapping.
+private final class RecordingAudioSource: NSObject, AudioRenderer, @unchecked Sendable {
+
+    private let playerNode: AVAudioPlayerNode
+    private let targetFormat: AVAudioFormat
+
+    /// Guards `_converter` — render() may be called from any LiveKit audio thread.
+    private let _lock = NSLock()
+    private var _converter: AVAudioConverter?
+
+    init(playerNode: AVAudioPlayerNode, targetFormat: AVAudioFormat) {
+        self.playerNode   = playerNode
+        self.targetFormat = targetFormat
+        super.init()
     }
 
-    func reset() {
-        _head.store(0, ordering: .relaxed)
-        _tail.store(0, ordering: .relaxed)
-        _overflowCount.store(0, ordering: .relaxed)
+    // MARK: - AudioRenderer
+
+    func render(pcmBuffer: AVAudioPCMBuffer) {
+        guard pcmBuffer.frameLength > 0 else { return }
+
+        let srcFmt = pcmBuffer.format
+
+        // Fast path: formats already match — no converter needed.
+        if srcFmt.sampleRate   == targetFormat.sampleRate,
+           srcFmt.channelCount == targetFormat.channelCount {
+            playerNode.scheduleBuffer(pcmBuffer)
+            return
+        }
+
+        // Slow path: resolve converter under lock, then convert outside.
+        let conv: AVAudioConverter? = {
+            _lock.lock()
+            defer { _lock.unlock() }
+            if _converter == nil || _converter?.inputFormat != srcFmt {
+                _converter = AVAudioConverter(from: srcFmt, to: targetFormat)
+            }
+            return _converter
+        }()
+
+        guard let conv else {
+            playerNode.scheduleBuffer(pcmBuffer)
+            return
+        }
+
+        let ratio     = targetFormat.sampleRate / srcFmt.sampleRate
+        let outFrames = AVAudioFrameCount(Double(pcmBuffer.frameLength) * ratio)
+
+        guard let outBuf = AVAudioPCMBuffer(
+            pcmFormat:     targetFormat,
+            frameCapacity: outFrames
+        ) else { return }
+
+        var error: NSError?
+        conv.convert(to: outBuf, error: &error) { _, status in
+            status.pointee = .haveData
+            return pcmBuffer
+        }
+
+        if error == nil, outBuf.frameLength > 0 {
+            playerNode.scheduleBuffer(outBuf)
+        }
     }
 }

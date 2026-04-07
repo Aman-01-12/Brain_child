@@ -20,6 +20,10 @@ typedef NS_ENUM(NSInteger, InterComposedLayout) {
     InterComposedLayoutScreenSharePiP,
     /// Screen share only — no active speaker camera available.
     InterComposedLayoutScreenShareOnly,
+    /// NxM grid of all participant cameras (3+ participants, no screen share).
+    InterComposedLayoutGrid,
+    /// Screen share (main) + filmstrip sidebar of participant cameras.
+    InterComposedLayoutScreenShareFilmstrip,
 };
 
 /// Delegate notified of layout changes (for logging / UI indicators).
@@ -85,6 +89,22 @@ typedef NS_ENUM(NSInteger, InterComposedLayout) {
 /// @param identity     Participant identity.
 - (void)updateSecondarySpeakerFrame:(CVPixelBufferRef _Nullable)pixelBuffer
                            identity:(NSString * _Nullable)identity;
+
+/// Update a participant's camera frame in the grid. Thread-safe.
+/// @param pixelBuffer  Latest camera frame (NULL to clear / use placeholder).
+/// @param identity     Participant identity (must be non-nil).
+- (void)updateParticipantFrame:(CVPixelBufferRef _Nullable)pixelBuffer
+                      identity:(NSString *)identity;
+
+/// Remove a participant from the grid entirely. Thread-safe.
+/// @param identity     Participant identity to remove.
+- (void)removeParticipant:(NSString *)identity;
+
+/// Set the ordered list of participant identities for grid layout.
+/// Thread-safe. The grid renders participants in this order (left-to-right,
+/// top-to-bottom). Identities not in this list are ignored in rendering.
+/// @param identities   Ordered NSArray of NSString participant identities.
+- (void)setParticipantOrder:(NSArray<NSString *> *)identities;
 
 /// Generate (or return cached) placeholder frame for an audio-only participant.
 /// Thread-safe — caches per identity. Dark background with the participant's name.

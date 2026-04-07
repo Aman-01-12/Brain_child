@@ -729,17 +729,19 @@ extension InterRoomController: RoomDelegate {
         }
 
         // [Phase 10] Auto-stop recording on room disconnect.
-        // Snapshot configuration and roomCode here (before the async dispatch) to avoid
-        // a race with disconnect(reason:), which clears configuration = nil synchronously
-        // on the main thread and may execute before the async block below runs.
-        let capturedServerURL = self.configuration?.tokenServerURL
-        let capturedCode = self.roomCode.isEmpty ? nil : self.roomCode
-        let capturedIdentity = self.configuration?.participantIdentity
+        // configuration and roomCode are main-thread-owned properties; read them
+        // inside the main.async block so all accesses are properly serialised.
+        // If disconnect(reason:) already ran and cleared configuration before this
+        // block executes, the coordinator receives nil — that is safe, because a
+        // user-initiated disconnect will have already stopped the recording.
         DispatchQueue.main.async {
+            let serverURL = self.configuration?.tokenServerURL
+            let code = self.roomCode.isEmpty ? nil : self.roomCode
+            let identity = self.configuration?.participantIdentity
             self.recordingCoordinator?.handleRoomDisconnect(
-                serverURL: capturedServerURL,
-                roomCode: capturedCode,
-                callerIdentity: capturedIdentity
+                serverURL: serverURL,
+                roomCode: code,
+                callerIdentity: identity
             )
         }
     }

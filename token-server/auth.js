@@ -19,8 +19,19 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const db = require('./db');
 
-const JWT_SECRET = process.env.JWT_SECRET || 'inter-dev-secret-change-in-production';
-const JWT_EXPIRES_IN = '7d';
+// ---------------------------------------------------------------------------
+// Secret validation — crash at startup rather than run with a weak secret.
+// Generate a suitable secret:
+//   node -e "console.log(require('crypto').randomBytes(32).toString('base64url'))"
+// ---------------------------------------------------------------------------
+const JWT_SECRET = process.env.JWT_SECRET;
+if (!JWT_SECRET || Buffer.from(JWT_SECRET, 'utf8').length < 32) {
+  console.error('[FATAL] JWT_SECRET must be set and at least 32 bytes. Server will not start.');
+  console.error('[FATAL] Generate one with: node -e "console.log(require(\'crypto\').randomBytes(32).toString(\'base64url\'))"');
+  process.exit(1);
+}
+
+const JWT_EXPIRES_IN = '7d';   // Phase B: shorten to '15m' when refresh token flow is built
 const BCRYPT_ROUNDS = 12;
 
 // ---------------------------------------------------------------------------
@@ -29,13 +40,18 @@ const BCRYPT_ROUNDS = 12;
 function generateAuthToken(user) {
   return jwt.sign(
     {
-      userId: user.id,
-      email: user.email,
+      userId:      user.id,
+      email:       user.email,
       displayName: user.display_name,
-      tier: user.tier,
+      tier:        user.tier,
     },
     JWT_SECRET,
-    { expiresIn: JWT_EXPIRES_IN }
+    {
+      algorithm:  'HS256',               // pin — never allow library to negotiate algorithm
+      expiresIn:  JWT_EXPIRES_IN,
+      issuer:     'inter-token-server',  // validated on verify — prevents cross-service reuse
+      audience:   'inter-macos-client', // validated on verify — prevents token misuse
+    }
   );
 }
 
@@ -151,16 +167,25 @@ function authenticateToken(req, res, next) {
     : authHeader;
 
   try {
-    const decoded = jwt.verify(token, JWT_SECRET);
+    const decoded = jwt.verify(token, JWT_SECRET, {
+      algorithms: ['HS256'],              // whitelist — rejects alg:none, RS256, ES256 forgeries
+      issuer:     'inter-token-server',   // must match what generateAuthToken sets
+      audience:   'inter-macos-client',  // must match what generateAuthToken sets
+    });
     req.user = {
-      userId: decoded.userId,
-      email: decoded.email,
+      userId:      decoded.userId,
+      email:       decoded.email,
       displayName: decoded.displayName,
-      tier: decoded.tier,
+      tier:        decoded.tier,
     };
     next();
   } catch (err) {
-    return res.status(401).json({ error: 'Invalid or expired auth token' });
+    if (err.name === 'TokenExpiredError') {
+      // Expired — distinguish from invalid so clients can trigger silent refresh (Phase B)
+      return res.status(401).json({ error: 'Access token expired', code: 'TOKEN_EXPIRED' });
+    }
+    // Tampered, wrong issuer, wrong audience, or structurally invalid
+    return res.status(401).json({ error: 'Invalid auth token', code: 'TOKEN_INVALID' });
   }
 }
 

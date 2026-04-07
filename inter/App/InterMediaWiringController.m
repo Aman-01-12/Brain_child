@@ -43,6 +43,23 @@ static void *InterWiringParticipantCountContext = &InterWiringParticipantCountCo
 
 @implementation InterMediaWiringController
 
+// Custom setter: when the layout manager is (re-)assigned, immediately push
+// the current active-speaker identity so that any KVO change that arrived
+// while remoteLayout was nil is not silently dropped.  This fixes the
+// "missing green border on first speaker" race in the normal-call path
+// where setupRoomControllerKVO runs at launch but remoteLayout is only
+// wired when the call window is created later.
+- (void)setRemoteLayout:(InterRemoteVideoLayoutManager *)remoteLayout {
+    _remoteLayout = remoteLayout;
+
+    if (remoteLayout) {
+        NSString *currentSpeaker = self.roomController.activeSpeakerIdentity;
+        if (currentSpeaker.length > 0) {
+            [remoteLayout setActiveSpeakerIdentity:currentSpeaker];
+        }
+    }
+}
+
 - (void)dealloc {
     [self teardownRoomControllerKVO];
     [self cancelReconnectionTimeout];

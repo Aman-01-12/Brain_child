@@ -1,7 +1,7 @@
 # LiveKit Integration — Implementation Plan
 
-> **Status**: Phase 0–5A complete. Phase 6 (Infrastructure Foundation) complete — Redis migration, PostgreSQL schema, auth middleware. Phase 7 (Scale to 50 Participants) complete — cap raised, adaptive grid, pagination, selective subscription, active speaker highlight. Phase 8 (In-Meeting Communication) complete — public chat via DataChannel, DMs, raise hand + speaker queue, chat transcript export. Post-Phase 8 hardening complete — queue UI polish, mic/camera coupling fix, dismiss-all, active speaker debounce. Phase 8.5 (Live Polls) complete — poll controller, poll panel, DataChannel topic routing. Phase 8.6 (Q&A Board) complete — Q&A controller, Q&A panel, upvote/highlight/answered/dismiss moderation. Phase 9 (Meeting Management) complete — roles & permissions, moderation controls (mute/remove/lock/suspend/spotlight), lobby/waiting room, meeting passwords. Phase 10 (Recording) complete — 10A recording engine + composed renderer, 10B coordinator + UI + audio, 10C watermark + cloud recording, 10D multi-track + edge cases + polish. **Post-10D audit complete — all 14 architecture gaps closed.** 140 tests passing. See `implementation_plan.md` for Phases 11–14 roadmap.  
-> **Last updated**: 1 April 2026 (post-10D audit)  
+> **Status**: Phase 0–5A complete. Phase 6 (Infrastructure Foundation) complete — Redis migration, PostgreSQL schema, auth middleware. Phase 7 (Scale to 50 Participants) complete — cap raised, adaptive grid, pagination, selective subscription, active speaker highlight. Phase 8 (In-Meeting Communication) complete — public chat via DataChannel, DMs, raise hand + speaker queue, chat transcript export. Post-Phase 8 hardening complete — queue UI polish, mic/camera coupling fix, dismiss-all, active speaker debounce. Phase 8.5 (Live Polls) complete — poll controller, poll panel, DataChannel topic routing. Phase 8.6 (Q&A Board) complete — Q&A controller, Q&A panel, upvote/highlight/answered/dismiss moderation. Phase 9 (Meeting Management) complete — roles & permissions, moderation controls (mute/remove/lock/suspend/spotlight), lobby/waiting room, meeting passwords. Phase 10 (Recording) complete — 10A recording engine + composed renderer, 10B coordinator + UI + audio, 10C watermark + cloud recording, 10D multi-track + edge cases + polish. **Post-10D audit complete — all 14 architecture gaps closed.** Recording flow complete — grid layout, screen-share-aware start, host-priority, filmstrip. **Post-recording-flow bug fixes complete** — build errors, black screen, frozen duplicate frame, screen share mid-session, audio not recorded, audio rewrite (LiveKit AudioRenderer), active speaker border fix. 140 tests passing. See `implementation_plan.md` for Phases 11–14 roadmap.  
+> **Last updated**: 5 April 2026 (audio rewrite + active speaker border fix)  
 > **Tracking**: Changes logged in `work_done.md`. Long-term plan in `implementation_plan.md`.
 
 ---
@@ -1210,5 +1210,54 @@ LiveKit SFU handles all media forwarding — no transcoding.
 - [x] 9.7.3 — InterChatPanel: setChatInputEnabled: + displaySystemMessage: (Phase 9 additions)
 
 **Files**: `InterPermissions.swift`, `InterModerationController.swift`, `InterLobbyPanel.h/.m`, `InterChatMessage.swift`, `InterChatController.swift`, `InterChatPanel.h/.m`, `InterRoomController.swift`, `AppDelegate.m`, `token-server/index.js`
+
+---
+
+## Post-Phase 10: Recording Bug Fixes (April 2026)
+
+All items in this section were identified and resolved after the Phase 10D audit and the recording-flow implementation. Each fix was verified with a passing build.
+
+### BF-1 — Build Errors After Recording Flow Implementation ✅ DONE
+- [x] BF-1.1 — Fix garbled `_startLocalRecording` selector name
+- [x] BF-1.2 — Add missing `//` comment prefix on loose text fragment
+- [x] BF-1.3 — Remove spurious extra `}` causing mismatched scope
+- [x] BF-1.4 — Remove `@objc` from method with Swift default-value parameters (not Obj-C representable)
+- [x] BF-1.5 — Correct `screenShareDidChange(isActive:)` call site to match declared protocol selector
+- [x] BF-1.6 — Add `subscriber.recordingFrameDelegate = self` inside `_startLocalRecording`
+
+**Files**: `InterRecordingCoordinator.swift`
+
+### BF-2 — Black Screen in Recording (Active Speaker Not Seeded) ✅ DONE
+- [x] BF-2.1 — Seed `_activeSpeakerId` from `existingParticipants` in `_startLocalRecording`
+- [x] BF-2.2 — Add late-bootstrap fallback in `didReceiveRemoteCameraFrame`: accept first arriving identity when `_activeSpeakerId` is nil
+
+**Files**: `InterRecordingCoordinator.swift`
+
+### BF-3 — Frozen Duplicate Frame (Phantom Active Speaker from Empty String) ✅ DONE
+- [x] BF-3.1 — Guard `activeSpeakerDidChange`: early-return on `identity.length == 0`
+- [x] BF-3.2 — Clear stale secondary buffer in `_acceptSpeakerSwitch` on speaker promotion
+- [x] BF-3.3 — Auto-promote in `activeSpeakerDidChange` when `_activeSpeakerId` is currently nil/empty
+- [x] BF-3.4 — Replace nested ifs with `if/else if` chain in `didReceiveRemoteCameraFrame` (single-slot routing)
+- [x] BF-3.5 — Auto-fill active speaker in `participantDidJoin` when pipeline is running and no speaker set
+- [x] BF-3.6 — Clear and promote in `participantDidLeave` when leaving participant was the active speaker
+
+**Files**: `InterRecordingCoordinator.swift`
+
+### BF-4 — Screen Share Not Recorded Mid-Session ✅ DONE
+- [x] BF-4.1 — Wire `screenShareDidStop` → `[normalRecordingCoordinator screenShareDidChangeWithIsActive:NO]` in AppDelegate
+- [x] BF-4.2 — Wire `screenShareDidStart` → `[normalRecordingCoordinator screenShareDidChangeWithIsActive:YES]` in AppDelegate
+- [x] BF-4.3 — Set `_isActive = YES` at init in `InterRecordingSink` (eliminate timing window)
+- [x] BF-4.4 — Implement `didReceiveRemoteScreenShareFrame:fromParticipant:` in coordinator — forward frames to `InterComposedRenderer`
+
+**Files**: `AppDelegate.m`, `InterRecordingSink.m`, `InterRecordingCoordinator.swift`
+
+### BF-5 — Audio Not Recorded (Silent Tap / Format Mismatch / nil Guard) ✅ DONE
+- [x] BF-5.1 — Add `_attemptTapInstall()` helper: query actual mixer format, size ring buffer to real sample rate, install tap, set `tapInstalled = YES`
+- [x] BF-5.2 — Add 500 ms `DispatchSourceTimer` (`tapRetryTimer`) in `start()`: retry `_attemptTapInstall()` until engine is running and tap succeeds
+- [x] BF-5.3 — Cancel `tapRetryTimer` in `stop()`; introduce `_teardownTap()` to remove tap and invalidate interleave buffer
+- [x] BF-5.4 — Store `tapSampleRate` and `tapChannelCount` from actual `mixerNode.outputFormat`; use them in drain loop and `convertFloatsToCMSampleBuffer` (replace hardcoded 48000 / 2)
+- [x] BF-5.5 — Add Int16 fallback path in tap callback: reinterpret buffer as Int16 and convert to Float32 when `floatChannelData` pointer is nil
+
+**Files**: `InterRecordingAudioCapture.swift`
 
 ---
