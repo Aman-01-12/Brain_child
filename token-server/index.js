@@ -63,6 +63,7 @@ const express = require('express');
 const { AccessToken, RoomServiceClient, TrackSource, EgressClient,
         EncodedFileOutput, EncodingOptionsPreset,
         WebhookReceiver } = require('livekit-server-sdk');
+const crypto = require('crypto');
 const bcrypt = require('bcryptjs');
 const redis = require('./redis');
 const db = require('./db');
@@ -83,6 +84,8 @@ app.use((_req, res, next) => {
   res.setHeader('X-Content-Type-Options', 'nosniff');
   // Disallow embedding in iframes
   res.setHeader('X-Frame-Options', 'DENY');
+  // Prevent leaking referrer data — pure API server, no referrals needed
+  res.setHeader('Referrer-Policy', 'no-referrer');
   next();
 });
 
@@ -243,7 +246,7 @@ async function createToken(identity, displayName, roomName, isHost, metadata = n
 // ---------------------------------------------------------------------------
 // POST /auth/register
 // Body: { email, password, displayName }
-// Returns: { user, token }
+// Returns: { user, accessToken, refreshToken, expiresIn }
 // ---------------------------------------------------------------------------
 app.post('/auth/register', rateLimitAuth, async (req, res) => {
   const { email, password, displayName } = req.body;
@@ -253,11 +256,13 @@ app.post('/auth/register', rateLimitAuth, async (req, res) => {
     console.log(`[audit] User registered: ${result.user.email} (${result.user.id})`);
     res.status(201).json(result);
   } catch (err) {
-    const status = err.message.includes('already registered') ? 409
-                 : err.message.includes('required') ? 400
-                 : err.message.includes('at least') ? 400
-                 : 500;
-    // Only return known business-level messages — 500s go to global error handler
+    const status = err.status
+                 || (err.message.includes('already registered') ? 409
+                 :   err.message.includes('required') ? 400
+                 :   err.message.includes('at least') ? 400
+                 :   err.message.includes('Invalid') ? 400
+                 :   err.message.includes('must be') ? 400
+                 :   500);
     if (status === 500) throw err;
     res.status(status).json({ error: err.message });
   }
@@ -266,7 +271,7 @@ app.post('/auth/register', rateLimitAuth, async (req, res) => {
 // ---------------------------------------------------------------------------
 // POST /auth/login
 // Body: { email, password }
-// Returns: { user, token }
+// Returns: { user, accessToken, refreshToken, expiresIn }
 // ---------------------------------------------------------------------------
 app.post('/auth/login', rateLimitAuth, async (req, res) => {
   const { email, password } = req.body;
@@ -290,6 +295,166 @@ app.post('/auth/login', rateLimitAuth, async (req, res) => {
 // ---------------------------------------------------------------------------
 app.get('/auth/me', auth.requireAuth, (req, res) => {
   res.json(req.user);
+});
+
+// ---------------------------------------------------------------------------
+// POST /auth/refresh — rotate refresh token, issue new access token
+// Body: { refreshToken (base64url), clientId (optional macOS hardware UUID) }
+// Returns: { accessToken, refreshToken, expiresIn }
+// No auth middleware — this IS the auth recovery path
+// ---------------------------------------------------------------------------
+app.post('/auth/refresh', rateLimitAuth, async (req, res) => {
+  const { refreshToken, clientId } = req.body;
+
+  if (!refreshToken || typeof refreshToken !== 'string') {
+    return res.status(400).json({ error: 'refreshToken required' });
+  }
+
+  // Decode, HMAC-verify, and derive DB lookup hash in one step.
+  // verifyRefreshToken throws TOKEN_INVALID on any malformed or tampered input.
+  let tokenHash;
+  try {
+    tokenHash = auth.verifyRefreshToken(refreshToken);
+  } catch {
+    return res.status(401).json({ error: 'Invalid refresh token', code: 'TOKEN_INVALID' });
+  }
+
+  let dbClient;
+  try {
+    dbClient = await db.getClient();
+    await dbClient.query('BEGIN');
+
+    // Fetch the token row — include revoked rows for theft detection
+    const { rows } = await dbClient.query(
+      `SELECT id, user_id, family_id, client_id, expires_at, revoked_at
+       FROM refresh_tokens
+       WHERE token_hash = $1
+       LIMIT 1`,
+      [tokenHash]
+    );
+
+    if (rows.length === 0) {
+      await dbClient.query('ROLLBACK');
+      return res.status(401).json({ error: 'Invalid refresh token', code: 'TOKEN_INVALID' });
+    }
+
+    const stored = rows[0];
+
+    // ── THEFT DETECTION ──────────────────────────────────────────────
+    // A revoked token being presented means the family is compromised.
+    // Kill all active tokens in the family immediately.
+    if (stored.revoked_at !== null) {
+      await dbClient.query(
+        `UPDATE refresh_tokens SET revoked_at = NOW()
+         WHERE family_id = $1 AND revoked_at IS NULL`,
+        [stored.family_id]
+      );
+      await dbClient.query('COMMIT');
+      console.error(`[SECURITY] Refresh token reuse detected. family=${stored.family_id} userId=${stored.user_id}`);
+      return res.status(401).json({
+        error: 'Security alert: your session was compromised. Please log in again.',
+        code: 'SESSION_COMPROMISED',
+      });
+    }
+
+    // ── EXPIRY ───────────────────────────────────────────────────────
+    if (new Date(stored.expires_at) < new Date()) {
+      await dbClient.query('ROLLBACK');
+      return res.status(401).json({ error: 'Refresh token expired', code: 'TOKEN_EXPIRED' });
+    }
+
+    // ── DEVICE BINDING (soft) ────────────────────────────────────────
+    if (stored.client_id && clientId && stored.client_id !== clientId) {
+      console.warn(`[SECURITY] Client ID mismatch on refresh. stored=${stored.client_id} got=${clientId} userId=${stored.user_id}`);
+    }
+
+    // ── ROTATION ─────────────────────────────────────────────────────
+    // Revoke old token, issue new one in same family — atomic transaction
+    await dbClient.query(
+      `UPDATE refresh_tokens SET revoked_at = NOW() WHERE id = $1`,
+      [stored.id]
+    );
+
+    const newRaw = crypto.randomBytes(32);
+    const { clientToken: newClientToken, tokenHash: newHash } = auth.signRefreshToken(newRaw);
+
+    await dbClient.query(
+      `INSERT INTO refresh_tokens
+         (user_id, token_hash, family_id, client_id, expires_at, predecessor_id)
+       VALUES ($1, $2, $3, $4, NOW() + make_interval(days => $5), $6)`,
+      [stored.user_id, newHash, stored.family_id, clientId || stored.client_id, auth.REFRESH_TOKEN_DAYS, stored.id]
+    );
+
+    // ── FRESH TIER RE-READ ───────────────────────────────────────────
+    // This is the key design point: tier is re-read from DB on every refresh.
+    // A billing webhook may have changed it since the last access token was issued.
+    const { rows: userRows } = await dbClient.query(
+      `SELECT id, email, display_name, tier FROM users WHERE id = $1`,
+      [stored.user_id]
+    );
+
+    if (userRows.length === 0) {
+      await dbClient.query('ROLLBACK');
+      return res.status(401).json({ error: 'User account not found', code: 'TOKEN_INVALID' });
+    }
+
+    await dbClient.query('COMMIT');
+
+    const accessToken = auth.generateAccessToken(userRows[0], stored.family_id);
+
+    res.json({
+      accessToken,
+      refreshToken: newClientToken,
+      expiresIn: auth.parseTTLtoSeconds(process.env.ACCESS_TOKEN_TTL || '15m'),
+    });
+
+  } catch (err) {
+    if (dbClient) await dbClient.query('ROLLBACK').catch(() => {});
+    throw err;
+  } finally {
+    if (dbClient) dbClient.release();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// POST /auth/logout — revoke a specific refresh token
+// Body: { refreshToken (optional) }
+// Returns: 204 No Content
+// ---------------------------------------------------------------------------
+app.post('/auth/logout', auth.requireAuth, async (req, res) => {
+  const { refreshToken } = req.body;
+
+  if (refreshToken) {
+    try {
+      const tokenHash = auth.verifyRefreshToken(refreshToken);
+      // Scope revocation to the authenticated user — prevents one user from
+      // revoking another user's token by submitting a known token_hash.
+      // rowCount === 0 means either already revoked or not owned by caller;
+      // both are treated as success — logout must not leak token ownership.
+      const { rowCount } = await db.query(
+        `UPDATE refresh_tokens SET revoked_at = NOW()
+         WHERE token_hash = $1 AND user_id = $2 AND revoked_at IS NULL`,
+        [tokenHash, req.user.userId]
+      );
+      if (rowCount === 0) {
+        console.warn(`[auth] Logout: token not found or not owned by user ${req.user.userId}`);
+      }
+    } catch (err) {
+      // Logout must not fail visibly — log and continue
+      console.error('[auth] Logout token revocation failed:', err.message);
+    }
+  }
+
+  res.status(204).end();
+});
+
+// ---------------------------------------------------------------------------
+// POST /auth/logout-all — revoke all refresh tokens for the current user
+// Returns: 204 No Content
+// ---------------------------------------------------------------------------
+app.post('/auth/logout-all', auth.requireAuth, async (req, res) => {
+  await auth.revokeAllForUser(req.user.userId);
+  res.status(204).end();
 });
 
 // ---------------------------------------------------------------------------

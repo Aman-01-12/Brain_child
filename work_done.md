@@ -1324,3 +1324,119 @@ Token TTL was already configured at 6 hours in `token-server/index.js` (`TOKEN_T
 **Fix**: Added a custom `setRemoteLayout:` setter in `InterMediaWiringController.m` that immediately pushes the current `roomController.activeSpeakerIdentity` to the newly assigned layout manager. This ensures any speaker identity that was "missed" during the nil-layout window is synced as soon as the layout becomes available.
 
 **Build**: BUILD SUCCEEDED.
+
+---
+
+# ══════════════════════════════════════════════════════════
+# RECORDING FEATURE — PAUSE CHECKPOINT (7 April 2026)
+# ══════════════════════════════════════════════════════════
+
+> **Read this when returning to recording AFTER completing the auth system.**
+> Auth must be live before the "Resume" steps below can be applied.
+
+---
+
+## What Is Fully Working (Do Not Re-Implement)
+
+All Phase 10A–10D work is complete and bug-free. Do not re-implement any of this.
+
+| Feature | Status | Files |
+|---|---|---|
+| Recording engine (`InterRecordingEngine`) | ✅ Done | `inter/Media/Recording/InterRecordingEngine.h/.m` |
+| Multi-layout composed renderer (`InterComposedRenderer`) | ✅ Done | `inter/Media/Recording/InterComposedRenderer.h/.m` |
+| Grid layout (NxM for 3+ participants) | ✅ Done | `InterComposedRenderer.m` — `InterGridDimensions()`, `_encodeGridLayout:` |
+| Filmstrip sidebar (screen share + cameras) | ✅ Done | `InterComposedRenderer.m` — `_encodeScreenShareFilmstripLayout:` |
+| Watermark overlay (Metal shader, free tier) | ✅ Done | `InterComposedRenderer.m` — `_encodeWatermarkWithEncoder:` |
+| Recording sink (`InterRecordingSink`) | ✅ Done | `inter/Media/Recording/InterRecordingSink.h/.m` |
+| Recording coordinator (`InterRecordingCoordinator`) | ✅ Done | `inter/Media/Recording/InterRecordingCoordinator.swift` |
+| Audio capture (LiveKit AudioRenderer path) | ✅ Done | `inter/Media/Recording/InterRecordingAudioCapture.swift` |
+| Cloud recording via LiveKit Egress | ✅ Done | `token-server/index.js` — `POST /room/record/start`, `/stop`, `/status` |
+| Multi-track per-participant Egress | ✅ Done | `token-server/index.js` + migration `003_multitrack_tracks.sql` |
+| Manifest JSON generation | ✅ Done | `token-server/index.js` — `EGRESS_COMPLETE` webhook handler |
+| Recording sessions DB schema | ✅ Done | Migrations: `001_initial.sql`, `002_recording_sessions.sql`, `003_multitrack_tracks.sql` |
+| S3 presigned URL + delete | ✅ Done | `token-server/index.js` — `@aws-sdk/client-s3` + `@aws-sdk/s3-request-presigner` |
+| Disk space monitor + orphan cleanup | ✅ Done | `InterRecordingCoordinator.swift` |
+| Room disconnect auto-stop | ✅ Done | `InterRoomController.swift` → `recordingCoordinator.handleRoomDisconnect()` |
+| Recording list panel UI | ✅ Done | `inter/UI/Views/InterRecordingListPanel.h/.m` |
+| New joiner consent dialog UI | ✅ Done | `inter/UI/Views/InterRecordingConsentPanel.h/.m` |
+| Active speaker seeding + frozen frame fix | ✅ Done | `InterRecordingCoordinator.swift` |
+| Screen share mid-session fix | ✅ Done | `AppDelegate.m` + `InterRecordingSink.m` + `InterRecordingCoordinator.swift` |
+| All 14 post-audit architecture gaps | ✅ Done | `recording_architecture.md` — all items resolved |
+| Test suite (coordinator + engine + renderer) | ✅ Done | `interTests/InterRecordingCoordinatorTests.swift`, `InterRecordingEngineTests.swift`, `InterComposedRendererTests.swift` |
+
+**Build state**: BUILD SUCCEEDED, 140 tests passing, 0 failures (5 April 2026, Xcode 16, arm64).
+
+---
+
+## What Is INCOMPLETE — Resume Here After Auth Is Done
+
+Three recording items were intentionally left because they depend on the auth system:
+
+### 1. Tier Gating Is Hardcoded — MUST FIX AFTER AUTH
+
+**File**: `inter/App/AppDelegate.m`, line 1988
+
+**Current state (broken)**:
+```objc
+NSString *tier = @"free"; // Phase 10C: read from auth profile
+[coordinator startLocalRecordingWithScreenShareSource:self.normalSurfaceShareController
+                                           subscriber:self.roomController.subscriber
+                                  localMediaController:self.normalMediaController
+                                             userTier:tier];
+```
+
+**Effect of the bug**: Watermark is *always* shown (even for Pro/Hiring users). Cloud recording is *always* blocked. This is not a runtime crash — it's a silent capability regression for paid users.
+
+**What to do**: After auth (Phase B) is live and `InterTokenService.swift` holds the signed-in user profile:
+- Read tier from the auth profile stored in the macOS Keychain (Phase B.4 adds this)
+- Replace `@"free"` with the actual `tier` string from the decoded JWT or stored profile
+- `userTier:` accepts `@"free"`, `@"pro"`, `@"hiring"` — the coordinator handles the rest
+
+**Exact fix location**: `AppDelegate.m` → `handleRecordToggle` method, the `tier` variable.
+
+---
+
+### 2. Recording List Panel Is Not Exposed in the UI — MUST WIRE
+
+**File**: `inter/UI/Views/InterRecordingListPanel.h/.m` — fully built, never shown.
+
+**Current state**: `InterRecordingListPanel` has no call site in `AppDelegate.m`. There is no button, menu item, or keyboard shortcut that presents it. The panel physically exists but is unreachable by the user.
+
+**What to do**: Add a "Recordings" button to `InterLocalCallControlPanel` (alongside the existing "Start Recording" button area), or add a menu item in `MainMenu.xib`. When triggered, `AppDelegate` should:
+1. Instantiate `InterRecordingListPanel` (if not already shown)
+2. Implement `InterRecordingListPanelDelegate`:
+   - `didRequestOpenLocal:` → `[[NSWorkspace sharedWorkspace] openURL:fileURL]`
+   - `didRequestDownload:recordingId` → `GET /recordings/:id` → open presigned URL in browser
+   - `didRequestDelete:recordingId` → `DELETE /recordings/:id` then reload list
+3. Add it to the call window or as a floating panel
+
+**Prerequisite**: Auth must be live first — the list panel fetches `GET /recordings` which requires `authenticateToken` middleware.
+
+---
+
+### 3. New Joiner Consent Dialog Is Not Wired — MUST WIRE
+
+**File**: `inter/UI/Views/InterRecordingConsentPanel.h/.m` — fully built, never shown to joiners.
+
+**Current state**: `InterRecordingConsentPanel` is never instantiated or shown in `AppDelegate.m`. When a participant joins a room where recording is active, they receive no consent notification and no choice to accept or leave. This violates GDPR and most recording-consent laws.
+
+**What to do**: In `AppDelegate.m`, in the room participant-join handler (wherever new remote participants are added to the call UI), check `self.normalRecordingCoordinator.state == InterRecordingStateRecording`. If true:
+1. Instantiate `InterRecordingConsentPanel` and add it as an overlay on the `normalCallWindow`
+2. Implement `InterRecordingConsentPanelDelegate`:
+   - `recordingConsentPanelDidAccept:` → dismiss panel, participant stays
+   - `recordingConsentPanelDidDecline:` → hang up (`[self leaveCall]` or equivalent)
+3. The consent panel already shows mode-specific text — call `showConsentForMode:` with the current recording mode (`@"local"`, `@"cloud"`, `@"multitrack"`)
+
+**Prerequisite**: No auth dependency. Can be wired immediately. But is included here because it is a recording system completion item, not a standalone task.
+
+---
+
+## Summary Table — Recording Resume Checklist
+
+| # | Task | Depends On | File(s) to Edit |
+|---|---|---|---|
+| R1 | Replace hardcoded `tier = @"free"` with real auth profile tier | Auth Phase B live + Keychain token | `inter/App/AppDelegate.m` line 1988 |
+| R2 | Wire `InterRecordingListPanel` into the call UI | Auth live (endpoint requires token) | `inter/App/AppDelegate.m`, `inter/UI/Views/InterLocalCallControlPanel.m` |
+| R3 | Wire `InterRecordingConsentPanel` to show on participant join during recording | No auth dependency | `inter/App/AppDelegate.m` (participant-join handler) |
+
+**When all 3 are done, recording is 100% feature-complete.**

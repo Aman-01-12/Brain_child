@@ -17,6 +17,7 @@
 
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
 const db = require('./db');
 
 // ---------------------------------------------------------------------------
@@ -31,86 +32,246 @@ if (!JWT_SECRET || Buffer.from(JWT_SECRET, 'utf8').length < 32) {
   process.exit(1);
 }
 
-const JWT_EXPIRES_IN = '7d';   // Phase B: shorten to '15m' when refresh token flow is built
+const REFRESH_TOKEN_SECRET = process.env.REFRESH_TOKEN_SECRET;
+if (!REFRESH_TOKEN_SECRET || Buffer.from(REFRESH_TOKEN_SECRET, 'utf8').length < 32) {
+  console.error('[FATAL] REFRESH_TOKEN_SECRET must be set and at least 32 bytes.');
+  console.error('[FATAL] Generate one with: node -e "console.log(require(\'crypto\').randomBytes(32).toString(\'base64url\'))"');
+  process.exit(1);
+}
+
+const ACCESS_TOKEN_TTL   = process.env.ACCESS_TOKEN_TTL || '15m';
+const REFRESH_TOKEN_DAYS = parseInt(process.env.REFRESH_TOKEN_TTL_DAYS || '30', 10);
 const BCRYPT_ROUNDS = 12;
 
 // ---------------------------------------------------------------------------
-// Generate a user auth JWT (NOT a LiveKit token)
+// Timing normalization — pre-computed dummy hash used to equalize response
+// times on early-exit paths (email-not-found in login, email-taken in register).
+// Without this, an attacker can enumerate valid emails by timing alone.
+// Computed synchronously at module load so it is guaranteed to exist before
+// any request handler runs. hashSync blocks for ~300 ms once — acceptable at
+// startup, unacceptable in a request path.
 // ---------------------------------------------------------------------------
-function generateAuthToken(user) {
+const DUMMY_HASH = bcrypt.hashSync('inter-dummy-constant-do-not-change', BCRYPT_ROUNDS);
+
+// ---------------------------------------------------------------------------
+// Parse TTL string (e.g. '15m', '1h', '7d') to seconds for client-side scheduling.
+// ---------------------------------------------------------------------------
+function parseTTLtoSeconds(ttl) {
+  const match = String(ttl).match(/^(\d+)(s|m|h|d)?$/);
+  if (!match) return 900; // fallback: 15 min
+  const n = parseInt(match[1], 10);
+  const unit = match[2] || 's';
+  return { s: n, m: n * 60, h: n * 3600, d: n * 86400 }[unit];
+}
+
+// ---------------------------------------------------------------------------
+// Generate a short-lived access token (JWT, 15 min default).
+// Contains userId, email, displayName, tier, and the refresh token family ID.
+// The family ID (fam) links this access token to its refresh token session.
+// ---------------------------------------------------------------------------
+function generateAccessToken(user, familyId) {
   return jwt.sign(
     {
       userId:      user.id,
       email:       user.email,
       displayName: user.display_name,
       tier:        user.tier,
+      fam:         familyId,
     },
     JWT_SECRET,
     {
-      algorithm:  'HS256',               // pin — never allow library to negotiate algorithm
-      expiresIn:  JWT_EXPIRES_IN,
-      issuer:     'inter-token-server',  // validated on verify — prevents cross-service reuse
-      audience:   'inter-macos-client', // validated on verify — prevents token misuse
+      algorithm:  'HS256',
+      expiresIn:  ACCESS_TOKEN_TTL,
+      issuer:     'inter-token-server',
+      audience:   'inter-macos-client',
     }
   );
 }
 
 // ---------------------------------------------------------------------------
-// Register — create new user account
-// Returns: { user, token }
-// Throws: if email already exists or validation fails
+// signRefreshToken(rawBytes) → { clientToken, tokenHash }
+//
+// Given 32 random bytes, produces:
+//   clientToken — base64url(raw || HMAC-SHA256(REFRESH_TOKEN_SECRET, raw))
+//   tokenHash   — SHA-256(clientToken bytes) stored in DB for lookup
+//
+// Defense-in-depth: an attacker who can INSERT rows into refresh_tokens
+// (e.g. via SQL injection) still cannot forge a valid client token without
+// knowing REFRESH_TOKEN_SECRET. Plain SHA-256 storage alone would allow
+// a DB-write attacker to plant an arbitrary hash they already know.
 // ---------------------------------------------------------------------------
-async function register(email, password, displayName) {
-  // Validate inputs
-  if (!email || !password || !displayName) {
-    throw new Error('email, password, and displayName are required');
-  }
-  if (password.length < 8) {
-    throw new Error('Password must be at least 8 characters');
-  }
-
-  const emailNormalized = email.toLowerCase().trim();
-
-  // Check if email already exists
-  const existing = await db.query('SELECT id FROM users WHERE email = $1', [emailNormalized]);
-  if (existing.rows.length > 0) {
-    throw new Error('Email already registered');
-  }
-
-  // Hash password
-  const passwordHash = await bcrypt.hash(password, BCRYPT_ROUNDS);
-
-  // Insert user
-  const result = await db.query(
-    `INSERT INTO users (email, display_name, password_hash)
-     VALUES ($1, $2, $3)
-     RETURNING id, email, display_name, tier, created_at`,
-    [emailNormalized, displayName.trim(), passwordHash]
-  );
-
-  const user = result.rows[0];
-  const token = generateAuthToken(user);
-
+function signRefreshToken(rawBytes) {
+  const sig     = crypto.createHmac('sha256', REFRESH_TOKEN_SECRET).update(rawBytes).digest();
+  const payload = Buffer.concat([rawBytes, sig]);          // 64 bytes total
   return {
-    user: {
-      id: user.id,
-      email: user.email,
-      displayName: user.display_name,
-      tier: user.tier,
-      createdAt: user.created_at,
-    },
-    token,
+    clientToken: payload.toString('base64url'),
+    tokenHash:   crypto.createHash('sha256').update(payload).digest(),
   };
 }
 
 // ---------------------------------------------------------------------------
-// Login — verify credentials and return JWT
-// Returns: { user, token }
+// verifyRefreshToken(clientToken) → tokenHash (Buffer)
+//
+// Decodes the base64url token, recomputes HMAC, and validates with a
+// constant-time comparison. Returns the SHA-256(payload) hash for DB lookup.
+// Throws an error with { code: 'TOKEN_INVALID' } on any failure so callers
+// can forward a consistent error response.
+// ---------------------------------------------------------------------------
+function verifyRefreshToken(clientToken) {
+  let payload;
+  try {
+    payload = Buffer.from(String(clientToken), 'base64url');
+  } catch {
+    const err = new Error('Invalid refresh token'); err.code = 'TOKEN_INVALID'; throw err;
+  }
+  if (payload.length !== 64) {
+    const err = new Error('Invalid refresh token'); err.code = 'TOKEN_INVALID'; throw err;
+  }
+  const raw         = payload.subarray(0, 32);
+  const sig         = payload.subarray(32);
+  const expectedSig = crypto.createHmac('sha256', REFRESH_TOKEN_SECRET).update(raw).digest();
+  if (!crypto.timingSafeEqual(sig, expectedSig)) {
+    const err = new Error('Invalid refresh token'); err.code = 'TOKEN_INVALID'; throw err;
+  }
+  return crypto.createHash('sha256').update(payload).digest();
+}
+
+// ---------------------------------------------------------------------------
+// Issue a new refresh token for a login session.
+// Creates a new token family (UUID) — each login gets its own family.
+// The signed client token is returned to the caller. Only the SHA-256
+// hash of the full signed payload is stored in the DB.
+//
+// dbClient: a pg client from db.getClient() — caller manages the transaction.
+// Returns: { rawToken (base64url signed string), familyId (UUID) }
+// ---------------------------------------------------------------------------
+async function issueRefreshToken(userId, clientId, dbClient) {
+  const rawBytes  = crypto.randomBytes(32);
+  const { clientToken, tokenHash } = signRefreshToken(rawBytes);
+  const familyId  = crypto.randomUUID();
+
+  await dbClient.query(
+    `INSERT INTO refresh_tokens (user_id, token_hash, family_id, client_id, expires_at)
+     VALUES ($1, $2, $3, $4, NOW() + make_interval(days => $5))`,
+    [userId, tokenHash, familyId, clientId || null, REFRESH_TOKEN_DAYS]
+  );
+
+  return { rawToken: clientToken, familyId };
+}
+
+// ---------------------------------------------------------------------------
+// Revoke all active refresh tokens for a user (logout-all-devices).
+// ---------------------------------------------------------------------------
+async function revokeAllForUser(userId) {
+  await db.query(
+    `UPDATE refresh_tokens SET revoked_at = NOW()
+     WHERE user_id = $1 AND revoked_at IS NULL`,
+    [userId]
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Register — create new user account
+// Returns: { user, accessToken, refreshToken, expiresIn }
+// Throws: if email already exists or validation fails
+// ---------------------------------------------------------------------------
+async function register(email, password, displayName) {
+  // Validate presence
+  if (!email || !password || !displayName) {
+    throw new Error('email, password, and displayName are required');
+  }
+
+  // Email: RFC 5321 format + length cap (local ≤63, total ≤254)
+  const emailStr = String(email).toLowerCase().trim();
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(emailStr) || emailStr.length > 254) {
+    throw new Error('Invalid email address');
+  }
+
+  // Password: NIST minimum 8 chars, bcrypt hard cap 72 bytes
+  const passwordBytes = Buffer.byteLength(String(password), 'utf8');
+  if (passwordBytes < 8) {
+    throw new Error('Password must be at least 8 characters');
+  }
+  if (passwordBytes > 72) {
+    throw new Error('Password must be 72 characters or fewer');
+  }
+
+  // Display name: trim and cap at 100 chars
+  const nameStr = String(displayName).trim();
+  if (nameStr.length < 1 || nameStr.length > 100) {
+    throw new Error('Display name must be between 1 and 100 characters');
+  }
+
+  const emailNormalized = emailStr;
+
+  // Check if email already exists
+  const existing = await db.query('SELECT id FROM users WHERE email = $1', [emailNormalized]);
+  if (existing.rows.length > 0) {
+    // Normalize timing — compare against precomputed DUMMY_HASH (same CPU cost as
+    // bcrypt.compare in login()) instead of computing a fresh hash on every duplicate.
+    await bcrypt.compare('inter-dummy-constant-do-not-change', DUMMY_HASH);
+    const err = new Error('Email already registered');
+    err.status = 409;
+    throw err;
+  }
+
+  // Hash password (outside transaction — CPU-bound, no DB needed)
+  const passwordHash = await bcrypt.hash(password, BCRYPT_ROUNDS);
+
+  // Transaction: insert user + issue refresh token atomically
+  const dbClient = await db.getClient();
+  try {
+    await dbClient.query('BEGIN');
+
+    const result = await dbClient.query(
+      `INSERT INTO users (email, display_name, password_hash)
+       VALUES ($1, $2, $3)
+       RETURNING id, email, display_name, tier, created_at`,
+      [emailNormalized, nameStr, passwordHash]
+    );
+
+    const user = result.rows[0];
+    const { rawToken, familyId } = await issueRefreshToken(user.id, null, dbClient);
+
+    await dbClient.query('COMMIT');
+
+    const accessToken = generateAccessToken(user, familyId);
+
+    return {
+      user: {
+        id: user.id,
+        email: user.email,
+        displayName: user.display_name,
+        tier: user.tier,
+        createdAt: user.created_at,
+      },
+      accessToken,
+      refreshToken: rawToken,
+      expiresIn: parseTTLtoSeconds(ACCESS_TOKEN_TTL),
+    };
+  } catch (err) {
+    await dbClient.query('ROLLBACK');
+    throw err;
+  } finally {
+    dbClient.release();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Login — verify credentials and return tokens
+// Returns: { user, accessToken, refreshToken, expiresIn }
 // Throws: if credentials are invalid
 // ---------------------------------------------------------------------------
 async function login(email, password) {
   if (!email || !password) {
     throw new Error('email and password are required');
+  }
+
+  // Reject passwords exceeding bcrypt's 72-byte input limit early
+  const passwordBytes = Buffer.byteLength(String(password), 'utf8');
+  if (passwordBytes > 72) {
+    await bcrypt.compare(password, DUMMY_HASH); // normalize timing
+    throw new Error('Invalid email or password');
   }
 
   const emailNormalized = email.toLowerCase().trim();
@@ -121,6 +282,8 @@ async function login(email, password) {
   );
 
   if (result.rows.length === 0) {
+    // Normalize timing — pay bcrypt cost even when user doesn't exist
+    await bcrypt.compare(password, DUMMY_HASH);
     throw new Error('Invalid email or password');
   }
 
@@ -131,27 +294,42 @@ async function login(email, password) {
     throw new Error('Invalid email or password');
   }
 
-  const token = generateAuthToken(user);
+  // Issue refresh token inside a transaction
+  const dbClient = await db.getClient();
+  try {
+    await dbClient.query('BEGIN');
+    const { rawToken, familyId } = await issueRefreshToken(user.id, null, dbClient);
+    await dbClient.query('COMMIT');
 
-  return {
-    user: {
-      id: user.id,
-      email: user.email,
-      displayName: user.display_name,
-      tier: user.tier,
-      createdAt: user.created_at,
-    },
-    token,
-  };
+    const accessToken = generateAccessToken(user, familyId);
+
+    return {
+      user: {
+        id: user.id,
+        email: user.email,
+        displayName: user.display_name,
+        tier: user.tier,
+        createdAt: user.created_at,
+      },
+      accessToken,
+      refreshToken: rawToken,
+      expiresIn: parseTTLtoSeconds(ACCESS_TOKEN_TTL),
+    };
+  } catch (err) {
+    await dbClient.query('ROLLBACK');
+    throw err;
+  } finally {
+    dbClient.release();
+  }
 }
 
 // ---------------------------------------------------------------------------
 // Middleware: authenticateToken (OPTIONAL)
 //
 // Checks for Authorization: Bearer <token> header.
-// If present and valid → attaches req.user = { userId, email, displayName, tier }
+// If present and valid → attaches req.user = { userId, email, displayName, tier, tokenFamily }
 // If absent → req.user = null (anonymous — continues without error)
-// If present but invalid → 401 Unauthorized
+// If present but invalid → 401 (TOKEN_INVALID or TOKEN_EXPIRED)
 // ---------------------------------------------------------------------------
 function authenticateToken(req, res, next) {
   const authHeader = req.headers['authorization'];
@@ -168,15 +346,16 @@ function authenticateToken(req, res, next) {
 
   try {
     const decoded = jwt.verify(token, JWT_SECRET, {
-      algorithms: ['HS256'],              // whitelist — rejects alg:none, RS256, ES256 forgeries
-      issuer:     'inter-token-server',   // must match what generateAuthToken sets
-      audience:   'inter-macos-client',  // must match what generateAuthToken sets
+      algorithms: ['HS256'],
+      issuer:     'inter-token-server',
+      audience:   'inter-macos-client',
     });
     req.user = {
       userId:      decoded.userId,
       email:       decoded.email,
       displayName: decoded.displayName,
       tier:        decoded.tier,
+      tokenFamily: decoded.fam || null,
     };
     next();
   } catch (err) {
@@ -238,4 +417,11 @@ module.exports = {
   authenticateToken,
   requireAuth,
   requireTier,
+  generateAccessToken,
+  signRefreshToken,
+  verifyRefreshToken,
+  issueRefreshToken,
+  revokeAllForUser,
+  parseTTLtoSeconds,
+  REFRESH_TOKEN_DAYS,
 };
