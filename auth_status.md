@@ -1,6 +1,6 @@
 # Auth System — Implementation Status
 
-> Last updated: 13 April 2026 (Phase A complete, Phase B complete, Phase C 6/7, Billing UX complete, Billing Audit 14/14 fixes applied)
+> Last updated: 13 April 2026 (Phase A complete, Phase B complete, Phase C complete, Billing UX complete, Billing Audit 14/14 fixes applied)
 > Reference document: `auth_implementation.md` (11 sections)
 > Billing provider: **Lemon Squeezy** (Merchant of Record)
 > Build baseline: BUILD SUCCEEDED, 140 tests, 0 failures (5 April 2026, arm64)
@@ -114,7 +114,7 @@ A full cross-layer audit of the billing flow was performed across billing-page.j
 
 ### Production Steps (C-UX)
 
-- **Migrate to Apple Universal Links** — The current custom URL scheme (`com-inter-app://`) is hardened (vendor-prefixed, whitelisted host/path, no query/fragment accepted) but custom schemes can still be hijacked by a malicious app claiming the same scheme on the same device. For production, replace the deep-link callback with Universal Links: host an `apple-app-site-association` (AASA) JSON file at `https://api.inter.com/.well-known/apple-app-site-association`, add the Associated Domains entitlement (`applinks:api.inter.com`) to the app, and change the LS `redirectUrl` to `https://api.inter.com/billing/success`. macOS will then route the HTTPS URL directly to the app without going through the browser's URL-scheme dispatcher, fully preventing scheme hijacking.
+- **Migrate to Apple Universal Links** — The current custom URL scheme (`inter://`) is registered in Info.plist but custom schemes can still be hijacked by a malicious app claiming the same scheme on the same device. For production, replace the deep-link callback with Universal Links: host an `apple-app-site-association` (AASA) JSON file at `https://api.inter.com/.well-known/apple-app-site-association`, add the Associated Domains entitlement (`applinks:api.inter.com`) to the app, and change the LS `redirectUrl` to `https://api.inter.com/billing/success`. macOS will then route the HTTPS URL directly to the app without going through the browser's URL-scheme dispatcher, fully preventing scheme hijacking.
 
 ---
 
@@ -288,6 +288,6 @@ The token-server needs zero changes — the web app calls the same `/auth/*` and
 | C — Billing | 7 | 7 | 0 ✅ |
 | C-UX — Billing Upgrade Flow | 8 | 8 | 0 ✅ |
 | D — Account Recovery | 16 | 2 | 14 |
-| **Total** | **53** | **38** | **15** |
+| **Total** | **53** | **39** | **14** |
 
 **Next:** Phase D — Account Recovery.
