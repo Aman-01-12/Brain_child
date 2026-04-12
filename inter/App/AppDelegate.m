@@ -10,6 +10,7 @@
 #import "MetalSurfaceView.h"
 #import "SecureWindowController.h"
 #import "InterConnectionSetupPanel.h"
+#import "InterLoginPanel.h"
 #import "InterRemoteVideoLayoutManager.h"
 #import "InterTrackRendererBridge.h"
 #import "InterParticipantOverlayView.h"
@@ -28,7 +29,7 @@
 #import "inter-Swift.h"
 #endif
 
-@interface AppDelegate () <NSWindowDelegate, InterConnectionSetupPanelDelegate, InterParticipantOverlayDelegate, InterChatPanelDelegate, InterSpeakerQueuePanelDelegate, InterPollPanelDelegate, InterQAPanelDelegate, InterMediaWiringDelegate, InterModerationDelegate, InterLobbyPanelDelegate, InterRecordingCoordinatorDelegate, InterRecordingSignalDelegate>
+@interface AppDelegate () <NSWindowDelegate, InterConnectionSetupPanelDelegate, InterLoginPanelDelegate, InterAuthSessionDelegate, InterParticipantOverlayDelegate, InterChatPanelDelegate, InterSpeakerQueuePanelDelegate, InterPollPanelDelegate, InterQAPanelDelegate, InterMediaWiringDelegate, InterModerationDelegate, InterLobbyPanelDelegate, InterRecordingCoordinatorDelegate, InterRecordingSignalDelegate>
 @property (nonatomic, strong) NSMutableArray<CapWindow *> *capWindows;
 @property (nonatomic, strong) SecureWindowController *secureController;
 @property (nonatomic, strong) NSWindow *setupWindow;
@@ -85,6 +86,16 @@
 
 // [2.5.2] Room controller — persists across mode transitions [G4]
 @property (nonatomic, strong, nullable) InterRoomController *roomController;
+
+// [Phase B.4d] Auth — login/register panel and window
+@property (nonatomic, strong, nullable) NSWindow *loginWindow;
+@property (nonatomic, strong, nullable) InterLoginPanel *loginPanel;
+
+// Billing — upgrade/manage buttons on setup overlay
+@property (nonatomic, strong, nullable) NSButton *upgradeButton;
+@property (nonatomic, strong, nullable) NSButton *manageSubscriptionButton;
+@property (nonatomic, strong, nullable) NSTextField *billingStatusLabel;
+@property (nonatomic, assign) BOOL isBillingPollInProgress;
 
 @end
 
@@ -171,8 +182,34 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
         self.chatController.moderationController = self.moderationController;
     }
 
-    [self launchSetupUI];
-    [self preflightMediaPermissions];
+    // [Phase B.4d] Wire auth delegate and attempt session restore before showing setup UI.
+    // If a valid refresh token exists in Keychain, silently restore the session.
+    // Otherwise, show the login window.
+    if (self.roomController) {
+        self.roomController.tokenService.authDelegate = self;
+        NSString *tokenServerURL = [[NSUserDefaults standardUserDefaults]
+            stringForKey:@"InterDefaultTokenServerURL"];
+        if (!tokenServerURL.length) {
+            tokenServerURL = @"http://localhost:3000";
+        }
+        __weak typeof(self) weakSelf = self;
+        [self.roomController.tokenService attemptSessionRestoreWithServerURL:tokenServerURL
+                                                                  completion:^(BOOL restored) {
+            __strong typeof(weakSelf) strongSelf = weakSelf;
+            if (!strongSelf) { return; }
+            if (restored) {
+                NSLog(@"[Auth] Session restored — tier=%@", strongSelf.roomController.tokenService.currentTier ?: @"unknown");
+                [strongSelf launchSetupUI];
+                [strongSelf preflightMediaPermissions];
+            } else {
+                [strongSelf showLoginWindow];
+            }
+        }];
+    } else {
+        // No room controller (local-only) — skip auth, launch directly
+        [self launchSetupUI];
+        [self preflightMediaPermissions];
+    }
 }
 
 - (InterCallMode)currentCallMode {
@@ -354,6 +391,11 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
         return;
     }
 
+    // Lock the tier for the duration of this meeting so that mid-meeting
+    // token refreshes (which may carry a tier change) do not affect the
+    // active session.
+    [self.roomController.tokenService lockTierForMeeting];
+
     [self teardownActiveWindows];
     [self.settingsWindow orderOut:nil];
     InterTeardownSetupWindow(&_setupWindow, &_setupRenderView, &_connectionPanel);
@@ -462,6 +504,15 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
 }
 
 - (void)launchNativeSetupControlsInContainerView:(NSView *)containerView {
+    // Clear billing UI from any previous setup window lifecycle
+    [self.upgradeButton removeFromSuperview];
+    self.upgradeButton = nil;
+    [self.manageSubscriptionButton removeFromSuperview];
+    self.manageSubscriptionButton = nil;
+    [self.billingStatusLabel removeFromSuperview];
+    self.billingStatusLabel = nil;
+    self.isBillingPollInProgress = NO;
+
     NSView *overlayView = [[NSView alloc] initWithFrame:containerView.bounds];
     overlayView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
     [overlayView setWantsLayer:YES];
@@ -484,6 +535,223 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
     [settingsButton setTarget:self];
     [settingsButton setAction:@selector(openSettingsWindow)];
     [overlayView addSubview:settingsButton];
+
+    NSButton *signOutButton = [[NSButton alloc] initWithFrame:NSMakeRect(panelX, panelY + panelH + 8, 100, 26)];
+    signOutButton.autoresizingMask = NSViewMaxXMargin | NSViewMinYMargin;
+    [signOutButton setTitle:@"Sign Out"];
+    [signOutButton setTarget:self];
+    [signOutButton setAction:@selector(handleLogout)];
+    [overlayView addSubview:signOutButton];
+
+    // Billing — Upgrade / Manage Subscription
+    NSString *currentTier = self.roomController.tokenService.currentTier ?: @"free";
+    BOOL isPaid = ([currentTier isEqualToString:@"pro"] || [currentTier isEqualToString:@"pro+"]);
+
+    if (!isPaid) {
+        self.upgradeButton = [[NSButton alloc] initWithFrame:NSMakeRect(panelX + 108, panelY + panelH + 8, 120, 26)];
+        self.upgradeButton.autoresizingMask = NSViewMinXMargin | NSViewMaxXMargin | NSViewMinYMargin;
+        [self.upgradeButton setTitle:@"Upgrade to Pro"];
+        [self.upgradeButton setTarget:self];
+        [self.upgradeButton setAction:@selector(handleUpgradeToPro)];
+        [overlayView addSubview:self.upgradeButton];
+    } else {
+        self.manageSubscriptionButton = [[NSButton alloc] initWithFrame:NSMakeRect(panelX + 108, panelY + panelH + 8, 160, 26)];
+        self.manageSubscriptionButton.autoresizingMask = NSViewMinXMargin | NSViewMaxXMargin | NSViewMinYMargin;
+        [self.manageSubscriptionButton setTitle:@"Manage Subscription"];
+        [self.manageSubscriptionButton setTarget:self];
+        [self.manageSubscriptionButton setAction:@selector(handleManageSubscription)];
+        [overlayView addSubview:self.manageSubscriptionButton];
+    }
+
+    self.billingStatusLabel = [[NSTextField alloc] initWithFrame:NSMakeRect(panelX, panelY - 28, panelW, 20)];
+    self.billingStatusLabel.autoresizingMask = NSViewMinXMargin | NSViewMaxXMargin | NSViewMinYMargin | NSViewMaxYMargin;
+    self.billingStatusLabel.stringValue = @"";
+    self.billingStatusLabel.font = [NSFont systemFontOfSize:12 weight:NSFontWeightMedium];
+    self.billingStatusLabel.textColor = [NSColor secondaryLabelColor];
+    self.billingStatusLabel.alignment = NSTextAlignmentCenter;
+    self.billingStatusLabel.editable = NO;
+    self.billingStatusLabel.selectable = NO;
+    self.billingStatusLabel.bezeled = NO;
+    self.billingStatusLabel.drawsBackground = NO;
+    [overlayView addSubview:self.billingStatusLabel];
+}
+
+#pragma mark - Auth Login Window [Phase B.4d]
+
+- (void)handleLogout {
+    NSLog(@"[Auth] User requested sign out");
+    // Clear meeting tier lock before teardown
+    [self.roomController.tokenService unlockTierFromMeeting];
+    // Tear down any active call session first
+    if (self.currentCallMode != InterCallModeNone) {
+        [NSApp setPresentationOptions:NSApplicationPresentationDefault];
+        [self stopScreenMonitoring];
+        [self teardownActiveWindows];
+        [self.sessionCoordinator finishExit];
+    }
+    if (self.roomController) {
+        [self.roomController disconnect];
+    }
+    InterTeardownSetupWindow(&_setupWindow, &_setupRenderView, &_connectionPanel);
+    __weak typeof(self) weakSelf = self;
+    if (self.roomController && self.roomController.tokenService) {
+        [self.roomController.tokenService logoutWithCompletion:^{
+            NSLog(@"[Auth] Signed out");
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [weakSelf showLoginWindow];
+            });
+        }];
+    } else {
+        NSLog(@"[Auth] Signed out");
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [weakSelf showLoginWindow];
+        });
+    }
+}
+
+- (void)showLoginWindow {
+    if (self.loginWindow) {
+        [self.loginWindow makeKeyAndOrderFront:nil];
+        return;
+    }
+
+    self.loginWindow =
+    [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 420, 380)
+                                styleMask:(NSWindowStyleMaskTitled |
+                                           NSWindowStyleMaskClosable)
+                                  backing:NSBackingStoreBuffered
+                                    defer:NO];
+    [self.loginWindow center];
+    [self.loginWindow setTitle:@"Inter — Sign In"];
+    [self.loginWindow setBackgroundColor:[NSColor colorWithWhite:0.1 alpha:1.0]];
+    [self.loginWindow setDelegate:self];
+    [self.loginWindow setMinSize:NSMakeSize(420.0, 380.0)];
+
+    NSView *contentView = self.loginWindow.contentView;
+    contentView.wantsLayer = YES;
+    contentView.layer.backgroundColor = [NSColor colorWithWhite:0.1 alpha:1.0].CGColor;
+
+    CGFloat panelW = 380.0;
+    CGFloat panelH = 340.0;
+    CGFloat panelX = (contentView.bounds.size.width - panelW) / 2.0;
+    CGFloat panelY = (contentView.bounds.size.height - panelH) / 2.0;
+
+    self.loginPanel = [[InterLoginPanel alloc] initWithFrame:NSMakeRect(panelX, panelY, panelW, panelH)];
+    self.loginPanel.autoresizingMask = NSViewMinXMargin | NSViewMaxXMargin | NSViewMinYMargin | NSViewMaxYMargin;
+    self.loginPanel.delegate = self;
+    [contentView addSubview:self.loginPanel];
+
+    [self.loginWindow makeKeyAndOrderFront:nil];
+    [NSApp activateIgnoringOtherApps:YES];
+}
+
+- (void)dismissLoginWindow {
+    if (self.loginWindow) {
+        [self.loginWindow orderOut:nil];
+        self.loginWindow = nil;
+        self.loginPanel = nil;
+    }
+}
+
+#pragma mark - InterLoginPanelDelegate [Phase B.4d]
+
+- (void)loginPanel:(InterLoginPanel *)panel
+    didRequestLoginWithEmail:(NSString *)email
+                    password:(NSString *)password {
+    [panel setActionsEnabled:NO];
+    [panel setLoading:YES];
+    [panel clearError];
+
+    NSString *tokenServerURL = [[NSUserDefaults standardUserDefaults]
+        stringForKey:@"InterDefaultTokenServerURL"];
+    if (!tokenServerURL.length) {
+        tokenServerURL = @"http://localhost:3000";
+    }
+
+    __weak typeof(self) weakSelf = self;
+    [self.roomController.tokenService loginWithEmail:email
+                                            password:password
+                                           serverURL:tokenServerURL
+                                          completion:^(InterAuthResponse *response, NSError *error) {
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf) { return; }
+        [panel setLoading:NO];
+        [panel setActionsEnabled:YES];
+        if (error) {
+            [panel showError:error.localizedDescription];
+            return;
+        }
+        NSLog(@"[Auth] Login successful — user=%@ tier=%@", response.userId, response.tier);
+        [strongSelf dismissLoginWindow];
+        [strongSelf launchSetupUI];
+        [strongSelf preflightMediaPermissions];
+    }];
+}
+
+- (void)loginPanel:(InterLoginPanel *)panel
+    didRequestRegisterWithEmail:(NSString *)email
+                       password:(NSString *)password
+                    displayName:(NSString *)displayName {
+    [panel setActionsEnabled:NO];
+    [panel setLoading:YES];
+    [panel clearError];
+
+    NSString *tokenServerURL = [[NSUserDefaults standardUserDefaults]
+        stringForKey:@"InterDefaultTokenServerURL"];
+    if (!tokenServerURL.length) {
+        tokenServerURL = @"http://localhost:3000";
+    }
+
+    __weak typeof(self) weakSelf = self;
+    [self.roomController.tokenService registerWithEmail:email
+                                               password:password
+                                            displayName:displayName
+                                              serverURL:tokenServerURL
+                                             completion:^(InterAuthResponse *response, NSError *error) {
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf) { return; }
+        [panel setLoading:NO];
+        [panel setActionsEnabled:YES];
+        if (error) {
+            [panel showError:error.localizedDescription];
+            return;
+        }
+        NSLog(@"[Auth] Registration successful — user=%@ tier=%@", response.userId, response.tier);
+        [strongSelf dismissLoginWindow];
+        [strongSelf launchSetupUI];
+        [strongSelf preflightMediaPermissions];
+    }];
+}
+
+#pragma mark - InterAuthSessionDelegate [Phase B.4d]
+
+- (void)authSessionDidExpire {
+    NSLog(@"[Auth] Session expired — showing login window");
+    // Clear meeting tier lock before teardown
+    [self.roomController.tokenService unlockTierFromMeeting];
+    // Tear down any active call session first
+    if (self.currentCallMode != InterCallModeNone) {
+        [NSApp setPresentationOptions:NSApplicationPresentationDefault];
+        [self stopScreenMonitoring];
+        [self teardownActiveWindows];
+        [self.sessionCoordinator finishExit];
+    }
+    if (self.roomController) {
+        [self.roomController disconnect];
+    }
+    InterTeardownSetupWindow(&_setupWindow, &_setupRenderView, &_connectionPanel);
+    [self showLoginWindow];
+}
+
+- (void)authSessionDidAuthenticateWithUserId:(NSString *)userId tier:(NSString *)tier {
+    NSLog(@"[Auth] Authenticated — userId=%@ tier=%@", userId, tier);
+    // During an active meeting the tier is locked — log the deferred change
+    // but do not react to it. The unlock at meeting end will trigger a
+    // fresh delegate callback if the tier actually changed.
+    if (self.currentCallMode != InterCallModeNone) {
+        NSLog(@"[Auth] Tier update deferred — meeting in progress (effective=%@)",
+              self.roomController.tokenService.effectiveTier ?: @"nil");
+    }
 }
 
 #pragma mark - InterConnectionSetupPanelDelegate [3.1]
@@ -1985,7 +2253,7 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
     InterRecordingState state = coordinator.state;
     if (state == InterRecordingStateIdle || state == InterRecordingStateFinalized) {
         if (!self.normalMediaController || !self.normalSurfaceShareController) return;
-        NSString *tier = @"free"; // Phase 10C: read from auth profile
+        NSString *tier = self.roomController.tokenService.effectiveTier ?: @"free";
         [coordinator startLocalRecordingWithScreenShareSource:self.normalSurfaceShareController
                                                    subscriber:self.roomController.subscriber
                                           localMediaController:self.normalMediaController
@@ -2101,6 +2369,12 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
 
     if (sender == self.normalCallWindow && self.currentCallMode != InterCallModeNone) {
         [self requestExitCurrentMode];
+        return NO;
+    }
+
+    // Login window is the landing screen — closing it quits the app.
+    if (sender == self.loginWindow) {
+        [NSApp terminate:nil];
         return NO;
     }
 
@@ -2234,6 +2508,10 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
 }
 
 - (void)finalizeCurrentModeExit {
+    // Unlock the meeting tier lock so that any tier changes that arrived
+    // during the meeting now take effect.
+    [self.roomController.tokenService unlockTierFromMeeting];
+
     [NSApp setPresentationOptions:NSApplicationPresentationDefault];
     [self stopScreenMonitoring];
     self.isShowingExternalDisplayAlert = NO;
@@ -2389,6 +2667,220 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
 - (BOOL)applicationShouldRestoreApplicationState:(NSApplication *)sender {
 #pragma unused(sender)
     return NO;
+}
+
+#pragma mark - Billing Actions
+
+- (void)handleUpgradeToPro {
+    NSLog(@"[Billing] User requested upgrade to Pro");
+    if (self.upgradeButton) {
+        [self.upgradeButton setEnabled:NO];
+        [self.upgradeButton setTitle:@"Opening…"];
+    }
+    self.billingStatusLabel.stringValue = @"";
+
+    __weak typeof(self) weakSelf = self;
+    // LS variant ID for Pro tier
+    [self.roomController.tokenService requestCheckoutURLWithVariantId:@"1516868"
+                                                           completion:^(NSString *url) {
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf) { return; }
+
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (url.length) {
+                NSURL *checkoutURL = [NSURL URLWithString:url];
+                if (checkoutURL) {
+                    [[NSWorkspace sharedWorkspace] openURL:checkoutURL];
+                    strongSelf.billingStatusLabel.stringValue = @"Complete payment in your browser…";
+                } else {
+                    NSLog(@"[Billing] Checkout URL is malformed: %@", url);
+                    NSAlert *alert = [[NSAlert alloc] init];
+                    alert.messageText = @"Unable to Open Checkout";
+                    alert.informativeText = @"The checkout link appears to be invalid. Please try again.";
+                    alert.alertStyle = NSAlertStyleWarning;
+                    [alert addButtonWithTitle:@"OK"];
+                    [alert runModal];
+                }
+            } else {
+                NSLog(@"[Billing] Failed to get checkout URL");
+                strongSelf.billingStatusLabel.stringValue = @"Failed to start checkout. Try again.";
+            }
+
+            if (strongSelf.upgradeButton) {
+                [strongSelf.upgradeButton setEnabled:YES];
+                [strongSelf.upgradeButton setTitle:@"Upgrade to Pro"];
+            }
+        });
+    }];
+}
+
+- (void)handleManageSubscription {
+    NSLog(@"[Billing] User requested subscription management");
+    if (self.manageSubscriptionButton) {
+        [self.manageSubscriptionButton setEnabled:NO];
+    }
+
+    __weak typeof(self) weakSelf = self;
+    [self.roomController.tokenService requestPortalURLWithCompletion:^(NSString *url) {
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf) { return; }
+
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (url.length) {
+                NSURL *portalURL = [NSURL URLWithString:url];
+                if (portalURL) {
+                    [[NSWorkspace sharedWorkspace] openURL:portalURL];
+                } else {
+                    NSLog(@"[Billing] Portal URL is malformed: %@", url);
+                    NSAlert *alert = [[NSAlert alloc] init];
+                    alert.messageText = @"Unable to Open Subscription Portal";
+                    alert.informativeText = @"The portal link appears to be invalid. Please try again.";
+                    alert.alertStyle = NSAlertStyleWarning;
+                    [alert addButtonWithTitle:@"OK"];
+                    [alert runModal];
+                }
+            } else {
+                NSLog(@"[Billing] Failed to get portal URL");
+                strongSelf.billingStatusLabel.stringValue = @"Failed to open subscription portal.";
+            }
+
+            if (strongSelf.manageSubscriptionButton) {
+                [strongSelf.manageSubscriptionButton setEnabled:YES];
+            }
+        });
+    }];
+}
+
+#pragma mark - Deep Link Handling (inter:// URL scheme)
+
+- (void)application:(NSApplication *)application openURLs:(NSArray<NSURL *> *)urls {
+#pragma unused(application)
+    // Allowed deep-link paths per host (whitelist)
+    NSDictionary<NSString *, NSArray<NSString *> *> *allowedPaths = @{
+        @"billing": @[@"/success"],
+    };
+
+    for (NSURL *url in urls) {
+        // Reject any URL that does not carry the exact registered scheme
+        if (![url.scheme isEqualToString:@"com-inter-app"]) {
+            NSLog(@"[DeepLink] Rejected URL with unexpected scheme: %@", url.scheme);
+            continue;
+        }
+
+        NSString *host = url.host;
+        NSString *path = url.path;
+
+        // Reject empty or nil host
+        if (!host.length) {
+            NSLog(@"[DeepLink] Rejected URL with missing host: %@", url.absoluteString);
+            continue;
+        }
+
+        // Reject host not in allowlist
+        NSArray<NSString *> *allowedForHost = allowedPaths[host];
+        if (!allowedForHost) {
+            NSLog(@"[DeepLink] Rejected URL with unknown host '%@'", host);
+            continue;
+        }
+
+        // Normalize path: treat nil/empty as "/"
+        if (!path.length) { path = @"/"; }
+
+        // Reject path not in allowlist for this host
+        if (![allowedForHost containsObject:path]) {
+            NSLog(@"[DeepLink] Rejected URL with unknown path '%@' for host '%@'", path, host);
+            continue;
+        }
+
+        // Reject URLs carrying a query string or fragment (unexpected for these endpoints)
+        if (url.query.length || url.fragment.length) {
+            NSLog(@"[DeepLink] Rejected URL with unexpected query/fragment: %@", url.absoluteString);
+            continue;
+        }
+
+        // Dispatch to the appropriate handler
+        if ([host isEqualToString:@"billing"] && [path isEqualToString:@"/success"]) {
+            [self handleBillingSuccessDeepLink];
+            return;
+        }
+
+        // Should not be reached given the whitelist above, but log defensively
+        NSLog(@"[DeepLink] Unhandled whitelisted URL: %@", url.absoluteString);
+    }
+}
+
+- (void)handleBillingSuccessDeepLink {
+    NSLog(@"[Billing] Deep link received — com-inter-app://billing/success");
+
+    // Bring app to front
+    [NSApp activateIgnoringOtherApps:YES];
+    if (self.setupWindow) {
+        [self.setupWindow makeKeyAndOrderFront:nil];
+    }
+
+    // Guard against duplicate polls
+    if (self.isBillingPollInProgress) {
+        NSLog(@"[Billing] Poll already in progress — ignoring duplicate deep link");
+        return;
+    }
+    self.isBillingPollInProgress = YES;
+
+    self.billingStatusLabel.stringValue = @"Verifying your upgrade…";
+    if (self.upgradeButton) {
+        [self.upgradeButton setEnabled:NO];
+        [self.upgradeButton setTitle:@"Verifying…"];
+    }
+
+    NSString *previousTier = self.roomController.tokenService.currentTier ?: @"free";
+
+    __weak typeof(self) weakSelf = self;
+    [self.roomController.tokenService refreshAndWaitForTierChangeWithPreviousTier:previousTier
+                                                                     maxAttempts:5
+                                                                        interval:2.0
+                                                                      completion:^(NSString *newTier) {
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf) { return; }
+
+        dispatch_async(dispatch_get_main_queue(), ^{
+            strongSelf.isBillingPollInProgress = NO;
+
+            if (newTier.length) {
+                NSLog(@"[Billing] Tier upgraded: %@ → %@", previousTier, newTier);
+                strongSelf.billingStatusLabel.stringValue =
+                    [NSString stringWithFormat:@"Upgraded to %@!", [newTier capitalizedString]];
+
+                // Replace the Upgrade button with Manage Subscription
+                if (strongSelf.upgradeButton) {
+                    NSView *parent = strongSelf.upgradeButton.superview;
+                    NSRect frame = strongSelf.upgradeButton.frame;
+                    [strongSelf.upgradeButton removeFromSuperview];
+                    strongSelf.upgradeButton = nil;
+
+                    strongSelf.manageSubscriptionButton = [[NSButton alloc] initWithFrame:NSMakeRect(frame.origin.x, frame.origin.y, 160, 26)];
+                    strongSelf.manageSubscriptionButton.autoresizingMask = NSViewMinXMargin | NSViewMaxXMargin | NSViewMinYMargin;
+                    [strongSelf.manageSubscriptionButton setTitle:@"Manage Subscription"];
+                    [strongSelf.manageSubscriptionButton setTarget:strongSelf];
+                    [strongSelf.manageSubscriptionButton setAction:@selector(handleManageSubscription)];
+                    [parent addSubview:strongSelf.manageSubscriptionButton];
+                }
+
+                // Clear the success message after a few seconds
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5 * NSEC_PER_SEC)),
+                               dispatch_get_main_queue(), ^{
+                    if ([strongSelf.billingStatusLabel.stringValue containsString:@"Upgraded"]) {
+                        strongSelf.billingStatusLabel.stringValue = @"";
+                    }
+                });
+            } else {
+                NSLog(@"[Billing] Tier poll timed out — tier unchanged from %@", previousTier);
+                strongSelf.billingStatusLabel.stringValue = @"Upgrade pending — it may take a moment.";
+                if (strongSelf.upgradeButton) {
+                    [strongSelf.upgradeButton setEnabled:YES];
+                    [strongSelf.upgradeButton setTitle:@"Upgrade to Pro"];
+                }
+            }
+        });
+    }];
 }
 
 @end

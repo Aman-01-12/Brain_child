@@ -384,30 +384,87 @@ function requireAuth(req, res, next) {
 // ---------------------------------------------------------------------------
 // Middleware Factory: requireTier(minTier)
 //
-// Checks req.user.tier against a tier hierarchy: free < pro < hiring.
-// Returns 403 if user's tier is insufficient.
-// Must be used AFTER authenticateToken + requireAuth.
+// Checks the user's effective tier against a tier hierarchy: free < pro < pro+ < hiring.
+// Also checks subscription_status from DB (fresh read) — rejects users whose
+// subscription is inactive (unpaid/expired/paused) unless in grace period.
+//
+// IMPORTANT: past_due is NOT in INACTIVE_STATUSES. Per LS docs, past_due means
+// LS is retrying the payment (up to 4 times over 2 weeks) and the user KEEPS access.
+// Only when status becomes 'unpaid' (all retries failed) should access be restricted.
+//
+// Trial users (on_trial) get pro-equivalent access via TRIAL_GRANTS_TIER.
+// Phase C — Gap G15 (P0)
 // ---------------------------------------------------------------------------
-const TIER_LEVELS = { free: 0, pro: 1, hiring: 2 };
+const TIER_LEVELS = { free: 0, pro: 1, 'pro+': 2, hiring: 3 };
+const INACTIVE_STATUSES = new Set(['unpaid', 'expired', 'paused']);
+const TRIAL_GRANTS_TIER = { on_trial: 'pro' };
 
 function requireTier(minTier) {
-  return (req, res, next) => {
+  return async (req, res, next) => {
     if (!req.user) {
       return res.status(401).json({ error: 'Authentication required' });
     }
 
-    const userLevel = TIER_LEVELS[req.user.tier] ?? 0;
-    const requiredLevel = TIER_LEVELS[minTier] ?? 0;
+    try {
+      // Fresh read from DB — JWT tier may be up to 15 min stale
+      const result = await db.query(
+        'SELECT tier, subscription_status, grace_until FROM users WHERE id = $1',
+        [req.user.userId]
+      );
+      if (result.rows.length === 0) {
+        return res.status(401).json({ error: 'User not found', code: 'USER_NOT_FOUND' });
+      }
 
-    if (userLevel < requiredLevel) {
-      return res.status(403).json({
-        error: `This feature requires a ${minTier} plan or higher`,
-        currentTier: req.user.tier,
-        requiredTier: minTier,
-      });
+      const { tier, subscription_status, grace_until } = result.rows[0];
+
+      // Check if subscription is inactive (and not in grace period)
+      if (INACTIVE_STATUSES.has(subscription_status)) {
+        const inGracePeriod = grace_until && new Date() < new Date(grace_until);
+        if (!inGracePeriod) {
+          return res.status(403).json({
+            error: 'Your subscription is inactive',
+            code: 'SUBSCRIPTION_INACTIVE',
+            subscriptionStatus: subscription_status,
+          });
+        }
+      }
+
+      // Cancelled users keep access until grace_until (end of billing period)
+      if (subscription_status === 'cancelled') {
+        const inGracePeriod = grace_until && new Date() < new Date(grace_until);
+        if (!inGracePeriod) {
+          return res.status(403).json({
+            error: 'Your subscription has ended',
+            code: 'SUBSCRIPTION_INACTIVE',
+            subscriptionStatus: subscription_status,
+          });
+        }
+      }
+
+      // on_trial users get pro-equivalent access
+      const effectiveTier = TRIAL_GRANTS_TIER[subscription_status] ?? tier;
+
+      const userLevel = TIER_LEVELS[effectiveTier] ?? 0;
+      const requiredLevel = TIER_LEVELS[minTier] ?? 0;
+
+      if (userLevel < requiredLevel) {
+        return res.status(403).json({
+          error: `This feature requires a ${minTier} plan or higher`,
+          code: 'INSUFFICIENT_TIER',
+          currentTier: effectiveTier,
+          requiredTier: minTier,
+        });
+      }
+
+      // Update req.user with fresh tier for downstream use
+      req.user.tier = effectiveTier;
+      req.user.subscriptionStatus = subscription_status;
+
+      next();
+    } catch (err) {
+      console.error('[auth] requireTier DB error:', err.message);
+      return res.status(500).json({ error: 'Internal error checking subscription' });
     }
-
-    next();
   };
 }
 

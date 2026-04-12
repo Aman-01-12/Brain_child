@@ -24,6 +24,19 @@
 	<string>Camera access is required for secure video interviews and calls.</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Microphone access is required for secure video interviews and calls.</string>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleTypeRole</key>
+			<string>Editor</string>
+			<key>CFBundleURLName</key>
+			<string>com.inter.app</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>com-inter-app</string>
+			</array>
+		</dict>
+	</array>
 	<key>NSPrincipalClass</key>
 	<string>NSApplication</string>
 	<key>NSScreenCaptureUsageDescription</key>

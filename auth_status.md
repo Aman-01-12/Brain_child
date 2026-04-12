@@ -1,7 +1,8 @@
 # Auth System — Implementation Status
 
-> Last updated: 8 April 2026 (Phase A complete, Phase B server-side complete)
-> Reference document: `auth_implementation.md` (3,212 lines, 11 sections)
+> Last updated: 12 April 2026 (Phase A complete, Phase B complete, Phase C 6/7, Billing UX complete)
+> Reference document: `auth_implementation.md` (11 sections)
+> Billing provider: **Lemon Squeezy** (Merchant of Record)
 > Build baseline: BUILD SUCCEEDED, 140 tests, 0 failures (5 April 2026, arm64)
 
 **Legend:** ✅ Done · ⚠️ Partial · ❌ Not started · 🔴 Blocking (P0)
@@ -41,31 +42,56 @@
 | B.3a | Add `POST /auth/refresh` endpoint | ✅ | `token-server/index.js` | Theft detection, rotation, fresh tier re-read, device binding (soft) |
 | B.3b | Add `POST /auth/logout` endpoint | ✅ | `token-server/index.js` | Revokes single refresh token; returns 204 |
 | B.3c | Add `POST /auth/logout-all` endpoint | ✅ | `token-server/index.js` | Calls `auth.revokeAllForUser()`; returns 204 |
-| B.3d | Apply `rateLimitAuth` to `/auth/refresh` | ✅ | `token-server/index.js` | Consistent with login/register |
-| B.4a | `InterTokenService.swift` — store tokens in Keychain | ❌ | `inter/Networking/InterTokenService.swift` | See §4 B.4 — kSecAttrService `"com.inter.auth"`, access tokens in memory only |
-| B.4b | `InterTokenService.swift` — silent refresh on 401 `TOKEN_EXPIRED` | ❌ | `inter/Networking/InterTokenService.swift` | Retry original request after successful refresh |
-| B.4c | `InterTokenService.swift` — TLS certificate pinning | ❌ | `inter/Networking/InterTokenService.swift` | `URLSessionDelegate` — pin SHA-256 of server cert pubkey |
-| B.4d | macOS login/register UI (AppDelegate or dedicated window) | ❌ | `inter/App/AppDelegate.m` or new controller | Gate app launch on successful auth; store `tier` from token payload |
+| B.3d | Rate limiting on `/auth/refresh` | ✅ | `token-server/index.js` | Dedicated `rateLimitRefresh` middleware — IP-keyed, 30 req/60s, `Retry-After` header, Redis-fault-tolerant |
+| B.4a | `InterTokenService.swift` — store tokens in Keychain | ✅ | `inter/Networking/InterTokenService.swift` | `kSecAttrService "com.inter.app.refreshtoken"`, `kSecAttrAccessibleWhenUnlockedThisDeviceOnly`, access tokens memory-only |
+| B.4b | `InterTokenService.swift` — silent refresh on 401 `TOKEN_EXPIRED` | ✅ | `inter/Networking/InterTokenService.swift` | `performAuthenticatedRequest` intercepts TOKEN_EXPIRED → `refreshAccessToken` → replay; proactive timer at expiresIn-75s |
+| B.4c | `InterTokenService.swift` — TLS certificate pinning | ✅ | `inter/Networking/InterTokenService.swift` | `InterPinnedSessionDelegate` — SPKI SHA-256 pinning via `SecCertificateCopyKey`; dev bypass when no pins configured |
+| B.4d | macOS login/register UI (AppDelegate or dedicated window) | ✅ | `inter/UI/Views/InterLoginPanel.h/.m`, `inter/App/AppDelegate.m` | Login/register panel gates app launch; session restore via Keychain; tier stored from JWT; InterAuthSessionDelegate for expiry |
 
-**Phase B server-side: 9/9 done ✅. Client-side: 0/4 done.**
+**Phase B: 13/13 done ✅ COMPLETE (server 9/9 + client 4/4).**
 
 ---
 
 ## Phase C — Billing & Tier Lifecycle Integration
 
-> **Dependency:** Phase B must be complete. Payment gateway (Stripe) must be configured.
+> **Dependency:** Phase B must be complete. Payment gateway (Lemon Squeezy) must be configured.
+> **Provider:** Lemon Squeezy (Merchant of Record — handles tax, 3DS, dunning, disputes)
 
 | ID | Task | Status | File | Notes |
 |---|---|---|---|---|
-| C.1 | 🔴 Mount Stripe webhook route BEFORE `express.json()` | ❌ | `token-server/index.js` | **P0 — Gap G20.** `express.raw({ type: 'application/json' })` required. Wrong order = silent failure on all webhooks |
-| C.2 | Migration: billing columns on `users` table | ❌ | `token-server/migrations/005_billing_columns.sql` | See §10 migration starter — `subscription_status`, `subscription_id`, `customer_id`, `trial_ends_at`, `current_period_ends_at` |
-| C.3 | Migration: `processed_webhook_events` idempotency table | ❌ | Included in `005_billing_columns.sql` | Prevents double-processing of at-least-once Stripe delivery |
-| C.4 | Create `billing.js` webhook handler | ❌ | `token-server/billing.js` | See §10 for complete starter — handles 8 Stripe event types |
-| C.5 | Update `requireTier()` to check `subscription_status` | ❌ | `token-server/auth.js` | **P0 — Gap G15.** Past-due users currently keep paid access. Must reject if `subscription_status = 'past_due'` |
-| C.6 | Wire Stripe customer creation on register/upgrade | ❌ | `token-server/auth.js` or `billing.js` | `stripe.customers.create({email})` — store `customer_id` on user row |
-| C.7 | Configure `STRIPE_SECRET_KEY` and `STRIPE_WEBHOOK_SECRET` in `.env` | ❌ | `token-server/.env` | Already in `.env.example` — copy and fill values |
+| C.1 | 🔴 Mount LS webhook route BEFORE `express.json()` | ✅ | `token-server/index.js` | `express.raw()` + HMAC-SHA256 via `X-Signature`. Mounted before `express.json()` — line 76 |
+| C.2 | Migration: billing columns on `users` table | ✅ | `token-server/migrations/006_billing_columns.sql` | 11 columns: `subscription_status`, `ls_customer_id`, `ls_subscription_id`, `ls_variant_id`, `ls_product_id`, `grace_until`, `trial_ends_at`, `current_period_ends_at`, `ls_portal_url`, `deleted_at`, `deletion_reason` |
+| C.3 | Migration: `processed_webhook_events` idempotency table | ✅ | Included in `006_billing_columns.sql` | + `user_tier_history` audit table (append-only) |
+| C.4 | Create `billing.js` webhook handler | ✅ | `token-server/billing.js` | 12 LS event types via `meta.event_name`, HMAC-SHA256 verification, idempotency, state machine transitions, tier audit logging |
+| C.5 | Update `requireTier()` to check `subscription_status` | ✅ | `token-server/auth.js` | Fresh DB read, `INACTIVE_STATUSES` set, grace period for `cancelled`, `TRIAL_GRANTS_TIER` for `on_trial` → `pro` |
+| C.6 | Create `POST /billing/checkout` endpoint | ✅ | `token-server/index.js` | LS checkout URL via `createCheckout()` with `custom_data.user_id` + `GET /billing/portal-url` for customer portal |
+| C.7 | Configure `LEMONSQUEEZY_API_KEY`, `LEMONSQUEEZY_WEBHOOK_SECRET`, `LEMONSQUEEZY_STORE_ID` in `.env` | ⚠️ | `token-server/.env.example` | `.env.example` updated. Actual keys pending — need LS dashboard setup |
 
-**Phase C overall: 0/7 done.**
+**Phase C overall: 6/7 done (C.7 pending LS dashboard config).**
+
+---
+
+## Phase C-UX — Seamless Billing Upgrade Flow
+
+> **Dependency:** Phase C.6 (checkout endpoint) must be complete. `inter://` URL scheme registered.
+> **Design:** LS checkout → browser → `inter://billing/success` deep link → poll `/billing/status` → auto-refresh token → new tier propagated instantly.
+
+| ID | Task | Status | File | Notes |
+|---|---|---|---|---|
+| CX.1 | Register `inter://` URL scheme in `Info.plist` | ✅ | `inter/Info.plist` | `CFBundleURLTypes` with `inter` scheme (also used by Phase D password reset) |
+| CX.2 | Set checkout redirect URL to `inter://billing/success` | ✅ | `token-server/index.js` | `redirectUrl` in `createCheckout()` call |
+| CX.3 | Add `GET /billing/status` endpoint | ✅ | `token-server/index.js` | Returns `{ tier, subscriptionStatus }` — lightweight poll target |
+| CX.4 | Add `refreshAndWaitForTierChange` in InterTokenService | ✅ | `inter/Networking/InterTokenService.swift` | Polls `/billing/status` up to 5× at 2s intervals, then `/auth/refresh` for new JWT |
+| CX.5 | Add `requestCheckoutURL` / `requestPortalURL` in InterTokenService | ✅ | `inter/Networking/InterTokenService.swift` | `@objc` methods callable from AppDelegate.m |
+| CX.6 | Handle `inter://billing/success` deep link in AppDelegate | ✅ | `inter/App/AppDelegate.m` | `application:openURLs:` → polls → refresh → UI update |
+| CX.7 | Add Upgrade/Manage buttons to setup overlay | ✅ | `inter/App/AppDelegate.m` | Conditional: free→"Upgrade to Pro", paid→"Manage Subscription" |
+| CX.8 | Billing status label + success confirmation | ✅ | `inter/App/AppDelegate.m` | Shows "Verifying…" / "Upgraded to Pro!" / timeout message |
+
+**Phase C-UX overall: 8/8 done ✅ COMPLETE.**
+
+### Production Steps (C-UX)
+
+- **Migrate to Apple Universal Links** — The current custom URL scheme (`com-inter-app://`) is hardened (vendor-prefixed, whitelisted host/path, no query/fragment accepted) but custom schemes can still be hijacked by a malicious app claiming the same scheme on the same device. For production, replace the deep-link callback with Universal Links: host an `apple-app-site-association` (AASA) JSON file at `https://yourdomain.com/.well-known/apple-app-site-association`, add the Associated Domains entitlement (`applinks:yourdomain.com`) to the app, and change the LS `redirectUrl` to `https://yourdomain.com/billing/success`. macOS will then route the HTTPS URL directly to the app without going through the browser's URL-scheme dispatcher, fully preventing scheme hijacking.
 
 ---
 
@@ -79,7 +105,7 @@
 | D.1b | `POST /auth/forgot-password` endpoint | ❌ | `token-server/index.js` | Rate-limited; generates reset token; sends email; always 200 (anti-enumeration) |
 | D.1c | `POST /auth/reset-password` endpoint | ❌ | `token-server/index.js` | Validates token, bcrypt new hash, marks token used, revokes all refresh tokens |
 | D.1d | Add `auth.resetPassword(token, newPassword)` to `auth.js` | ❌ | `token-server/auth.js` | See §6 D.1 — extractable function, uses `db.getClient()` (not `db.connect()`) |
-| D.1e | 🔴 Register `inter://` URL scheme in `Info.plist` | ❌ | `inter/Info.plist` | **P0 — Gap G12.** macOS deep link for password reset email. Without it the reset link silently drops. See §6 for XML block |
+| D.1e | 🔴 Register `inter://` URL scheme in `Info.plist` | ✅ | `inter/Info.plist` | Done in CX.1 — shared by billing + password reset |
 | D.1f | Handle `inter://reset-password?token=xxx` in macOS app | ❌ | `inter/App/AppDelegate.m` | `application:openURL:options:` delegate method |
 | D.2a | Migration: `email_verifications` table | ❌ | `token-server/migrations/007_email_verifications.sql` | See §6 D.2 — UUID token, `verified_at`, `expires_at` |
 | D.2b | `POST /auth/verify-email` endpoint | ❌ | `token-server/index.js` | Marks email verified; gates features if unverified |
@@ -102,7 +128,7 @@ These 3 items are tracked in the Recording Pause Checkpoint in `work_done.md` bu
 
 | ID | Task | Status | Dependency | File |
 |---|---|---|---|---|
-| R1 | Replace hardcoded `tier = @"free"` with real profile tier from auth | ❌ | Phase B live + Keychain token | `inter/App/AppDelegate.m` line ~1988 |
+| R1 | Replace hardcoded `tier = @"free"` with real profile tier from auth | ✅ | Phase B live + Keychain token | `inter/App/AppDelegate.m` — uses `effectiveTier` from JWT |
 | R2 | Wire `InterRecordingListPanel` into call UI | ❌ | Auth live (endpoint requires token) | `inter/App/AppDelegate.m`, `InterLocalCallControlPanel.m` |
 | R3 | Wire `InterRecordingConsentPanel` to show on participant join | ❌ | No auth dependency | `inter/App/AppDelegate.m` (participant-join handler) |
 
@@ -118,7 +144,7 @@ These 3 items are tracked in the Recording Pause Checkpoint in `work_done.md` bu
 | Token server boots cleanly | ✅ | `node token-server/index.js` |
 | `.env` has `JWT_SECRET` (32+ bytes) | ✅ | Generated and set in `.env` |
 | `.env` has `REFRESH_TOKEN_SECRET` | ✅ | Generated and set in `.env` |
-| Stripe keys configured | ❌ | Required for Phase C |
+| Lemon Squeezy keys configured | ⚠️ | `.env.example` updated — actual keys pending LS dashboard setup |
 | SMTP provider configured | ❌ | Required for Phase D |
 
 ---
@@ -128,11 +154,11 @@ These 3 items are tracked in the Recording Pause Checkpoint in `work_done.md` bu
 | File | Phase | Status |
 |---|---|---|
 | `token-server/migrations/004_refresh_tokens.sql` | B.1 | ✅ |
-| `token-server/migrations/005_billing_columns.sql` | C.2/C.3 | ❌ |
+| `token-server/migrations/006_billing_columns.sql` | C.2/C.3 | ✅ | LS columns + idempotency + tier history |
 | `token-server/migrations/006_password_reset_tokens.sql` | D.1a | ❌ |
 | `token-server/migrations/007_email_verifications.sql` | D.2a | ❌ |
 | `token-server/migrations/008_audit_log.sql` | D.4a | ❌ |
-| `token-server/billing.js` | C.4 | ❌ |
+| `token-server/billing.js` | C.4 | ✅ |
 | `token-server/mailer.js` | D.6 | ❌ |
 
 ---
@@ -142,9 +168,10 @@ These 3 items are tracked in the Recording Pause Checkpoint in `work_done.md` bu
 | Phase | Tasks | Done | Remaining |
 |---|---|---|---|
 | A — Hardening | 9 | 9 | 0 ✅ |
-| B — Refresh Tokens | 13 | 9 | 4 (client-side) |
-| C — Billing | 7 | 0 | 7 |
-| D — Account Recovery | 16 | 1 | 15 |
-| **Total** | **45** | **19** | **26** |
+| B — Refresh Tokens | 13 | 13 | 0 ✅ |
+| C — Billing | 7 | 6 | 1 (env keys) |
+| C-UX — Billing Upgrade Flow | 8 | 8 | 0 ✅ |
+| D — Account Recovery | 16 | 2 | 14 |
+| **Total** | **53** | **38** | **15** |
 
-**Next:** Phase B client-side (B.4a–B.4d) — Keychain storage, silent refresh, TLS pinning, login UI in `InterTokenService.swift`.
+**Next:** Phase C.7 — configure LS dashboard + API keys, then Phase D — Account Recovery.

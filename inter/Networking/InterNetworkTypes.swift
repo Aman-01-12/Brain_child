@@ -234,6 +234,12 @@ public let InterNetworkErrorDomain = "com.secure.inter.network"
     case lobbyWaiting = 1010
     /// Meeting requires a password (401 from token server).
     case passwordRequired = 1011
+    /// Authentication failed (invalid credentials, malformed response, etc.).
+    case authFailed = 1012
+    /// Auth session expired — user must re-login.
+    case sessionExpired = 1013
+    /// Auth session compromised — theft detected, forced re-login.
+    case sessionCompromised = 1014
 }
 
 // MARK: - Error Helpers

@@ -904,51 +904,158 @@ class PinnedSessionDelegate: NSObject, URLSessionDelegate {
 
 ---
 
-## 5. Phase C — Billing & Tier Lifecycle Integration
+## 5. Phase C — Billing & Tier Lifecycle Integration (Lemon Squeezy)
 
-> **Dependency**: Payment gateway chosen and integrated. Phase B must be complete first.
+> **Dependency**: Lemon Squeezy store configured with products/variants. Phase B must be complete first.
+> **Payment provider**: [Lemon Squeezy](https://lemonsqueezy.com/) — Merchant of Record (MoR).
+> LS handles all tax collection, VAT, SCA/3DS authentication, payment retries, and dunning
+> internally. Our server only receives webhook events and updates tier state.
+
+### Architecture Overview
+
+```
+┌──────────────────┐    POST /billing/checkout    ┌──────────────────────────┐
+│  macOS Client    │ ────────────────────────────► │  token-server            │
+│  (Inter.app)     │                               │  1. Validate user auth   │
+│                  │ ◄──────────────────────────── │  2. Create LS checkout   │
+│                  │  { checkoutUrl }               │     with custom_data:    │
+│  Opens URL in    │                               │     { user_id: <uuid> }  │
+│  default browser │                               │  3. Return checkout URL  │
+└──────────────────┘                               └──────────────────────────┘
+        │
+        │  User completes payment on LS hosted checkout page
+        ▼
+┌──────────────────┐    POST /webhooks/lemonsqueezy  ┌──────────────────────────┐
+│  Lemon Squeezy   │ ─────────────────────────────► │  token-server            │
+│  (webhook)       │                                 │  1. Verify X-Signature   │
+│                  │                                 │  2. Extract user_id from │
+│  Fires events:   │                                 │     meta.custom_data     │
+│  subscription_   │                                 │  3. Update users.tier    │
+│  created, etc.   │                                 │     + subscription_status│
+│                  │ ◄───────────────────────────── │  4. Return 200           │
+└──────────────────┘                                 └──────────────────────────┘
+        │
+        │  Next /auth/refresh cycle (max 15 min)
+        ▼
+  Client receives new access token with updated tier
+```
 
 ### What Phase C adds
 
 1. **DB billing columns** on the `users` table:
    ```sql
    ALTER TABLE users
-     ADD COLUMN subscription_status   VARCHAR(20) DEFAULT 'none',
-     -- 'none' | 'trialing' | 'active' | 'past_due' | 'canceled'
-     ADD COLUMN subscription_id       VARCHAR(255),   -- Stripe/Razorpay subscription ID
-     ADD COLUMN customer_id           VARCHAR(255),   -- Stripe customer / Razorpay customer ID
-     ADD COLUMN trial_ends_at         TIMESTAMPTZ,
-     ADD COLUMN current_period_ends_at TIMESTAMPTZ;
+     ADD COLUMN subscription_status    VARCHAR(20) DEFAULT 'none',
+     -- 'none' | 'on_trial' | 'active' | 'past_due' | 'unpaid'
+     -- | 'cancelled' | 'expired' | 'paused'
+     ADD COLUMN ls_subscription_id     VARCHAR(255),   -- Lemon Squeezy subscription ID
+     ADD COLUMN ls_customer_id         VARCHAR(255),   -- Lemon Squeezy customer ID
+     ADD COLUMN ls_variant_id          VARCHAR(255),   -- Current plan variant ID
+     ADD COLUMN ls_product_id          VARCHAR(255),   -- Current product ID
+     ADD COLUMN trial_ends_at          TIMESTAMPTZ,
+     ADD COLUMN current_period_ends_at TIMESTAMPTZ,    -- renews_at from LS
+     ADD COLUMN grace_until            TIMESTAMPTZ,    -- ends_at from LS (for cancelled subs)
+     ADD COLUMN ls_portal_url          TEXT;            -- customer portal URL (24h expiry, refreshed on webhook)
    ```
 
-2. **Webhook receiver** for payment provider lifecycle events:
+2. **Webhook receiver** for Lemon Squeezy subscription lifecycle events:
 
-   | Payment Event | Action |
+   | LS Webhook Event | Action |
    |---|---|
-   | `customer.subscription.created` | `UPDATE users SET tier = 'pro', subscription_status = 'active'` |
-   | `customer.subscription.trial_will_end` | Send user email warning |
-   | `customer.subscription.deleted` | `UPDATE users SET tier = 'free', subscription_status = 'canceled'` |
-   | `invoice.payment_failed` | `UPDATE users SET subscription_status = 'past_due'` |
-   | `customer.subscription.updated` (plan change) | `UPDATE users SET tier = <new_plan>` |
+   | `subscription_created` | Set tier from variant_id, status = `active` or `on_trial` |
+   | `subscription_updated` | Sync tier + status (plan changes, status transitions) |
+   | `subscription_cancelled` | Keep tier until `ends_at`, set grace_until |
+   | `subscription_expired` | Downgrade to `free` immediately |
+   | `subscription_payment_success` | Confirm `active`, clear grace period |
+   | `subscription_payment_failed` | Set `past_due`, start grace countdown |
+   | `subscription_payment_recovered` | Restore `active` after payment recovery |
+   | `subscription_paused` | Set `paused`, block paid access |
+   | `subscription_unpaused` | Restore previous tier, set `active` |
+   | `order_created` | Log only (subscription_created does the real work) |
 
    The tier change in the DB is immediately reflected in the next `/auth/refresh` cycle
    (max 15 min lag via Phase B). No other code needs to change.
 
 3. **Webhook signature validation** — mandatory, not optional:
    ```javascript
-   // Stripe: stripe.webhooks.constructEvent(rawBody, sig, STRIPE_WEBHOOK_SECRET)
-   // Razorpay: validate X-Razorpay-Signature using HMAC-SHA256 of rawBody + webhook_secret
-   // Never process a webhook event without verifying its signature
+   // Lemon Squeezy uses HMAC-SHA256 hex digest in X-Signature header
+   const crypto = require('crypto');
+   const hmac = crypto.createHmac('sha256', LEMONSQUEEZY_WEBHOOK_SECRET);
+   const digest = Buffer.from(hmac.update(rawBody).digest('hex'), 'utf8');
+   const signature = Buffer.from(req.get('X-Signature') || '', 'utf8');
+   if (!crypto.timingSafeEqual(digest, signature)) {
+     throw new Error('Invalid webhook signature');
+   }
+   // CRITICAL: Uses crypto.timingSafeEqual — never use === for signature comparison
+   // CRITICAL: rawBody must be the exact bytes received — express.raw() required on route
    ```
 
-4. **Idempotency** — payment webhooks are delivered at-least-once:
+4. **Idempotency** — payment webhooks are delivered at-least-once (up to 4 attempts):
    ```sql
    -- Store processed event IDs to prevent double-processing
+   -- LS webhook payloads include meta.event_name but no guaranteed unique event ID.
+   -- Generate a deterministic ID from: event_name + subscription_id + timestamp
    CREATE TABLE processed_webhook_events (
-       event_id    VARCHAR(255) PRIMARY KEY,  -- Stripe event ID / Razorpay event ID
+       event_id     VARCHAR(255) PRIMARY KEY,
+       event_type   VARCHAR(100) NOT NULL,
        processed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
    );
    ```
+
+5. **User linking via `custom_data`** — this is the critical architectural difference:
+   - At checkout creation, we pass `checkout_data.custom.user_id` with our DB user UUID
+   - Every webhook event includes `meta.custom_data.user_id` — this is how we look up the user
+   - We also store `ls_customer_id` for future API calls (portal URLs, subscription management)
+   - Unlike Stripe, there is no need to pre-create a customer on registration
+
+6. **Checkout URL endpoint** — replaces Stripe customer creation:
+   ```
+   POST /billing/checkout  (authenticated)
+   Body: { variantId: "123456" }
+   → Creates LS checkout via POST https://api.lemonsqueezy.com/v1/checkouts
+   → Passes user_id + email in checkout_data.custom
+   → Returns { checkoutUrl: "https://..." }
+   → macOS app opens URL in default browser
+   ```
+
+7. **Customer portal** — Lemon Squeezy provides built-in portal URLs:
+   - `urls.customer_portal` — full subscription management (cancel, upgrade, invoices)
+   - `urls.update_payment_method` — payment method update only
+   - Both are pre-signed URLs with 24-hour expiry, refreshed on every webhook event
+   - No API call needed to create a portal session (unlike Stripe)
+
+### Subscription State Machine (Lemon Squeezy)
+
+```
+States: none | on_trial | active | past_due | unpaid | cancelled | expired | paused
+
+Valid transitions (enforced by validateTransition):
+  none       → on_trial, active
+  on_trial   → active, cancelled
+  active     → past_due, cancelled, paused
+  past_due   → active, unpaid, cancelled
+  unpaid     → active, cancelled, expired
+  cancelled  → expired              (grace period ended)
+  expired    → none                 (terminal — new subscription = new checkout)
+  paused     → active               (unpaused)
+```
+
+Note: Re-subscription after `cancelled`/`expired` creates a brand new LS subscription.
+The user goes through checkout again, receiving a new `ls_subscription_id`. The old
+subscription row is not reactivated.
+
+### Lemon Squeezy as Merchant of Record — What We Do NOT Handle
+
+Because LS is the Merchant of Record, the following are handled entirely by LS:
+- **Tax collection** (sales tax, VAT, GST) — LS calculates and remits
+- **3DS / SCA authentication** — LS handles all payment authentication
+- **Payment method collection** — via LS hosted checkout page
+- **Dunning / retry logic** — LS retries failed payments (4 attempts over ~2 weeks)
+- **Refund processing** — managed via LS dashboard or API
+- **Dispute/chargeback handling** — LS handles as MoR; we receive `order_refunded` if applicable
+
+This eliminates the need for: `invoice.payment_action_required` (3DS), `charge.dispute.created`,
+`incomplete_expired` handling, and Stripe Customer Portal session creation.
 
 ---
 
@@ -1451,12 +1558,13 @@ inter/Networking/InterTokenService.swift        — Keychain storage, silent ref
 inter/App/AppDelegate.m                         — read tier from auth profile (remove hardcoded @"free")
 ```
 
-### Phase C (billing gateway)
+### Phase C (billing — Lemon Squeezy)
 ```
-token-server/migrations/005_billing_columns.sql  — new file
-token-server/billing.js                          — new file (webhook receiver + tier update logic)
-token-server/index.js                            — POST /webhooks/stripe or /webhooks/razorpay
-token-server/.env.example                        — STRIPE_WEBHOOK_SECRET or RAZORPAY_WEBHOOK_SECRET
+token-server/migrations/005_billing_columns.sql  — new file (LS billing columns + idempotency table)
+token-server/billing.js                          — new file (LS webhook receiver + tier update logic)
+token-server/index.js                            — POST /webhooks/lemonsqueezy (express.raw), POST /billing/checkout, POST /billing/portal
+token-server/.env.example                        — LEMONSQUEEZY_API_KEY, LEMONSQUEEZY_WEBHOOK_SECRET, LEMONSQUEEZY_STORE_ID, variant-to-tier mapping
+token-server/package.json                        — add @lemonsqueezy/lemonsqueezy.js dependency
 ```
 
 ### Phase D (account recovery + audit — server-only, no client deps)
@@ -1503,10 +1611,23 @@ token-server/mailer.js     — new file (nodemailer wrapper — sendPasswordRese
 - [ ] Mismatched `clientId` in refresh logs a warning but does not block (soft binding)
 
 ### Phase C verification
-- [ ] Stripe `customer.subscription.deleted` webhook → `users.tier` updated to `'free'`
-- [ ] Replaying the same Stripe event ID a second time → `409` (idempotency table blocks it)
-- [ ] Webhook with invalid signature → `400` / `401` — event not processed
+- [ ] `subscription_expired` webhook → `users.tier` updated to `'free'`, `subscription_status` = `'expired'`
+- [ ] `subscription_created` webhook with `meta.custom_data.user_id` → correct user row updated
+- [ ] Replaying the same webhook event a second time → `200` with `{ duplicate: true }` (idempotency table blocks reprocessing)
+- [ ] Webhook with invalid `X-Signature` → `401` — event not processed, security event logged
+- [ ] Webhook with missing `X-Signature` header → `401` — event not processed
 - [ ] After tier downgrade in DB: user's next 15-min refresh cycle picks up `free` tier in new access token
+- [ ] `POST /billing/checkout` with valid `variantId` → returns `{ checkoutUrl }` (valid LS URL)
+- [ ] `POST /billing/checkout` with unknown `variantId` → `400` error
+- [ ] `POST /billing/checkout` without auth → `401`
+- [ ] `POST /billing/portal` returns `{ portalUrl }` from stored `ls_portal_url` or creates fresh one via API
+- [ ] `subscription_cancelled` webhook → `subscription_status` = `'cancelled'`, `grace_until` = `ends_at`, tier preserved
+- [ ] `subscription_payment_failed` → `subscription_status` = `'past_due'`
+- [ ] `subscription_payment_recovered` → `subscription_status` = `'active'`, grace period cleared
+- [ ] `subscription_paused` → `subscription_status` = `'paused'`, paid access blocked
+- [ ] `subscription_unpaused` → `subscription_status` = `'active'`, paid access restored
+- [ ] `requireTier()` blocks access for `past_due`, `unpaid`, `expired` statuses
+- [ ] `requireTier()` allows `cancelled` status access while `NOW() < grace_until`
 
 ### Phase D verification
 - [ ] `POST /auth/forgot-password` returns 200 with generic message for BOTH existing and non-existing emails
@@ -1540,41 +1661,90 @@ token-server/mailer.js     — new file (nodemailer wrapper — sendPasswordRese
 
 ```javascript
 // ============================================================================
-// billing.js — Stripe Subscription Lifecycle Webhooks (Phase C)
+// billing.js — Lemon Squeezy Subscription Lifecycle Webhooks (Phase C)
 //
-// Mounted at: POST /webhooks/stripe
+// Mounted at: POST /webhooks/lemonsqueezy
 // CRITICAL: Must be mounted with express.raw() BEFORE express.json() in index.js:
-//   app.post('/webhooks/stripe', express.raw({ type: 'application/json' }), require('./billing'));
+//   app.post('/webhooks/lemonsqueezy', express.raw({ type: 'application/json' }), require('./billing'));
 //   app.use(express.json());  // <-- AFTER
 //
-// All Stripe subscription lifecycle events are handled here.
+// All Lemon Squeezy subscription lifecycle events are handled here.
 // Tier changes are reflected in the access token on the next /auth/refresh call (max 15 min).
+//
+// KEY DIFFERENCE FROM STRIPE:
+// - User linking: meta.custom_data.user_id (NOT customer_id lookup)
+// - Signature: HMAC-SHA256 hex digest in X-Signature header (NOT Stripe-Signature)
+// - LS is Merchant of Record — handles tax, 3DS, dunning, disputes internally
+// - No need for invoice.payment_action_required (3DS) or charge.dispute.created
 // ============================================================================
 
-const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 const db     = require('./db');
 const crypto = require('crypto');
 
+const LEMONSQUEEZY_WEBHOOK_SECRET = process.env.LEMONSQUEEZY_WEBHOOK_SECRET;
+if (!LEMONSQUEEZY_WEBHOOK_SECRET || LEMONSQUEEZY_WEBHOOK_SECRET.length < 6) {
+  console.error('[FATAL] LEMONSQUEEZY_WEBHOOK_SECRET must be set (6-40 characters).');
+  process.exit(1);
+}
+
 // ---------------------------------------------------------------------------
-// Price ID → tier mapping — fill in your actual Stripe price IDs
+// Variant ID → tier mapping — fill in your actual Lemon Squeezy variant IDs
+// Found in: LS Dashboard → Store → Products → Variants, or via API
 // ---------------------------------------------------------------------------
-const PRICE_ID_TO_TIER = {
-  // TODO: replace with your actual Stripe price IDs from the Stripe Dashboard
-  'price_pro_monthly':     'pro',
-  'price_pro_annual':      'pro',
-  'price_hiring_monthly':  'hiring',
-  'price_hiring_annual':   'hiring',
+const VARIANT_ID_TO_TIER = {
+  // TODO: replace with your actual Lemon Squeezy variant IDs from the LS Dashboard
+  // Each variant represents a specific plan (e.g., "Pro Monthly", "Pro Annual")
+  // Example:
+  // '123456': 'pro',   // Pro Monthly
+  // '123457': 'pro',   // Pro Annual
+  // '123458': 'hiring', // Hiring Monthly
+  // '123459': 'hiring', // Hiring Annual
 };
 
 // Statuses that grant paid-tier access even without a confirmed 'active' subscription
-const TRIAL_GRANTS_TIER = { trialing: 'pro' }; // trialing = pro-equivalent (G19)
+// on_trial in LS = trialing equivalent — user has full access, no payment yet
+const TRIAL_GRANTS_TIER = { on_trial: 'pro' };
 
-// Grace period for past_due before blocking access (G18)
+// Grace period for past_due before blocking access
 const GRACE_PERIOD_DAYS = 3;
+
+// Subscription statuses (from Lemon Squeezy):
+// on_trial | active | paused | past_due | unpaid | cancelled | expired
+
+// Valid state transitions — enforced before every DB update (per SYSTEM_PRINCIPLES §2.5)
+const VALID_TRANSITIONS = {
+  none:      ['on_trial', 'active'],
+  on_trial:  ['active', 'cancelled'],
+  active:    ['past_due', 'cancelled', 'paused'],
+  past_due:  ['active', 'unpaid', 'cancelled'],
+  unpaid:    ['active', 'cancelled', 'expired'],
+  cancelled: ['expired'],
+  expired:   ['none'],   // terminal — new subscription = fresh checkout
+  paused:    ['active'],
+};
+
+function validateTransition(from, to) {
+  if (!VALID_TRANSITIONS[from]?.includes(to)) {
+    // Log but do not throw — LS may fire events in unexpected order during edge cases.
+    // We log the invalid transition and proceed with the update to avoid blocking webhooks.
+    console.error(`[billing] Invalid subscription transition: ${from} → ${to}`);
+    return false;
+  }
+  return true;
+}
 
 // ---------------------------------------------------------------------------
 // Idempotency — prevent double-processing of replayed webhook events
+// LS does not provide a unique event ID in every webhook payload. We generate
+// a deterministic ID from: event_name + subscription_id + a truncated timestamp
+// (rounded to 1-second granularity to handle replays within the same second).
 // ---------------------------------------------------------------------------
+function generateEventId(eventName, subscriptionId, timestamp) {
+  const ts = timestamp ? new Date(timestamp).toISOString() : new Date().toISOString();
+  const raw = `${eventName}:${subscriptionId}:${ts}`;
+  return crypto.createHash('sha256').update(raw).digest('hex').slice(0, 64);
+}
+
 async function isEventAlreadyProcessed(eventId) {
   const result = await db.query(
     'SELECT 1 FROM processed_webhook_events WHERE event_id = $1',
@@ -1583,186 +1753,476 @@ async function isEventAlreadyProcessed(eventId) {
   return result.rows.length > 0;
 }
 
-async function markEventProcessed(eventId) {
+async function markEventProcessed(eventId, eventType) {
   await db.query(
-    `INSERT INTO processed_webhook_events (event_id) VALUES ($1)
+    `INSERT INTO processed_webhook_events (event_id, event_type) VALUES ($1, $2)
      ON CONFLICT (event_id) DO NOTHING`,
-    [eventId]
+    [eventId, eventType]
   );
 }
 
 // ---------------------------------------------------------------------------
-// Webhook handler — Express middleware (req.body is a Buffer here)
+// Webhook signature verification — HMAC-SHA256 (Lemon Squeezy)
+// Source: https://docs.lemonsqueezy.com/guides/developer-guide/webhooks
+// ---------------------------------------------------------------------------
+function verifySignature(rawBody, signatureHeader) {
+  if (!signatureHeader) return false;
+
+  const hmac = crypto.createHmac('sha256', LEMONSQUEEZY_WEBHOOK_SECRET);
+  const digest = Buffer.from(hmac.update(rawBody).digest('hex'), 'utf8');
+  const signature = Buffer.from(signatureHeader, 'utf8');
+
+  // Constant-time comparison — prevents timing attacks on signature
+  if (digest.length !== signature.length) return false;
+  return crypto.timingSafeEqual(digest, signature);
+}
+
+// ---------------------------------------------------------------------------
+// Webhook handler — Express middleware (req.body is a raw Buffer here)
 // ---------------------------------------------------------------------------
 module.exports = async function billingWebhook(req, res) {
-  const sig     = req.headers['stripe-signature'];
-  const secret  = process.env.STRIPE_WEBHOOK_SECRET;
-
-  let event;
-  try {
-    // req.body is a raw Buffer — ONLY works if express.raw() is applied to this route
-    event = stripe.webhooks.constructEvent(req.body, sig, secret);
-  } catch (err) {
-    console.error('[billing] Webhook signature verification failed:', err.message);
-    return res.status(400).send(`Webhook Error: ${err.message}`);
+  // Step 1: Verify webhook signature
+  const isValid = verifySignature(req.body, req.get('X-Signature'));
+  if (!isValid) {
+    console.error('[billing] Webhook signature verification failed');
+    // Log as security event — failed signatures may indicate tampering
+    return res.status(401).json({ error: 'Invalid webhook signature' });
   }
 
-  // Idempotency check — silently skip already-processed events
-  if (await isEventAlreadyProcessed(event.id)) {
+  // Step 2: Parse the verified payload
+  let payload;
+  try {
+    payload = JSON.parse(req.body.toString('utf8'));
+  } catch (err) {
+    console.error('[billing] Webhook payload parse error:', err.message);
+    return res.status(400).json({ error: 'Invalid JSON payload' });
+  }
+
+  const eventName = payload.meta?.event_name;
+  const customData = payload.meta?.custom_data;
+  const subscriptionData = payload.data?.attributes;
+  const subscriptionId = String(payload.data?.id || '');
+
+  if (!eventName || !subscriptionData) {
+    console.error('[billing] Webhook missing event_name or data.attributes');
+    return res.status(400).json({ error: 'Invalid webhook payload structure' });
+  }
+
+  // Step 3: Idempotency check
+  const eventId = generateEventId(eventName, subscriptionId, subscriptionData.updated_at);
+  if (await isEventAlreadyProcessed(eventId)) {
     return res.status(200).json({ received: true, duplicate: true });
   }
 
+  // Step 4: Process the event — return 200 immediately on success
+  // LS expects HTTP 200. Non-200 triggers up to 3 retries (4 total attempts).
   try {
-    await handleEvent(event);
-    await markEventProcessed(event.id);
+    await handleEvent(eventName, payload, customData);
+    await markEventProcessed(eventId, eventName);
     res.status(200).json({ received: true });
   } catch (err) {
-    console.error('[billing] Event handler failed:', event.type, err.message);
-    // Return 500 so Stripe retries delivery
+    console.error('[billing] Event handler failed:', eventName, err.message);
+    // Return 500 so Lemon Squeezy retries delivery
     res.status(500).json({ error: 'Event processing failed' });
   }
 };
 
 // ---------------------------------------------------------------------------
+// Resolve the user — custom_data.user_id is primary, ls_customer_id is fallback
+// ---------------------------------------------------------------------------
+async function resolveUserId(customData, subscriptionData) {
+  // Primary: user_id passed through checkout custom_data
+  if (customData?.user_id) {
+    const result = await db.query(
+      'SELECT id, tier, subscription_status FROM users WHERE id = $1 AND deleted_at IS NULL',
+      [customData.user_id]
+    );
+    if (result.rows.length > 0) return result.rows[0];
+  }
+
+  // Fallback: look up by ls_customer_id (for events where custom_data may be missing)
+  const customerId = String(subscriptionData?.customer_id || '');
+  if (customerId) {
+    const result = await db.query(
+      'SELECT id, tier, subscription_status FROM users WHERE ls_customer_id = $1 AND deleted_at IS NULL',
+      [customerId]
+    );
+    if (result.rows.length > 0) return result.rows[0];
+  }
+
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// Tier resolution from variant ID
+// ---------------------------------------------------------------------------
+function resolveTier(variantId) {
+  return VARIANT_ID_TO_TIER[String(variantId)] ?? 'free';
+}
+
+// ---------------------------------------------------------------------------
 // Event dispatch
 // ---------------------------------------------------------------------------
-async function handleEvent(event) {
-  switch (event.type) {
+async function handleEvent(eventName, payload, customData) {
+  const sub = payload.data.attributes;
+  const subscriptionId = String(payload.data.id);
 
-    // ── Checkout completed (first subscription purchase) ──────────────────
-    case 'checkout.session.completed': {           // G17
-      const session = event.data.object;
-      if (session.mode !== 'subscription') break;
+  switch (eventName) {
 
-      const subscription = await stripe.subscriptions.retrieve(session.subscription);
-      const priceId = subscription.items.data[0]?.price?.id;
-      const tier    = PRICE_ID_TO_TIER[priceId] ?? 'free';
+    // ── Subscription created (first purchase or re-subscribe) ─────────────
+    case 'subscription_created': {
+      const user = await resolveUserId(customData, sub);
+      if (!user) {
+        console.error(`[billing] subscription_created: user not found. custom_data=${JSON.stringify(customData)}`);
+        break;
+      }
 
-      await db.query(
-        `UPDATE users
-         SET tier = $1, subscription_status = 'active',
-             stripe_subscription_id = $2, updated_at = NOW()
-         WHERE stripe_customer_id = $3`,
-        [tier, session.subscription, session.customer]
-      );
-      console.log(`[billing] checkout.session.completed: customer=${session.customer} tier=${tier}`);
-      break;
-    }
-
-    // ── Subscription created ──────────────────────────────────────────────
-    case 'customer.subscription.created': {
-      const sub   = event.data.object;
-      const priceId = sub.items.data[0]?.price?.id;
-      const tier    = PRICE_ID_TO_TIER[priceId] ?? 'free';
+      const tier = resolveTier(sub.variant_id);
+      const newStatus = sub.status === 'on_trial' ? 'on_trial' : 'active';
+      validateTransition(user.subscription_status || 'none', newStatus);
 
       await db.query(
         `UPDATE users
-         SET tier = $1, subscription_status = $2,
-             stripe_subscription_id = $3, updated_at = NOW()
-         WHERE stripe_customer_id = $4`,
-        [tier, sub.status, sub.id, sub.customer]
+         SET tier = $1,
+             subscription_status = $2,
+             ls_subscription_id = $3,
+             ls_customer_id = $4,
+             ls_variant_id = $5,
+             ls_product_id = $6,
+             trial_ends_at = $7,
+             current_period_ends_at = $8,
+             grace_until = NULL,
+             ls_portal_url = $9,
+             updated_at = NOW()
+         WHERE id = $10`,
+        [
+          tier,
+          newStatus,
+          subscriptionId,
+          String(sub.customer_id),
+          String(sub.variant_id),
+          String(sub.product_id),
+          sub.trial_ends_at || null,
+          sub.renews_at || null,
+          sub.urls?.customer_portal || null,
+          user.id,
+        ]
       );
+
+      // Audit log — tier change
+      await db.query(
+        `INSERT INTO user_tier_history (user_id, from_tier, to_tier, reason, event_id)
+         VALUES ($1, $2, $3, 'ls_subscription_created', $4)`,
+        [user.id, user.tier, tier, subscriptionId]
+      ).catch(err => console.error('[billing] audit log failed:', err.message));
+
+      console.log(`[billing] subscription_created: user=${user.id} tier=${tier} status=${newStatus}`);
       break;
     }
 
-    // ── Subscription updated (plan change, status change) ─────────────────
-    case 'customer.subscription.updated': {
-      const sub = event.data.object;
+    // ── Subscription updated (plan change, status change, renewal) ────────
+    case 'subscription_updated': {
+      const user = await resolveUserId(customData, sub);
+      if (!user) {
+        console.error(`[billing] subscription_updated: user not found. sub_id=${subscriptionId}`);
+        break;
+      }
 
-      // Hard cutoff states — lose access regardless of tier column
-      if (sub.status === 'incomplete_expired') {   // G23
+      const tier = resolveTier(sub.variant_id);
+      const newStatus = sub.status; // on_trial | active | paused | past_due | unpaid | cancelled | expired
+
+      // Validate transition (log-only, do not block — LS may send events out of order)
+      validateTransition(user.subscription_status || 'none', newStatus);
+
+      // Handle terminal states
+      if (newStatus === 'expired') {
         await db.query(
           `UPDATE users
-           SET tier = 'free', subscription_status = 'incomplete_expired',
-               stripe_subscription_id = NULL, updated_at = NOW()
-           WHERE stripe_customer_id = $1`,
-          [sub.customer]
+           SET tier = 'free',
+               subscription_status = 'expired',
+               ls_subscription_id = NULL,
+               ls_variant_id = NULL,
+               ls_product_id = NULL,
+               grace_until = NULL,
+               ls_portal_url = $1,
+               updated_at = NOW()
+           WHERE id = $2`,
+          [sub.urls?.customer_portal || null, user.id]
         );
-        break;
-      }
 
-      if (sub.status === 'paused') {               // G24
         await db.query(
-          `UPDATE users SET subscription_status = 'paused', updated_at = NOW()
-           WHERE stripe_customer_id = $1`,
-          [sub.customer]
+          `INSERT INTO user_tier_history (user_id, from_tier, to_tier, reason, event_id)
+           VALUES ($1, $2, 'free', 'ls_subscription_expired', $3)`,
+          [user.id, user.tier, subscriptionId]
+        ).catch(err => console.error('[billing] audit log failed:', err.message));
+
+        break;
+      }
+
+      // Handle paused (block paid access but keep tier column for resumption)
+      if (newStatus === 'paused') {
+        await db.query(
+          `UPDATE users
+           SET subscription_status = 'paused',
+               ls_portal_url = $1,
+               updated_at = NOW()
+           WHERE id = $2`,
+          [sub.urls?.customer_portal || null, user.id]
         );
         break;
       }
 
-      const priceId = sub.items.data[0]?.price?.id;
-      const tier    = PRICE_ID_TO_TIER[priceId] ?? 'free';
+      // Handle cancelled (grace period — access until ends_at)
+      if (newStatus === 'cancelled') {
+        await db.query(
+          `UPDATE users
+           SET subscription_status = 'cancelled',
+               grace_until = $1,
+               ls_portal_url = $2,
+               updated_at = NOW()
+           WHERE id = $3`,
+          [sub.ends_at || null, sub.urls?.customer_portal || null, user.id]
+        );
+        break;
+      }
+
+      // General update — sync tier, status, and renewal info
+      await db.query(
+        `UPDATE users
+         SET tier = $1,
+             subscription_status = $2,
+             ls_variant_id = $3,
+             ls_product_id = $4,
+             current_period_ends_at = $5,
+             trial_ends_at = $6,
+             ls_portal_url = $7,
+             updated_at = NOW()
+         WHERE id = $8`,
+        [
+          tier,
+          newStatus,
+          String(sub.variant_id),
+          String(sub.product_id),
+          sub.renews_at || null,
+          sub.trial_ends_at || null,
+          sub.urls?.customer_portal || null,
+          user.id,
+        ]
+      );
+
+      // Audit tier change if tier actually changed
+      if (tier !== user.tier) {
+        await db.query(
+          `INSERT INTO user_tier_history (user_id, from_tier, to_tier, reason, event_id)
+           VALUES ($1, $2, $3, 'ls_subscription_updated', $4)`,
+          [user.id, user.tier, tier, subscriptionId]
+        ).catch(err => console.error('[billing] audit log failed:', err.message));
+      }
+      break;
+    }
+
+    // ── Subscription cancelled (user or admin cancelled) ──────────────────
+    // Access continues until ends_at (grace period). Then subscription_expired fires.
+    case 'subscription_cancelled': {
+      const user = await resolveUserId(customData, sub);
+      if (!user) break;
+
+      validateTransition(user.subscription_status || 'none', 'cancelled');
 
       await db.query(
         `UPDATE users
-         SET tier = $1, subscription_status = $2, updated_at = NOW()
-         WHERE stripe_customer_id = $3`,
-        [tier, sub.status, sub.customer]
+         SET subscription_status = 'cancelled',
+             grace_until = $1,
+             ls_portal_url = $2,
+             updated_at = NOW()
+         WHERE id = $3`,
+        [sub.ends_at || null, sub.urls?.customer_portal || null, user.id]
+      );
+      // TODO: send cancellation confirmation email with ends_at date
+      console.log(`[billing] subscription_cancelled: user=${user.id} ends_at=${sub.ends_at}`);
+      break;
+    }
+
+    // ── Subscription expired (grace period ended or dunning completed) ────
+    // This is the terminal event — user loses all paid access.
+    case 'subscription_expired': {
+      const user = await resolveUserId(customData, sub);
+      if (!user) break;
+
+      const previousTier = user.tier;
+      await db.query(
+        `UPDATE users
+         SET tier = 'free',
+             subscription_status = 'expired',
+             ls_subscription_id = NULL,
+             ls_variant_id = NULL,
+             ls_product_id = NULL,
+             grace_until = NULL,
+             current_period_ends_at = NULL,
+             trial_ends_at = NULL,
+             updated_at = NOW()
+         WHERE id = $1`,
+        [user.id]
+      );
+
+      await db.query(
+        `INSERT INTO user_tier_history (user_id, from_tier, to_tier, reason, event_id)
+         VALUES ($1, $2, 'free', 'ls_subscription_expired', $3)`,
+        [user.id, previousTier, subscriptionId]
+      ).catch(err => console.error('[billing] audit log failed:', err.message));
+
+      console.log(`[billing] subscription_expired: user=${user.id} downgraded from ${previousTier}`);
+      break;
+    }
+
+    // ── Payment succeeded (renewal or recovery) ───────────────────────────
+    case 'subscription_payment_success': {
+      const user = await resolveUserId(customData, sub);
+      if (!user) break;
+
+      // Clear any grace period / past_due state on successful payment
+      await db.query(
+        `UPDATE users
+         SET subscription_status = 'active',
+             grace_until = NULL,
+             current_period_ends_at = $1,
+             updated_at = NOW()
+         WHERE id = $2`,
+        [sub.renews_at || null, user.id]
       );
       break;
     }
 
-    // ── Subscription canceled / deleted ───────────────────────────────────
-    case 'customer.subscription.deleted': {
-      const sub = event.data.object;
-      await db.query(
-        `UPDATE users
-         SET tier = 'free', subscription_status = 'canceled',
-             stripe_subscription_id = NULL, updated_at = NOW()
-         WHERE stripe_customer_id = $1`,
-        [sub.customer]
-      );
-      break;
-    }
+    // ── Payment failed (LS will retry up to 4 times over ~2 weeks) ────────
+    case 'subscription_payment_failed': {
+      const user = await resolveUserId(customData, sub);
+      if (!user) break;
 
-    // ── Payment failed (with grace period) ────────────────────────────────
-    case 'invoice.payment_failed': {               // G18
-      const invoice  = event.data.object;
       const graceUntil = new Date();
       graceUntil.setDate(graceUntil.getDate() + GRACE_PERIOD_DAYS);
 
       await db.query(
         `UPDATE users
-         SET subscription_status = 'past_due', grace_until = $1, updated_at = NOW()
-         WHERE stripe_customer_id = $2`,
-        [graceUntil, invoice.customer]
+         SET subscription_status = 'past_due',
+             grace_until = $1,
+             updated_at = NOW()
+         WHERE id = $2`,
+        [graceUntil, user.id]
       );
-      // TODO: send payment-failed notification email with invoice.hosted_invoice_url
+      // TODO: send payment-failed notification email with LS update_payment_method URL
+      // The URL is in sub.urls?.update_payment_method (pre-signed, 24h expiry)
+      console.log(`[billing] subscription_payment_failed: user=${user.id}`);
       break;
     }
 
-    // ── 3DS SCA action required (EU/UK cards) ─────────────────────────────
-    case 'invoice.payment_action_required': {      // G16
-      const invoice = event.data.object;
+    // ── Payment recovered (successful payment after failure) ──────────────
+    case 'subscription_payment_recovered': {
+      const user = await resolveUserId(customData, sub);
+      if (!user) break;
+
       await db.query(
-        `UPDATE users SET subscription_status = 'incomplete', updated_at = NOW()
-         WHERE stripe_customer_id = $1`,
-        [invoice.customer]
+        `UPDATE users
+         SET subscription_status = 'active',
+             grace_until = NULL,
+             current_period_ends_at = $1,
+             updated_at = NOW()
+         WHERE id = $2`,
+        [sub.renews_at || null, user.id]
       );
-      const userResult = await db.query(
-        'SELECT id, email FROM users WHERE stripe_customer_id = $1',
-        [invoice.customer]
-      );
-      if (userResult.rows.length > 0) {
-        const { email } = userResult.rows[0];
-        // TODO: await sendPaymentActionEmail(email, invoice.hosted_invoice_url);
-        console.log(`[billing] 3DS required for ${email} — invoice: ${invoice.id}`);
-      }
+      console.log(`[billing] subscription_payment_recovered: user=${user.id}`);
       break;
     }
 
-    // ── Trial ending soon ─────────────────────────────────────────────────
-    case 'customer.subscription.trial_will_end': {
-      // TODO: send trial-ending notification email (3 days before trial ends)
-      console.log(`[billing] trial_will_end: customer=${event.data.object.customer}`);
+    // ── Subscription paused (payment collection paused) ───────────────────
+    case 'subscription_paused': {
+      const user = await resolveUserId(customData, sub);
+      if (!user) break;
+
+      validateTransition(user.subscription_status || 'none', 'paused');
+
+      await db.query(
+        `UPDATE users
+         SET subscription_status = 'paused',
+             ls_portal_url = $1,
+             updated_at = NOW()
+         WHERE id = $2`,
+        [sub.urls?.customer_portal || null, user.id]
+      );
+      // requireTier() blocks paid access via INACTIVE_STATUSES check
+      break;
+    }
+
+    // ── Subscription unpaused (payment collection resumed) ────────────────
+    case 'subscription_unpaused': {
+      const user = await resolveUserId(customData, sub);
+      if (!user) break;
+
+      const tier = resolveTier(sub.variant_id);
+      await db.query(
+        `UPDATE users
+         SET subscription_status = 'active',
+             tier = $1,
+             ls_portal_url = $2,
+             updated_at = NOW()
+         WHERE id = $3`,
+        [tier, sub.urls?.customer_portal || null, user.id]
+      );
+      break;
+    }
+
+    // ── Subscription resumed (cancelled sub resumed before expiry) ────────
+    case 'subscription_resumed': {
+      const user = await resolveUserId(customData, sub);
+      if (!user) break;
+
+      const tier = resolveTier(sub.variant_id);
+      await db.query(
+        `UPDATE users
+         SET subscription_status = 'active',
+             tier = $1,
+             grace_until = NULL,
+             current_period_ends_at = $2,
+             ls_portal_url = $3,
+             updated_at = NOW()
+         WHERE id = $4`,
+        [tier, sub.renews_at || null, sub.urls?.customer_portal || null, user.id]
+      );
+      console.log(`[billing] subscription_resumed: user=${user.id} tier=${tier}`);
+      break;
+    }
+
+    // ── Order created (initial purchase — logged only) ────────────────────
+    case 'order_created': {
+      // The subscription_created event handles the actual tier update.
+      // Log order for audit purposes only.
+      const orderId = payload.data?.id;
+      console.log(`[billing] order_created: order=${orderId} user_id=${customData?.user_id}`);
+      break;
+    }
+
+    // ── Order refunded (LS processed a refund) ────────────────────────────
+    case 'order_refunded': {
+      // LS as MoR handles refunds. Log for our records.
+      // Note: refund does NOT automatically cancel the subscription —
+      // that is a separate action in the LS dashboard or API.
+      const orderId = payload.data?.id;
+      console.log(`[billing] order_refunded: order=${orderId} user_id=${customData?.user_id}`);
       break;
     }
 
     default:
-      // Unknown event — log and ignore. Stripe will not retry unrecognised events.
-      console.log(`[billing] Unhandled event type: ${event.type}`);
+      // Unknown event — log and ignore. LS will not retry for 200 responses.
+      console.log(`[billing] Unhandled event type: ${eventName}`);
   }
 }
+
+// ---------------------------------------------------------------------------
+// Exported helpers for use in index.js (checkout URL creation, portal URL)
+// ---------------------------------------------------------------------------
+
+// VARIANT_ID_TO_TIER is needed by the checkout endpoint to validate variantId
+module.exports.VARIANT_ID_TO_TIER = VARIANT_ID_TO_TIER;
+module.exports.TRIAL_GRANTS_TIER = TRIAL_GRANTS_TIER;
 ```
 
 ---
@@ -1882,29 +2342,31 @@ async function sendVerificationEmail(toEmail, rawToken) {
 }
 
 // ---------------------------------------------------------------------------
-// sendPaymentActionEmail — 3DS SCA authentication required (G16)
-// Called from: billing.js invoice.payment_action_required handler
+// sendPaymentFailedEmail — payment failed notification
+// Called from: billing.js subscription_payment_failed handler
+// Includes the Lemon Squeezy update_payment_method URL (pre-signed, 24h expiry)
 // ---------------------------------------------------------------------------
-async function sendPaymentActionEmail(toEmail, invoiceUrl) {
+async function sendPaymentFailedEmail(toEmail, updatePaymentUrl) {
   await transporter.sendMail({
     from:    FROM,
     to:      toEmail,
-    subject: 'Action required: complete your Inter payment',
+    subject: 'Action required: update your Inter payment method',
     text: [
-      'Your payment requires additional authentication (3D Secure).',
-      'Please complete it within 23 hours to keep your subscription active.',
+      'Your most recent subscription payment failed.',
+      'Please update your payment method to keep your subscription active.',
       '',
-      invoiceUrl,
+      updatePaymentUrl || 'Please log in to manage your subscription.',
     ].join('\n'),
     html: `
-      <p>Your payment requires additional authentication (3D Secure).</p>
-      <p>Please complete it within 23 hours to keep your subscription active.</p>
+      <p>Your most recent subscription payment failed.</p>
+      <p>Please update your payment method to keep your subscription active.</p>
+      ${updatePaymentUrl ? `
       <p style="margin:24px 0">
-        <a href="${invoiceUrl}" style="background:#FF3B30;color:#fff;padding:12px 24px;
+        <a href="${updatePaymentUrl}" style="background:#FF3B30;color:#fff;padding:12px 24px;
            border-radius:6px;text-decoration:none;font-weight:bold">
-          Complete payment
+          Update payment method
         </a>
-      </p>
+      </p>` : ''}
     `,
   });
 }
@@ -1912,7 +2374,7 @@ async function sendPaymentActionEmail(toEmail, invoiceUrl) {
 module.exports = {
   sendPasswordResetEmail,
   sendVerificationEmail,
-  sendPaymentActionEmail,
+  sendPaymentFailedEmail,
 };
 ```
 
@@ -1923,22 +2385,43 @@ module.exports = {
 **New file**: `token-server/migrations/005_billing_columns.sql`
 
 ```sql
--- Phase C: Add Stripe billing columns to users table
+-- Phase C: Add Lemon Squeezy billing columns to users table
 ALTER TABLE users
-  ADD COLUMN IF NOT EXISTS subscription_status   VARCHAR(20) DEFAULT 'none',
-  --  'none' | 'trialing' | 'active' | 'past_due' | 'unpaid'
-  --  | 'canceled' | 'incomplete' | 'incomplete_expired' | 'paused'
-  ADD COLUMN IF NOT EXISTS stripe_customer_id     VARCHAR(255),
-  ADD COLUMN IF NOT EXISTS stripe_subscription_id VARCHAR(255),
+  ADD COLUMN IF NOT EXISTS subscription_status    VARCHAR(20) DEFAULT 'none'
+    CHECK (subscription_status IN ('none', 'on_trial', 'active', 'past_due', 'unpaid', 'cancelled', 'expired', 'paused')),
+  ADD COLUMN IF NOT EXISTS ls_customer_id         VARCHAR(255),
+  ADD COLUMN IF NOT EXISTS ls_subscription_id     VARCHAR(255),
+  ADD COLUMN IF NOT EXISTS ls_variant_id          VARCHAR(255),
+  ADD COLUMN IF NOT EXISTS ls_product_id          VARCHAR(255),
   ADD COLUMN IF NOT EXISTS grace_until            TIMESTAMPTZ,
   ADD COLUMN IF NOT EXISTS trial_ends_at          TIMESTAMPTZ,
-  ADD COLUMN IF NOT EXISTS current_period_ends_at TIMESTAMPTZ;
+  ADD COLUMN IF NOT EXISTS current_period_ends_at TIMESTAMPTZ,
+  ADD COLUMN IF NOT EXISTS ls_portal_url          TEXT;
+
+-- Index for webhook user lookup by LS customer ID (fallback path)
+CREATE INDEX IF NOT EXISTS idx_users_ls_customer ON users (ls_customer_id) WHERE ls_customer_id IS NOT NULL;
 
 -- Idempotency table — prevents double-processing of replayed webhook events
 CREATE TABLE IF NOT EXISTS processed_webhook_events (
     event_id     VARCHAR(255) PRIMARY KEY,
+    event_type   VARCHAR(100) NOT NULL,
     processed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+-- Tier change audit trail — append-only (per SYSTEM_PRINCIPLES §5.5)
+CREATE TABLE IF NOT EXISTS user_tier_history (
+    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id     UUID REFERENCES users(id) ON DELETE SET NULL,
+    from_tier   VARCHAR(20),
+    to_tier     VARCHAR(20) NOT NULL,
+    reason      VARCHAR(100) NOT NULL,  -- 'ls_subscription_created' | 'ls_subscription_expired' | 'admin_override'
+    event_id    VARCHAR(255),           -- LS subscription ID for traceability
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    -- NO updated_at — append-only, never updated
+);
+
+-- Lock tier history at DB level — prevent accidental modification
+-- REVOKE UPDATE, DELETE ON user_tier_history FROM app_db_user;
 
 -- Auto-clean old event IDs after 30 days (optional — run via pg_cron or a cron job)
 -- DELETE FROM processed_webhook_events WHERE processed_at < NOW() - INTERVAL '30 days';
@@ -1949,7 +2432,7 @@ CREATE TABLE IF NOT EXISTS processed_webhook_events (
 ## 11. Industry Standards Gap Analysis & Mitigation Plan
 
 > **Sources:** OWASP Session Management Cheat Sheet, NIST SP 800-63B (Digital Identity
-> Guidelines), RFC 8252 (OAuth 2.0 for Native Apps), Stripe Subscription Lifecycle Docs.
+> Guidelines), RFC 8252 (OAuth 2.0 for Native Apps), Lemon Squeezy Subscription Lifecycle Docs.
 >
 > **Audit date:** April 2026. All 24 gaps below were **not** covered by Phases A–D above.
 > They are additive. Implement in priority order: P0 → P1 → P2 → P3.
@@ -1970,7 +2453,7 @@ CREATE TABLE IF NOT EXISTS processed_webhook_events (
 | SHA-256 of reset/refresh token stored | Raw token never in DB — breach-safe | ✅ |
 | HSTS + `Cache-Control: no-store` | OWASP HTTP Headers CS | ✅ |
 | `ASWebAuthenticationSession` for OAuth | RFC 8252 §6 — mandatory external user-agent | ✅ |
-| Webhook signature validation + idempotency | Stripe best practice | ✅ |
+| Webhook signature validation + idempotency | Lemon Squeezy best practice | ✅ |
 | Tier re-read from DB on every refresh | Max 15-min stale-tier window | ✅ |
 | Revoke all sessions on password reset | Industry standard | ✅ |
 | `emailVerified` soft prompt (no hard gate) | OWASP — hard gate causes lockout on mail failure | ✅ |
@@ -1984,15 +2467,15 @@ implemented. Fix before any Phase B/C deployment.
 
 ---
 
-#### G20 — Stripe webhook route requires `express.raw()`, not `express.json()`
+#### G20 — Lemon Squeezy webhook route requires `express.raw()`, not `express.json()`
 
-**Source:** Stripe docs — *"Webhook signature verification requires the raw request body"*  
-**Impact:** Every Stripe webhook event silently fails signature validation and is rejected.
-Billing webhooks never process. Tier upgrades/downgrades from Stripe will not apply.
+**Source:** Lemon Squeezy docs — *"Webhook signature verification requires the raw request body"*  
+**Impact:** Every Lemon Squeezy webhook event silently fails HMAC signature validation and is
+rejected. Billing webhooks never process. Tier upgrades/downgrades from LS will not apply.
 
-`stripe.webhooks.constructEvent(rawBody, sig, secret)` receives a *parsed* JS object when
-`express.json()` middleware runs first — the raw bytes are gone and the signature cannot be
-reconstructed. The call throws on every request regardless of whether the signature is valid.
+The HMAC-SHA256 digest is computed over the exact raw bytes of the request body. If
+`express.json()` middleware runs first, `req.body` becomes a parsed JS object — the raw bytes
+are gone and the signature cannot be reconstructed. Every webhook silently fails.
 
 **Fix — `token-server/index.js`:**
 
@@ -2002,7 +2485,7 @@ middleware applies. Order matters.
 ```javascript
 // MUST come before app.use(express.json())
 app.post(
-  '/webhooks/stripe',
+  '/webhooks/lemonsqueezy',
   express.raw({ type: 'application/json' }),  // preserves raw body bytes
   require('./billing')                         // billing.js receives req.body as Buffer
 );
@@ -2011,25 +2494,37 @@ app.post(
 app.use(express.json({ limit: '16kb' }));
 ```
 
-In `billing.js`, use `req.body` directly as the raw buffer:
+In `billing.js`, verify the signature using the raw Buffer:
 
 ```javascript
-const sig = req.headers['stripe-signature'];
-let event;
-try {
-  event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
-} catch (err) {
-  return res.status(400).send(`Webhook signature verification failed: ${err.message}`);
+const crypto = require('crypto');
+
+function verifySignature(rawBody, signatureHeader) {
+  if (!signatureHeader) return false;
+  const hmac = crypto.createHmac('sha256', process.env.LEMONSQUEEZY_WEBHOOK_SECRET);
+  const digest = Buffer.from(hmac.update(rawBody).digest('hex'), 'utf8');
+  const signature = Buffer.from(signatureHeader, 'utf8');
+  if (digest.length !== signature.length) return false;
+  return crypto.timingSafeEqual(digest, signature);  // constant-time comparison
+}
+
+// In the webhook handler:
+const isValid = verifySignature(req.body, req.get('X-Signature'));
+if (!isValid) {
+  return res.status(401).json({ error: 'Invalid webhook signature' });
 }
 ```
 
 Add to `.env.example`:
 ```
-STRIPE_WEBHOOK_SECRET=whsec_...
+# Lemon Squeezy — Billing (Phase C)
+LEMONSQUEEZY_API_KEY=           # From LS Dashboard → Settings → API
+LEMONSQUEEZY_WEBHOOK_SECRET=    # 6-40 chars, set when creating webhook in LS Dashboard → Settings → Webhooks
+LEMONSQUEEZY_STORE_ID=          # Your store ID (found in LS Dashboard URL or API)
 ```
 
-**Verification:** In Stripe CLI: `stripe listen --forward-to localhost:3000/webhooks/stripe`
-— confirm events are processed without `No signatures found` errors.
+**Verification:** Create a test webhook in LS Dashboard → Settings → Webhooks. Use test mode.
+Trigger a test subscription event and confirm the server processes it without signature errors.
 
 ---
 
@@ -2114,10 +2609,10 @@ Confirm the app receives and logs the token.
 
 #### G15 — `requireTier()` does not check `subscription_status`
 
-**Source:** Stripe subscription lifecycle docs  
+**Source:** Lemon Squeezy subscription lifecycle docs  
 **Impact:** When a subscription goes `past_due` or `unpaid`, the user's `tier` column
-stays `'pro'` until `customer.subscription.deleted` fires — which only happens after Stripe
-exhausts all retry attempts (up to ~2 weeks by default). During that entire window, a
+stays `'pro'` until `subscription_expired` fires — which only happens after Lemon Squeezy
+exhausts all payment retry attempts (up to ~2 weeks). During that entire window, a
 non-paying user retains full paid-tier access.
 
 **Fix — `token-server/auth.js`:**
@@ -2126,7 +2621,12 @@ Update `requireTier` (and the `GET /auth/me` response) to enforce `subscription_
 
 ```javascript
 // Subscription statuses that should block paid-tier access
-const INACTIVE_STATUSES = new Set(['past_due', 'unpaid', 'canceled', 'incomplete_expired']);
+// 'cancelled' is allowed until grace_until (ends_at from LS) — user paid for that period
+// 'on_trial' grants access (handled via TRIAL_GRANTS_TIER)
+const INACTIVE_STATUSES = new Set(['past_due', 'unpaid', 'expired', 'paused']);
+
+// on_trial users get pro-equivalent access
+const TRIAL_GRANTS_TIER = { on_trial: 'pro' };
 
 function requireTier(minTier) {
   const tierRank = { free: 0, pro: 1, hiring: 2 };
@@ -2134,24 +2634,46 @@ function requireTier(minTier) {
     try {
       // Re-read from DB on every gated request (not just at token refresh)
       const result = await db.query(
-        'SELECT tier, subscription_status FROM users WHERE id = $1',
+        'SELECT tier, subscription_status, grace_until FROM users WHERE id = $1',
         [req.user.userId]
       );
       if (result.rows.length === 0) {
         return res.status(401).json({ error: 'USER_NOT_FOUND' });
       }
-      const { tier, subscription_status } = result.rows[0];
+      const { tier, subscription_status, grace_until } = result.rows[0];
 
-      // Block access if payment has lapsed, regardless of tier column value
+      // Check if user is in a cancelled grace period (access until ends_at)
+      const inGracePeriod = subscription_status === 'cancelled'
+        && grace_until
+        && new Date() < new Date(grace_until);
+
+      // Block access if payment has lapsed (unless in grace period)
       if (INACTIVE_STATUSES.has(subscription_status)) {
         return res.status(403).json({
-          error: 'SUBSCRIPTION_INACTIVE',
+          error: 'Subscription inactive',
+          code: 'SUBSCRIPTION_INACTIVE',
           subscriptionStatus: subscription_status,
         });
       }
 
-      if ((tierRank[tier] ?? -1) < (tierRank[minTier] ?? 999)) {
-        return res.status(403).json({ error: 'INSUFFICIENT_TIER', required: minTier });
+      // Cancelled users past their grace period lose paid access
+      if (subscription_status === 'cancelled' && !inGracePeriod) {
+        return res.status(403).json({
+          error: 'Subscription expired',
+          code: 'SUBSCRIPTION_INACTIVE',
+          subscriptionStatus: subscription_status,
+        });
+      }
+
+      // Resolve effective tier — on_trial maps to pro-equivalent
+      const effectiveTier = TRIAL_GRANTS_TIER[subscription_status] ?? tier;
+
+      if ((tierRank[effectiveTier] ?? -1) < (tierRank[minTier] ?? 999)) {
+        return res.status(403).json({
+          error: 'Insufficient tier',
+          code: 'TIER_INSUFFICIENT',
+          required: minTier,
+        });
       }
 
       next();
@@ -2360,7 +2882,7 @@ app.delete('/auth/account', auth.requireAuth, async (req, res) => {
   }
 
   const userResult = await db.query(
-    'SELECT id, password_hash, stripe_customer_id FROM users WHERE id = $1',
+    'SELECT id, password_hash, ls_customer_id, ls_subscription_id FROM users WHERE id = $1',
     [req.user.userId]
   );
   if (userResult.rows.length === 0) {
@@ -2377,20 +2899,16 @@ app.delete('/auth/account', auth.requireAuth, async (req, res) => {
   try {
     await client.query('BEGIN');
 
-    // 1. Cancel any active Stripe subscription
-    if (user.stripe_customer_id) {
+    // 1. Cancel any active Lemon Squeezy subscription
+    //    LS stores one subscription per user (variant upgrade creates new sub).
+    //    DELETE /v1/subscriptions/{id} cancels it (sets status → cancelled, access until ends_at).
+    if (user.ls_subscription_id) {
       try {
-        const subs = await stripe.subscriptions.list({
-          customer: user.stripe_customer_id,
-          status: 'active',
-          limit: 10,
-        });
-        for (const sub of subs.data) {
-          await stripe.subscriptions.cancel(sub.id);
-        }
-      } catch (stripeErr) {
-        console.error('[auth] Stripe cancel on deletion failed:', stripeErr.message);
-        // Don't abort the deletion if Stripe is unreachable
+        await cancelSubscription(user.ls_subscription_id);
+      } catch (lsErr) {
+        console.error('[auth] Lemon Squeezy cancel on deletion failed:', lsErr.message);
+        // Don't abort the deletion if LS is unreachable — the subscription will
+        // eventually expire on its own.
       }
     }
 
@@ -2409,8 +2927,12 @@ app.delete('/auth/account', auth.requireAuth, async (req, res) => {
          password_hash  = '',
          email_verified_at = NULL,
          tier           = 'free',
-         subscription_status = 'canceled',
-         stripe_customer_id  = NULL,
+         subscription_status = 'expired',
+         ls_customer_id      = NULL,
+         ls_subscription_id  = NULL,
+         ls_variant_id       = NULL,
+         ls_product_id       = NULL,
+         ls_portal_url       = NULL,
          deleted_at     = NOW(),
          deletion_reason = 'user_request'
        WHERE id = $2`,
@@ -2437,72 +2959,26 @@ app.delete('/auth/account', auth.requireAuth, async (req, res) => {
 
 ---
 
-#### G16 — Missing `invoice.payment_action_required` webhook (3DS)
+#### G16 — ~~Missing `invoice.payment_action_required` webhook (3DS)~~ — NOT APPLICABLE
 
-**Source:** Stripe docs — EU Strong Customer Authentication (SCA), 3D Secure  
-**Impact:** When a EU card payment requires 3DS authentication, Stripe fires
-`invoice.payment_action_required` instead of `invoice.payment_failed`. The plan handles
-`invoice.payment_failed` but not 3DS. Result: EU card payments silently fail — the user
-is never prompted to complete authentication, the subscription enters `incomplete` after
-23 hours, and no notification reaches the user.
+**Source:** Previously Stripe SCA/3DS documentation  
+**Status:** **N/A — Lemon Squeezy handles 3DS/SCA as Merchant of Record.**
 
-**Fix — `token-server/billing.js`:**
+Lemon Squeezy is the Merchant of Record for all transactions. This means **all payment
+authentication** — including 3D Secure (SCA), Strong Customer Authentication, and regional
+payment compliance — is handled entirely by Lemon Squeezy's checkout and payment flow.
 
-Add a new case in the webhook event switch:
+- There is no `invoice.payment_action_required` equivalent in Lemon Squeezy.
+- If additional authentication is needed, LS handles it within their hosted checkout/payment
+  page before the transaction completes.
+- We never need to prompt the user for 3DS or send them a hosted invoice URL.
+- The `subscription_payment_failed` event may fire if the user abandons authentication,
+  and that is already handled in our `billing.js` event router.
 
-```javascript
-case 'invoice.payment_action_required': {
-  // 3DS authentication required — SCA mandate (EU/UK)
-  const invoice = event.data.object;
-  const customerId = invoice.customer;
-  const hostedUrl  = invoice.hosted_invoice_url;  // send this to the user
-  const paymentIntentId = invoice.payment_intent;
+**No implementation required.** This gap is closed by the choice of Lemon Squeezy as the
+billing provider.
 
-  await db.query(
-    `UPDATE users
-     SET subscription_status = 'incomplete',
-         updated_at = NOW()
-     WHERE stripe_customer_id = $1`,
-    [customerId]
-  );
-
-  // Retrieve user email for notification
-  const userResult = await db.query(
-    'SELECT id, email FROM users WHERE stripe_customer_id = $1',
-    [customerId]
-  );
-  if (userResult.rows.length > 0) {
-    const user = userResult.rows[0];
-    await auditLog(user.id, 'payment_action_required', null, {
-      invoiceId: invoice.id,
-      paymentIntentId,
-    });
-    // Send authentication-required email
-    await sendPaymentActionEmail(user.email, hostedUrl).catch(err =>
-      console.error('[billing] 3DS notification email failed:', err.message)
-    );
-  }
-  break;
-}
-```
-
-Add `sendPaymentActionEmail` to `token-server/mailer.js`:
-
-```javascript
-async function sendPaymentActionEmail(toEmail, invoiceUrl) {
-  await transporter.sendMail({
-    from: process.env.SMTP_FROM,
-    to: toEmail,
-    subject: 'Action required: complete your payment',
-    text: [
-      'Your payment requires additional authentication (3D Secure).',
-      'Please complete it within 23 hours to keep your subscription active:',
-      '',
-      invoiceUrl,
-    ].join('\n'),
-  });
-}
-```
+---
 
 #### G14 — No PKCE for OAuth flows
 
@@ -2767,46 +3243,36 @@ may route the URL to the wrong app. RFC 8252 requires reverse-domain format.
 
 ---
 
-#### G17 — Missing `checkout.session.completed` webhook
+#### G17 — ~~Missing `checkout.session.completed`~~ → Handled by `subscription_created`
 
-**Source:** Stripe docs — *"If you use Stripe Checkout, listen to this event to fulfill orders."*  
+**Source:** Lemon Squeezy subscription lifecycle docs  
+**Impact:** Previously required a separate `checkout.session.completed` handler (Stripe).
+With Lemon Squeezy, the equivalent event is `subscription_created`, which fires when a new
+subscription is created after checkout completes.
 
-**Fix — `token-server/billing.js`:**
+**Status: Already handled in `billing.js` event router (see §10 starter code).**
 
-```javascript
-case 'checkout.session.completed': {
-  const session = event.data.object;
-  if (session.mode !== 'subscription') break;  // only handle subscription checkouts
+The `subscription_created` handler in `billing.js`:
+1. Extracts `user_id` from `meta.custom_data.user_id`
+2. Maps `variant_id` → tier via `VARIANT_ID_TO_TIER`
+3. Stores `ls_subscription_id`, `ls_customer_id`, `ls_variant_id`, `ls_product_id`
+4. Updates `subscription_status = 'active'` (or `'on_trial'` if trial)
+5. Caches `urls.customer_portal` and `urls.update_payment_method` for portal access
 
-  const customerId   = session.customer;
-  const subscriptionId = session.subscription;
+Additionally, the `order_created` event (which fires alongside `subscription_created`)
+is logged for audit purposes but does not trigger tier changes — the subscription event
+is the source of truth for access control.
 
-  // Retrieve subscription to get the price/tier mapping
-  const subscription = await stripe.subscriptions.retrieve(subscriptionId);
-  const priceId = subscription.items.data[0]?.price?.id;
-  const tier = PRICE_ID_TO_TIER[priceId] ?? 'free';  // your price→tier map
-
-  await db.query(
-    `UPDATE users
-     SET tier = $1,
-         subscription_status = 'active',
-         stripe_subscription_id = $2,
-         updated_at = NOW()
-     WHERE stripe_customer_id = $3`,
-    [tier, subscriptionId, customerId]
-  );
-  break;
-}
-```
+**No additional implementation required beyond the billing.js event router.**
 
 ---
 
 #### G18 — No grace period for `past_due`
 
-**Source:** Stripe best practice — *"We recommend giving customers a grace period before
-restricting access."*  
-**Problem:** `invoice.payment_failed` immediately flags the user. Customers with a declined
-card that gets updated within hours are locked out.
+**Source:** Lemon Squeezy subscription lifecycle docs — dunning and payment recovery  
+**Problem:** When a payment fails, immediately restricting access creates poor UX. LS
+automatically retries failed payments (up to 4 attempts over ~2 weeks), but we should grant
+a grace period during `past_due` so the user isn't locked out during the retry window.
 
 **New migration — add grace period column:**
 
@@ -2814,28 +3280,16 @@ card that gets updated within hours are locked out.
 ALTER TABLE users ADD COLUMN grace_until TIMESTAMPTZ;
 ```
 
-**Fix — `token-server/billing.js`:** Update the `invoice.payment_failed` handler:
+**Status: Already handled in `billing.js` event router (see §10 starter code).**
 
-```javascript
-case 'invoice.payment_failed': {
-  const invoice = event.data.object;
-  const GRACE_PERIOD_DAYS = 3;
+The `subscription_payment_failed` handler in `billing.js`:
+1. Sets `subscription_status = 'past_due'`
+2. Calculates `grace_until = NOW() + GRACE_PERIOD_DAYS` (default: 3 days)
+3. Sends payment-failed notification email with `urls.update_payment_method` link
 
-  const graceUntil = new Date();
-  graceUntil.setDate(graceUntil.getDate() + GRACE_PERIOD_DAYS);
-
-  await db.query(
-    `UPDATE users
-     SET subscription_status = 'past_due',
-         grace_until = $1,
-         updated_at = NOW()
-     WHERE stripe_customer_id = $2`,
-    [graceUntil, invoice.customer]
-  );
-  // Send payment-failed notification email with Stripe's hosted invoice URL
-  break;
-}
-```
+The `subscription_payment_recovered` handler:
+1. Clears `grace_until` to `NULL`
+2. Restores `subscription_status = 'active'`
 
 **Update `requireTier()` to respect grace period (from G15 fix):**
 
@@ -2845,149 +3299,191 @@ const { tier, subscription_status, grace_until } = user;
 const inGracePeriod = grace_until && new Date() < new Date(grace_until);
 
 if (INACTIVE_STATUSES.has(subscription_status) && !inGracePeriod) {
-  return res.status(403).json({ error: 'SUBSCRIPTION_INACTIVE', subscriptionStatus: subscription_status });
+  return res.status(403).json({
+    code: 'SUBSCRIPTION_INACTIVE',
+    error: 'Your subscription is inactive',
+    subscriptionStatus: subscription_status,
+  });
 }
 ```
 
+Note: The `cancelled` status uses a different grace mechanism — access continues until
+`ends_at` (the end of the billing period). This is set by LS automatically and stored in
+our `grace_until` column by the `subscription_cancelled` handler.
+
 ---
 
-#### G19 — No `trialing` state mapping
+#### G19 — No `on_trial` state mapping
 
-**Source:** Stripe docs — subscription can be `trialing` (full access, no payment yet)  
-**Problem:** `tier CHECK IN ('free','pro','hiring')` has no trialing concept. A Stripe
-trialing subscriber should get `pro`-equivalent access but is not yet a paid customer.
+**Source:** Lemon Squeezy subscription lifecycle docs — trial subscriptions  
+**Problem:** `tier CHECK IN ('free','pro','hiring')` has no trial concept. A Lemon Squeezy
+trial subscriber (status = `on_trial`) should get `pro`-equivalent access but is not yet a
+paying customer.
 
-**Fix:** Treat `trialing` as access-grant via `subscription_status`, not via `tier`.
+**Fix:** Treat `on_trial` as access-grant via `subscription_status`, not via `tier`.
 No new `tier` value needed. Update `requireTier()`:
 
 ```javascript
-// trialing users get pro-equivalent access
-const TRIAL_GRANTS_TIER = { trialing: 'pro' };
+// on_trial users get pro-equivalent access
+const TRIAL_GRANTS_TIER = { on_trial: 'pro' };
 
 const effectiveTier = TRIAL_GRANTS_TIER[subscription_status] ?? tier;
 
 if ((tierRank[effectiveTier] ?? -1) < (tierRank[minTier] ?? 999)) {
-  return res.status(403).json({ error: 'INSUFFICIENT_TIER', required: minTier });
+  return res.status(403).json({ code: 'INSUFFICIENT_TIER', error: 'Insufficient tier', required: minTier });
 }
 ```
 
-**In billing.js `customer.subscription.updated`:** When status changes from `trialing`
-to `active`, update `subscription_status = 'active'` (tier already `'pro'`).
+**Status: Already handled in `billing.js` event router and G15 `requireTier()` fix.**
+
+The `subscription_created` handler in `billing.js` sets `subscription_status = 'on_trial'`
+when `data.attributes.status === 'on_trial'`. The G15 `requireTier()` fix includes the
+`TRIAL_GRANTS_TIER` mapping above. When the trial ends and payment succeeds, LS fires
+`subscription_updated` with `status: 'active'`, which the `subscription_updated` handler
+processes to set `subscription_status = 'active'`.
 
 ---
 
-#### G21 — No Stripe Customer Portal
+#### G21 — No Customer Portal
 
-**Source:** Stripe best practice — self-service subscription management  
+**Source:** Lemon Squeezy subscription management — self-service portal  
 **Impact:** Users must email support to cancel, update a card, or view invoices.
 
 **Fix — `token-server/index.js`:**
 
+Lemon Squeezy provides **pre-signed portal URLs** on every subscription object. These are
+stored in `urls.customer_portal` and `urls.update_payment_method`. Our `billing.js` event
+router already caches the latest `ls_portal_url` on every subscription webhook event.
+
+The portal URL is pre-signed and valid for 24 hours. No API call is needed to create a
+portal session (unlike Stripe's `billingPortal.sessions.create()`).
+
 ```javascript
-app.post('/billing/portal-session', auth.requireAuth, async (req, res) => {
+app.get('/billing/portal-url', auth.requireAuth, async (req, res) => {
   const userResult = await db.query(
-    'SELECT stripe_customer_id FROM users WHERE id = $1',
+    'SELECT ls_portal_url FROM users WHERE id = $1',
     [req.user.userId]
   );
-  const customerId = userResult.rows[0]?.stripe_customer_id;
-  if (!customerId) {
-    return res.status(400).json({ error: 'No billing account found' });
+  const portalUrl = userResult.rows[0]?.ls_portal_url;
+  if (!portalUrl) {
+    return res.status(404).json({
+      code: 'NO_SUBSCRIPTION',
+      error: 'No active subscription found. Subscribe first.',
+    });
   }
 
-  const session = await stripe.billingPortal.sessions.create({
-    customer: customerId,
-    return_url: process.env.APP_RETURN_URL ?? 'https://your-app.com',
-  });
+  // Portal URLs are pre-signed with 24h expiry.
+  // If the cached URL has expired, the user can trigger a subscription update
+  // webhook (any billing event refreshes the cached URL).
+  // For a guaranteed fresh URL, fetch subscription from LS API:
+  //   const sub = await getSubscription(user.ls_subscription_id);
+  //   portalUrl = sub.data.attributes.urls.customer_portal;
 
-  res.json({ url: session.url });
+  res.json({ url: portalUrl });
 });
 ```
 
 The macOS client calls this endpoint and opens the returned `url` in the default browser
-via `NSWorkspace.sharedWorkspace.open(url)`. No custom cancellation UI needed.
+via `NSWorkspace.sharedWorkspace.open(url)`. The LS portal allows users to:
+- View and download invoices
+- Update payment method
+- Cancel subscription
+- View subscription details
+
+No custom cancellation UI is needed — LS handles the entire portal experience.
 
 ---
 
 #### G22 — No re-subscription flow
 
-**Source:** Stripe docs — *"A canceled subscription cannot be reactivated.
-Create a new subscription for the customer."*  
+**Source:** Lemon Squeezy subscription lifecycle docs — *A cancelled/expired subscription
+cannot be reactivated. A new checkout creates a new subscription.*  
 **Impact:** A user who cancels has no path back to `pro` tier.
 
 **Fix — `token-server/index.js`:**
 
+Lemon Squeezy re-subscription works through a new checkout. When a user subscribes (or
+re-subscribes), we create a checkout URL via the LS API, passing `custom_data.user_id` to
+link the new subscription back to their account.
+
 ```javascript
-app.post('/billing/subscribe', auth.requireAuth, async (req, res) => {
-  const { priceId } = req.body || {};
-  if (!priceId || typeof priceId !== 'string') {
-    return res.status(400).json({ error: 'priceId required' });
-  }
-  // Validate priceId is one of the known allowed values
-  const ALLOWED_PRICE_IDS = new Set(Object.keys(PRICE_ID_TO_TIER));
-  if (!ALLOWED_PRICE_IDS.has(priceId)) {
-    return res.status(400).json({ error: 'Invalid priceId' });
+const { createCheckout } = require('@lemonsqueezy/lemonsqueezy.js');
+
+app.post('/billing/checkout', auth.requireAuth, async (req, res) => {
+  const { variantId } = req.body || {};
+  if (!variantId || typeof variantId !== 'string') {
+    return res.status(400).json({ code: 'INVALID_INPUT', error: 'variantId required' });
   }
 
+  // Validate variantId is one of the known allowed values
+  const ALLOWED_VARIANT_IDS = new Set(Object.keys(VARIANT_ID_TO_TIER));
+  if (!ALLOWED_VARIANT_IDS.has(variantId)) {
+    return res.status(400).json({ code: 'INVALID_VARIANT', error: 'Invalid variantId' });
+  }
+
+  // Fetch user email for pre-fill
   const userResult = await db.query(
-    'SELECT stripe_customer_id FROM users WHERE id = $1',
+    'SELECT email, display_name FROM users WHERE id = $1',
     [req.user.userId]
   );
-  let customerId = userResult.rows[0]?.stripe_customer_id;
-
-  // Create Stripe customer on first subscribe
-  if (!customerId) {
-    const customer = await stripe.customers.create({
-      email: req.user.email,
-      metadata: { userId: req.user.userId },
-    });
-    customerId = customer.id;
-    await db.query(
-      'UPDATE users SET stripe_customer_id = $1 WHERE id = $2',
-      [customerId, req.user.userId]
-    );
+  const user = userResult.rows[0];
+  if (!user) {
+    return res.status(404).json({ code: 'USER_NOT_FOUND', error: 'User not found' });
   }
 
-  // Create a new Stripe Checkout session (handles payment method collection)
-  const checkoutSession = await stripe.checkout.sessions.create({
-    customer: customerId,
-    mode: 'subscription',
-    line_items: [{ price: priceId, quantity: 1 }],
-    success_url: `${process.env.APP_RETURN_URL}?checkout=success`,
-    cancel_url:  `${process.env.APP_RETURN_URL}?checkout=canceled`,
-  });
+  // Create Lemon Squeezy checkout
+  // CRITICAL: custom_data.user_id is how the webhook links the subscription to our user.
+  // This is the ONLY linkage mechanism — without it, we cannot process the subscription.
+  const checkout = await createCheckout(
+    process.env.LEMONSQUEEZY_STORE_ID,
+    variantId,
+    {
+      checkoutData: {
+        email: user.email,
+        name: user.display_name || undefined,
+        custom: {
+          user_id: req.user.userId,        // CRITICAL: links subscription → user
+        },
+      },
+      productOptions: {
+        redirectUrl: process.env.APP_RETURN_URL ?? 'https://your-app.com/billing/success',
+      },
+      expiresAt: new Date(Date.now() + 30 * 60 * 1000).toISOString(), // 30 min expiry
+    }
+  );
 
-  res.json({ url: checkoutSession.url });
-  // Client opens this URL in default browser; tier update arrives via G17 webhook
+  res.json({ url: checkout.data.attributes.url });
+  // Client opens this URL in default browser.
+  // Tier update arrives via subscription_created webhook (handled in billing.js).
 });
 ```
 
+**Note:** Unlike Stripe, Lemon Squeezy does not require pre-creating a customer. The
+customer is automatically created (or matched by email) during checkout. The `ls_customer_id`
+is captured from the `subscription_created` webhook and stored for future API lookups.
+
 ---
 
-#### G23 — No `incomplete_expired` handling
+#### G23 — ~~No `incomplete_expired` handling~~ — NOT APPLICABLE
 
-**Source:** Stripe docs — if first invoice not paid within 23 hours, subscription →
-`incomplete_expired`. `customer.subscription.deleted` is NOT fired for this state.
+**Source:** Previously Stripe `incomplete_expired` subscription status  
+**Status:** **N/A — Lemon Squeezy does not have an `incomplete_expired` state.**
 
-**Fix — `token-server/billing.js`:**
+In Stripe, if the first invoice for a new subscription is not paid within 23 hours, the
+subscription transitions to `incomplete_expired`. This required a dedicated handler.
 
-```javascript
-case 'customer.subscription.updated': {
-  const subscription = event.data.object;
-  if (subscription.status === 'incomplete_expired') {
-    await db.query(
-      `UPDATE users
-       SET tier = 'free',
-           subscription_status = 'incomplete_expired',
-           stripe_subscription_id = NULL,
-           updated_at = NOW()
-       WHERE stripe_customer_id = $1`,
-      [subscription.customer]
-    );
-  }
-  // ... existing update logic for other status changes
-  break;
-}
-```
+Lemon Squeezy handles initial payment collection entirely within their hosted checkout:
+- Payment must succeed before checkout completes
+- If the user abandons checkout, no subscription is created at all
+- There is no `incomplete` or `incomplete_expired` state in LS
+- A failed initial payment simply means the checkout was never completed
+
+The subscription statuses in LS are: `on_trial`, `active`, `paused`, `past_due`, `unpaid`,
+`cancelled`, `expired`. The `expired` terminal state covers subscriptions that reached end
+of life (after cancellation grace period or dunning exhaustion).
+
+**No implementation required.** This gap is closed by the choice of Lemon Squeezy as the
+billing provider.
 
 ---
 
@@ -3131,27 +3627,47 @@ ALTER TABLE refresh_tokens ADD COLUMN last_used_at TIMESTAMPTZ;
 
 ---
 
-#### G24 — No `customer.subscription.paused` handling
+#### G24 — No `paused` subscription handling
 
-**Source:** Stripe docs — subscription can be `paused` when trial ends with no payment method.
+**Source:** Lemon Squeezy subscription lifecycle docs — subscription pausing  
 
-**Fix — `token-server/billing.js`:**
+**Status: Already handled in `billing.js` event router (see §10 starter code).**
 
-In the `customer.subscription.updated` handler, add:
+Lemon Squeezy supports pausing subscriptions (via the portal or API). When paused:
+- `subscription_paused` event fires → our handler sets `subscription_status = 'paused'`
+- `subscription_unpaused` event fires when resumed → handler sets `subscription_status = 'active'`
+- `paused` is included in `INACTIVE_STATUSES` in `requireTier()` (G15 fix), so paid
+  features are blocked while paused
+- The `data.attributes.pause` object contains `mode` and `resumes_at` fields if auto-resume
+  is configured
 
+The billing.js handler for `subscription_paused`:
 ```javascript
-if (subscription.status === 'paused') {
+case 'subscription_paused': {
+  const userId = resolveUserId(payload);
   await db.query(
-    `UPDATE users
-     SET subscription_status = 'paused',
-         updated_at = NOW()
-     WHERE stripe_customer_id = $1`,
-    [subscription.customer]
+    `UPDATE users SET subscription_status = 'paused', updated_at = NOW() WHERE id = $1`,
+    [userId]
   );
-  // Paused = no payment method, trial ended.
-  // requireTier() will block paid access via INACTIVE_STATUSES check (G15 fix).
+  await auditLog(userId, 'subscription_paused', null, { subscriptionId });
+  break;
 }
 ```
+
+And `subscription_unpaused`:
+```javascript
+case 'subscription_unpaused': {
+  const userId = resolveUserId(payload);
+  await db.query(
+    `UPDATE users SET subscription_status = 'active', updated_at = NOW() WHERE id = $1`,
+    [userId]
+  );
+  await auditLog(userId, 'subscription_unpaused', null, { subscriptionId });
+  break;
+}
+```
+
+**No additional implementation required beyond the billing.js event router.**
 
 ---
 
@@ -3167,12 +3683,13 @@ Existing files modified by gap mitigations:
 ```
 token-server/auth.js      — G1 isPwnedPassword(), G8 change-password, G15 requireTier fix
 token-server/index.js     — G8 POST /auth/change-password, G9 DELETE /auth/account,
-                             G11 GET/DELETE /auth/sessions, G21 POST /billing/portal-session,
-                             G22 POST /billing/subscribe
-token-server/billing.js   — G15 subscription_status in requireTier, G16 3DS webhook,
-                             G17 checkout.session.completed, G18 grace period,
-                             G19 trialing mapping, G23 incomplete_expired, G24 paused
-token-server/mailer.js    — G16 sendPaymentActionEmail
+                             G11 GET/DELETE /auth/sessions, G21 GET /billing/portal-url,
+                             G22 POST /billing/checkout
+token-server/billing.js   — G15 subscription_status in requireTier,
+                             G17 subscription_created (handled in event router),
+                             G18 grace period (subscription_payment_failed handler),
+                             G19 on_trial mapping, G24 paused/unpaused
+token-server/mailer.js    — G18 sendPaymentFailedEmail (with update_payment_method URL)
 inter/Info.plist          — G12 CFBundleURLTypes registration (CRITICAL — do first)
 inter/App/AppDelegate.m   — G12 handleGetURLEvent:withReplyEvent:, G3 idle timeout
 ```
@@ -3181,27 +3698,27 @@ inter/App/AppDelegate.m   — G12 handleGetURLEvent:withReplyEvent:, G3 idle tim
 
 | # | Gap | Priority | Source | Status |
 |---|-----|----------|--------|--------|
-| G20 | `express.raw()` on webhook route | **P0** | Stripe | ❌ Not implemented |
+| G20 | `express.raw()` on webhook route | **P0** | Lemon Squeezy | ❌ Not implemented |
 | G12 | CFBundleURLTypes in Info.plist | **P0** | RFC 8252 B.4 | ❌ Not implemented |
-| G15 | `requireTier()` ignores `subscription_status` | **P0** | Stripe | ❌ Not implemented |
+| G15 | `requireTier()` ignores `subscription_status` | **P0** | Lemon Squeezy | ❌ Not implemented |
 | G1  | No breach corpus / pwned password check | **P1** | NIST §5.1.1.2 | ❌ Not implemented |
 | G8  | No `POST /auth/change-password` | **P1** | OWASP | ❌ Not implemented |
 | G9  | No `DELETE /auth/account` (GDPR) | **P1** | GDPR Art.17 | ❌ Not implemented |
 | G14 | No PKCE for OAuth flows | **P1** | RFC 8252 §6 | ❌ Not implemented |
-| G16 | Missing `invoice.payment_action_required` (3DS) | **P1** | Stripe SCA | ❌ Not implemented |
+| G16 | ~~3DS webhook~~ | **N/A** | LS handles as MoR | ✅ Not needed |
 | G2  | Password byte cap vs NIST char requirement | **P2** | NIST §5.1.1.2 | ❌ Not implemented |
 | G3  | No idle timeout / reauthentication prompt | **P2** | NIST §4.2.3 | ❌ Not implemented |
 | G4  | No absolute session hard cutoff | **P2** | OWASP Session Mgmt | ❌ Not implemented |
 | G7  | No MFA path documented | **P2** | NIST §4.2 | ❌ Phase E planned |
 | G13 | URI scheme should be reverse-domain | **P2** | RFC 8252 §7.1 | ❌ Not implemented |
-| G17 | Missing `checkout.session.completed` | **P2** | Stripe | ❌ Not implemented |
-| G18 | No grace period for `past_due` | **P2** | Stripe best practice | ❌ Not implemented |
-| G19 | No `trialing` state mapping | **P2** | Stripe | ❌ Not implemented |
-| G21 | No Stripe Customer Portal | **P2** | Stripe best practice | ❌ Not implemented |
-| G22 | No re-subscription flow | **P2** | Stripe | ❌ Not implemented |
-| G23 | No `incomplete_expired` handling | **P2** | Stripe | ❌ Not implemented |
+| G17 | ~~`checkout.session.completed`~~ → subscription_created | **P2** | Lemon Squeezy | ✅ In billing.js |
+| G18 | No grace period for `past_due` | **P2** | Lemon Squeezy best practice | ❌ Not implemented |
+| G19 | No `on_trial` state mapping | **P2** | Lemon Squeezy | ✅ In billing.js + G15 |
+| G21 | No Customer Portal | **P2** | Lemon Squeezy best practice | ❌ Not implemented |
+| G22 | No re-subscription flow | **P2** | Lemon Squeezy | ❌ Not implemented |
+| G23 | ~~`incomplete_expired` handling~~ | **N/A** | LS handles at checkout | ✅ Not needed |
 | G5  | No password strength meter | **P3** | NIST §5.1.1.2 | ❌ Not implemented |
 | G6  | No show/hide password toggle | **P3** | NIST §5.1.1.2 | ❌ Not implemented |
 | G10 | No change-email flow | **P3** | Industry standard | ❌ Not implemented |
 | G11 | No active sessions list | **P3** | OWASP Session Mgmt | ❌ Not implemented |
-| G24 | No `paused` subscription handling | **P3** | Stripe | ❌ Not implemented |
+| G24 | No `paused` subscription handling | **P3** | Lemon Squeezy | ✅ In billing.js |

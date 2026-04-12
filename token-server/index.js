@@ -70,6 +70,19 @@ const db = require('./db');
 const auth = require('./auth');
 
 const app = express();
+
+// ---------------------------------------------------------------------------
+// Lemon Squeezy webhook — MUST be mounted BEFORE express.json()
+// The raw body bytes are required for HMAC-SHA256 signature verification.
+// express.json() would parse the body and destroy the original byte sequence.
+// Phase C — Gap G20 (P0)
+// ---------------------------------------------------------------------------
+app.post(
+  '/webhooks/lemonsqueezy',
+  express.raw({ type: 'application/json' }),
+  require('./billing')
+);
+
 app.use(express.json());
 
 // ---------------------------------------------------------------------------
@@ -179,6 +192,33 @@ async function rateLimitAuth(req, res, next) {
   } catch (redisErr) {
     // Redis unavailability must not block legitimate logins
     console.error('[auth rate limit] Redis error:', redisErr.message);
+  }
+  next();
+}
+
+// ---------------------------------------------------------------------------
+// Refresh token endpoint rate limiter — protects /auth/refresh
+// Keyed on IP (no authenticated user context yet at this point).
+// 30 attempts per 60s per IP — generous enough for normal client behaviour
+// (proactive refresh fires once per 15-min token TTL) but blocks brute-force.
+// Redis failure is non-blocking — logs error and allows request through.
+// ---------------------------------------------------------------------------
+async function rateLimitRefresh(req, res, next) {
+  const identifier = `ratelimit:refresh:ip:${req.ip}`;
+  try {
+    const count = await redis.incr(identifier);
+    if (count === 1) await redis.expire(identifier, 60); // 60s window
+
+    if (count > 30) {
+      const ttl = await redis.ttl(identifier);
+      res.setHeader('Retry-After', String(ttl > 0 ? ttl : 60));
+      return res.status(429).json({
+        error: 'Too many refresh attempts. Please try again later.',
+      });
+    }
+  } catch (redisErr) {
+    // Redis unavailability must not block legitimate token refreshes
+    console.error('[refresh rate limit] Redis error:', redisErr.message);
   }
   next();
 }
@@ -303,7 +343,7 @@ app.get('/auth/me', auth.requireAuth, (req, res) => {
 // Returns: { accessToken, refreshToken, expiresIn }
 // No auth middleware — this IS the auth recovery path
 // ---------------------------------------------------------------------------
-app.post('/auth/refresh', rateLimitAuth, async (req, res) => {
+app.post('/auth/refresh', rateLimitRefresh, async (req, res) => {
   const { refreshToken, clientId } = req.body;
 
   if (!refreshToken || typeof refreshToken !== 'string') {
@@ -458,6 +498,166 @@ app.post('/auth/logout-all', auth.requireAuth, async (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// Billing endpoints — Phase C (Lemon Squeezy)
+// ---------------------------------------------------------------------------
+const { createCheckout, lemonSqueezySetup } = require('@lemonsqueezy/lemonsqueezy.js');
+const { VARIANT_ID_TO_TIER } = require('./billing');
+
+// Initialize LS SDK — only if API key is configured
+if (process.env.LEMONSQUEEZY_API_KEY) {
+  lemonSqueezySetup({ apiKey: process.env.LEMONSQUEEZY_API_KEY });
+}
+
+// POST /billing/checkout — Create a Lemon Squeezy checkout URL
+// The user completes payment on the LS hosted page. Tier update arrives via webhook.
+app.post('/billing/checkout', auth.requireAuth, async (req, res) => {
+  if (!process.env.LEMONSQUEEZY_API_KEY || !process.env.LEMONSQUEEZY_STORE_ID) {
+    return res.status(503).json({ error: 'Billing not configured' });
+  }
+
+  const { variantId } = req.body || {};
+  if (!variantId || typeof variantId !== 'string') {
+    return res.status(400).json({ code: 'INVALID_INPUT', error: 'variantId required' });
+  }
+
+  const ALLOWED_VARIANT_IDS = new Set(Object.keys(VARIANT_ID_TO_TIER));
+  if (!ALLOWED_VARIANT_IDS.has(variantId)) {
+    return res.status(400).json({ code: 'INVALID_VARIANT', error: 'Invalid variantId' });
+  }
+
+  const userResult = await db.query(
+    'SELECT email, display_name FROM users WHERE id = $1',
+    [req.user.userId]
+  );
+  const user = userResult.rows[0];
+  if (!user) {
+    return res.status(404).json({ code: 'USER_NOT_FOUND', error: 'User not found' });
+  }
+
+  let checkout;
+  try {
+    checkout = await createCheckout(
+      process.env.LEMONSQUEEZY_STORE_ID,
+      variantId,
+      {
+        checkoutData: {
+          email: user.email,
+          name: user.display_name || undefined,
+          custom: {
+            user_id: req.user.userId,
+          },
+        },
+        productOptions: {
+          redirectUrl: process.env.APP_RETURN_URL || 'com-inter-app://billing/success',
+        },
+        expiresAt: new Date(Date.now() + 30 * 60 * 1000).toISOString(),
+      }
+    );
+  } catch (err) {
+    console.error(`[billing] createCheckout threw for user=${req.user.userId} variantId=${variantId}:`, err.message);
+    return res.status(502).json({ error: 'Failed to create checkout' });
+  }
+
+  const url = checkout?.data?.data?.attributes?.url;
+  if (!url) {
+    console.error(`[billing] createCheckout returned unexpected shape for user=${req.user.userId}:`, JSON.stringify({
+      id: checkout?.data?.data?.id,
+      type: checkout?.data?.data?.type,
+      url_present: !!checkout?.data?.data?.attributes?.url,
+    }));
+    return res.status(502).json({ error: 'Failed to create checkout' });
+  }
+
+  res.json({ url });
+});
+
+// GET /billing/portal-url — Return the user's LS customer portal URL
+// The portal URL is pre-signed (24h expiry) and refreshed on every webhook event.
+app.get('/billing/portal-url', auth.requireAuth, async (req, res) => {
+  const result = await db.query(
+    'SELECT ls_portal_url, subscription_status FROM users WHERE id = $1',
+    [req.user.userId]
+  );
+  const user = result.rows[0];
+  if (!user || !user.ls_portal_url) {
+    return res.status(404).json({ code: 'NO_BILLING', error: 'No billing account found' });
+  }
+
+  res.json({
+    portalUrl: user.ls_portal_url,
+    subscriptionStatus: user.subscription_status,
+  });
+});
+
+// GET /billing/status — Lightweight tier + subscription status check
+// Used by the macOS client after returning from the LS checkout page to poll
+// for the webhook-driven tier update. Returns the current DB state — no
+// side effects. The client calls this in a retry loop (up to 5x, 2s apart)
+// until tier !== 'free' (or gives up and waits for the proactive refresh).
+app.get('/billing/status', auth.requireAuth, async (req, res) => {
+  const result = await db.query(
+    'SELECT tier, subscription_status FROM users WHERE id = $1',
+    [req.user.userId]
+  );
+  const user = result.rows[0];
+  if (!user) {
+    return res.status(404).json({ code: 'USER_NOT_FOUND', error: 'User not found' });
+  }
+
+  res.json({
+    tier: user.tier || 'free',
+    subscriptionStatus: user.subscription_status || 'none',
+  });
+});
+
+// GET /billing/success — Browser-to-app bridge page
+// After LS checkout completes, the browser is redirected here. This page
+// opens the `com-inter-app://billing/success` deep link to bring the macOS app to
+// the foreground, then shows a "you can close this tab" message.
+// No auth required — the page contains no sensitive data.
+app.get('/billing/success', (_req, res) => {
+  res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  res.send(`<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Payment Complete — Inter</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+           background: #111; color: #e0e0e0; display: flex; align-items: center;
+           justify-content: center; min-height: 100vh; margin: 0; }
+    .card { text-align: center; max-width: 420px; padding: 48px 32px;
+            background: #1a1a1a; border-radius: 16px; border: 1px solid #333; }
+    .check { font-size: 48px; margin-bottom: 16px; }
+    h1 { font-size: 22px; margin: 0 0 8px; color: #fff; }
+    p  { font-size: 14px; color: #999; margin: 4px 0; line-height: 1.5; }
+    .open-link { display: inline-block; margin-top: 20px; padding: 10px 28px;
+                 background: #7c3aed; color: #fff; border-radius: 8px;
+                 text-decoration: none; font-weight: 600; font-size: 14px; }
+    .open-link:hover { background: #6d28d9; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="check">✓</div>
+    <h1>Payment Complete</h1>
+    <p>Your upgrade is being activated.</p>
+    <p>Returning you to Inter…</p>
+    <a class="open-link" href="com-inter-app://billing/success" id="openApp">Open Inter</a>
+    <p style="margin-top:24px; font-size:12px; color:#666;">
+      If the app didn't open automatically, click the button above.
+    </p>
+  </div>
+  <script>
+    // Attempt the deep link redirect immediately
+    setTimeout(function() { window.location.href = 'com-inter-app://billing/success'; }, 500);
+  </script>
+</body>
+</html>`);
+});
+
+// ---------------------------------------------------------------------------
 // Redis key helpers
 // ---------------------------------------------------------------------------
 function roomKey(code) { return `room:${code}`; }
@@ -605,12 +805,16 @@ app.post('/room/create', async (req, res) => {
   const roomName = `inter-${roomCode}`;
 
   // Store room data as a Redis Hash with 24h TTL
+  // hostTier is snapshotted at creation so in-meeting tier checks use the
+  // tier the host had when the room was created, not the current JWT tier.
+  const hostTier = (req.user && req.user.tier) ? req.user.tier : 'free';
   const pipeline = redis.pipeline();
   pipeline.hset(roomKey(roomCode),
     'roomName', roomName,
     'createdAt', Date.now().toString(),
     'hostIdentity', identity,
     'roomType', roomType,
+    'hostTier', hostTier,
   );
   pipeline.expire(roomKey(roomCode), ROOM_CODE_EXPIRY_SECONDS);
   // Participants stored as a Redis Set (identity dedup is automatic)
@@ -1500,10 +1704,12 @@ async function checkRecordingQuota(userId, tier) {
 // POST /room/record/start — Start cloud recording (Egress API)
 // Body: { roomCode, callerIdentity, mode?, estimatedDurationMinutes? }
 // mode: "cloud_composed" (default) | "multi_track"
-// Requires: auth + pro tier + host/co-host role
+// Requires: auth + host/co-host role
+// Tier check uses the room's hostTier (snapshotted at creation) so that
+// mid-meeting tier downgrades do not block recording during an active meeting.
 // Returns: { success, egressId, recordingSessionId }
 // ---------------------------------------------------------------------------
-app.post('/room/record/start', auth.requireAuth, auth.requireTier('pro'), async (req, res) => {
+app.post('/room/record/start', auth.requireAuth, async (req, res) => {
   const { roomCode, callerIdentity, mode, estimatedDurationMinutes } = req.body;
 
   if (!roomCode || !callerIdentity) {
@@ -1513,6 +1719,19 @@ app.post('/room/record/start', auth.requireAuth, auth.requireTier('pro'), async 
   const code = roomCode.toUpperCase();
   const roomData = await getRoomData(code);
   if (!roomData) return res.status(404).json({ error: 'Invalid or expired room code' });
+
+  // Use the room's creation-time tier for feature gating. This ensures that
+  // a host who was Pro when the meeting started retains Pro features for the
+  // entire meeting duration, even if their account tier changes mid-session.
+  const TIER_LEVELS = { free: 0, pro: 1, hiring: 2 };
+  const roomTier = roomData.hostTier || 'free';
+  if ((TIER_LEVELS[roomTier] ?? 0) < (TIER_LEVELS['pro'] ?? 0)) {
+    return res.status(403).json({
+      error: 'This feature requires a pro plan or higher',
+      currentTier: roomTier,
+      requiredTier: 'pro',
+    });
+  }
 
   // Validate caller is a moderator (host/co-host)
   const validation = await validateModerator(code, callerIdentity);
@@ -1530,8 +1749,8 @@ app.post('/room/record/start', auth.requireAuth, auth.requireTier('pro'), async 
   }
   const estimatedMinutes = Math.ceil(rawEstimate);
 
-  // Check quota
-  const quotaCheck = await checkRecordingQuota(req.user.userId, req.user.tier);
+  // Check quota using the room's creation-time tier (same grace period logic)
+  const quotaCheck = await checkRecordingQuota(req.user.userId, roomTier);
   if (!quotaCheck.allowed) {
     return res.status(403).json({ error: quotaCheck.reason, quota: quotaCheck });
   }
@@ -1559,7 +1778,7 @@ app.post('/room/record/start', auth.requireAuth, auth.requireTier('pro'), async 
     return res.status(409).json({ error: 'Another recording start is already in progress for this room' });
   }
 
-  const validatedTier = getValidatedTier(req.user.tier);
+  const validatedTier = getValidatedTier(roomTier);
   const recordingMode = mode === 'multi_track' ? 'multi_track' : 'cloud_composed';
 
   try {
