@@ -706,41 +706,6 @@ Token TTL was already configured at 6 hours in `token-server/index.js` (`TOKEN_T
 
 ---
 
-## [26 March 2026] — Phase 6.3: Authentication Middleware
-
-**Phase**: 6.3 from `implementation_plan.md`
-**Files changed**:
-- `token-server/auth.js` — CREATED. Full authentication module:
-  - `register(email, password, displayName)` — bcrypt hash (12 rounds), INSERT user, return user auth JWT
-  - `login(email, password)` — verify credentials, return JWT
-  - `authenticateToken` middleware — OPTIONAL. Checks `Authorization: Bearer` header. If present+valid → `req.user`. If absent → `req.user = null` (anonymous). If present+invalid → 401.
-  - `requireAuth` middleware — requires `req.user` to be non-null (401 if missing)
-  - `requireTier(minTier)` middleware — tier hierarchy: free < pro < hiring. Returns 403 if insufficient tier.
-  - User auth JWTs expire in 7 days, separate from LiveKit room JWTs.
-- `token-server/index.js` — MODIFIED:
-  - Added `require('./auth')`, applied `auth.authenticateToken` globally as Express middleware
-  - Added `POST /auth/register`, `POST /auth/login`, `GET /auth/me` (requires auth)
-  - `/room/create`: If `req.user` exists, persists meeting to `meetings` table + host to `meeting_participants`. Stores `meetingId` in Redis Hash for join-time reference. Best-effort — failure doesn't break room creation.
-  - `/room/join`: If `roomData.meetingId` exists, persists joiner to `meeting_participants` (user_id is NULL for anonymous guests).
-- `token-server/.env.example` — MODIFIED. Added `JWT_SECRET` variable.
-- `token-server/package.json` — MODIFIED. Added `bcryptjs` and `jsonwebtoken` dependencies.
-
-**Why**: Authentication is additive — the existing anonymous flow is completely untouched. Hosts who register get meeting history, participant tracking, and tier-based feature gating. Anonymous joiners can still join via room code with zero friction (Zoom model).
-
-**Verification**:
-- `POST /auth/register` → 201 with user + JWT
-- `POST /auth/login` → 200 with user + JWT
-- `GET /auth/me` with Bearer token → user info; without → 401
-- Duplicate email → 409 "Email already registered"
-- Wrong password → 401 "Invalid email or password"
-- Short password (<8 chars) → 400
-- Authenticated `POST /room/create` → Meeting persisted to PostgreSQL. Host logged as first participant with `role=host` and `user_id` linked.
-- Anonymous `POST /room/create` → Works exactly as before (no DB write)
-- Anonymous `POST /room/join` on authenticated room → Participant tracked with `user_id=NULL`, `role=participant`
-- **138/138 Xcode tests pass** (0 failures) — existing client fully backward-compatible
-
----
-
 ## [26 March 2026] — Phase 7: Scale to 50 Participants
 
 **Phase**: 7.1–7.4 from `implementation_plan.md`
@@ -1050,7 +1015,7 @@ Token TTL was already configured at 6 hours in `token-server/index.js` (`TOKEN_T
 > PF.7 system-audio share + audio-path hardening + permission handoff UX fixes complete.
 > Phase 4 next (Production Hardening) — major items done (Steps 1–7).
 > Phase 5A multi-participant support complete (cap: 50 after Phase 7).
-> Phase 6 infrastructure foundation complete (Redis, PostgreSQL, auth).
+> Phase 6 infrastructure foundation complete (Redis, PostgreSQL).
 > Phase 7 scale to 50 complete (adaptive grid, pagination, selective subscription).
 > Phase 8 in-meeting communication complete (chat, raise hand, DMs, transcript export).
 > Post-Phase 8 hardening complete (queue polish, mic/camera fix, dismiss all, active speaker debounce).

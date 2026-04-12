@@ -209,6 +209,21 @@ private struct TokenCacheEntry {
         }
     }
 
+    // MARK: - Tier Validation
+
+    private static let knownTiers: Set<String> = ["free", "pro", "pro+"]
+
+    /// Returns a validated tier string, or `nil` if the input is empty or unrecognised.
+    private func validatedTier(_ raw: String?) -> String? {
+        guard let raw = raw, !raw.isEmpty else { return nil }
+        let lowered = raw.lowercased()
+        if Self.knownTiers.contains(lowered) {
+            return lowered
+        }
+        interLogError(InterLog.networking, "Auth: unknown tier value '%{public}@' — ignoring", raw)
+        return nil
+    }
+
     // MARK: - Billing: Post-Checkout Tier Verification
 
     /// Poll `/billing/status` until the user's tier changes from the `previousTier`,
@@ -299,12 +314,13 @@ private struct TokenCacheEntry {
 
             // Tier changed — trigger a full token refresh so the new tier enters the JWT,
             // then report the confirmed tier from the refreshed access token.
+            // Fall back to the poll-detected tier if JWT extraction fails for any reason.
             if let tier = tier, tier != previousTier {
                 interLogInfo(InterLog.networking,
                              "Auth: billing status tier changed (%{public}@ → %{public}@) on attempt %d",
                              previousTier, tier, attempt)
                 self.refreshAccessToken { [weak self] success in
-                    let confirmedTier = success ? self?.currentTier : tier
+                    let confirmedTier = self?.currentTier ?? tier
                     DispatchQueue.main.async { completion(confirmedTier) }
                 }
                 return
@@ -315,7 +331,11 @@ private struct TokenCacheEntry {
                 DispatchQueue.global(qos: .userInitiated).asyncAfter(
                     deadline: .now() + interval
                 ) { [weak self] in
-                    self?.pollBillingStatus(
+                    guard let self = self else {
+                        DispatchQueue.main.async { completion(nil) }
+                        return
+                    }
+                    self.pollBillingStatus(
                         serverURL: serverURL,
                         previousTier: previousTier,
                         attempt: attempt + 1,
@@ -362,27 +382,24 @@ private struct TokenCacheEntry {
         }
     }
 
-    /// Request a checkout URL from the server for the given variant ID.
-    /// The server calls the LS API and returns a signed checkout URL.
-    /// - Parameters:
-    ///   - variantId: The LS variant ID (e.g. "1516868" for Pro).
-    ///   - completion: Called on main queue with the checkout URL, or nil on failure.
-    @objc public func requestCheckoutURL(
-        variantId: String,
+    /// Request a billing plans page URL from the server.
+    /// The server issues a short-lived JWT and returns a URL pointing to the hosted
+    /// pricing page. The caller opens this URL in the default browser.
+    /// - Parameter completion: Called on main queue with the plans page URL, or nil on failure.
+    @objc public func requestBillingPageURL(
         completion: @escaping (_ url: String?) -> Void
     ) {
         guard let serverURL = authServerBaseURL,
               let accessToken = currentAccessToken else {
-            interLogError(InterLog.networking, "Auth: checkout skipped — no active session")
+            interLogError(InterLog.networking, "Auth: billing page skipped — no active session")
             completeOnMain { completion(nil) }
             return
         }
 
-        let body: [String: Any] = ["variantId": variantId]
         performAuthHTTPRequest(
-            url: "\(serverURL)/billing/checkout",
-            method: "POST",
-            body: body,
+            url: "\(serverURL)/billing/plans-token",
+            method: "GET",
+            body: nil,
             bearerToken: accessToken,
             retryCount: 0
         ) { [weak self] data, httpResponse, error in
@@ -398,15 +415,14 @@ private struct TokenCacheEntry {
                   let url = json["url"] as? String else {
                 if let data = data, let json = self.parseJSON(data),
                    let errorMsg = json["error"] as? String {
-                    interLogError(InterLog.networking, "Auth: checkout failed — %{public}@", errorMsg)
+                    interLogError(InterLog.networking, "Auth: billing page failed — %{public}@", errorMsg)
                 } else {
-                    interLogError(InterLog.networking, "Auth: checkout request failed (HTTP %d)",
+                    interLogError(InterLog.networking, "Auth: billing page request failed (HTTP %d)",
                                   httpResponse?.statusCode ?? 0)
                 }
                 self.completeOnMain { completion(nil) }
                 return
             }
-
             self.completeOnMain { completion(url) }
         }
     }
@@ -440,6 +456,13 @@ private struct TokenCacheEntry {
                   let data = data,
                   let json = self.parseJSON(data),
                   let url = json["portalUrl"] as? String else {
+                if let data = data, let json = self.parseJSON(data),
+                   let errorMsg = json["error"] as? String {
+                    interLogError(InterLog.networking, "Auth: portal URL failed — %{public}@", errorMsg)
+                } else {
+                    interLogError(InterLog.networking, "Auth: portal URL request failed (HTTP %d)",
+                                  httpResponse?.statusCode ?? 0)
+                }
                 self.completeOnMain { completion(nil) }
                 return
             }
@@ -866,10 +889,15 @@ private struct TokenCacheEntry {
 
                 // Derive new values from the JWT payload using only local variables —
                 // no reads of shared properties on this background thread.
+                // Prefer the plain-text tier from the response body (added Phase C-UX)
+                // over JWT extraction — eliminates any base64url/encoding edge cases.
                 let payload = self.extractJWTPayload(from: newAccessToken)
+                if payload == nil {
+                    interLogError(InterLog.networking, "Auth: JWT payload extraction failed — using response body fields")
+                }
                 let newEmail       = payload?["email"]       as? String
                 let newDisplayName = payload?["displayName"] as? String
-                let newTier        = payload?["tier"]        as? String
+                let newTier        = self.validatedTier((json["tier"] as? String) ?? (payload?["tier"] as? String))
 
                 // Store the new refresh token in Keychain (upsert — no delete-first window)
                 // BEFORE touching any in-memory state. If the write fails the old Keychain
@@ -1226,6 +1254,8 @@ private struct TokenCacheEntry {
         guard parts.count == 3 else { return nil }
 
         var base64 = String(parts[1])
+            .replacingOccurrences(of: "-", with: "+")
+            .replacingOccurrences(of: "_", with: "/")
         // Pad to multiple of 4
         let remainder = base64.count % 4
         if remainder > 0 {
@@ -1351,6 +1381,8 @@ private struct TokenCacheEntry {
             return nil
         }
 
+        let safeTier = validatedTier(tier) ?? "free"
+
         // Store the refresh token in Keychain BEFORE committing any in-memory state.
         // Mirrors the guard in refreshAccessToken: if the write fails, return nil so the
         // caller (login/register) treats the response as a failure.
@@ -1370,7 +1402,7 @@ private struct TokenCacheEntry {
             self.currentUserId = userId
             self.currentEmail = email
             self.currentDisplayName = displayName
-            self.currentTier = tier
+            self.currentTier = safeTier
             self.authServerBaseURL = serverURL
             self.isAuthenticated = true
             UserDefaults.standard.set(userId, forKey: Self.userIdDefaultsKey)
@@ -1380,7 +1412,7 @@ private struct TokenCacheEntry {
         scheduleProactiveRefresh(expiresIn: expiresIn)
 
         return InterAuthResponse(userId: userId, email: email, displayName: displayName,
-                                 tier: tier, accessToken: accessToken,
+                                 tier: safeTier, accessToken: accessToken,
                                  refreshToken: refreshToken, expiresIn: expiresIn)
     }
 
@@ -1389,6 +1421,8 @@ private struct TokenCacheEntry {
         let parts = token.split(separator: ".")
         guard parts.count == 3 else { return nil }
         var base64 = String(parts[1])
+            .replacingOccurrences(of: "-", with: "+")
+            .replacingOccurrences(of: "_", with: "/")
         let remainder = base64.count % 4
         if remainder > 0 { base64 += String(repeating: "=", count: 4 - remainder) }
         guard let data = Data(base64Encoded: base64) else { return nil }

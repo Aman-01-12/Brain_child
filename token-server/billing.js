@@ -36,12 +36,15 @@ if (!LEMONSQUEEZY_WEBHOOK_SECRET || LEMONSQUEEZY_WEBHOOK_SECRET.length < 6) {
 
 // ---------------------------------------------------------------------------
 // Variant ID → tier mapping
-// Found in: LS Dashboard → Store → Products → Variants, or via API
+// Derived from BILLING_PLANS (billing-page.js) — single source of truth.
+// This avoids the two maps drifting if plans are added or variantIds change.
 // ---------------------------------------------------------------------------
-const VARIANT_ID_TO_TIER = {
-  '1516865': 'pro+',  // Pro+ (test)
-  '1516868': 'pro',   // Pro  (test)
-};
+const { BILLING_PLANS } = require('./billing-page');
+const VARIANT_ID_TO_TIER = Object.fromEntries(
+  BILLING_PLANS
+    .filter(p => p.variantId)
+    .map(p => [p.variantId, p.tier])
+);
 
 // Statuses that grant paid-tier access even without a confirmed 'active' subscription
 const TRIAL_GRANTS_TIER = { on_trial: 'pro' };

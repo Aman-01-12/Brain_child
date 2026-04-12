@@ -446,6 +446,7 @@ app.post('/auth/refresh', rateLimitRefresh, async (req, res) => {
       accessToken,
       refreshToken: newClientToken,
       expiresIn: auth.parseTTLtoSeconds(process.env.ACCESS_TOKEN_TTL || '15m'),
+      tier: userRows[0].tier || 'free',
     });
 
   } catch (err) {
@@ -498,93 +499,82 @@ app.post('/auth/logout-all', auth.requireAuth, async (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// Billing endpoint rate limiter — protects /billing/* authenticated endpoints
+// Keyed on authenticated userId — 10 requests per 60s.
+// Redis failure is non-blocking — logs error and allows request through.
+// ---------------------------------------------------------------------------
+async function rateLimitBilling(req, res, next) {
+  const userId = req.user?.userId;
+  if (!userId) return next(); // requireAuth runs first; this is a safety fallback
+  const identifier = `ratelimit:billing:${userId}`;
+  try {
+    const count = await redis.incr(identifier);
+    if (count === 1) await redis.expire(identifier, 60);
+
+    if (count > 10) {
+      const ttl = await redis.ttl(identifier);
+      res.setHeader('Retry-After', String(ttl > 0 ? ttl : 60));
+      return res.status(429).json({
+        error: 'Too many billing requests. Please try again later.',
+      });
+    }
+  } catch (redisErr) {
+    console.error('[billing rate limit] Redis error:', redisErr.message);
+  }
+  next();
+}
+
+// ---------------------------------------------------------------------------
 // Billing endpoints — Phase C (Lemon Squeezy)
 // ---------------------------------------------------------------------------
-const { createCheckout, lemonSqueezySetup } = require('@lemonsqueezy/lemonsqueezy.js');
+const jwt = require('jsonwebtoken');
+const { createCheckout, getCustomer, lemonSqueezySetup } = require('@lemonsqueezy/lemonsqueezy.js');
 const { VARIANT_ID_TO_TIER } = require('./billing');
+const { BILLING_PLANS, renderPricingPage, renderErrorPage } = require('./billing-page');
 
 // Initialize LS SDK — only if API key is configured
 if (process.env.LEMONSQUEEZY_API_KEY) {
   lemonSqueezySetup({ apiKey: process.env.LEMONSQUEEZY_API_KEY });
 }
 
-// POST /billing/checkout — Create a Lemon Squeezy checkout URL
-// The user completes payment on the LS hosted page. Tier update arrives via webhook.
-app.post('/billing/checkout', auth.requireAuth, async (req, res) => {
-  if (!process.env.LEMONSQUEEZY_API_KEY || !process.env.LEMONSQUEEZY_STORE_ID) {
-    return res.status(503).json({ error: 'Billing not configured' });
-  }
-
-  const { variantId } = req.body || {};
-  if (!variantId || typeof variantId !== 'string') {
-    return res.status(400).json({ code: 'INVALID_INPUT', error: 'variantId required' });
-  }
-
-  const ALLOWED_VARIANT_IDS = new Set(Object.keys(VARIANT_ID_TO_TIER));
-  if (!ALLOWED_VARIANT_IDS.has(variantId)) {
-    return res.status(400).json({ code: 'INVALID_VARIANT', error: 'Invalid variantId' });
-  }
-
-  const userResult = await db.query(
-    'SELECT email, display_name FROM users WHERE id = $1',
-    [req.user.userId]
-  );
-  const user = userResult.rows[0];
-  if (!user) {
-    return res.status(404).json({ code: 'USER_NOT_FOUND', error: 'User not found' });
-  }
-
-  let checkout;
-  try {
-    checkout = await createCheckout(
-      process.env.LEMONSQUEEZY_STORE_ID,
-      variantId,
-      {
-        checkoutData: {
-          email: user.email,
-          name: user.display_name || undefined,
-          custom: {
-            user_id: req.user.userId,
-          },
-        },
-        productOptions: {
-          redirectUrl: process.env.APP_RETURN_URL || 'com-inter-app://billing/success',
-        },
-        expiresAt: new Date(Date.now() + 30 * 60 * 1000).toISOString(),
-      }
-    );
-  } catch (err) {
-    console.error(`[billing] createCheckout threw for user=${req.user.userId} variantId=${variantId}:`, err.message);
-    return res.status(502).json({ error: 'Failed to create checkout' });
-  }
-
-  const url = checkout?.data?.data?.attributes?.url;
-  if (!url) {
-    console.error(`[billing] createCheckout returned unexpected shape for user=${req.user.userId}:`, JSON.stringify({
-      id: checkout?.data?.data?.id,
-      type: checkout?.data?.data?.type,
-      url_present: !!checkout?.data?.data?.attributes?.url,
-    }));
-    return res.status(502).json({ error: 'Failed to create checkout' });
-  }
-
-  res.json({ url });
-});
-
 // GET /billing/portal-url — Return the user's LS customer portal URL
 // The portal URL is pre-signed (24h expiry) and refreshed on every webhook event.
-app.get('/billing/portal-url', auth.requireAuth, async (req, res) => {
+// To avoid serving an expired cached URL, we fetch a fresh one from the LS API
+// when the customer ID is available, falling back to the stored URL on failure.
+app.get('/billing/portal-url', auth.requireAuth, rateLimitBilling, async (req, res) => {
   const result = await db.query(
-    'SELECT ls_portal_url, subscription_status FROM users WHERE id = $1',
+    'SELECT ls_customer_id, ls_portal_url, subscription_status FROM users WHERE id = $1',
     [req.user.userId]
   );
   const user = result.rows[0];
-  if (!user || !user.ls_portal_url) {
+  if (!user || (!user.ls_portal_url && !user.ls_customer_id)) {
     return res.status(404).json({ code: 'NO_BILLING', error: 'No billing account found' });
   }
 
+  let portalUrl = user.ls_portal_url;
+
+  // Try to fetch a fresh portal URL from the LS API (pre-signed URLs expire after 24h)
+  if (user.ls_customer_id && process.env.LEMONSQUEEZY_API_KEY) {
+    try {
+      const { data: customer } = await getCustomer(user.ls_customer_id);
+      const freshUrl = customer?.data?.attributes?.urls?.customer_portal;
+      if (freshUrl) {
+        portalUrl = freshUrl;
+        // Persist the fresh URL so the DB cache stays current
+        await db.query('UPDATE users SET ls_portal_url = $1 WHERE id = $2', [freshUrl, req.user.userId]);
+      }
+    } catch (err) {
+      // Fall back to cached URL — better than failing entirely
+      console.error('[billing] Failed to fetch fresh portal URL from LS:', err.message);
+    }
+  }
+
+  if (!portalUrl) {
+    return res.status(404).json({ code: 'NO_BILLING', error: 'No billing portal available' });
+  }
+
   res.json({
-    portalUrl: user.ls_portal_url,
+    portalUrl,
     subscriptionStatus: user.subscription_status,
   });
 });
@@ -594,7 +584,7 @@ app.get('/billing/portal-url', auth.requireAuth, async (req, res) => {
 // for the webhook-driven tier update. Returns the current DB state — no
 // side effects. The client calls this in a retry loop (up to 5x, 2s apart)
 // until tier !== 'free' (or gives up and waits for the proactive refresh).
-app.get('/billing/status', auth.requireAuth, async (req, res) => {
+app.get('/billing/status', auth.requireAuth, rateLimitBilling, async (req, res) => {
   const result = await db.query(
     'SELECT tier, subscription_status FROM users WHERE id = $1',
     [req.user.userId]
@@ -645,17 +635,199 @@ app.get('/billing/success', (_req, res) => {
     <p>Your upgrade is being activated.</p>
     <p>Returning you to Inter…</p>
     <a class="open-link" href="com-inter-app://billing/success" id="openApp">Open Inter</a>
-    <p style="margin-top:24px; font-size:12px; color:#666;">
-      If the app didn't open automatically, click the button above.
+    <p id="status-msg" style="margin-top:24px; font-size:12px; color:#666;">
+      If the app didn't open automatically, click the button above.<br>
+      On mobile or without the app? Your account has been upgraded — open Inter on your Mac to see it.
     </p>
   </div>
   <script>
-    // Attempt the deep link redirect immediately
+    // Attempt the deep link redirect immediately (works when macOS app is installed + open)
     setTimeout(function() { window.location.href = 'com-inter-app://billing/success'; }, 500);
   </script>
 </body>
 </html>`);
 });
+
+// GET /billing/plans-token — Issue a short-lived page JWT; return the plans URL.
+// The app opens this URL in the default browser. Token encodes userId + tier so
+// the plans page can render the correct current-plan state without another DB hit.
+app.get('/billing/plans-token', auth.requireAuth, rateLimitBilling, async (req, res) => {
+  const result = await db.query(
+    'SELECT tier FROM users WHERE id = $1',
+    [req.user.userId]
+  );
+  const user = result.rows[0];
+  if (!user) {
+    return res.status(404).json({ code: 'USER_NOT_FOUND', error: 'User not found' });
+  }
+
+  const tier = user.tier || 'free';
+  const token = jwt.sign(
+    { userId: req.user.userId, tier, purpose: 'billing' },
+    process.env.JWT_SECRET,
+    {
+      audience: 'inter-billing-page',
+      issuer: 'inter-token-server',
+      expiresIn: '2m',
+    }
+  );
+
+  const baseUrl = process.env.BILLING_PAGE_BASE_URL ||
+    `http://localhost:${PORT}`;
+  res.json({ url: `${baseUrl}/billing/plans?t=${encodeURIComponent(token)}` });
+});
+
+// GET /billing/plans — Render the pricing page (no JS, pure HTML + form POSTs).
+// Validates the short-lived page JWT issued by /billing/plans-token above.
+// CSP: script-src 'none' — zero client-side JavaScript.
+app.get('/billing/plans', async (req, res) => {
+  const token = req.query.t;
+  if (!token || typeof token !== 'string') {
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    return res.status(400).send(renderErrorPage('Missing or invalid page token. Please reopen Inter and try again.'));
+  }
+
+  let payload;
+  try {
+    payload = jwt.verify(token, process.env.JWT_SECRET, {
+      audience: 'inter-billing-page',
+      issuer: 'inter-token-server',
+    });
+  } catch (err) {
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    const expired = err.name === 'TokenExpiredError';
+    return res.status(401).send(renderErrorPage(
+      expired
+        ? 'This pricing page link has expired. Please reopen Inter and try again.'
+        : 'Invalid page token. Please reopen Inter and try again.'
+    ));
+  }
+
+  if (payload.purpose !== 'billing') {
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    return res.status(403).send(renderErrorPage('Invalid token purpose.'));
+  }
+
+  // Generate a per-request nonce so we can strip the page token from the
+  // browser address bar via history.replaceState (prevents token leaking in
+  // browser history). The nonce is tied to CSP script-src.
+  const nonce = require('crypto').randomBytes(16).toString('base64');
+
+  const csp = [
+    "default-src 'none'",
+    "style-src 'unsafe-inline'",  // inline <style> block only
+    `script-src 'nonce-${nonce}'`,
+    "form-action 'self' https://*.lemonsqueezy.com",
+    "frame-ancestors 'none'",
+    "base-uri 'none'",
+  ].join('; ');
+
+  // Minimal inline script to strip the token query param from the URL bar.
+  const stripTokenScript = `<script nonce="${nonce}">history.replaceState(null,'',location.pathname)</script>`;
+
+  res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  res.setHeader('Content-Security-Policy', csp);
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Cache-Control', 'no-store');
+  res.send(renderPricingPage(BILLING_PLANS, payload.tier, token) + stripTokenScript);
+});
+
+// POST /billing/checkout-redirect — Validate page token + variantId, create a
+// Lemon Squeezy checkout session, then 302-redirect the browser directly to it.
+// The LS API key is server-side only and never touches the browser.
+app.post(
+  '/billing/checkout-redirect',
+  express.urlencoded({ extended: false }),
+  async (req, res) => {
+    if (!process.env.LEMONSQUEEZY_API_KEY || !process.env.LEMONSQUEEZY_STORE_ID) {
+      res.setHeader('Content-Type', 'text/html; charset=utf-8');
+      return res.status(503).send(renderErrorPage('Billing is not configured on this server.'));
+    }
+
+    const { token, variantId } = req.body || {};
+
+    if (!token || typeof token !== 'string' ||
+        !variantId || typeof variantId !== 'string') {
+      res.setHeader('Content-Type', 'text/html; charset=utf-8');
+      return res.status(400).send(renderErrorPage('Invalid request. Please reopen Inter and try again.'));
+    }
+
+    // Validate the page token
+    let payload;
+    try {
+      payload = jwt.verify(token, process.env.JWT_SECRET, {
+        audience: 'inter-billing-page',
+        issuer: 'inter-token-server',
+      });
+    } catch (err) {
+      res.setHeader('Content-Type', 'text/html; charset=utf-8');
+      const expired = err.name === 'TokenExpiredError';
+      return res.status(401).send(renderErrorPage(
+        expired
+          ? 'This page has expired. Please reopen Inter to get a fresh link.'
+          : 'Invalid token. Please reopen Inter and try again.'
+      ));
+    }
+
+    if (payload.purpose !== 'billing') {
+      res.setHeader('Content-Type', 'text/html; charset=utf-8');
+      return res.status(403).send(renderErrorPage('Invalid token purpose.'));
+    }
+
+    // Validate variantId against BILLING_PLANS (not VARIANT_ID_TO_TIER which only
+    // knows paid variants — BILLING_PLANS is the authoritative list for the page)
+    const ALLOWED_VARIANT_IDS = new Set(
+      BILLING_PLANS.map(p => p.variantId).filter(Boolean)
+    );
+    if (!ALLOWED_VARIANT_IDS.has(variantId)) {
+      res.setHeader('Content-Type', 'text/html; charset=utf-8');
+      return res.status(400).send(renderErrorPage('Invalid plan selected.'));
+    }
+
+    // Fetch user email for the LS checkout
+    const userResult = await db.query(
+      'SELECT email, display_name FROM users WHERE id = $1',
+      [payload.userId]
+    );
+    const user = userResult.rows[0];
+    if (!user) {
+      res.setHeader('Content-Type', 'text/html; charset=utf-8');
+      return res.status(404).send(renderErrorPage('User account not found.'));
+    }
+
+    let checkout;
+    try {
+      checkout = await createCheckout(
+        process.env.LEMONSQUEEZY_STORE_ID,
+        variantId,
+        {
+          checkoutData: {
+            email: user.email,
+            name: user.display_name || undefined,
+            custom: { user_id: payload.userId },
+          },
+          productOptions: {
+            redirectUrl: process.env.APP_RETURN_URL || 'com-inter-app://billing/success',
+          },
+          expiresAt: new Date(Date.now() + 30 * 60 * 1000).toISOString(),
+        }
+      );
+    } catch (err) {
+      console.error(`[billing] createCheckout threw for userId=${payload.userId} variantId=${variantId}:`, err.message);
+      res.setHeader('Content-Type', 'text/html; charset=utf-8');
+      return res.status(502).send(renderErrorPage('Failed to create checkout. Please try again.'));
+    }
+
+    const checkoutUrl = checkout?.data?.data?.attributes?.url;
+    if (!checkoutUrl) {
+      console.error(`[billing] createCheckout returned unexpected shape for userId=${payload.userId}`);
+      res.setHeader('Content-Type', 'text/html; charset=utf-8');
+      return res.status(502).send(renderErrorPage('Failed to create checkout. Please try again.'));
+    }
+
+    res.redirect(302, checkoutUrl);
+  }
+);
 
 // ---------------------------------------------------------------------------
 // Redis key helpers

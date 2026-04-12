@@ -96,6 +96,7 @@
 @property (nonatomic, strong, nullable) NSButton *manageSubscriptionButton;
 @property (nonatomic, strong, nullable) NSTextField *billingStatusLabel;
 @property (nonatomic, assign) BOOL isBillingPollInProgress;
+@property (nonatomic, assign) NSUInteger billingPollGeneration;
 
 @end
 
@@ -472,7 +473,7 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
     InterTeardownSetupWindow(&_setupWindow, &_setupRenderView, &_connectionPanel);
 
     self.setupWindow =
-    [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 660, 560)
+    [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 660, 600)
                                 styleMask:(NSWindowStyleMaskTitled |
                                            NSWindowStyleMaskClosable |
                                            NSWindowStyleMaskMiniaturizable |
@@ -485,7 +486,7 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
     [self.setupWindow setSharingType:NSWindowSharingNone];
     [self.setupWindow setDelegate:self];
     [self.setupWindow setBackgroundColor:[NSColor blackColor]];
-    [self.setupWindow setMinSize:NSMakeSize(660.0, 560.0)];
+    [self.setupWindow setMinSize:NSMakeSize(660.0, 600.0)];
     [self.setupWindow setCollectionBehavior:NSWindowCollectionBehaviorFullScreenPrimary];
 
     NSView *view = [[NSView alloc] initWithFrame:self.setupWindow.contentView.bounds];
@@ -512,6 +513,7 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
     [self.billingStatusLabel removeFromSuperview];
     self.billingStatusLabel = nil;
     self.isBillingPollInProgress = NO;
+    self.billingPollGeneration++;
 
     NSView *overlayView = [[NSView alloc] initWithFrame:containerView.bounds];
     overlayView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
@@ -529,13 +531,7 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
     self.connectionPanel.delegate = self;
     [overlayView addSubview:self.connectionPanel];
 
-    NSButton *settingsButton = [[NSButton alloc] initWithFrame:NSMakeRect(panelX + panelW - 112, panelY + panelH + 8, 112, 26)];
-    settingsButton.autoresizingMask = NSViewMinXMargin | NSViewMinYMargin;
-    [settingsButton setTitle:@"Settings"];
-    [settingsButton setTarget:self];
-    [settingsButton setAction:@selector(openSettingsWindow)];
-    [overlayView addSubview:settingsButton];
-
+    // Row 1: Sign Out (left) | Settings (right)
     NSButton *signOutButton = [[NSButton alloc] initWithFrame:NSMakeRect(panelX, panelY + panelH + 8, 100, 26)];
     signOutButton.autoresizingMask = NSViewMaxXMargin | NSViewMinYMargin;
     [signOutButton setTitle:@"Sign Out"];
@@ -543,19 +539,32 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
     [signOutButton setAction:@selector(handleLogout)];
     [overlayView addSubview:signOutButton];
 
-    // Billing — Upgrade / Manage Subscription
+    NSButton *settingsButton = [[NSButton alloc] initWithFrame:NSMakeRect(panelX + panelW - 112, panelY + panelH + 8, 112, 26)];
+    settingsButton.autoresizingMask = NSViewMinXMargin | NSViewMinYMargin;
+    [settingsButton setTitle:@"Settings"];
+    [settingsButton setTarget:self];
+    [settingsButton setAction:@selector(openSettingsWindow)];
+    [overlayView addSubview:settingsButton];
+
+    // Row 2: Billing buttons (centered)
     NSString *currentTier = self.roomController.tokenService.currentTier ?: @"free";
     BOOL isPaid = ([currentTier isEqualToString:@"pro"] || [currentTier isEqualToString:@"pro+"]);
+    NSLog(@"[Billing UI] Setting up buttons — currentTier=%@ isPaid=%@", currentTier, isPaid ? @"YES" : @"NO");
+
+    CGFloat billingY = panelY + panelH + 42;
 
     if (!isPaid) {
-        self.upgradeButton = [[NSButton alloc] initWithFrame:NSMakeRect(panelX + 108, panelY + panelH + 8, 120, 26)];
+        // Free users: show "View Plans" to browse and subscribe
+        self.upgradeButton = [[NSButton alloc] initWithFrame:NSMakeRect(panelX + (panelW - 100) / 2.0, billingY, 100, 26)];
         self.upgradeButton.autoresizingMask = NSViewMinXMargin | NSViewMaxXMargin | NSViewMinYMargin;
-        [self.upgradeButton setTitle:@"Upgrade to Pro"];
+        [self.upgradeButton setTitle:@"View Plans"];
         [self.upgradeButton setTarget:self];
-        [self.upgradeButton setAction:@selector(handleUpgradeToPro)];
+        [self.upgradeButton setAction:@selector(handleViewPlans)];
         [overlayView addSubview:self.upgradeButton];
     } else {
-        self.manageSubscriptionButton = [[NSButton alloc] initWithFrame:NSMakeRect(panelX + 108, panelY + panelH + 8, 160, 26)];
+        // Paid users: show only "Manage Subscription" — tier changes (upgrade/downgrade)
+        // must go through Lemon Squeezy's portal to avoid duplicate subscriptions.
+        self.manageSubscriptionButton = [[NSButton alloc] initWithFrame:NSMakeRect(panelX + (panelW - 160) / 2.0, billingY, 160, 26)];
         self.manageSubscriptionButton.autoresizingMask = NSViewMinXMargin | NSViewMaxXMargin | NSViewMinYMargin;
         [self.manageSubscriptionButton setTitle:@"Manage Subscription"];
         [self.manageSubscriptionButton setTarget:self];
@@ -751,6 +760,29 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
     if (self.currentCallMode != InterCallModeNone) {
         NSLog(@"[Auth] Tier update deferred — meeting in progress (effective=%@)",
               self.roomController.tokenService.effectiveTier ?: @"nil");
+        return;
+    }
+
+    // Update billing buttons to reflect the current tier when a proactive
+    // token refresh picks up a tier change (e.g. after webhook-driven upgrade).
+    BOOL isPaid = ([tier isEqualToString:@"pro"] || [tier isEqualToString:@"pro+"]);
+    if (isPaid && self.upgradeButton && !self.manageSubscriptionButton) {
+        // Swap "View Plans" → "Manage Subscription" so users upgrade/downgrade
+        // through Lemon Squeezy's portal instead of buying a second subscription.
+        NSView *parent = self.upgradeButton.superview;
+        NSRect frame = self.upgradeButton.frame;
+        if (parent) {
+            [self.upgradeButton removeFromSuperview];
+            self.upgradeButton = nil;
+
+            CGFloat centeredX = frame.origin.x + (frame.size.width - 160) / 2.0;
+            self.manageSubscriptionButton = [[NSButton alloc] initWithFrame:NSMakeRect(centeredX, frame.origin.y, 160, 26)];
+            self.manageSubscriptionButton.autoresizingMask = NSViewMinXMargin | NSViewMaxXMargin | NSViewMinYMargin;
+            [self.manageSubscriptionButton setTitle:@"Manage Subscription"];
+            [self.manageSubscriptionButton setTarget:self];
+            [self.manageSubscriptionButton setAction:@selector(handleManageSubscription)];
+            [parent addSubview:self.manageSubscriptionButton];
+        }
     }
 }
 
@@ -2671,44 +2703,47 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
 
 #pragma mark - Billing Actions
 
-- (void)handleUpgradeToPro {
-    NSLog(@"[Billing] User requested upgrade to Pro");
+- (void)handleViewPlans {
+    NSLog(@"[Billing] User requested billing plans page");
+    if (!self.roomController.tokenService) {
+        NSLog(@"[Billing] tokenService is nil — cannot open plans");
+        self.billingStatusLabel.stringValue = @"Not signed in.";
+        return;
+    }
     if (self.upgradeButton) {
         [self.upgradeButton setEnabled:NO];
-        [self.upgradeButton setTitle:@"Opening…"];
+        [self.upgradeButton setTitle:@"Loading…"];
     }
     self.billingStatusLabel.stringValue = @"";
 
     __weak typeof(self) weakSelf = self;
-    // LS variant ID for Pro tier
-    [self.roomController.tokenService requestCheckoutURLWithVariantId:@"1516868"
-                                                           completion:^(NSString *url) {
+    [self.roomController.tokenService requestBillingPageURLWithCompletion:^(NSString *url) {
         __strong typeof(weakSelf) strongSelf = weakSelf;
         if (!strongSelf) { return; }
 
         dispatch_async(dispatch_get_main_queue(), ^{
             if (url.length) {
-                NSURL *checkoutURL = [NSURL URLWithString:url];
-                if (checkoutURL) {
-                    [[NSWorkspace sharedWorkspace] openURL:checkoutURL];
-                    strongSelf.billingStatusLabel.stringValue = @"Complete payment in your browser…";
+                NSURL *plansURL = [NSURL URLWithString:url];
+                if (plansURL) {
+                    [[NSWorkspace sharedWorkspace] openURL:plansURL];
+                    strongSelf.billingStatusLabel.stringValue = @"Plans page opened in your browser.";
                 } else {
-                    NSLog(@"[Billing] Checkout URL is malformed: %@", url);
+                    NSLog(@"[Billing] Plans URL is malformed: %@", url);
                     NSAlert *alert = [[NSAlert alloc] init];
-                    alert.messageText = @"Unable to Open Checkout";
-                    alert.informativeText = @"The checkout link appears to be invalid. Please try again.";
+                    alert.messageText = @"Unable to Open Plans";
+                    alert.informativeText = @"The plans page link appears to be invalid. Please try again.";
                     alert.alertStyle = NSAlertStyleWarning;
                     [alert addButtonWithTitle:@"OK"];
                     [alert runModal];
                 }
             } else {
-                NSLog(@"[Billing] Failed to get checkout URL");
-                strongSelf.billingStatusLabel.stringValue = @"Failed to start checkout. Try again.";
+                NSLog(@"[Billing] Failed to get billing plans URL");
+                strongSelf.billingStatusLabel.stringValue = @"Failed to open plans. Try again.";
             }
 
             if (strongSelf.upgradeButton) {
                 [strongSelf.upgradeButton setEnabled:YES];
-                [strongSelf.upgradeButton setTitle:@"Upgrade to Pro"];
+                [strongSelf.upgradeButton setTitle:@"View Plans"];
             }
         });
     }];
@@ -2716,8 +2751,14 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
 
 - (void)handleManageSubscription {
     NSLog(@"[Billing] User requested subscription management");
+    if (!self.roomController.tokenService) {
+        NSLog(@"[Billing] tokenService is nil — cannot open portal");
+        self.billingStatusLabel.stringValue = @"Not signed in.";
+        return;
+    }
     if (self.manageSubscriptionButton) {
         [self.manageSubscriptionButton setEnabled:NO];
+        [self.manageSubscriptionButton setTitle:@"Loading…"];
     }
 
     __weak typeof(self) weakSelf = self;
@@ -2746,6 +2787,7 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
 
             if (strongSelf.manageSubscriptionButton) {
                 [strongSelf.manageSubscriptionButton setEnabled:YES];
+                [strongSelf.manageSubscriptionButton setTitle:@"Manage Subscription"];
             }
         });
     }];
@@ -2830,18 +2872,27 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
         [self.upgradeButton setEnabled:NO];
         [self.upgradeButton setTitle:@"Verifying…"];
     }
+    if (self.manageSubscriptionButton) {
+        [self.manageSubscriptionButton setEnabled:NO];
+    }
 
     NSString *previousTier = self.roomController.tokenService.currentTier ?: @"free";
+    NSUInteger pollGen = self.billingPollGeneration;
 
     __weak typeof(self) weakSelf = self;
     [self.roomController.tokenService refreshAndWaitForTierChangeWithPreviousTier:previousTier
-                                                                     maxAttempts:5
+                                                                     maxAttempts:15
                                                                         interval:2.0
                                                                       completion:^(NSString *newTier) {
         __strong typeof(weakSelf) strongSelf = weakSelf;
         if (!strongSelf) { return; }
 
         dispatch_async(dispatch_get_main_queue(), ^{
+            if (pollGen != strongSelf.billingPollGeneration) {
+                NSLog(@"[Billing] Stale poll completion (gen %lu vs %lu) — ignoring",
+                      (unsigned long)pollGen, (unsigned long)strongSelf.billingPollGeneration);
+                return;
+            }
             strongSelf.isBillingPollInProgress = NO;
 
             if (newTier.length) {
@@ -2849,19 +2900,23 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
                 strongSelf.billingStatusLabel.stringValue =
                     [NSString stringWithFormat:@"Upgraded to %@!", [newTier capitalizedString]];
 
-                // Replace the Upgrade button with Manage Subscription
-                if (strongSelf.upgradeButton) {
+                // Replace "View Plans" with "Manage Subscription" so tier changes
+                // go through Lemon Squeezy's portal (no duplicate subscriptions).
+                if (strongSelf.upgradeButton && !strongSelf.manageSubscriptionButton) {
                     NSView *parent = strongSelf.upgradeButton.superview;
                     NSRect frame = strongSelf.upgradeButton.frame;
                     [strongSelf.upgradeButton removeFromSuperview];
                     strongSelf.upgradeButton = nil;
 
-                    strongSelf.manageSubscriptionButton = [[NSButton alloc] initWithFrame:NSMakeRect(frame.origin.x, frame.origin.y, 160, 26)];
-                    strongSelf.manageSubscriptionButton.autoresizingMask = NSViewMinXMargin | NSViewMaxXMargin | NSViewMinYMargin;
-                    [strongSelf.manageSubscriptionButton setTitle:@"Manage Subscription"];
-                    [strongSelf.manageSubscriptionButton setTarget:strongSelf];
-                    [strongSelf.manageSubscriptionButton setAction:@selector(handleManageSubscription)];
-                    [parent addSubview:strongSelf.manageSubscriptionButton];
+                    if (parent) {
+                        CGFloat centeredX = frame.origin.x + (frame.size.width - 160) / 2.0;
+                        strongSelf.manageSubscriptionButton = [[NSButton alloc] initWithFrame:NSMakeRect(centeredX, frame.origin.y, 160, 26)];
+                        strongSelf.manageSubscriptionButton.autoresizingMask = NSViewMinXMargin | NSViewMaxXMargin | NSViewMinYMargin;
+                        [strongSelf.manageSubscriptionButton setTitle:@"Manage Subscription"];
+                        [strongSelf.manageSubscriptionButton setTarget:strongSelf];
+                        [strongSelf.manageSubscriptionButton setAction:@selector(handleManageSubscription)];
+                        [parent addSubview:strongSelf.manageSubscriptionButton];
+                    }
                 }
 
                 // Clear the success message after a few seconds
@@ -2876,7 +2931,10 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
                 strongSelf.billingStatusLabel.stringValue = @"Upgrade pending — it may take a moment.";
                 if (strongSelf.upgradeButton) {
                     [strongSelf.upgradeButton setEnabled:YES];
-                    [strongSelf.upgradeButton setTitle:@"Upgrade to Pro"];
+                    [strongSelf.upgradeButton setTitle:@"View Plans"];
+                }
+                if (strongSelf.manageSubscriptionButton) {
+                    [strongSelf.manageSubscriptionButton setEnabled:YES];
                 }
             }
         });

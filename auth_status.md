@@ -1,6 +1,6 @@
 # Auth System — Implementation Status
 
-> Last updated: 12 April 2026 (Phase A complete, Phase B complete, Phase C 6/7, Billing UX complete)
+> Last updated: 13 April 2026 (Phase A complete, Phase B complete, Phase C 6/7, Billing UX complete, Billing Audit 14/14 fixes applied)
 > Reference document: `auth_implementation.md` (11 sections)
 > Billing provider: **Lemon Squeezy** (Merchant of Record)
 > Build baseline: BUILD SUCCEEDED, 140 tests, 0 failures (5 April 2026, arm64)
@@ -65,9 +65,9 @@
 | C.4 | Create `billing.js` webhook handler | ✅ | `token-server/billing.js` | 12 LS event types via `meta.event_name`, HMAC-SHA256 verification, idempotency, state machine transitions, tier audit logging |
 | C.5 | Update `requireTier()` to check `subscription_status` | ✅ | `token-server/auth.js` | Fresh DB read, `INACTIVE_STATUSES` set, grace period for `cancelled`, `TRIAL_GRANTS_TIER` for `on_trial` → `pro` |
 | C.6 | Create `POST /billing/checkout` endpoint | ✅ | `token-server/index.js` | LS checkout URL via `createCheckout()` with `custom_data.user_id` + `GET /billing/portal-url` for customer portal |
-| C.7 | Configure `LEMONSQUEEZY_API_KEY`, `LEMONSQUEEZY_WEBHOOK_SECRET`, `LEMONSQUEEZY_STORE_ID` in `.env` | ⚠️ | `token-server/.env.example` | `.env.example` updated. Actual keys pending — need LS dashboard setup |
+| C.7 | Configure `LEMONSQUEEZY_API_KEY`, `LEMONSQUEEZY_WEBHOOK_SECRET`, `LEMONSQUEEZY_STORE_ID` in `.env` | ✅ | `token-server/.env` | All three keys set. Webhook secret truncated to 26 chars (`N9X7PBZ3U6gN64Un3HZnIX8GF2`) — LS dashboard enforces 40-char max. Same value set in LS dashboard. |
 
-**Phase C overall: 6/7 done (C.7 pending LS dashboard config).**
+**Phase C overall: 7/7 done ✅ COMPLETE.**
 
 ---
 
@@ -89,9 +89,32 @@
 
 **Phase C-UX overall: 8/8 done ✅ COMPLETE.**
 
+### Billing Audit Fixes (13 April 2026) — All 14 Applied
+
+A full cross-layer audit of the billing flow was performed across billing-page.js, index.js, InterTokenService.swift, and AppDelegate.m.
+
+| # | Priority | Fix | File |
+|---|---|---|---|
+| 1 | P0 | Crypto-random webhook secret (replaced weak `amanverma019999`) | `.env` |
+| 2 | P1 | `pollBillingStatus` completion leak — `guard let self` + `completion(nil)` on dealloc | `InterTokenService.swift` |
+| 3 | P1 | `VARIANT_ID_TO_TIER` derived from `BILLING_PLANS` — no more duplicate hardcoded map | `billing.js` |
+| 4 | P1 | `extractExpiration` base64url→base64 conversion (`-`→`+`, `_`→`/`) | `InterTokenService.swift` |
+| 5 | P1 | `requestPortalURL` error logging added | `InterTokenService.swift` |
+| 6 | P1 | Stale poll guard — `billingPollGeneration` counter; stale completions discarded | `AppDelegate.m` |
+| 7 | P2 | Nil `tokenService` guard in `handleViewPlans` + `handleManageSubscription` | `AppDelegate.m` |
+| 8 | P2 | `validatedTier()` — rejects empty/unknown tier values at both login and refresh | `InterTokenService.swift` |
+| 9 | P2 | `GET /billing/portal-url` fetches fresh URL from LS API (fixes 24h expiry), falls back to DB cache | `index.js` |
+| 10 | P2 | `handleManageSubscription` shows "Loading…" while fetching portal URL | `AppDelegate.m` |
+| 11 | P2 | Production env var placeholders added to `.env` | `.env` |
+| 12 | P3 | `rateLimitBilling` middleware on authenticated billing endpoints (10 req/60s) | `index.js` |
+| 13 | P3 | `formatPrice` early-return for `price === 0` removed — `Intl.NumberFormat` handles all | `billing-page.js` |
+| 14 | P3 | Per-request nonce + `history.replaceState` strips page token from browser URL bar | `index.js` |
+
+**Note**: Webhook secret in `.env` is `N9X7PBZ3U6gN64Un3HZnIX8GF2` (26 chars). LS dashboard enforces a 40-char maximum so the original 32-byte secret was trimmed. The same trimmed value is set in the LS dashboard.
+
 ### Production Steps (C-UX)
 
-- **Migrate to Apple Universal Links** — The current custom URL scheme (`com-inter-app://`) is hardened (vendor-prefixed, whitelisted host/path, no query/fragment accepted) but custom schemes can still be hijacked by a malicious app claiming the same scheme on the same device. For production, replace the deep-link callback with Universal Links: host an `apple-app-site-association` (AASA) JSON file at `https://yourdomain.com/.well-known/apple-app-site-association`, add the Associated Domains entitlement (`applinks:yourdomain.com`) to the app, and change the LS `redirectUrl` to `https://yourdomain.com/billing/success`. macOS will then route the HTTPS URL directly to the app without going through the browser's URL-scheme dispatcher, fully preventing scheme hijacking.
+- **Migrate to Apple Universal Links** — The current custom URL scheme (`com-inter-app://`) is hardened (vendor-prefixed, whitelisted host/path, no query/fragment accepted) but custom schemes can still be hijacked by a malicious app claiming the same scheme on the same device. For production, replace the deep-link callback with Universal Links: host an `apple-app-site-association` (AASA) JSON file at `https://api.inter.com/.well-known/apple-app-site-association`, add the Associated Domains entitlement (`applinks:api.inter.com`) to the app, and change the LS `redirectUrl` to `https://api.inter.com/billing/success`. macOS will then route the HTTPS URL directly to the app without going through the browser's URL-scheme dispatcher, fully preventing scheme hijacking.
 
 ---
 
@@ -144,7 +167,7 @@ These 3 items are tracked in the Recording Pause Checkpoint in `work_done.md` bu
 | Token server boots cleanly | ✅ | `node token-server/index.js` |
 | `.env` has `JWT_SECRET` (32+ bytes) | ✅ | Generated and set in `.env` |
 | `.env` has `REFRESH_TOKEN_SECRET` | ✅ | Generated and set in `.env` |
-| Lemon Squeezy keys configured | ⚠️ | `.env.example` updated — actual keys pending LS dashboard setup |
+| Lemon Squeezy keys configured | ✅ | `LEMONSQUEEZY_API_KEY`, `LEMONSQUEEZY_WEBHOOK_SECRET`, `LEMONSQUEEZY_STORE_ID` all set in `.env` |
 | SMTP provider configured | ❌ | Required for Phase D |
 
 ---
@@ -163,15 +186,108 @@ These 3 items are tracked in the Recording Pause Checkpoint in `work_done.md` bu
 
 ---
 
-## Summary
+## Production Deployment Guide
 
-| Phase | Tasks | Done | Remaining |
+### Branding Note
+
+The internal codename is **inter** and nothing in the codebase changes — bundle IDs (`com.inter.app`), class names (`InterTokenService`, `InterRoomController`, etc.), file names, URL schemes (`inter://`), and Redis/DB keys all stay as-is.
+
+Only the **public-facing layer** changes when a final brand name is chosen:
+- App display name (shown in Finder, Dock, macOS menu bar) — `Info.plist` → `CFBundleDisplayName`
+- App icon / logo assets
+- Website domain (e.g. `<newname>.com` instead of `inter.com`)
+- API subdomain (e.g. `api.<newname>.com`) — also update `BILLING_PAGE_BASE_URL`, `APP_RETURN_URL`, AASA file host, and LS dashboard redirect/webhook URLs
+- Marketing copy, App Store / Setapp listing
+
+No Swift, Objective-C, SQL, or server code needs to change for a rebrand.
+
+---
+
+### Domain Strategy
+
+Buy one domain (e.g. `inter.com`). Subdomains (`api.inter.com`, `app.inter.com`) are free and unlimited once you own the root.
+
+**Recommended layout — start with `api.inter.com` from day one:**
+
+```
+Day 1 (launch):
+  api.inter.com  →  token-server (Railway / Render)
+  inter.com      →  unused, or a simple "coming soon" / download HTML page
+
+Month 3:
+  api.inter.com  →  token-server (unchanged)
+  inter.com      →  landing page with download button (Vercel / Netlify — free)
+
+Year 1+ (if web app built):
+  api.inter.com  →  token-server (still unchanged)
+  inter.com      →  React web app (Vercel)
+```
+
+Starting on `api.inter.com` means `inter.com` is always free for whatever comes next — no migration, no downtime dance, no forcing users to update the app.
+
+### What to Deploy
+
+Your entire backend is the `token-server/` folder — **one Node.js server, one deployment, one domain.** It already serves:
+- All auth API endpoints (`/auth/*`)
+- The billing pricing page (`/billing/plans`) — rendered server-side, opened in browser by the macOS app
+- The post-payment return page (`/billing/success`) — fires the deep link back to the app
+- The LS webhook receiver (`/webhooks/lemonsqueezy`)
+- All other API calls from the macOS app
+
+No separate frontend deployment needed for the initial launch.
+
+### Env Vars to Set on the Server
+
+When deploying, set these in your hosting platform's environment variables panel:
+
+```dotenv
+BILLING_PAGE_BASE_URL=https://api.inter.com   # base URL of your token-server
+APP_RETURN_URL=https://api.inter.com/billing/success
+
+# All other vars same as .env — DB, Redis, JWT secrets, LS keys, LiveKit
+```
+
+### Lemon Squeezy Dashboard Updates (on every domain change)
+
+1. **Webhook URL** → `https://api.inter.com/webhooks/lemonsqueezy`
+2. **Redirect URL (after checkout)** → `https://api.inter.com/billing/success` — must be whitelisted in LS store settings
+3. **Webhook signing secret** → must match `LEMONSQUEEZY_WEBHOOK_SECRET` in `.env`
+
+### Zero-Downtime Migration (only needed if you launched on `inter.com` first)
+
+If you ever need to move the token-server from `inter.com` to `api.inter.com`:
+
+1. Lower DNS TTL on `inter.com` to 60s — wait 24h
+2. Point `api.inter.com` to the same server — now both domains work simultaneously
+3. Ship a macOS app update that uses `api.inter.com` as the server URL
+4. Wait 2–4 weeks for user adoption (watch version analytics)
+5. When 95%+ are on the new version, point `inter.com` to your web app / landing page
+
+### If a Web App Is Built Later (`inter.com/app`)
+
+The token-server needs zero changes — the web app calls the same `/auth/*` and `/livekit/token` endpoints as the macOS app. Only additions needed:
+- A CORS header on the token-server allowing `inter.com` origin
+- A React frontend using the LiveKit JavaScript SDK (`@livekit/components-react`)
+- Deploy the React app to Vercel, point `inter.com` DNS there
+
+---
+
+## Implementation Changelog
+
+| Date | Phase | Key Changes | Files |
 |---|---|---|---|
+| 26 March 2026 | Phase A (9/9) | Created `auth.js` — bcrypt register/login, JWT (HS256, 7d), `authenticateToken`/`requireAuth`/`requireTier` middleware, `DUMMY_HASH` timing normalisation, email/password/displayName validation, rate limiting, security headers, centralised error handler | `token-server/auth.js`, `token-server/index.js` |
+| 8 April 2026 | Phase B (13/13) | Refresh token system: rotation, theft detection, `/auth/refresh`, `/auth/logout`, `/auth/logout-all`, Redis rate limiting; macOS client: Keychain storage, silent refresh on 401, TLS SPKI pinning, login/register UI gating app launch | `token-server/auth.js`, `token-server/index.js`, `token-server/migrations/004_refresh_tokens.sql`, `inter/Networking/InterTokenService.swift`, `inter/UI/Views/InterLoginPanel.h/.m`, `inter/App/AppDelegate.m` |
+| 8 April 2026 | Phase C (6/7) + C-UX (8/8) | LS webhook (raw body + HMAC-SHA256), billing migrations (11 columns + idempotency table + tier history), `billing.js` (12 event types), `requireTier()` with grace period, checkout/portal endpoints; `inter://billing/success` deep link, billing poll, Upgrade/Manage buttons, billing status label | `token-server/billing.js`, `token-server/index.js`, `token-server/migrations/006_billing_columns.sql`, `inter/Networking/InterTokenService.swift`, `inter/App/AppDelegate.m` |
+| 13 April 2026 | Billing Audit (14/14) | All P0–P3 hardening fixes — see Billing Audit Fixes table above | `token-server/.env`, `token-server/billing.js`, `token-server/billing-page.js`, `token-server/index.js`, `inter/Networking/InterTokenService.swift`, `inter/App/AppDelegate.m` |
+
+---
+
 | A — Hardening | 9 | 9 | 0 ✅ |
 | B — Refresh Tokens | 13 | 13 | 0 ✅ |
-| C — Billing | 7 | 6 | 1 (env keys) |
+| C — Billing | 7 | 7 | 0 ✅ |
 | C-UX — Billing Upgrade Flow | 8 | 8 | 0 ✅ |
 | D — Account Recovery | 16 | 2 | 14 |
 | **Total** | **53** | **38** | **15** |
 
-**Next:** Phase C.7 — configure LS dashboard + API keys, then Phase D — Account Recovery.
+**Next:** Phase D — Account Recovery.
