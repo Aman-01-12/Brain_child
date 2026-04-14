@@ -65,6 +65,7 @@ const { AccessToken, RoomServiceClient, TrackSource, EgressClient,
         WebhookReceiver } = require('livekit-server-sdk');
 const crypto = require('crypto');
 const bcrypt = require('bcryptjs');
+const path   = require('path');
 const redis = require('./redis');
 const db = require('./db');
 const auth = require('./auth');
@@ -84,6 +85,9 @@ app.post(
 );
 
 app.use(express.json());
+
+// Static files — login page, public assets (Phase F)
+app.use(express.static(path.join(__dirname, 'public')));
 
 // ---------------------------------------------------------------------------
 // Security response headers — applied to every response
@@ -284,6 +288,22 @@ async function createToken(identity, displayName, roomName, isHost, metadata = n
 // ===========================================================================
 
 // ---------------------------------------------------------------------------
+// pseudonymizeEmail — redacts email PII before writing to audit logs.
+// By default (AUDIT_LOG_FULL_EMAIL !== 'true'), the address is HMAC-SHA256
+// hashed so raw emails are never stored in logs.
+// Key precedence: AUDIT_EMAIL_HMAC_KEY → JWT_SECRET → hard fallback.
+// Set AUDIT_LOG_FULL_EMAIL=true only in tightly controlled forensic
+// environments; never enable by default in production.
+// ---------------------------------------------------------------------------
+function pseudonymizeEmail(email) {
+  const raw = String(email || '').toLowerCase().trim();
+  if (process.env.AUDIT_LOG_FULL_EMAIL === 'true') return raw;
+  const salt = process.env.AUDIT_EMAIL_HMAC_KEY || process.env.JWT_SECRET;
+  if (!salt) return 'email:redacted';
+  return 'hmac256:' + crypto.createHmac('sha256', salt).update(raw).digest('hex').slice(0, 32);
+}
+
+// ---------------------------------------------------------------------------
 // POST /auth/register
 // Body: { email, password, displayName }
 // Returns: { user, accessToken, refreshToken, expiresIn }
@@ -293,7 +313,24 @@ app.post('/auth/register', rateLimitAuth, async (req, res) => {
 
   try {
     const result = await auth.register(email, password, displayName);
-    console.log(`[audit] User registered: ${result.user.email} (${result.user.id})`);
+    auth.auditLog(result.user.id, 'register', req.ip, { email: result.user.email });
+
+    // Fire-and-forget verification email — don't fail registration if email fails
+    (async () => {
+      try {
+        const rawToken  = crypto.randomBytes(32);
+        const tokenHash = crypto.createHash('sha256').update(rawToken).digest();
+        await db.query(
+          `INSERT INTO email_verification_tokens (user_id, token_hash, expires_at)
+           VALUES ($1, $2, NOW() + INTERVAL '8 hours')`,
+          [result.user.id, tokenHash]
+        );
+        await sendVerificationEmail(result.user.email, rawToken.toString('base64url'));
+      } catch (err) {
+        console.error('[auth] verification email on register failed:', err.message);
+      }
+    })();
+
     res.status(201).json(result);
   } catch (err) {
     const status = err.status
@@ -318,13 +355,16 @@ app.post('/auth/login', rateLimitAuth, async (req, res) => {
 
   try {
     const result = await auth.login(email, password);
-    console.log(`[audit] User logged in: ${result.user.email}`);
+    auth.auditLog(result.user.id, 'login_success', req.ip, { email: result.user.email });
     res.json(result);
   } catch (err) {
     const status = err.message.includes('Invalid') ? 401
                  : err.message.includes('required') ? 400
                  : 500;
     if (status === 500) throw err;
+    if (status === 401) {
+      auth.auditLog(null, 'login_failure', req.ip, { email: pseudonymizeEmail(email) });
+    }
     res.status(status).json({ error: err.message });
   }
 });
@@ -366,7 +406,7 @@ app.post('/auth/refresh', rateLimitRefresh, async (req, res) => {
 
     // Fetch the token row — include revoked rows for theft detection
     const { rows } = await dbClient.query(
-      `SELECT id, user_id, family_id, client_id, expires_at, revoked_at
+      `SELECT id, user_id, family_id, client_id, expires_at, revoked_at, absolute_expires_at
        FROM refresh_tokens
        WHERE token_hash = $1
        LIMIT 1`,
@@ -390,7 +430,17 @@ app.post('/auth/refresh', rateLimitRefresh, async (req, res) => {
         [stored.family_id]
       );
       await dbClient.query('COMMIT');
-      console.error(`[SECURITY] Refresh token reuse detected. family=${stored.family_id} userId=${stored.user_id}`);
+      auth.auditLog(stored.user_id, 'session_compromised', req.ip, { familyId: stored.family_id });
+
+      // Fetch user email for security alert
+      const { rows: alertUserRows } = await db.query('SELECT email FROM users WHERE id = $1', [stored.user_id]);
+      dispatchSecurityAlert('Refresh token reuse detected', {
+        userId: stored.user_id,
+        familyId: stored.family_id,
+        email: alertUserRows[0]?.email,
+        ip: req.ip,
+      });
+
       return res.status(401).json({
         error: 'Security alert: your session was compromised. Please log in again.',
         code: 'SESSION_COMPROMISED',
@@ -403,6 +453,12 @@ app.post('/auth/refresh', rateLimitRefresh, async (req, res) => {
       return res.status(401).json({ error: 'Refresh token expired', code: 'TOKEN_EXPIRED' });
     }
 
+    // ── ABSOLUTE SESSION CUTOFF (G4) ────────────────────────────────
+    if (stored.absolute_expires_at && new Date(stored.absolute_expires_at) < new Date()) {
+      await dbClient.query('ROLLBACK');
+      return res.status(401).json({ error: 'Session expired — please log in again', code: 'SESSION_EXPIRED' });
+    }
+
     // ── DEVICE BINDING (soft) ────────────────────────────────────────
     if (stored.client_id && clientId && stored.client_id !== clientId) {
       console.warn(`[SECURITY] Client ID mismatch on refresh. stored=${stored.client_id} got=${clientId} userId=${stored.user_id}`);
@@ -411,7 +467,7 @@ app.post('/auth/refresh', rateLimitRefresh, async (req, res) => {
     // ── ROTATION ─────────────────────────────────────────────────────
     // Revoke old token, issue new one in same family — atomic transaction
     await dbClient.query(
-      `UPDATE refresh_tokens SET revoked_at = NOW() WHERE id = $1`,
+      `UPDATE refresh_tokens SET revoked_at = NOW(), last_used_at = NOW() WHERE id = $1`,
       [stored.id]
     );
 
@@ -420,9 +476,9 @@ app.post('/auth/refresh', rateLimitRefresh, async (req, res) => {
 
     await dbClient.query(
       `INSERT INTO refresh_tokens
-         (user_id, token_hash, family_id, client_id, expires_at, predecessor_id)
-       VALUES ($1, $2, $3, $4, NOW() + make_interval(days => $5), $6)`,
-      [stored.user_id, newHash, stored.family_id, clientId || stored.client_id, auth.REFRESH_TOKEN_DAYS, stored.id]
+         (user_id, token_hash, family_id, client_id, expires_at, absolute_expires_at, predecessor_id)
+       VALUES ($1, $2, $3, $4, NOW() + make_interval(days => $5), $6, $7)`,
+      [stored.user_id, newHash, stored.family_id, clientId || stored.client_id, auth.REFRESH_TOKEN_DAYS, stored.absolute_expires_at, stored.id]
     );
 
     // ── FRESH TIER RE-READ ───────────────────────────────────────────
@@ -486,6 +542,7 @@ app.post('/auth/logout', auth.requireAuth, async (req, res) => {
     }
   }
 
+  auth.auditLog(req.user.userId, 'logout', req.ip);
   res.status(204).end();
 });
 
@@ -495,7 +552,1033 @@ app.post('/auth/logout', auth.requireAuth, async (req, res) => {
 // ---------------------------------------------------------------------------
 app.post('/auth/logout-all', auth.requireAuth, async (req, res) => {
   await auth.revokeAllForUser(req.user.userId);
+  auth.auditLog(req.user.userId, 'logout_all', req.ip);
   res.status(204).end();
+});
+
+// ===========================================================================
+// GAP MITIGATIONS — G8, G9, G11 (P1–P3)
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// POST /auth/change-password — authenticated password change (G8, P1)
+// Body: { currentPassword, newPassword }
+// Keeps the current session alive; revokes all OTHER sessions.
+// ---------------------------------------------------------------------------
+app.post('/auth/change-password', auth.requireAuth, async (req, res) => {
+  const { currentPassword, newPassword } = req.body || {};
+
+  if (!currentPassword || typeof currentPassword !== 'string') {
+    return res.status(400).json({ error: 'currentPassword required' });
+  }
+  if (!newPassword || typeof newPassword !== 'string') {
+    return res.status(400).json({ error: 'newPassword required' });
+  }
+  const passwordBytes = Buffer.byteLength(newPassword, 'utf8');
+  if (passwordBytes < 8) {
+    return res.status(400).json({ error: 'Password must be at least 8 characters' });
+  }
+  if (passwordBytes > 72) {
+    return res.status(400).json({ error: 'Password must be 72 characters or fewer' });
+  }
+
+  const userResult = await db.query(
+    'SELECT id, password_hash FROM users WHERE id = $1 AND deleted_at IS NULL',
+    [req.user.userId]
+  );
+  if (userResult.rows.length === 0) {
+    return res.status(401).json({ error: 'User not found', code: 'USER_NOT_FOUND' });
+  }
+  const user = userResult.rows[0];
+
+  const valid = await bcrypt.compare(currentPassword, user.password_hash);
+  if (!valid) {
+    auth.auditLog(user.id, 'change_password_failure', req.ip);
+    return res.status(401).json({ error: 'Current password is incorrect' });
+  }
+
+  // HIBP breach check on new password
+  await auth.checkPwnedPassword(newPassword);
+
+  const newHash = await bcrypt.hash(newPassword, auth.BCRYPT_ROUNDS);
+
+  // Revoke all sessions EXCEPT the current one (keep the caller logged in)
+  const currentTokenFamily = req.user.tokenFamily;
+  await db.query(
+    `UPDATE refresh_tokens SET revoked_at = NOW()
+     WHERE user_id = $1 AND revoked_at IS NULL AND family_id != $2`,
+    [user.id, currentTokenFamily]
+  );
+
+  await db.query('UPDATE users SET password_hash = $1 WHERE id = $2', [newHash, user.id]);
+
+  auth.auditLog(user.id, 'change_password_success', req.ip);
+  res.json({ message: 'Password changed. All other sessions have been revoked.' });
+});
+
+// ---------------------------------------------------------------------------
+// DELETE /auth/account — account deletion / GDPR right-to-erasure (G9, P1)
+// Body: { password }
+// Anonymizes PII, revokes all sessions, cancels LS subscription.
+// ---------------------------------------------------------------------------
+app.delete('/auth/account', auth.requireAuth, async (req, res) => {
+  const { password } = req.body || {};
+  if (!password || typeof password !== 'string') {
+    return res.status(400).json({ error: 'password required to confirm deletion' });
+  }
+
+  const userResult = await db.query(
+    'SELECT id, password_hash, ls_customer_id, ls_subscription_id FROM users WHERE id = $1 AND deleted_at IS NULL',
+    [req.user.userId]
+  );
+  if (userResult.rows.length === 0) {
+    return res.status(404).json({ error: 'User not found' });
+  }
+  const user = userResult.rows[0];
+
+  const valid = await bcrypt.compare(password, user.password_hash);
+  if (!valid) {
+    return res.status(401).json({ error: 'Password incorrect' });
+  }
+
+  // 1. Cancel active LS subscription — hard failure: abort deletion if this fails
+  //    to prevent orphaned paid subscriptions with no associated account.
+  if (user.ls_subscription_id) {
+    try {
+      await cancelSubscription(user.ls_subscription_id);
+    } catch (lsErr) {
+      console.error('[auth] LS cancellation failed during account deletion:', lsErr);
+      return res.status(502).json({
+        error: 'Failed to cancel your subscription. Please try again or contact support.',
+        code: 'SUBSCRIPTION_CANCEL_FAILED',
+      });
+    }
+  }
+
+  const dbClient = await db.getClient();
+  try {
+    await dbClient.query('BEGIN');
+
+    // 2. Revoke all refresh tokens
+    await dbClient.query(
+      'UPDATE refresh_tokens SET revoked_at = NOW() WHERE user_id = $1 AND revoked_at IS NULL',
+      [user.id]
+    );
+
+    // 3. Anonymize PII — keep row for audit_events FK integrity
+    const anonEmail = `deleted_${user.id}@deleted.invalid`;
+    await dbClient.query(
+      `UPDATE users SET
+         email               = $1,
+         display_name        = 'Deleted User',
+         password_hash       = '',
+         email_verified_at   = NULL,
+         tier                = 'free',
+         subscription_status = 'expired',
+         ls_customer_id      = NULL,
+         ls_subscription_id  = NULL,
+         ls_variant_id       = NULL,
+         ls_product_id       = NULL,
+         ls_portal_url       = NULL,
+         deleted_at          = NOW(),
+         deletion_reason     = 'user_request'
+       WHERE id = $2`,
+      [anonEmail, user.id]
+    );
+
+    await dbClient.query('COMMIT');
+  } catch (err) {
+    await dbClient.query('ROLLBACK');
+    // CRITICAL: if LS cancellation already succeeded above but the DB commit failed,
+    // the subscription is now cancelled while the account still exists. Ops must
+    // manually reconcile (reactivate or re-cancel) for user.id.
+    if (user.ls_subscription_id) {
+      console.error(
+        '[CRITICAL] account_delete DB transaction failed AFTER LS cancellation succeeded.',
+        `userId=${user.id} ls_subscription_id=${user.ls_subscription_id}`,
+        'Manual reconciliation required.',
+        err
+      );
+    }
+    throw err;
+  } finally {
+    dbClient.release();
+  }
+
+  auth.auditLog(user.id, 'account_deleted', req.ip, { reason: 'user_request' });
+  res.json({ message: 'Account deleted. All personal data has been removed.' });
+});
+
+// ---------------------------------------------------------------------------
+// GET /auth/sessions — list active sessions for the current user (G11, P3)
+// Returns: { sessions: [{ id, clientId, createdAt, lastUsedAt }] }
+// ---------------------------------------------------------------------------
+app.get('/auth/sessions', auth.requireAuth, async (req, res) => {
+  const result = await db.query(
+    `SELECT id, family_id, client_id, created_at, last_used_at
+     FROM refresh_tokens
+     WHERE user_id = $1
+       AND revoked_at IS NULL
+       AND expires_at > NOW()
+     ORDER BY COALESCE(last_used_at, created_at) DESC`,
+    [req.user.userId]
+  );
+  res.json({
+    sessions: result.rows.map(r => ({
+      id: r.id,
+      clientId: r.client_id,
+      createdAt: r.created_at,
+      lastUsedAt: r.last_used_at,
+      isCurrent: r.family_id === req.user.tokenFamily || false,
+    })),
+  });
+});
+
+// ---------------------------------------------------------------------------
+// DELETE /auth/sessions/:id — revoke a specific session (G11, P3)
+// ---------------------------------------------------------------------------
+app.delete('/auth/sessions/:id', auth.requireAuth, async (req, res) => {
+  const { id } = req.params;
+  if (!id || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)) {
+    return res.status(400).json({ error: 'Invalid session id' });
+  }
+  const result = await db.query(
+    `UPDATE refresh_tokens SET revoked_at = NOW()
+     WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL`,
+    [id, req.user.userId]
+  );
+  if (result.rowCount === 0) {
+    return res.status(404).json({ error: 'Session not found' });
+  }
+  auth.auditLog(req.user.userId, 'session_revoked', req.ip, { sessionId: id });
+  res.json({ revoked: true });
+});
+
+// ---------------------------------------------------------------------------
+// POST /auth/change-email — initiate email change (G10, P3)
+// Body: { password, newEmail }
+// Verifies current password, sends verification link to new email.
+// ---------------------------------------------------------------------------
+app.post('/auth/change-email', auth.requireAuth, rateLimitAuth, async (req, res) => {
+  const { password, newEmail } = req.body || {};
+
+  if (!password || typeof password !== 'string') {
+    return res.status(400).json({ error: 'password required' });
+  }
+  if (!newEmail || typeof newEmail !== 'string') {
+    return res.status(400).json({ error: 'newEmail required' });
+  }
+
+  const emailNormalized = newEmail.toLowerCase().trim();
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(emailNormalized) || emailNormalized.length > 254) {
+    return res.status(400).json({ error: 'Invalid email address' });
+  }
+
+  // Verify password
+  const userResult = await db.query(
+    'SELECT id, email, password_hash FROM users WHERE id = $1 AND deleted_at IS NULL',
+    [req.user.userId]
+  );
+  if (userResult.rows.length === 0) {
+    return res.status(401).json({ error: 'User not found' });
+  }
+  const user = userResult.rows[0];
+
+  if (emailNormalized === user.email) {
+    return res.status(400).json({ error: 'New email is the same as current email' });
+  }
+
+  const valid = await bcrypt.compare(password, user.password_hash);
+  if (!valid) {
+    return res.status(401).json({ error: 'Password incorrect' });
+  }
+
+  // Check if new email is already taken
+  const existing = await db.query('SELECT id FROM users WHERE email = $1', [emailNormalized]);
+  if (existing.rows.length > 0) {
+    return res.status(409).json({ error: 'Email already in use' });
+  }
+
+  // Generate verification token for the new email
+  const rawToken  = crypto.randomBytes(32);
+  const tokenHash = crypto.createHash('sha256').update(rawToken).digest();
+
+  await db.query(
+    `INSERT INTO email_change_tokens (user_id, new_email, token_hash, expires_at)
+     VALUES ($1, $2, $3, NOW() + INTERVAL '1 hour')`,
+    [user.id, emailNormalized, tokenHash]
+  );
+
+  // Send verification to the NEW email address
+  const { sendVerificationEmail: sendVerify } = require('./mailer');
+  sendVerify(emailNormalized, rawToken.toString('base64url')).catch(err => {
+    console.error('[auth] email change verification send failed:', err.message);
+  });
+
+  auth.auditLog(user.id, 'email_change_requested', req.ip, { newEmail: emailNormalized });
+  res.json({ message: 'Verification email sent to your new address. Check your inbox.' });
+});
+
+// ---------------------------------------------------------------------------
+// GET /auth/verify-email-change?token=<base64url> — confirm the new email (G10)
+// ---------------------------------------------------------------------------
+app.get('/auth/verify-email-change', async (req, res) => {
+  const { token } = req.query;
+  if (!token) return res.status(400).json({ error: 'token required' });
+
+  const tokenHash = crypto.createHash('sha256')
+    .update(Buffer.from(token, 'base64url'))
+    .digest();
+
+  const result = await db.query(
+    `SELECT id, user_id, new_email FROM email_change_tokens
+     WHERE token_hash = $1 AND used_at IS NULL AND expires_at > NOW()`,
+    [tokenHash]
+  );
+
+  if (result.rows.length === 0) {
+    return res.status(400).json({ error: 'Invalid or expired email change link' });
+  }
+
+  const { id: tokenId, user_id: userId, new_email: newEmail } = result.rows[0];
+
+  const dbClient = await db.getClient();
+  let oldEmail;
+  try {
+    await dbClient.query('BEGIN');
+
+    // Fetch old email inside the transaction so the read is consistent
+    const userResult = await dbClient.query('SELECT email FROM users WHERE id = $1 FOR UPDATE', [userId]);
+    oldEmail = userResult.rows[0]?.email;
+
+    // Atomically check the new email isn't taken — race-free inside the transaction
+    const existing = await dbClient.query(
+      'SELECT id FROM users WHERE email = $1 AND id != $2',
+      [newEmail, userId]
+    );
+    if (existing.rows.length > 0) {
+      await dbClient.query('ROLLBACK');
+      return res.status(409).json({ error: 'Email already in use by another account' });
+    }
+
+    await dbClient.query('UPDATE email_change_tokens SET used_at = NOW() WHERE id = $1', [tokenId]);
+    await dbClient.query('UPDATE users SET email = $1, email_verified_at = NOW() WHERE id = $2', [newEmail, userId]);
+    await dbClient.query('COMMIT');
+  } catch (err) {
+    await dbClient.query('ROLLBACK');
+    throw err;
+  } finally {
+    dbClient.release();
+  }
+
+  // Notify old email address of the change (security measure)
+  if (oldEmail) {
+    sendSecurityAlertEmail(oldEmail, 'email_changed', {
+      newEmail,
+      message: 'Your email address was changed. If you did not do this, contact support immediately.',
+    }).catch(err => {
+      console.error('[auth] old email notification failed:', err.message);
+    });
+  }
+
+  auth.auditLog(userId, 'email_changed', null, { oldEmail, newEmail });
+  res.json({ message: 'Email updated successfully.' });
+});
+
+// ===========================================================================
+// PHASE D — ACCOUNT RECOVERY & SECURITY HARDENING
+// ===========================================================================
+
+const { sendPasswordResetEmail, sendVerificationEmail, sendSecurityAlertEmail } = require('./mailer');
+
+// ---------------------------------------------------------------------------
+// POST /auth/forgot-password
+// Body: { email }
+// ALWAYS returns 200 with generic message (anti-enumeration).
+// ---------------------------------------------------------------------------
+app.post('/auth/forgot-password', rateLimitAuth, async (req, res) => {
+  const email = String(req.body?.email || '').toLowerCase().trim();
+
+  // Fire-and-forget — never let DB/email timing leak email existence
+  (async () => {
+    try {
+      const result = await db.query('SELECT id FROM users WHERE email = $1', [email]);
+      if (result.rows.length === 0) return;
+
+      const rawToken  = crypto.randomBytes(32);
+      const tokenHash = crypto.createHash('sha256').update(rawToken).digest();
+
+      await db.query(
+        `INSERT INTO password_reset_tokens (user_id, token_hash, expires_at)
+         VALUES ($1, $2, NOW() + INTERVAL '1 hour')`,
+        [result.rows[0].id, tokenHash]
+      );
+
+      await sendPasswordResetEmail(email, rawToken.toString('base64url'));
+      auth.auditLog(result.rows[0].id, 'password_reset_requested', req.ip);
+    } catch (err) {
+      console.error('[auth] forgot-password error:', err.message);
+    }
+  })();
+
+  res.json({ message: "If that email is registered, you'll receive a reset link shortly." });
+});
+
+// ---------------------------------------------------------------------------
+// POST /auth/reset-password — JSON API (consumed by macOS client)
+// Body: { token (base64url), newPassword }
+// ---------------------------------------------------------------------------
+app.post('/auth/reset-password', async (req, res) => {
+  const { token, newPassword } = req.body || {};
+  try {
+    const userId = await auth.resetPassword(token, newPassword);
+    auth.auditLog(userId, 'password_reset_completed', req.ip);
+    res.json({ message: 'Password updated. Please log in again.' });
+  } catch (err) {
+    const status = err.status || 500;
+    if (status === 500) throw err;
+    res.status(status).json({ error: err.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// POST /auth/reset-password-web — form submission variant (browser fallback)
+// Returns HTML instead of JSON.
+// ---------------------------------------------------------------------------
+app.post('/auth/reset-password-web', express.urlencoded({ extended: false }), async (req, res) => {
+  const { token, newPassword } = req.body || {};
+  try {
+    const userId = await auth.resetPassword(token, newPassword);
+    auth.auditLog(userId, 'password_reset_completed', req.ip, { via: 'web' });
+    res.send('<p>Password updated. You can close this page and log in to the Inter app.</p>');
+  } catch (err) {
+    res.status(400).send(`<p>Error: ${err.message}. Please request a new reset link.</p>`);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// GET /reset-password — HTML landing page linked from the reset email
+// Tries inter:// deep link first; shows web form as fallback.
+// ---------------------------------------------------------------------------
+app.get('/reset-password', (req, res) => {
+  const token = req.query.token;
+
+  // Validate token is base64url before rendering — prevents injection
+  if (!token || !/^[A-Za-z0-9_-]{40,}$/.test(token)) {
+    return res.status(400).send('<p>Invalid or missing reset token.</p>');
+  }
+
+  res.setHeader('Content-Security-Policy', "default-src 'none'; form-action 'self'; script-src 'unsafe-inline'");
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+
+  res.send(`<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Reset Password — Inter</title>
+</head>
+<body>
+  <script>
+    window.location = 'com-inter-app://reset-password?token=${token}';
+  <\/script>
+  <h2>Reset your Inter password</h2>
+  <p>Enter a new password below (8–72 characters).</p>
+  <form method="POST" action="/auth/reset-password-web">
+    <input type="hidden" name="token" value="${token}">
+    <input type="password" name="newPassword"
+           placeholder="New password" required minlength="8" maxlength="72"
+           autocomplete="new-password">
+    <button type="submit">Reset password</button>
+  </form>
+</body>
+</html>`);
+});
+
+// ---------------------------------------------------------------------------
+// GET /auth/verify-email?token=<base64url> — confirm email ownership
+// ---------------------------------------------------------------------------
+app.get('/auth/verify-email', async (req, res) => {
+  const { token } = req.query;
+  if (!token) return res.status(400).json({ error: 'token required' });
+
+  const tokenHash = crypto.createHash('sha256')
+    .update(Buffer.from(token, 'base64url'))
+    .digest();
+
+  const result = await db.query(
+    `SELECT id, user_id FROM email_verification_tokens
+     WHERE token_hash = $1 AND used_at IS NULL AND expires_at > NOW()`,
+    [tokenHash]
+  );
+
+  if (result.rows.length === 0) {
+    return res.status(400).json({ error: 'Invalid or expired verification link' });
+  }
+
+  const { id: tokenId, user_id: userId } = result.rows[0];
+
+  await db.query('UPDATE email_verification_tokens SET used_at = NOW() WHERE id = $1', [tokenId]);
+  await db.query('UPDATE users SET email_verified_at = NOW() WHERE id = $1', [userId]);
+
+  auth.auditLog(userId, 'email_verified', req.ip);
+  res.json({ message: 'Email verified. You can now use all features.' });
+});
+
+// ---------------------------------------------------------------------------
+// POST /auth/resend-verification — resend verification email
+// Body: { email }
+// ALWAYS returns 200 with generic message (anti-enumeration).
+// ---------------------------------------------------------------------------
+app.post('/auth/resend-verification', rateLimitAuth, async (req, res) => {
+  const email = String(req.body?.email || '').toLowerCase().trim();
+
+  (async () => {
+    try {
+      const result = await db.query(
+        'SELECT id FROM users WHERE email = $1 AND email_verified_at IS NULL',
+        [email]
+      );
+      if (result.rows.length === 0) return;
+
+      const rawToken  = crypto.randomBytes(32);
+      const tokenHash = crypto.createHash('sha256').update(rawToken).digest();
+
+      await db.query(
+        `INSERT INTO email_verification_tokens (user_id, token_hash, expires_at)
+         VALUES ($1, $2, NOW() + INTERVAL '8 hours')`,
+        [result.rows[0].id, tokenHash]
+      );
+
+      await sendVerificationEmail(email, rawToken.toString('base64url'));
+    } catch (err) {
+      console.error('[auth] resend-verification error:', err.message);
+    }
+  })();
+
+  res.json({ message: "If that email is registered and unverified, you'll receive a verification link shortly." });
+});
+
+// ---------------------------------------------------------------------------
+// dispatchSecurityAlert — Slack webhook + email on theft detection
+// ---------------------------------------------------------------------------
+async function dispatchSecurityAlert(type, details) {
+  console.error(`[SECURITY ALERT] ${type}:`, JSON.stringify(details));
+
+  if (process.env.SECURITY_WEBHOOK_URL) {
+    try {
+      await fetch(process.env.SECURITY_WEBHOOK_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          text: `\u{1F6A8} *${type}*\n${JSON.stringify(details, null, 2)}`,
+        }),
+      });
+    } catch (err) {
+      console.error('[alert] webhook delivery failed:', err.message);
+    }
+  }
+
+  // Also send email to the affected user if we have their address
+  if (details.email) {
+    sendSecurityAlertEmail(details.email, type, details).catch(err => {
+      console.error('[alert] security email failed:', err.message);
+    });
+  }
+}
+
+// ===========================================================================
+// Phase F — OAuth Social Sign-In
+// ===========================================================================
+const { OAuth2Client } = require('google-auth-library');
+const jwksClient = require('jwks-rsa');
+
+const GOOGLE_CLIENT_ID     = process.env.GOOGLE_CLIENT_ID;
+const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET;
+const MS_CLIENT_ID         = process.env.MICROSOFT_CLIENT_ID;
+const MS_CLIENT_SECRET     = process.env.MICROSOFT_CLIENT_SECRET;
+const MS_TENANT_ID         = process.env.MICROSOFT_TENANT_ID || 'common';
+const OAUTH_STATE_SECRET   = process.env.OAUTH_STATE_SECRET;
+const HANDOFF_TTL          = parseInt(process.env.OAUTH_HANDOFF_TTL_SECONDS || '30', 10);
+const SERVER_BASE_URL      = process.env.SERVER_BASE_URL || `http://localhost:${process.env.PORT || 3000}`;
+
+const googleOAuth = GOOGLE_CLIENT_ID ? new OAuth2Client(GOOGLE_CLIENT_ID) : null;
+const msJwks = jwksClient({
+  jwksUri: `https://login.microsoftonline.com/${MS_TENANT_ID}/discovery/v2.0/keys`,
+  cache: true,
+  rateLimit: true,
+});
+
+// In-memory PKCE/nonce store (use Redis for multi-instance prod deployments)
+const oauthSessions = new Map();
+setInterval(() => {
+  const cutoff = Date.now() - 10 * 60 * 1000;
+  for (const [key, val] of oauthSessions) {
+    if (val.createdAt < cutoff) oauthSessions.delete(key);
+  }
+  // Also purge expired handoff codes from DB (fire-and-forget)
+  db.query(`DELETE FROM pending_oauth_handoffs WHERE expires_at < NOW() - INTERVAL '1 hour'`)
+    .catch(err => console.error('[OAuth] Handoff cleanup failed:', err.message));
+}, 5 * 60 * 1000);
+
+const OAUTH_PROVIDERS = new Set(['google', 'microsoft']);
+
+// ---------------------------------------------------------------------------
+// GET /auth/login-page — serves the sign-in HTML
+// ---------------------------------------------------------------------------
+app.get('/auth/login-page', (_req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'login.html'));
+});
+
+// ---------------------------------------------------------------------------
+// GET /auth/oauth/:provider/start — initiate OAuth flow with PKCE + state
+// ---------------------------------------------------------------------------
+app.get('/auth/oauth/:provider/start', rateLimitAuth, (req, res) => {
+  const { provider } = req.params;
+  if (!OAUTH_PROVIDERS.has(provider)) {
+    return res.status(400).json({ error: 'Unknown provider' });
+  }
+  if (!OAUTH_STATE_SECRET) {
+    console.error('[OAuth] OAUTH_STATE_SECRET not configured');
+    return res.status(500).json({ error: 'OAuth not configured' });
+  }
+  if (provider === 'google' && !GOOGLE_CLIENT_ID) {
+    return res.status(500).json({ error: 'Google OAuth not configured' });
+  }
+  if (provider === 'microsoft' && !MS_CLIENT_ID) {
+    return res.status(500).json({ error: 'Microsoft OAuth not configured' });
+  }
+
+  // PKCE S256
+  const codeVerifier  = crypto.randomBytes(32).toString('base64url');
+  const codeChallenge = crypto.createHash('sha256').update(codeVerifier).digest('base64url');
+
+  // State: HMAC-signed — encodes provider + timestamp for CSRF and mix-up protection
+  const statePayload = `${provider}:${Date.now()}:${crypto.randomBytes(8).toString('hex')}`;
+  const stateHmac = crypto
+    .createHmac('sha256', OAUTH_STATE_SECRET)
+    .update(statePayload)
+    .digest('base64url');
+  const state = `${Buffer.from(statePayload).toString('base64url')}.${stateHmac}`;
+
+  // Nonce for ID token replay prevention
+  const nonce = crypto.randomBytes(16).toString('base64url');
+
+  oauthSessions.set(state, { codeVerifier, nonce, provider, createdAt: Date.now() });
+
+  const redirectUri = `${SERVER_BASE_URL}/auth/oauth/${provider}/callback`;
+
+  let authUrl;
+  if (provider === 'google') {
+    const params = new URLSearchParams({
+      client_id:             GOOGLE_CLIENT_ID,
+      redirect_uri:          redirectUri,
+      response_type:         'code',
+      scope:                 'openid email profile',
+      state,
+      nonce,
+      code_challenge:        codeChallenge,
+      code_challenge_method: 'S256',
+      access_type:           'online',
+      prompt:                'select_account',
+    });
+    authUrl = `https://accounts.google.com/o/oauth2/v2/auth?${params}`;
+  } else {
+    const params = new URLSearchParams({
+      client_id:             MS_CLIENT_ID,
+      redirect_uri:          redirectUri,
+      response_type:         'code',
+      scope:                 'openid email profile',
+      state,
+      nonce,
+      code_challenge:        codeChallenge,
+      code_challenge_method: 'S256',
+      response_mode:         'query',
+    });
+    authUrl = `https://login.microsoftonline.com/${MS_TENANT_ID}/oauth2/v2.0/authorize?${params}`;
+  }
+
+  res.redirect(authUrl);
+});
+
+// ---------------------------------------------------------------------------
+// GET /auth/oauth/start-url?provider=google|microsoft
+// Returns { "url": "http://…/auth/oauth/{provider}/start" } so the native app
+// never needs to hardcode the OAuth start path.  No auth required.
+// ---------------------------------------------------------------------------
+app.get('/auth/oauth/start-url', rateLimitAuth, (req, res) => {
+  const provider = req.query.provider;
+  if (!provider || !OAUTH_PROVIDERS.has(provider)) {
+    return res.status(400).json({ error: 'Unknown or missing provider' });
+  }
+  const baseUrl = process.env.BILLING_PAGE_BASE_URL ||
+    `http://localhost:${PORT}`;
+  res.json({ url: `${baseUrl}/auth/oauth/${provider}/start` });
+});
+
+// ---------------------------------------------------------------------------
+// verifyMicrosoftIdToken — JWKS-based signature verification for MS ID tokens
+// ---------------------------------------------------------------------------
+async function verifyMicrosoftIdToken(idToken) {
+  const jwt = require('jsonwebtoken');
+  const decoded = jwt.decode(idToken, { complete: true });
+  if (!decoded || !decoded.header || !decoded.header.kid) {
+    throw new Error('Invalid Microsoft ID token');
+  }
+  const key = await msJwks.getSigningKey(decoded.header.kid);
+  const signingKey = key.getPublicKey();
+
+  // When tenant is 'common', the issuer contains the user's real tenant ID,
+  // not 'common'. Verify audience + signature but validate issuer pattern manually.
+  const verifyOptions = {
+    algorithms: ['RS256'],
+    audience:   MS_CLIENT_ID,
+  };
+  if (MS_TENANT_ID !== 'common' && MS_TENANT_ID !== 'organizations' && MS_TENANT_ID !== 'consumers') {
+    verifyOptions.issuer = `https://login.microsoftonline.com/${MS_TENANT_ID}/v2.0`;
+  }
+  const payload = jwt.verify(idToken, signingKey, verifyOptions);
+
+  // For multi-tenant ('common'), validate issuer matches the expected Microsoft pattern
+  if (!verifyOptions.issuer) {
+    const issuerPattern = /^https:\/\/login\.microsoftonline\.com\/[0-9a-f-]+\/v2\.0$/;
+    if (!payload.iss || !issuerPattern.test(payload.iss)) {
+      throw new Error(`Unexpected Microsoft issuer: ${payload.iss}`);
+    }
+  }
+
+  return payload;
+}
+
+// ---------------------------------------------------------------------------
+// GET /auth/oauth/:provider/callback — provider redirects here after consent
+// ---------------------------------------------------------------------------
+app.get('/auth/oauth/:provider/callback', rateLimitAuth, async (req, res) => {
+  const { provider } = req.params;
+  const { code, state, error: providerError } = req.query;
+
+  // User denied consent
+  if (providerError) {
+    return res.redirect('com-inter-app://oauth-callback?error=access_denied');
+  }
+
+  // Missing authorization code
+  if (!code || !state) {
+    return res.status(400).send('Missing code or state parameter.');
+  }
+
+  // Validate state — CSRF + mix-up protection
+  if (!state || !oauthSessions.has(state)) {
+    return res.status(400).send('Invalid or expired state parameter.');
+  }
+  const dotIdx = state.lastIndexOf('.');
+  if (dotIdx === -1) {
+    oauthSessions.delete(state);
+    return res.status(400).send('Malformed state parameter.');
+  }
+  const encodedPayload = state.substring(0, dotIdx);
+  const receivedHmac   = state.substring(dotIdx + 1);
+  const expectedHmac = crypto
+    .createHmac('sha256', OAUTH_STATE_SECRET)
+    .update(Buffer.from(encodedPayload, 'base64url').toString())
+    .digest('base64url');
+
+  if (receivedHmac.length !== expectedHmac.length ||
+      !crypto.timingSafeEqual(Buffer.from(receivedHmac), Buffer.from(expectedHmac))) {
+    oauthSessions.delete(state);
+    return res.status(400).send('State signature invalid.');
+  }
+
+  const statePayload = Buffer.from(encodedPayload, 'base64url').toString();
+  const [stateProvider] = statePayload.split(':');
+  if (stateProvider !== provider) {
+    oauthSessions.delete(state);
+    return res.status(400).send('Provider mismatch.');
+  }
+
+  const { codeVerifier, nonce } = oauthSessions.get(state);
+  oauthSessions.delete(state);
+
+  const redirectUri = `${SERVER_BASE_URL}/auth/oauth/${provider}/callback`;
+  let providerUserId, providerEmail, displayName;
+
+  try {
+    if (provider === 'google') {
+      // Exchange authorization code for tokens
+      const tokenRes = await fetch('https://oauth2.googleapis.com/token', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          code,
+          client_id:     GOOGLE_CLIENT_ID,
+          client_secret: GOOGLE_CLIENT_SECRET,
+          redirect_uri:  redirectUri,
+          grant_type:    'authorization_code',
+          code_verifier: codeVerifier,
+        }),
+      });
+      const tokenData = await tokenRes.json();
+      if (!tokenRes.ok || !tokenData.id_token) {
+        throw new Error(`Google token exchange failed: ${tokenData.error || 'no id_token'}`);
+      }
+
+      // Verify ID token signature + claims via google-auth-library
+      const ticket = await googleOAuth.verifyIdToken({
+        idToken:  tokenData.id_token,
+        audience: GOOGLE_CLIENT_ID,
+      });
+      const payload = ticket.getPayload();
+
+      if (!payload.email_verified) throw new Error('email_not_verified');
+      if (payload.nonce !== nonce)  throw new Error('nonce_mismatch');
+      if (Date.now() / 1000 - payload.iat > 300) throw new Error('id_token_too_old');
+
+      providerUserId = payload.sub;
+      providerEmail  = payload.email.toLowerCase();
+      displayName    = payload.name || payload.email;
+
+    } else {
+      // Microsoft — exchange code + code_verifier
+      const tokenRes = await fetch(
+        `https://login.microsoftonline.com/${MS_TENANT_ID}/oauth2/v2.0/token`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: new URLSearchParams({
+            code,
+            client_id:     MS_CLIENT_ID,
+            client_secret: MS_CLIENT_SECRET,
+            redirect_uri:  redirectUri,
+            grant_type:    'authorization_code',
+            code_verifier: codeVerifier,
+          }),
+        }
+      );
+      const tokenData = await tokenRes.json();
+      if (!tokenRes.ok || !tokenData.id_token) {
+        throw new Error(`MS token exchange failed: ${tokenData.error || 'no id_token'}`);
+      }
+
+      // Verify MS ID token via JWKS
+      const payload = await verifyMicrosoftIdToken(tokenData.id_token);
+
+      if (payload.nonce !== nonce) throw new Error('nonce_mismatch');
+      if (Date.now() / 1000 - payload.iat > 300) throw new Error('id_token_too_old');
+
+      // Microsoft: work/school accounts don't always include email_verified,
+      // but the org tenant admin owns the domain — treat as verified.
+      // Personal accounts DO include it; reject if explicitly false.
+      if (payload.email_verified === false) throw new Error('email_not_verified');
+
+      providerUserId = payload.oid || payload.sub;
+      providerEmail  = (payload.email || payload.preferred_username || '').toLowerCase();
+      displayName    = payload.name || providerEmail;
+    }
+  } catch (err) {
+    console.error(`[OAuth] ${provider} token exchange/verification failed:`, err.message);
+    return res.redirect('com-inter-app://oauth-callback?error=provider_error');
+  }
+
+  if (!providerEmail) {
+    return res.redirect('com-inter-app://oauth-callback?error=no_email');
+  }
+
+  // Account lookup + linking (silent auto-link if email_verified from provider)
+  const client = await db.getClient();
+  try {
+    await client.query('BEGIN');
+
+    // Check if this OAuth identity already exists
+    const identityRes = await client.query(
+      `SELECT oi.id, u.id AS user_id, u.deleted_at
+       FROM oauth_identities oi
+       JOIN users u ON u.id = oi.user_id
+       WHERE oi.provider = $1 AND oi.provider_user_id = $2`,
+      [provider, providerUserId]
+    );
+
+    let userId;
+    let isNewUser = false;
+    let isNewLink = false;
+
+    if (identityRes.rows.length > 0) {
+      // Returning user via this provider
+      const row = identityRes.rows[0];
+      if (row.deleted_at) {
+        await client.query('ROLLBACK');
+        return res.redirect('com-inter-app://oauth-callback?error=account_deleted');
+      }
+      userId = row.user_id;
+      await client.query(
+        `UPDATE oauth_identities SET last_used_at = NOW()
+         WHERE provider = $1 AND provider_user_id = $2`,
+        [provider, providerUserId]
+      );
+    } else {
+      // New identity — check if email matches an existing Inter account
+      const existingRes = await client.query(
+        `SELECT id, deleted_at FROM users
+         WHERE lower(email) = $1 AND deleted_at IS NULL`,
+        [providerEmail]
+      );
+
+      if (existingRes.rows.length > 0) {
+        // Auto-link: provider asserted email_verified (checked above)
+        userId = existingRes.rows[0].id;
+        isNewLink = true;
+      } else {
+        // Create new user — password_hash is empty (OAuth-only account)
+        const newUserRes = await client.query(
+          `INSERT INTO users (email, password_hash, display_name, email_verified_at, tier)
+           VALUES ($1, '', $2, NOW(), 'free')
+           RETURNING id`,
+          [providerEmail, displayName]
+        );
+        userId = newUserRes.rows[0].id;
+        isNewUser = true;
+      }
+
+      await client.query(
+        `INSERT INTO oauth_identities (user_id, provider, provider_user_id, provider_email, last_used_at)
+         VALUES ($1, $2, $3, $4, NOW())`,
+        [userId, provider, providerUserId, providerEmail]
+      );
+    }
+
+    // Store one-time handoff code (30s TTL)
+    // Tokens are NOT issued here — only the exchange endpoint issues tokens.
+    // This avoids orphaned refresh token rows in the DB.
+    const rawCode = crypto.randomBytes(32);
+    const codeHash = crypto.createHash('sha256').update(rawCode).digest();
+    await client.query(
+      `INSERT INTO pending_oauth_handoffs (code_hash, user_id, expires_at)
+       VALUES ($1, $2, NOW() + make_interval(secs => $3))`,
+      [codeHash, userId, HANDOFF_TTL]
+    );
+
+    await client.query('COMMIT');
+
+    // Audit + security notifications (fire-and-forget, after commit)
+    const eventType = isNewUser ? 'oauth_register' : (isNewLink ? 'oauth_account_linked' : 'oauth_login');
+    auth.auditLog(userId, eventType, req.ip, { provider });
+
+    if (isNewLink) {
+      sendSecurityAlertEmail(providerEmail, 'oauth_account_linked', {
+        provider,
+        linkedAt: new Date().toUTCString(),
+      }).catch(err => console.error('[OAuth] Security alert email failed:', err.message));
+    }
+
+    // Redirect to Mac app with handoff code (NOT the actual tokens)
+    const handoffCode = rawCode.toString('base64url');
+    res.redirect(`com-inter-app://oauth-callback?code=${encodeURIComponent(handoffCode)}`);
+
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error('[OAuth] DB error during account resolution:', err);
+    res.redirect('com-inter-app://oauth-callback?error=server_error');
+  } finally {
+    client.release();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// POST /auth/oauth/exchange — redeem handoff code for tokens (one-time use)
+// ---------------------------------------------------------------------------
+app.post('/auth/oauth/exchange', rateLimitAuth, async (req, res, next) => {
+  const { code } = req.body;
+  if (!code || typeof code !== 'string') {
+    return res.status(400).json({ error: 'Missing code' });
+  }
+
+  let rawBytes;
+  try {
+    rawBytes = Buffer.from(code, 'base64url');
+    if (rawBytes.length !== 32) throw new Error('bad length');
+  } catch {
+    return res.status(400).json({ error: 'Invalid code format' });
+  }
+
+  const codeHash = crypto.createHash('sha256').update(rawBytes).digest();
+
+  const client = await db.getClient();
+  try {
+    await client.query('BEGIN');
+
+    // Atomically mark used — prevents double redemption
+    const result = await client.query(
+      `UPDATE pending_oauth_handoffs
+       SET used_at = NOW()
+       WHERE code_hash = $1
+         AND used_at IS NULL
+         AND expires_at > NOW()
+       RETURNING user_id`,
+      [codeHash]
+    );
+
+    if (result.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(401).json({ code: 'INVALID_OR_EXPIRED_CODE' });
+    }
+
+    const { user_id: userId } = result.rows[0];
+
+    const userRes = await client.query(
+      `SELECT id, email, display_name, tier FROM users WHERE id = $1 AND deleted_at IS NULL`,
+      [userId]
+    );
+    if (userRes.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(401).json({ code: 'USER_NOT_FOUND' });
+    }
+    const user = userRes.rows[0];
+
+    // Issue fresh token pair
+    const clientId = `oauth_exchange_${Date.now()}`;
+    const { rawToken: refreshToken, familyId } = await auth.issueRefreshToken(userId, clientId, client);
+    const accessToken = auth.generateAccessToken(user, familyId);
+
+    await client.query('COMMIT');
+
+    auth.auditLog(userId, 'oauth_exchange', req.ip);
+
+    res.json({
+      accessToken,
+      refreshToken,
+      expiresIn: auth.parseTTLtoSeconds(process.env.ACCESS_TOKEN_TTL || '15m'),
+      user: {
+        id:          userId,
+        email:       user.email,
+        displayName: user.display_name,
+        tier:        user.tier,
+      },
+    });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    next(err);
+  } finally {
+    client.release();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// POST /auth/oauth/create-handoff — create a handoff code for an authenticated
+// user (used by the login page's email/password form to redirect to the Mac app)
+// ---------------------------------------------------------------------------
+app.post('/auth/oauth/create-handoff', auth.requireAuth, async (req, res, next) => {
+  const userId = req.user.userId;
+  try {
+    const rawCode = crypto.randomBytes(32);
+    const codeHash = crypto.createHash('sha256').update(rawCode).digest();
+    await db.query(
+      `INSERT INTO pending_oauth_handoffs (code_hash, user_id, expires_at)
+       VALUES ($1, $2, NOW() + make_interval(secs => $3))`,
+      [codeHash, userId, HANDOFF_TTL]
+    );
+    res.json({ code: rawCode.toString('base64url') });
+  } catch (err) {
+    next(err);
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -528,7 +1611,7 @@ async function rateLimitBilling(req, res, next) {
 // Billing endpoints — Phase C (Lemon Squeezy)
 // ---------------------------------------------------------------------------
 const jwt = require('jsonwebtoken');
-const { createCheckout, getCustomer, lemonSqueezySetup } = require('@lemonsqueezy/lemonsqueezy.js');
+const { createCheckout, getCustomer, lemonSqueezySetup, cancelSubscription } = require('@lemonsqueezy/lemonsqueezy.js');
 const { VARIANT_ID_TO_TIER } = require('./billing');
 const { BILLING_PLANS, renderPricingPage, renderErrorPage } = require('./billing-page');
 
@@ -648,6 +1731,17 @@ app.get('/billing/success', (_req, res) => {
 </html>`);
 });
 
+// ---------------------------------------------------------------------------
+// GET /billing/public-plans-url — Return the public (unauthenticated) pricing
+// page URL.  No auth required.  The native app calls this instead of
+// hardcoding the path, so the server controls the canonical URL.
+// ---------------------------------------------------------------------------
+app.get('/billing/public-plans-url', (req, res) => {
+  const baseUrl = process.env.BILLING_PAGE_BASE_URL ||
+    `http://localhost:${PORT}`;
+  res.json({ url: `${baseUrl}/billing/plans` });
+});
+
 // GET /billing/plans-token — Issue a short-lived page JWT; return the plans URL.
 // The app opens this URL in the default browser. Token encodes userId + tier so
 // the plans page can render the correct current-plan state without another DB hit.
@@ -679,14 +1773,31 @@ app.get('/billing/plans-token', auth.requireAuth, rateLimitBilling, async (req, 
 
 // GET /billing/plans — Render the pricing page (no JS, pure HTML + form POSTs).
 // Validates the short-lived page JWT issued by /billing/plans-token above.
+// Also serves a public (unauthenticated) view if no token is provided —
+// upgrade buttons are disabled with a "Sign in first" prompt.
 // CSP: script-src 'none' — zero client-side JavaScript.
 app.get('/billing/plans', async (req, res) => {
   const token = req.query.t;
+
+  // --- Unauthenticated visit (no token) — render public read-only page ---
   if (!token || typeof token !== 'string') {
+    const csp = [
+      "default-src 'none'",
+      "style-src 'unsafe-inline'",
+      "script-src 'none'",
+      "form-action 'none'",
+      "frame-ancestors 'none'",
+      "base-uri 'none'",
+    ].join('; ');
+
     res.setHeader('Content-Type', 'text/html; charset=utf-8');
-    return res.status(400).send(renderErrorPage('Missing or invalid page token. Please reopen Inter and try again.'));
+    res.setHeader('Content-Security-Policy', csp);
+    res.setHeader('X-Frame-Options', 'DENY');
+    res.setHeader('Cache-Control', 'no-store');
+    return res.send(renderPricingPage(BILLING_PLANS, null, null));
   }
 
+  // --- Authenticated visit (valid token) — full interactive page ---
   let payload;
   try {
     payload = jwt.verify(token, process.env.JWT_SECRET, {

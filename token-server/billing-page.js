@@ -85,6 +85,7 @@ const TIER_ORDER = { free: 0, pro: 1, 'pro+': 2 };
 // renderPricingPage
 // ---------------------------------------------------------------------------
 function renderPricingPage(plans, currentTier, token) {
+  const isAuthenticated = !!token;
   const tierOrder = TIER_ORDER[currentTier] ?? 0;
 
   const formatPrice = (price, currency) => {
@@ -105,6 +106,17 @@ function renderPricingPage(plans, currentTier, token) {
   const renderButton = (plan) => {
     const planOrder = TIER_ORDER[plan.tier] ?? 0;
 
+    // Free tier has no upgrade button (it has no variantId)
+    if (!plan.variantId) {
+      return ``;
+    }
+
+    // Unauthenticated visitor — show disabled prompt button
+    if (!isAuthenticated) {
+      const label = plan.tier === 'pro+' ? 'Get Pro+' : `Get ${escHtml(plan.name)}`;
+      return `<button class="btn btn-signin" disabled>${label} — Sign in first</button>`;
+    }
+
     // Current plan
     if (plan.tier === currentTier) {
       return `<button class="btn btn-current" disabled>Current Plan</button>`;
@@ -112,11 +124,6 @@ function renderPricingPage(plans, currentTier, token) {
 
     // Downgrade path — no button per design spec
     if (planOrder < tierOrder) {
-      return ``;
-    }
-
-    // Free tier has no upgrade button (it has no variantId)
-    if (!plan.variantId) {
       return ``;
     }
 
@@ -159,6 +166,9 @@ function renderPricingPage(plans, currentTier, token) {
   }).join('\n');
 
   const currentPlanName = plans.find(p => p.tier === currentTier)?.name ?? 'Free';
+  const subtitleHtml = isAuthenticated
+    ? `You are currently on the <strong>${escHtml(currentPlanName)}</strong> plan.`
+    : `Sign in from the Inter app to purchase a plan.`;
 
   return `<!DOCTYPE html>
 <html lang="en">
@@ -307,6 +317,12 @@ function renderPricingPage(plans, currentTier, token) {
       cursor: default;
     }
 
+    .btn-signin {
+      background: #2a2a2a;
+      color: #888;
+      cursor: default;
+    }
+
     form { width: 100%; }
 
     .footer {
@@ -323,7 +339,7 @@ function renderPricingPage(plans, currentTier, token) {
 </head>
 <body>
   <h1>Choose Your Plan</h1>
-  <p class="subtitle">You are currently on the <strong>${escHtml(currentPlanName)}</strong> plan.</p>
+  <p class="subtitle">${subtitleHtml}</p>
 
   <div class="plans">
     ${cards}

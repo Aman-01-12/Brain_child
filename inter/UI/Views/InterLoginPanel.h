@@ -18,6 +18,11 @@ NS_ASSUME_NONNULL_BEGIN
                        password:(NSString *)password
                     displayName:(NSString *)displayName;
 
+@optional
+/// User tapped a social sign-in button (e.g. "google", "microsoft").
+- (void)loginPanel:(InterLoginPanel *)panel
+    didRequestOAuthWithProvider:(NSString *)provider;
+
 @end
 
 /// Self-contained login/register panel.

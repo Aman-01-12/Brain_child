@@ -18,6 +18,7 @@
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
+const https = require('https');
 const db = require('./db');
 
 // ---------------------------------------------------------------------------
@@ -41,6 +42,7 @@ if (!REFRESH_TOKEN_SECRET || Buffer.from(REFRESH_TOKEN_SECRET, 'utf8').length < 
 
 const ACCESS_TOKEN_TTL   = process.env.ACCESS_TOKEN_TTL || '15m';
 const REFRESH_TOKEN_DAYS = parseInt(process.env.REFRESH_TOKEN_TTL_DAYS || '30', 10);
+const ABSOLUTE_SESSION_TTL_DAYS = parseInt(process.env.ABSOLUTE_SESSION_TTL_DAYS || '30', 10);
 const BCRYPT_ROUNDS = 12;
 
 // ---------------------------------------------------------------------------
@@ -52,6 +54,63 @@ const BCRYPT_ROUNDS = 12;
 // startup, unacceptable in a request path.
 // ---------------------------------------------------------------------------
 const DUMMY_HASH = bcrypt.hashSync('inter-dummy-constant-do-not-change', BCRYPT_ROUNDS);
+
+// ---------------------------------------------------------------------------
+// isPwnedPassword(password) → boolean
+//
+// Checks against the HaveIBeenPwned breach corpus using k-anonymity.
+// Only the first 5 hex chars of the SHA-1 hash leave the server.
+// NIST SP 800-63B §5.1.1.2 — REQUIRED before accepting a password.
+// Throws on network error — caller decides whether to block or warn.
+// ---------------------------------------------------------------------------
+async function isPwnedPassword(password) {
+  const sha1   = crypto.createHash('sha1').update(password).digest('hex').toUpperCase();
+  const prefix = sha1.slice(0, 5);
+  const suffix = sha1.slice(5);
+
+  return new Promise((resolve, reject) => {
+    const req = https.get(
+      `https://api.pwnedpasswords.com/range/${prefix}`,
+      { headers: { 'Add-Padding': 'true' } },
+      (res) => {
+        let data = '';
+        res.on('data', chunk => { data += chunk; });
+        res.on('end', () => {
+          if (res.statusCode !== 200) {
+            return reject(new Error(`HIBP API returned status ${res.statusCode}: ${data.slice(0, 200)}`));
+          }
+          const found = data.split('\r\n').some(line => {
+            const [hashSuffix] = line.split(':');
+            return hashSuffix === suffix;
+          });
+          resolve(found);
+        });
+      }
+    );
+    req.on('error', reject);
+    req.setTimeout(3000, () => { req.destroy(); reject(new Error('HIBP timeout')); });
+  });
+}
+
+// ---------------------------------------------------------------------------
+// checkPwnedPassword(password) — soft-fail wrapper around isPwnedPassword.
+// Logs warnings on network failure but never crashes the caller.
+// ---------------------------------------------------------------------------
+async function checkPwnedPassword(password) {
+  try {
+    const pwned = await isPwnedPassword(password);
+    if (pwned) {
+      throw Object.assign(
+        new Error('This password has appeared in a data breach. Please choose a different password.'),
+        { status: 400, code: 'PASSWORD_PWNED' }
+      );
+    }
+  } catch (err) {
+    if (err.code === 'PASSWORD_PWNED') throw err;
+    // Network error — log and allow (don't block registration on HIBP outage)
+    console.warn('[auth] HIBP check failed:', err.message);
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Parse TTL string (e.g. '15m', '1h', '7d') to seconds for client-side scheduling.
@@ -151,9 +210,9 @@ async function issueRefreshToken(userId, clientId, dbClient) {
   const familyId  = crypto.randomUUID();
 
   await dbClient.query(
-    `INSERT INTO refresh_tokens (user_id, token_hash, family_id, client_id, expires_at)
-     VALUES ($1, $2, $3, $4, NOW() + make_interval(days => $5))`,
-    [userId, tokenHash, familyId, clientId || null, REFRESH_TOKEN_DAYS]
+    `INSERT INTO refresh_tokens (user_id, token_hash, family_id, client_id, expires_at, absolute_expires_at)
+     VALUES ($1, $2, $3, $4, NOW() + make_interval(days => $5), NOW() + make_interval(days => $6))`,
+    [userId, tokenHash, familyId, clientId || null, REFRESH_TOKEN_DAYS, ABSOLUTE_SESSION_TTL_DAYS]
   );
 
   return { rawToken: clientToken, familyId };
@@ -203,6 +262,9 @@ async function register(email, password, displayName) {
   }
 
   const emailNormalized = emailStr;
+
+  // NIST SP 800-63B §5.1.1.2 — check against breach corpus
+  await checkPwnedPassword(password);
 
   // Check if email already exists
   const existing = await db.query('SELECT id FROM users WHERE email = $1', [emailNormalized]);
@@ -468,6 +530,92 @@ function requireTier(minTier) {
   };
 }
 
+// ---------------------------------------------------------------------------
+// resetPassword(token, newPassword) → void
+//
+// Core logic for both JSON and web-form password reset routes.
+// Validates the token, updates the password, and revokes all refresh tokens
+// in a single transaction. Throws on invalid/expired token or bad password.
+// ---------------------------------------------------------------------------
+async function resetPassword(token, newPassword) {
+  if (!token || !newPassword) {
+    throw Object.assign(new Error('token and newPassword are required'), { status: 400 });
+  }
+
+  const passwordBytes = Buffer.byteLength(String(newPassword), 'utf8');
+  if (passwordBytes < 8 || passwordBytes > 72) {
+    throw Object.assign(new Error('Password must be 8-72 characters'), { status: 400 });
+  }
+
+  // NIST SP 800-63B §5.1.1.2 — check against breach corpus
+  await checkPwnedPassword(newPassword);
+
+  const tokenHash = crypto.createHash('sha256')
+    .update(Buffer.from(token, 'base64url'))
+    .digest();
+
+  // Compute bcrypt hash BEFORE opening the transaction — bcrypt is CPU-bound
+  // (~300 ms) and would hold the DB connection/transaction lock unnecessarily.
+  const newHash = await bcrypt.hash(newPassword, BCRYPT_ROUNDS);
+
+  const dbClient = await db.getClient();
+  try {
+    await dbClient.query('BEGIN');
+
+    const result = await dbClient.query(
+      `SELECT id, user_id FROM password_reset_tokens
+       WHERE token_hash = $1 AND used_at IS NULL AND expires_at > NOW()`,
+      [tokenHash]
+    );
+
+    if (result.rows.length === 0) {
+      throw Object.assign(new Error('Invalid or expired reset token'), { status: 400 });
+    }
+
+    const { id: tokenId, user_id: userId } = result.rows[0];
+
+    await dbClient.query(
+      'UPDATE password_reset_tokens SET used_at = NOW() WHERE id = $1',
+      [tokenId]
+    );
+    await dbClient.query(
+      'UPDATE users SET password_hash = $1 WHERE id = $2',
+      [newHash, userId]
+    );
+    await dbClient.query(
+      `UPDATE refresh_tokens SET revoked_at = NOW()
+       WHERE user_id = $1 AND revoked_at IS NULL`,
+      [userId]
+    );
+
+    await dbClient.query('COMMIT');
+    return userId;
+  } catch (err) {
+    await dbClient.query('ROLLBACK');
+    throw err;
+  } finally {
+    dbClient.release();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// auditLog(userId, eventType, ipAddress, metadata) → void
+//
+// Writes to audit_events table. Must NEVER crash auth flows — all DB errors
+// are caught and logged to console.error as a fallback.
+// ---------------------------------------------------------------------------
+async function auditLog(userId, eventType, ipAddress, metadata = {}) {
+  try {
+    await db.query(
+      `INSERT INTO audit_events (user_id, event_type, ip_address, metadata)
+       VALUES ($1, $2, $3::inet, $4)`,
+      [userId || null, eventType, ipAddress || null, JSON.stringify(metadata)]
+    );
+  } catch (err) {
+    console.error('[audit] log write failed:', err.message);
+  }
+}
+
 module.exports = {
   register,
   login,
@@ -479,6 +627,10 @@ module.exports = {
   verifyRefreshToken,
   issueRefreshToken,
   revokeAllForUser,
+  resetPassword,
+  auditLog,
+  checkPwnedPassword,
   parseTTLtoSeconds,
   REFRESH_TOKEN_DAYS,
+  BCRYPT_ROUNDS,
 };

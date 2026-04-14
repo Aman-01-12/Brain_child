@@ -473,8 +473,93 @@ private struct TokenCacheEntry {
     /// Whether the user is authenticated.
     @objc public private(set) var isAuthenticated: Bool = false
 
+    // MARK: - Public URL Resolution (no auth required)
+
+    /// Ask the server for the public (unauthenticated) billing plans page URL.
+    /// The server owns the canonical URL — the app never constructs it.
+    @objc public func requestPublicPlansURL(
+        completion: @escaping (_ url: String?) -> Void
+    ) {
+        guard let serverURL = authServerBaseURL else {
+            interLogError(InterLog.networking, "Public plans URL skipped — no server URL")
+            completeOnMain { completion(nil) }
+            return
+        }
+
+        performAuthHTTPRequest(
+            url: "\(serverURL)/billing/public-plans-url",
+            method: "GET",
+            body: nil,
+            bearerToken: nil,
+            retryCount: 0
+        ) { [weak self] data, httpResponse, error in
+            guard let self = self else {
+                DispatchQueue.main.async { completion(nil) }
+                return
+            }
+            guard error == nil,
+                  let httpResponse = httpResponse,
+                  httpResponse.statusCode == 200,
+                  let data = data,
+                  let json = self.parseJSON(data),
+                  let url = json["url"] as? String else {
+                interLogError(InterLog.networking, "Public plans URL request failed (HTTP %d)",
+                              httpResponse?.statusCode ?? 0)
+                self.completeOnMain { completion(nil) }
+                return
+            }
+            self.completeOnMain { completion(url) }
+        }
+    }
+
+    /// Ask the server for the OAuth start URL for the given provider.
+    /// The server owns the canonical URL — the app never constructs it.
+    @objc public func requestOAuthStartURL(
+        provider: String,
+        completion: @escaping (_ url: String?) -> Void
+    ) {
+        guard let serverURL = authServerBaseURL else {
+            interLogError(InterLog.networking, "OAuth start URL skipped — no server URL")
+            completeOnMain { completion(nil) }
+            return
+        }
+
+        guard let encodedProvider = provider.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) else {
+            completeOnMain { completion(nil) }
+            return
+        }
+
+        performAuthHTTPRequest(
+            url: "\(serverURL)/auth/oauth/start-url?provider=\(encodedProvider)",
+            method: "GET",
+            body: nil,
+            bearerToken: nil,
+            retryCount: 0
+        ) { [weak self] data, httpResponse, error in
+            guard let self = self else {
+                DispatchQueue.main.async { completion(nil) }
+                return
+            }
+            guard error == nil,
+                  let httpResponse = httpResponse,
+                  httpResponse.statusCode == 200,
+                  let data = data,
+                  let json = self.parseJSON(data),
+                  let url = json["url"] as? String else {
+                interLogError(InterLog.networking, "OAuth start URL request failed (HTTP %d)",
+                              httpResponse?.statusCode ?? 0)
+                self.completeOnMain { completion(nil) }
+                return
+            }
+            self.completeOnMain { completion(url) }
+        }
+    }
+
     /// Base URL of the token server for auth operations.
     private var authServerBaseURL: String?
+
+    /// Public read-only accessor for the current auth server base URL (ObjC-accessible).
+    @objc public var serverURL: String? { authServerBaseURL }
 
     /// Timer for proactive access token refresh.
     private var refreshTimer: Timer?
@@ -837,6 +922,53 @@ private struct TokenCacheEntry {
         }
     }
 
+    /// Exchange an OAuth handoff code for auth tokens.
+    ///
+    /// Called after `ASWebAuthenticationSession` completes. The one-time code
+    /// was issued by the server's OAuth callback and is redeemed at
+    /// `POST /auth/oauth/exchange`. The response format matches login/register.
+    @objc public func exchangeOAuthCode(_ code: String,
+                                        completion: @escaping (Bool, NSError?) -> Void) {
+        let baseURL = authServerBaseURL
+            ?? UserDefaults.standard.string(forKey: "InterDefaultTokenServerURL")
+            ?? "http://localhost:3000"
+
+        let body: [String: Any] = ["code": code]
+
+        interLogInfo(InterLog.networking, "Auth: exchanging OAuth handoff code")
+
+        performAuthHTTPRequest(url: "\(baseURL)/auth/oauth/exchange", method: "POST",
+                               body: body, bearerToken: nil, retryCount: 0) { [weak self] data, httpResponse, error in
+            guard let self = self else { return }
+
+            if let error = error {
+                self.completeOnMain { completion(false, error) }
+                return
+            }
+
+            guard let httpResponse = httpResponse, let data = data else {
+                self.completeOnMain {
+                    completion(false, InterNetworkErrorCode.authFailed.error(message: "No response"))
+                }
+                return
+            }
+
+            if httpResponse.statusCode == 200, let authResponse = self.parseAuthResponse(data, serverURL: baseURL) {
+                interLogInfo(InterLog.networking, "Auth: OAuth exchange successful")
+                self.completeOnMain {
+                    self.authDelegate?.authSessionDidAuthenticate(userId: authResponse.userId, tier: authResponse.tier)
+                    completion(true, nil)
+                }
+            } else {
+                let parsed = self.parseJSON(data)
+                let message = parsed?["error"] as? String ?? "OAuth exchange failed (\(httpResponse.statusCode))"
+                let nsError = InterNetworkErrorCode.authFailed.error(message: message)
+                interLogError(InterLog.networking, "Auth: OAuth exchange failed (%{public}d)", httpResponse.statusCode)
+                self.completeOnMain { completion(false, nsError) }
+            }
+        }
+    }
+
     /// Silently refresh the access token using the stored refresh token.
     ///
     /// Calls `POST /auth/refresh`. Rotates the refresh token in Keychain.
@@ -1000,6 +1132,10 @@ private struct TokenCacheEntry {
     /// Reads userId from UserDefaults and refresh token from Keychain.
     /// If both exist, calls `refreshAccessToken` to obtain a fresh access token.
     @objc public func attemptSessionRestore(serverURL: String, completion: @escaping (Bool) -> Void) {
+        // Always store the server URL so billing/plans and other public
+        // endpoints are reachable even when no session exists.
+        self.authServerBaseURL = serverURL
+
         guard let userId = UserDefaults.standard.string(forKey: Self.userIdDefaultsKey),
               loadRefreshToken() != nil else {
             interLogInfo(InterLog.networking, "Auth: no stored session to restore")
@@ -1008,7 +1144,6 @@ private struct TokenCacheEntry {
         }
 
         self.currentUserId = userId
-        self.authServerBaseURL = serverURL
 
         refreshAccessToken { [weak self] success in
             if !success {

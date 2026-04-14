@@ -23,13 +23,14 @@
 #import "InterRecordingIndicatorView.h"
 
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
+#import <AuthenticationServices/AuthenticationServices.h>
 
 // [2.5.1] Swift module import for networking layer
 #if __has_include("inter-Swift.h")
 #import "inter-Swift.h"
 #endif
 
-@interface AppDelegate () <NSWindowDelegate, InterConnectionSetupPanelDelegate, InterLoginPanelDelegate, InterAuthSessionDelegate, InterParticipantOverlayDelegate, InterChatPanelDelegate, InterSpeakerQueuePanelDelegate, InterPollPanelDelegate, InterQAPanelDelegate, InterMediaWiringDelegate, InterModerationDelegate, InterLobbyPanelDelegate, InterRecordingCoordinatorDelegate, InterRecordingSignalDelegate>
+@interface AppDelegate () <NSWindowDelegate, InterConnectionSetupPanelDelegate, InterLoginPanelDelegate, InterAuthSessionDelegate, InterParticipantOverlayDelegate, InterChatPanelDelegate, InterSpeakerQueuePanelDelegate, InterPollPanelDelegate, InterQAPanelDelegate, InterMediaWiringDelegate, InterModerationDelegate, InterLobbyPanelDelegate, InterRecordingCoordinatorDelegate, InterRecordingSignalDelegate, ASWebAuthenticationPresentationContextProviding>
 @property (nonatomic, strong) NSMutableArray<CapWindow *> *capWindows;
 @property (nonatomic, strong) SecureWindowController *secureController;
 @property (nonatomic, strong) NSWindow *setupWindow;
@@ -91,12 +92,27 @@
 @property (nonatomic, strong, nullable) NSWindow *loginWindow;
 @property (nonatomic, strong, nullable) InterLoginPanel *loginPanel;
 
+// Container view for auth-dependent controls (Sign In/Out, Settings, Billing)
+// on the setup screen. Rebuilt in-place when auth state changes without
+// tearing down the setup window or losing the connection panel’s field values.
+@property (nonatomic, strong, nullable) NSView *setupChromeView;
+
 // Billing — upgrade/manage buttons on setup overlay
 @property (nonatomic, strong, nullable) NSButton *upgradeButton;
 @property (nonatomic, strong, nullable) NSButton *manageSubscriptionButton;
 @property (nonatomic, strong, nullable) NSTextField *billingStatusLabel;
 @property (nonatomic, assign) BOOL isBillingPollInProgress;
 @property (nonatomic, assign) NSUInteger billingPollGeneration;
+
+// [G3] Idle timeout — reauthentication after 30 min inactivity
+@property (nonatomic, strong, nullable) NSDate *lastUserActivityAt;
+@property (nonatomic, strong, nullable) NSTimer *idleCheckTimer;
+@property (nonatomic, assign) BOOL isIdleLocked;
+@property (nonatomic, strong, nullable) id globalEventMonitor;
+@property (nonatomic, strong, nullable) id localEventMonitor;
+
+// [Phase F] OAuth — ASWebAuthenticationSession retained during flow
+@property (nonatomic, strong, nullable) ASWebAuthenticationSession *oauthSession;
 
 @end
 
@@ -200,17 +216,20 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
             if (!strongSelf) { return; }
             if (restored) {
                 NSLog(@"[Auth] Session restored — tier=%@", strongSelf.roomController.tokenService.currentTier ?: @"unknown");
-                [strongSelf launchSetupUI];
-                [strongSelf preflightMediaPermissions];
             } else {
-                [strongSelf showLoginWindow];
+                NSLog(@"[Auth] No saved session — launching in unauthenticated mode");
             }
+            [strongSelf launchSetupUI];
+            [strongSelf preflightMediaPermissions];
         }];
     } else {
         // No room controller (local-only) — skip auth, launch directly
         [self launchSetupUI];
         [self preflightMediaPermissions];
     }
+
+    // [G3] Idle timeout — track user activity for reauthentication prompt
+    [self setupIdleTimeout];
 }
 
 - (InterCallMode)currentCallMode {
@@ -271,6 +290,18 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
                                                         name:NSWindowDidExitFullScreenNotification
                                                       object:self.fullScreenExitPendingWindow];
         self.fullScreenExitPendingWindow = nil;
+    }
+
+    // [G3] Stop idle check timer and remove event monitors
+    [self.idleCheckTimer invalidate];
+    self.idleCheckTimer = nil;
+    if (self.globalEventMonitor) {
+        [NSEvent removeMonitor:self.globalEventMonitor];
+        self.globalEventMonitor = nil;
+    }
+    if (self.localEventMonitor) {
+        [NSEvent removeMonitor:self.localEventMonitor];
+        self.localEventMonitor = nil;
     }
 }
 
@@ -521,7 +552,9 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
     overlayView.layer.backgroundColor = NSColor.clearColor.CGColor;
     [containerView addSubview:overlayView];
 
-    // [3.1.1] Connection setup panel — server URLs, display name, room code, action buttons
+    // [3.1.1] Connection setup panel — server URLs, display name, room code, action buttons.
+    // The panel is created once and survives auth state changes. Only the chrome
+    // (Sign In/Out, Settings, Billing) around it is rebuilt.
     CGFloat panelW = 420.0;
     CGFloat panelH = 480.0;
     CGFloat panelX = (containerView.bounds.size.width - panelW) / 2.0;
@@ -531,45 +564,98 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
     self.connectionPanel.delegate = self;
     [overlayView addSubview:self.connectionPanel];
 
-    // Row 1: Sign Out (left) | Settings (right)
-    NSButton *signOutButton = [[NSButton alloc] initWithFrame:NSMakeRect(panelX, panelY + panelH + 8, 100, 26)];
-    signOutButton.autoresizingMask = NSViewMaxXMargin | NSViewMinYMargin;
-    [signOutButton setTitle:@"Sign Out"];
-    [signOutButton setTarget:self];
-    [signOutButton setAction:@selector(handleLogout)];
-    [overlayView addSubview:signOutButton];
+    [self buildSetupChromeInOverlay:overlayView];
+}
 
-    NSButton *settingsButton = [[NSButton alloc] initWithFrame:NSMakeRect(panelX + panelW - 112, panelY + panelH + 8, 112, 26)];
-    settingsButton.autoresizingMask = NSViewMinXMargin | NSViewMinYMargin;
-    [settingsButton setTitle:@"Settings"];
-    [settingsButton setTarget:self];
-    [settingsButton setAction:@selector(openSettingsWindow)];
-    [overlayView addSubview:settingsButton];
+/// Build (or rebuild) the auth-dependent controls that surround the connection panel.
+///
+/// Layout varies by auth state:
+/// - Unauthenticated: "Sign In / Sign Up" (right), Settings (left — gated),
+///   Billing (center — gated), billingStatusLabel.
+/// - Authenticated: "Sign Out" (left), Settings (right), Billing (functional),
+///   billingStatusLabel.
+///
+/// This method removes any existing chrome view before building a new one,
+/// preserving the connection panel and its field values.
+- (void)buildSetupChromeInOverlay:(NSView *)overlayView {
+    // Remove previous chrome controls — everything except the connection panel.
+    for (NSView *sub in [overlayView.subviews copy]) {
+        if (sub != self.connectionPanel) {
+            [sub removeFromSuperview];
+        }
+    }
+    self.upgradeButton = nil;
+    self.manageSubscriptionButton = nil;
+    self.billingStatusLabel = nil;
 
-    // Row 2: Billing buttons (centered)
-    NSString *currentTier = self.roomController.tokenService.currentTier ?: @"free";
-    BOOL isPaid = ([currentTier isEqualToString:@"pro"] || [currentTier isEqualToString:@"pro+"]);
-    NSLog(@"[Billing UI] Setting up buttons — currentTier=%@ isPaid=%@", currentTier, isPaid ? @"YES" : @"NO");
+    CGFloat panelW = 420.0;
+    CGFloat panelH = 480.0;
+    CGFloat panelX = (overlayView.bounds.size.width - panelW) / 2.0;
+    CGFloat panelY = (overlayView.bounds.size.height - panelH) / 2.0;
 
+    BOOL isAuth = self.roomController.tokenService.isAuthenticated;
+
+    // Row 1: Left button + Right button (positioned above the connection panel)
+    if (isAuth) {
+        NSButton *signOutButton = [[NSButton alloc] initWithFrame:NSMakeRect(panelX, panelY + panelH + 8, 100, 26)];
+        signOutButton.autoresizingMask = NSViewMaxXMargin | NSViewMinYMargin;
+        [signOutButton setTitle:@"Sign Out"];
+        [signOutButton setTarget:self];
+        [signOutButton setAction:@selector(handleLogout)];
+        [overlayView addSubview:signOutButton];
+
+        NSButton *settingsButton = [[NSButton alloc] initWithFrame:NSMakeRect(panelX + panelW - 112, panelY + panelH + 8, 112, 26)];
+        settingsButton.autoresizingMask = NSViewMinXMargin | NSViewMinYMargin;
+        [settingsButton setTitle:@"Settings"];
+        [settingsButton setTarget:self];
+        [settingsButton setAction:@selector(openSettingsWindow)];
+        [overlayView addSubview:settingsButton];
+    } else {
+        NSButton *settingsButton = [[NSButton alloc] initWithFrame:NSMakeRect(panelX, panelY + panelH + 8, 112, 26)];
+        settingsButton.autoresizingMask = NSViewMaxXMargin | NSViewMinYMargin;
+        [settingsButton setTitle:@"Settings"];
+        [settingsButton setTarget:self];
+        [settingsButton setAction:@selector(handleSettingsRequiresAuth)];
+        [overlayView addSubview:settingsButton];
+
+        NSButton *signInButton = [[NSButton alloc] initWithFrame:NSMakeRect(panelX + panelW - 140, panelY + panelH + 8, 140, 26)];
+        signInButton.autoresizingMask = NSViewMinXMargin | NSViewMinYMargin;
+        [signInButton setTitle:@"Sign In / Sign Up"];
+        [signInButton setTarget:self];
+        [signInButton setAction:@selector(handleSignIn)];
+        [overlayView addSubview:signInButton];
+    }
+
+    // Row 2: Billing buttons (centered, above row 1)
     CGFloat billingY = panelY + panelH + 42;
 
-    if (!isPaid) {
-        // Free users: show "View Plans" to browse and subscribe
+    if (isAuth) {
+        NSString *currentTier = self.roomController.tokenService.currentTier ?: @"free";
+        BOOL isPaid = ([currentTier isEqualToString:@"pro"] || [currentTier isEqualToString:@"pro+"]);
+        NSLog(@"[Billing UI] Setting up buttons — currentTier=%@ isPaid=%@", currentTier, isPaid ? @"YES" : @"NO");
+
+        if (!isPaid) {
+            self.upgradeButton = [[NSButton alloc] initWithFrame:NSMakeRect(panelX + (panelW - 100) / 2.0, billingY, 100, 26)];
+            self.upgradeButton.autoresizingMask = NSViewMinXMargin | NSViewMaxXMargin | NSViewMinYMargin;
+            [self.upgradeButton setTitle:@"View Plans"];
+            [self.upgradeButton setTarget:self];
+            [self.upgradeButton setAction:@selector(handleViewPlans)];
+            [overlayView addSubview:self.upgradeButton];
+        } else {
+            self.manageSubscriptionButton = [[NSButton alloc] initWithFrame:NSMakeRect(panelX + (panelW - 160) / 2.0, billingY, 160, 26)];
+            self.manageSubscriptionButton.autoresizingMask = NSViewMinXMargin | NSViewMaxXMargin | NSViewMinYMargin;
+            [self.manageSubscriptionButton setTitle:@"Manage Subscription"];
+            [self.manageSubscriptionButton setTarget:self];
+            [self.manageSubscriptionButton setAction:@selector(handleManageSubscription)];
+            [overlayView addSubview:self.manageSubscriptionButton];
+        }
+    } else {
         self.upgradeButton = [[NSButton alloc] initWithFrame:NSMakeRect(panelX + (panelW - 100) / 2.0, billingY, 100, 26)];
         self.upgradeButton.autoresizingMask = NSViewMinXMargin | NSViewMaxXMargin | NSViewMinYMargin;
         [self.upgradeButton setTitle:@"View Plans"];
         [self.upgradeButton setTarget:self];
         [self.upgradeButton setAction:@selector(handleViewPlans)];
         [overlayView addSubview:self.upgradeButton];
-    } else {
-        // Paid users: show only "Manage Subscription" — tier changes (upgrade/downgrade)
-        // must go through Lemon Squeezy's portal to avoid duplicate subscriptions.
-        self.manageSubscriptionButton = [[NSButton alloc] initWithFrame:NSMakeRect(panelX + (panelW - 160) / 2.0, billingY, 160, 26)];
-        self.manageSubscriptionButton.autoresizingMask = NSViewMinXMargin | NSViewMaxXMargin | NSViewMinYMargin;
-        [self.manageSubscriptionButton setTitle:@"Manage Subscription"];
-        [self.manageSubscriptionButton setTarget:self];
-        [self.manageSubscriptionButton setAction:@selector(handleManageSubscription)];
-        [overlayView addSubview:self.manageSubscriptionButton];
     }
 
     self.billingStatusLabel = [[NSTextField alloc] initWithFrame:NSMakeRect(panelX, panelY - 28, panelW, 20)];
@@ -585,7 +671,33 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
     [overlayView addSubview:self.billingStatusLabel];
 }
 
+/// Rebuild the auth-dependent chrome (Sign In/Out, Settings, Billing) in-place
+/// without tearing down the setup window or the connection panel.
+- (void)refreshSetupChrome {
+    if (!self.connectionPanel || !self.connectionPanel.superview) {
+        return;
+    }
+    NSView *overlayView = self.connectionPanel.superview;
+    [self buildSetupChromeInOverlay:overlayView];
+}
+
 #pragma mark - Auth Login Window [Phase B.4d]
+
+/// Show the login window so the user can sign in or create an account.
+/// Called from the "Sign In / Sign Up" button on the unauthenticated setup screen.
+- (void)handleSignIn {
+    [self showLoginWindow];
+}
+
+/// Auth-gated action: user tapped Settings while not signed in.
+- (void)handleSettingsRequiresAuth {
+    [self.connectionPanel setStatusText:@"Sign in to access settings."];
+}
+
+/// Auth-gated action: user tapped View Plans while not signed in.
+- (void)handleBillingRequiresAuth {
+    [self.connectionPanel setStatusText:@"Sign in to view plans."];
+}
 
 - (void)handleLogout {
     NSLog(@"[Auth] User requested sign out");
@@ -601,20 +713,27 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
     if (self.roomController) {
         [self.roomController disconnect];
     }
-    InterTeardownSetupWindow(&_setupWindow, &_setupRenderView, &_connectionPanel);
     __weak typeof(self) weakSelf = self;
     if (self.roomController && self.roomController.tokenService) {
         [self.roomController.tokenService logoutWithCompletion:^{
             NSLog(@"[Auth] Signed out");
             dispatch_async(dispatch_get_main_queue(), ^{
-                [weakSelf showLoginWindow];
+                __strong typeof(weakSelf) strongSelf = weakSelf;
+                if (!strongSelf) return;
+                if (strongSelf.setupWindow) {
+                    [strongSelf refreshSetupChrome];
+                } else {
+                    [strongSelf launchSetupUI];
+                }
             });
         }];
     } else {
         NSLog(@"[Auth] Signed out");
-        dispatch_async(dispatch_get_main_queue(), ^{
-            [weakSelf showLoginWindow];
-        });
+        if (self.setupWindow) {
+            [self refreshSetupChrome];
+        } else {
+            [self launchSetupUI];
+        }
     }
 }
 
@@ -625,7 +744,7 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
     }
 
     self.loginWindow =
-    [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 420, 380)
+    [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 420, 500)
                                 styleMask:(NSWindowStyleMaskTitled |
                                            NSWindowStyleMaskClosable)
                                   backing:NSBackingStoreBuffered
@@ -634,14 +753,14 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
     [self.loginWindow setTitle:@"Inter — Sign In"];
     [self.loginWindow setBackgroundColor:[NSColor colorWithWhite:0.1 alpha:1.0]];
     [self.loginWindow setDelegate:self];
-    [self.loginWindow setMinSize:NSMakeSize(420.0, 380.0)];
+    [self.loginWindow setMinSize:NSMakeSize(420.0, 500.0)];
 
     NSView *contentView = self.loginWindow.contentView;
     contentView.wantsLayer = YES;
     contentView.layer.backgroundColor = [NSColor colorWithWhite:0.1 alpha:1.0].CGColor;
 
     CGFloat panelW = 380.0;
-    CGFloat panelH = 340.0;
+    CGFloat panelH = 460.0;
     CGFloat panelX = (contentView.bounds.size.width - panelW) / 2.0;
     CGFloat panelY = (contentView.bounds.size.height - panelH) / 2.0;
 
@@ -692,8 +811,7 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
         }
         NSLog(@"[Auth] Login successful — user=%@ tier=%@", response.userId, response.tier);
         [strongSelf dismissLoginWindow];
-        [strongSelf launchSetupUI];
-        [strongSelf preflightMediaPermissions];
+        [strongSelf refreshSetupChrome];
     }];
 }
 
@@ -727,15 +845,20 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
         }
         NSLog(@"[Auth] Registration successful — user=%@ tier=%@", response.userId, response.tier);
         [strongSelf dismissLoginWindow];
-        [strongSelf launchSetupUI];
-        [strongSelf preflightMediaPermissions];
+        [strongSelf refreshSetupChrome];
     }];
+}
+
+- (void)loginPanel:(InterLoginPanel *)panel
+    didRequestOAuthWithProvider:(NSString *)provider {
+#pragma unused(panel)
+    [self startOAuthSignInWithProvider:provider];
 }
 
 #pragma mark - InterAuthSessionDelegate [Phase B.4d]
 
 - (void)authSessionDidExpire {
-    NSLog(@"[Auth] Session expired — showing login window");
+    NSLog(@"[Auth] Session expired — reverting to unauthenticated setup UI");
     // Clear meeting tier lock before teardown
     [self.roomController.tokenService unlockTierFromMeeting];
     // Tear down any active call session first
@@ -748,8 +871,16 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
     if (self.roomController) {
         [self.roomController disconnect];
     }
-    InterTeardownSetupWindow(&_setupWindow, &_setupRenderView, &_connectionPanel);
-    [self showLoginWindow];
+    // If the setup window is already visible, refresh the chrome in-place.
+    // Otherwise rebuild the full setup window (e.g. session expired while
+    // in a call and the call windows were just torn down above).
+    if (self.setupWindow) {
+        [self refreshSetupChrome];
+        [self.connectionPanel setStatusText:@"Session expired — please sign in again."];
+    } else {
+        [self launchSetupUI];
+        [self.connectionPanel setStatusText:@"Session expired — please sign in again."];
+    }
 }
 
 - (void)authSessionDidAuthenticateWithUserId:(NSString *)userId tier:(NSString *)tier {
@@ -765,34 +896,25 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
 
     // Update billing buttons to reflect the current tier when a proactive
     // token refresh picks up a tier change (e.g. after webhook-driven upgrade).
-    BOOL isPaid = ([tier isEqualToString:@"pro"] || [tier isEqualToString:@"pro+"]);
-    if (isPaid && self.upgradeButton && !self.manageSubscriptionButton) {
-        // Swap "View Plans" → "Manage Subscription" so users upgrade/downgrade
-        // through Lemon Squeezy's portal instead of buying a second subscription.
-        NSView *parent = self.upgradeButton.superview;
-        NSRect frame = self.upgradeButton.frame;
-        if (parent) {
-            [self.upgradeButton removeFromSuperview];
-            self.upgradeButton = nil;
-
-            CGFloat centeredX = frame.origin.x + (frame.size.width - 160) / 2.0;
-            self.manageSubscriptionButton = [[NSButton alloc] initWithFrame:NSMakeRect(centeredX, frame.origin.y, 160, 26)];
-            self.manageSubscriptionButton.autoresizingMask = NSViewMinXMargin | NSViewMaxXMargin | NSViewMinYMargin;
-            [self.manageSubscriptionButton setTitle:@"Manage Subscription"];
-            [self.manageSubscriptionButton setTarget:self];
-            [self.manageSubscriptionButton setAction:@selector(handleManageSubscription)];
-            [parent addSubview:self.manageSubscriptionButton];
-        }
-    }
+    // Rebuild the chrome so all auth-dependent controls reflect the new state.
+    [self refreshSetupChrome];
 }
 
 #pragma mark - InterConnectionSetupPanelDelegate [3.1]
 
 - (void)setupPanelDidRequestHostCall:(InterConnectionSetupPanel *)panel {
+    if (!self.roomController.tokenService.isAuthenticated) {
+        [panel setStatusText:@"Sign in to host a meeting."];
+        return;
+    }
     [self connectAndEnterMode:InterCallModeNormal role:InterInterviewRoleNone panel:panel];
 }
 
 - (void)setupPanelDidRequestHostInterview:(InterConnectionSetupPanel *)panel {
+    if (!self.roomController.tokenService.isAuthenticated) {
+        [panel setStatusText:@"Sign in to host an interview."];
+        return;
+    }
     [self connectAndEnterMode:InterCallModeInterview role:InterInterviewRoleInterviewer panel:panel];
 }
 
@@ -2404,9 +2526,10 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
         return NO;
     }
 
-    // Login window is the landing screen — closing it quits the app.
+    // Login window is a secondary sign-in sheet — closing it returns to the
+    // setup screen (which is always visible underneath).
     if (sender == self.loginWindow) {
-        [NSApp terminate:nil];
+        [self dismissLoginWindow];
         return NO;
     }
 
@@ -2707,9 +2830,49 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
     NSLog(@"[Billing] User requested billing plans page");
     if (!self.roomController.tokenService) {
         NSLog(@"[Billing] tokenService is nil — cannot open plans");
-        self.billingStatusLabel.stringValue = @"Not signed in.";
+        self.billingStatusLabel.stringValue = @"Unable to open plans.";
         return;
     }
+
+    BOOL isAuth = self.roomController.tokenService.isAuthenticated;
+
+    // Unauthenticated: ask the server for the public plans page URL.
+    // The server owns the canonical URL — the app never hardcodes it.
+    if (!isAuth) {
+        if (self.upgradeButton) {
+            [self.upgradeButton setEnabled:NO];
+            [self.upgradeButton setTitle:@"Loading…"];
+        }
+        self.billingStatusLabel.stringValue = @"";
+
+        __weak typeof(self) weakSelf = self;
+        [self.roomController.tokenService requestPublicPlansURLWithCompletion:^(NSString *url) {
+            __strong typeof(weakSelf) strongSelf = weakSelf;
+            if (!strongSelf) { return; }
+
+            dispatch_async(dispatch_get_main_queue(), ^{
+                if (url.length) {
+                    NSURL *plansURL = [NSURL URLWithString:url];
+                    if (plansURL) {
+                        [[NSWorkspace sharedWorkspace] openURL:plansURL];
+                        strongSelf.billingStatusLabel.stringValue = @"Plans page opened in your browser.";
+                    } else {
+                        strongSelf.billingStatusLabel.stringValue = @"Unable to open plans.";
+                    }
+                } else {
+                    strongSelf.billingStatusLabel.stringValue = @"Unable to open plans. Try again.";
+                }
+
+                if (strongSelf.upgradeButton) {
+                    [strongSelf.upgradeButton setEnabled:YES];
+                    [strongSelf.upgradeButton setTitle:@"View Plans"];
+                }
+            });
+        }];
+        return;
+    }
+
+    // Authenticated: request a tokenized URL so the page shows the current plan.
     if (self.upgradeButton) {
         [self.upgradeButton setEnabled:NO];
         [self.upgradeButton setTitle:@"Loading…"];
@@ -2793,6 +2956,221 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
     }];
 }
 
+#pragma mark - Idle Timeout (G3)
+
+static const NSTimeInterval kIdleTimeoutSeconds = 30 * 60; // 30 minutes
+
+- (void)setupIdleTimeout {
+    self.lastUserActivityAt = [NSDate date];
+    self.isIdleLocked = NO;
+
+    // Check every 60 seconds
+    self.idleCheckTimer = [NSTimer scheduledTimerWithTimeInterval:60.0
+                                                          target:self
+                                                        selector:@selector(checkIdleTimeout:)
+                                                        userInfo:nil
+                                                         repeats:YES];
+
+    // Monitor user input events globally
+    __weak typeof(self) weakSelf = self;
+    self.globalEventMonitor = [NSEvent addGlobalMonitorForEventsMatchingMask:(NSEventMaskMouseMoved |
+                                                                               NSEventMaskKeyDown    |
+                                                                               NSEventMaskLeftMouseDown |
+                                                                               NSEventMaskScrollWheel)
+                                                                     handler:^(NSEvent * __unused event) {
+        weakSelf.lastUserActivityAt = [NSDate date];
+    }];
+
+    // Also monitor local events (when our app is frontmost)
+    self.localEventMonitor = [NSEvent addLocalMonitorForEventsMatchingMask:(NSEventMaskMouseMoved |
+                                                                             NSEventMaskKeyDown    |
+                                                                             NSEventMaskLeftMouseDown |
+                                                                             NSEventMaskScrollWheel)
+                                                                   handler:^NSEvent *(NSEvent *event) {
+        weakSelf.lastUserActivityAt = [NSDate date];
+        return event;
+    }];
+}
+
+- (void)checkIdleTimeout:(NSTimer *)timer {
+#pragma unused(timer)
+    // Only applies to authenticated users
+    if (!self.roomController.tokenService.currentAccessToken) return;
+    if (self.isIdleLocked) return;
+
+    NSTimeInterval idle = [[NSDate date] timeIntervalSinceDate:self.lastUserActivityAt];
+    if (idle < kIdleTimeoutSeconds) return;
+
+    self.isIdleLocked = YES;
+    NSLog(@"[Auth] Idle timeout reached (%.0f seconds) — prompting reauthentication", idle);
+
+    dispatch_async(dispatch_get_main_queue(), ^{
+        NSAlert *alert = [[NSAlert alloc] init];
+        alert.messageText = @"Session Timed Out";
+        alert.informativeText = @"You've been inactive for 30 minutes. Please enter your password to continue.";
+        [alert addButtonWithTitle:@"Unlock"];
+        [alert addButtonWithTitle:@"Log Out"];
+
+        NSSecureTextField *passwordField = [[NSSecureTextField alloc] initWithFrame:NSMakeRect(0, 0, 260, 24)];
+        passwordField.placeholderString = @"Password";
+        alert.accessoryView = passwordField;
+        [alert.window setInitialFirstResponder:passwordField];
+
+        NSModalResponse response = [alert runModal];
+        if (response == NSAlertSecondButtonReturn) {
+            // Log out — revoke token on server and clear local state
+            [self.roomController.tokenService logoutWithCompletion:nil];
+            if (self.setupWindow) {
+                [self refreshSetupChrome];
+            } else {
+                [self launchSetupUI];
+            }
+            self.isIdleLocked = NO;
+            return;
+        }
+
+        // Re-authenticate by calling login with stored email + entered password
+        NSString *password = passwordField.stringValue;
+        NSString *email = self.roomController.tokenService.currentEmail;
+
+        if (!password.length || !email.length) {
+            self.isIdleLocked = NO;
+            return;
+        }
+
+        NSString *baseURL = self.roomController.tokenService.serverURL ?: @"http://localhost:3000";
+        [self.roomController.tokenService loginWithEmail:email
+                                                password:password
+                                               serverURL:baseURL
+                                              completion:^(InterAuthResponse *authResponse, NSError *loginError) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                if (authResponse && !loginError) {
+                    NSLog(@"[Auth] Idle reauthentication successful");
+                    self.lastUserActivityAt = [NSDate date];
+                    self.isIdleLocked = NO;
+                } else {
+                    NSAlert *errAlert = [[NSAlert alloc] init];
+                    errAlert.messageText = @"Authentication Failed";
+                    errAlert.informativeText = @"Incorrect password. Please try again or log out.";
+                    [errAlert addButtonWithTitle:@"Try Again"];
+                    [errAlert addButtonWithTitle:@"Log Out"];
+                    NSModalResponse retry = [errAlert runModal];
+                    if (retry == NSAlertSecondButtonReturn) {
+                        [self.roomController.tokenService logoutWithCompletion:nil];
+                        if (self.setupWindow) {
+                            [self refreshSetupChrome];
+                        } else {
+                            [self launchSetupUI];
+                        }
+                    }
+                    self.isIdleLocked = NO;
+                }
+            });
+        }];
+    });
+}
+
+#pragma mark - OAuth Social Sign-In (Phase F)
+
+- (void)startOAuthSignInWithProvider:(NSString *)provider {
+    // Validate provider to prevent URL path injection
+    if (![provider isEqualToString:@"google"] && ![provider isEqualToString:@"microsoft"]) {
+        NSLog(@"[OAuth] Unknown provider: %@", provider);
+        return;
+    }
+
+    // Ask the server for the OAuth start URL — the app never hardcodes it.
+    __weak typeof(self) weakSelf = self;
+    [self.roomController.tokenService requestOAuthStartURLWithProvider:provider
+                                                           completion:^(NSString *urlString) {
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf) { return; }
+
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (!urlString.length) {
+                NSLog(@"[OAuth] Server did not return a start URL for provider: %@", provider);
+                [strongSelf.loginPanel showError:@"Unable to start sign-in. Please try again."];
+                return;
+            }
+            NSURL *startURL = [NSURL URLWithString:urlString];
+            if (!startURL) {
+                NSLog(@"[OAuth] Invalid start URL: %@", urlString);
+                [strongSelf.loginPanel showError:@"Unable to start sign-in. Please try again."];
+                return;
+            }
+
+            ASWebAuthenticationSession *session =
+                [[ASWebAuthenticationSession alloc] initWithURL:startURL
+                                              callbackURLScheme:@"com-inter-app"
+                                              completionHandler:^(NSURL *callbackURL, NSError *error) {
+                strongSelf.oauthSession = nil; // Release session — allow deep link fallback
+                if (error) {
+                    if (error.code != ASWebAuthenticationSessionErrorCodeCanceledLogin) {
+                        dispatch_async(dispatch_get_main_queue(), ^{
+                            [strongSelf.loginPanel showError:@"Sign-in failed. Please try again."];
+                        });
+                    }
+                    return;
+                }
+                if (!callbackURL) return;
+
+                // Parse handoff code from callback URL
+                NSURLComponents *components = [NSURLComponents componentsWithURL:callbackURL
+                                                         resolvingAgainstBaseURL:NO];
+                NSString *code = nil;
+                NSString *oauthError = nil;
+                for (NSURLQueryItem *item in components.queryItems) {
+                    if ([item.name isEqualToString:@"code"]) code = item.value;
+                    if ([item.name isEqualToString:@"error"]) oauthError = item.value;
+                }
+
+                if (oauthError.length > 0) {
+                    NSString *message = [oauthError isEqualToString:@"access_denied"]
+                        ? @"Sign-in was cancelled."
+                        : @"Sign-in failed. Please try again.";
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        [strongSelf.loginPanel showError:message];
+                    });
+                    return;
+                }
+
+                if (code.length > 0) {
+                    [strongSelf handleOAuthCallbackWithCode:code];
+                }
+            }];
+
+            session.presentationContextProvider = strongSelf;
+            session.prefersEphemeralWebBrowserSession = YES;
+            [session start];
+            strongSelf.oauthSession = session;
+        });
+    }];
+}
+
+- (void)handleOAuthCallbackWithCode:(NSString *)code {
+    NSLog(@"[OAuth] Exchanging handoff code for tokens");
+
+    [self.roomController.tokenService exchangeOAuthCode:code completion:^(BOOL success, NSError *error) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (success) {
+                NSLog(@"[OAuth] Authentication successful");
+                [self dismissLoginWindow];
+                [self refreshSetupChrome];
+            } else {
+                NSLog(@"[OAuth] Exchange failed: %@", error.localizedDescription);
+                [self.loginPanel showError:@"Sign-in failed. Please try again."];
+            }
+        });
+    }];
+}
+
+#pragma mark - ASWebAuthenticationPresentationContextProviding
+
+- (ASPresentationAnchor)presentationAnchorForWebAuthenticationSession:(ASWebAuthenticationSession *)session {
+#pragma unused(session)
+    return self.loginWindow ?: NSApp.mainWindow ?: NSApp.windows.firstObject;
+}
+
 #pragma mark - Deep Link Handling (inter:// URL scheme)
 
 - (void)application:(NSApplication *)application openURLs:(NSArray<NSURL *> *)urls {
@@ -2800,7 +3178,12 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
     // Allowed deep-link paths per host (whitelist)
     NSDictionary<NSString *, NSArray<NSString *> *> *allowedPaths = @{
         @"billing": @[@"/success"],
+        @"reset-password": @[@"/"],
+        @"oauth-callback": @[@"/"],
     };
+
+    // Hosts that require a query string (e.g. token parameter)
+    NSSet<NSString *> *hostsAllowingQuery = [NSSet setWithObjects:@"reset-password", @"oauth-callback", nil];
 
     for (NSURL *url in urls) {
         // Reject any URL that does not carry the exact registered scheme
@@ -2834,15 +3217,66 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
             continue;
         }
 
-        // Reject URLs carrying a query string or fragment (unexpected for these endpoints)
-        if (url.query.length || url.fragment.length) {
-            NSLog(@"[DeepLink] Rejected URL with unexpected query/fragment: %@", url.absoluteString);
+        // Reject URLs carrying a query string or fragment unless the host allows it
+        if (url.fragment.length) {
+            NSLog(@"[DeepLink] Rejected URL with fragment: %@", url.absoluteString);
+            continue;
+        }
+        if (url.query.length && ![hostsAllowingQuery containsObject:host]) {
+            NSLog(@"[DeepLink] Rejected URL with unexpected query for host '%@': %@", host, url.absoluteString);
             continue;
         }
 
         // Dispatch to the appropriate handler
         if ([host isEqualToString:@"billing"] && [path isEqualToString:@"/success"]) {
             [self handleBillingSuccessDeepLink];
+            return;
+        }
+
+        if ([host isEqualToString:@"reset-password"]) {
+            NSURLComponents *components = [NSURLComponents componentsWithURL:url resolvingAgainstBaseURL:NO];
+            NSString *token = nil;
+            for (NSURLQueryItem *item in components.queryItems) {
+                if ([item.name isEqualToString:@"token"]) {
+                    token = item.value;
+                    break;
+                }
+            }
+            if (token.length > 0) {
+                [self handlePasswordResetDeepLinkWithToken:token];
+            } else {
+                NSLog(@"[DeepLink] reset-password URL missing token parameter");
+            }
+            return;
+        }
+
+        if ([host isEqualToString:@"oauth-callback"]) {
+            // ASWebAuthenticationSession intercepts the callback URL scheme before
+            // it reaches application:openURLs:. If oauthSession is still alive,
+            // the completionHandler already handled this — skip to avoid double exchange.
+            if (self.oauthSession) {
+                NSLog(@"[DeepLink] oauth-callback ignored — ASWebAuthenticationSession active");
+                return;
+            }
+            NSURLComponents *components = [NSURLComponents componentsWithURL:url resolvingAgainstBaseURL:NO];
+            NSString *code = nil;
+            NSString *error = nil;
+            for (NSURLQueryItem *item in components.queryItems) {
+                if ([item.name isEqualToString:@"code"]) code = item.value;
+                if ([item.name isEqualToString:@"error"]) error = item.value;
+            }
+            if (error.length > 0) {
+                NSString *message = [error isEqualToString:@"access_denied"]
+                    ? @"Sign-in was cancelled."
+                    : @"Sign-in failed. Please try again.";
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    [self.loginPanel showError:message];
+                });
+            } else if (code.length > 0) {
+                [self handleOAuthCallbackWithCode:code];
+            } else {
+                NSLog(@"[DeepLink] oauth-callback URL missing code and error");
+            }
             return;
         }
 
@@ -2897,27 +3331,11 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
 
             if (newTier.length) {
                 NSLog(@"[Billing] Tier upgraded: %@ → %@", previousTier, newTier);
+
+                // Rebuild chrome to show "Manage Subscription" instead of "View Plans"
+                [strongSelf refreshSetupChrome];
                 strongSelf.billingStatusLabel.stringValue =
                     [NSString stringWithFormat:@"Upgraded to %@!", [newTier capitalizedString]];
-
-                // Replace "View Plans" with "Manage Subscription" so tier changes
-                // go through Lemon Squeezy's portal (no duplicate subscriptions).
-                if (strongSelf.upgradeButton && !strongSelf.manageSubscriptionButton) {
-                    NSView *parent = strongSelf.upgradeButton.superview;
-                    NSRect frame = strongSelf.upgradeButton.frame;
-                    [strongSelf.upgradeButton removeFromSuperview];
-                    strongSelf.upgradeButton = nil;
-
-                    if (parent) {
-                        CGFloat centeredX = frame.origin.x + (frame.size.width - 160) / 2.0;
-                        strongSelf.manageSubscriptionButton = [[NSButton alloc] initWithFrame:NSMakeRect(centeredX, frame.origin.y, 160, 26)];
-                        strongSelf.manageSubscriptionButton.autoresizingMask = NSViewMinXMargin | NSViewMaxXMargin | NSViewMinYMargin;
-                        [strongSelf.manageSubscriptionButton setTitle:@"Manage Subscription"];
-                        [strongSelf.manageSubscriptionButton setTarget:strongSelf];
-                        [strongSelf.manageSubscriptionButton setAction:@selector(handleManageSubscription)];
-                        [parent addSubview:strongSelf.manageSubscriptionButton];
-                    }
-                }
 
                 // Clear the success message after a few seconds
                 dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5 * NSEC_PER_SEC)),
@@ -2939,6 +3357,74 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
             }
         });
     }];
+}
+
+#pragma mark - Password Reset Deep Link
+
+- (void)handlePasswordResetDeepLinkWithToken:(NSString *)token {
+    NSLog(@"[Auth] Password reset deep link received");
+
+    // Bring app to front
+    [NSApp activateIgnoringOtherApps:YES];
+
+    // Show a password reset alert with a secure text field
+    NSAlert *alert = [[NSAlert alloc] init];
+    alert.messageText = @"Reset Your Password";
+    alert.informativeText = @"Enter a new password (8–72 bytes UTF-8). Emoji and accented characters may count as multiple bytes.";
+    [alert addButtonWithTitle:@"Reset Password"];
+    [alert addButtonWithTitle:@"Cancel"];
+
+    NSSecureTextField *passwordField = [[NSSecureTextField alloc] initWithFrame:NSMakeRect(0, 0, 260, 24)];
+    passwordField.placeholderString = @"New password";
+    alert.accessoryView = passwordField;
+    [alert.window setInitialFirstResponder:passwordField];
+
+    NSModalResponse response = [alert runModal];
+    if (response != NSAlertFirstButtonReturn) return;
+
+    NSString *newPassword = passwordField.stringValue;
+    NSUInteger passwordBytes = [newPassword lengthOfBytesUsingEncoding:NSUTF8StringEncoding];
+    if (passwordBytes < 8 || passwordBytes > 72) {
+        NSAlert *errAlert = [[NSAlert alloc] init];
+        errAlert.messageText = @"Invalid Password";
+        errAlert.informativeText = @"Password must be between 8 and 72 bytes (UTF-8).";
+        [errAlert addButtonWithTitle:@"OK"];
+        [errAlert runModal];
+        return;
+    }
+
+    // POST to /auth/reset-password with the token and new password
+    NSString *baseURL = self.roomController.tokenService.serverURL ?: @"http://localhost:3000";
+    NSURL *url = [NSURL URLWithString:[NSString stringWithFormat:@"%@/auth/reset-password", baseURL]];
+    NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:url];
+    request.HTTPMethod = @"POST";
+    [request setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
+
+    NSDictionary *body = @{@"token": token, @"newPassword": newPassword};
+    request.HTTPBody = [NSJSONSerialization dataWithJSONObject:body options:0 error:nil];
+
+    [[NSURLSession.sharedSession dataTaskWithRequest:request completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            NSHTTPURLResponse *httpResponse = (NSHTTPURLResponse *)response;
+            NSAlert *resultAlert = [[NSAlert alloc] init];
+            [resultAlert addButtonWithTitle:@"OK"];
+
+            if (error || httpResponse.statusCode != 200) {
+                NSString *serverMsg = @"Something went wrong. Please request a new reset link.";
+                if (data) {
+                    NSDictionary *json = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+                    if (json[@"error"]) serverMsg = json[@"error"];
+                }
+                resultAlert.messageText = @"Password Reset Failed";
+                resultAlert.informativeText = serverMsg;
+                resultAlert.alertStyle = NSAlertStyleWarning;
+            } else {
+                resultAlert.messageText = @"Password Updated";
+                resultAlert.informativeText = @"Your password has been reset. Please log in with your new password.";
+            }
+            [resultAlert runModal];
+        });
+    }] resume];
 }
 
 @end

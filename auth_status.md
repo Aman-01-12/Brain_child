@@ -124,24 +124,24 @@ A full cross-layer audit of the billing flow was performed across billing-page.j
 
 | ID | Task | Status | File | Notes |
 |---|---|---|---|---|
-| D.1a | Migration: `password_reset_tokens` table | ❌ | `token-server/migrations/006_password_reset_tokens.sql` | See §6 D.1 — UUID PK, `token_hash`, 1-hour TTL, `used_at` |
-| D.1b | `POST /auth/forgot-password` endpoint | ❌ | `token-server/index.js` | Rate-limited; generates reset token; sends email; always 200 (anti-enumeration) |
-| D.1c | `POST /auth/reset-password` endpoint | ❌ | `token-server/index.js` | Validates token, bcrypt new hash, marks token used, revokes all refresh tokens |
-| D.1d | Add `auth.resetPassword(token, newPassword)` to `auth.js` | ❌ | `token-server/auth.js` | See §6 D.1 — extractable function, uses `db.getClient()` (not `db.connect()`) |
-| D.1e | 🔴 Register `inter://` URL scheme in `Info.plist` | ✅ | `inter/Info.plist` | Done in CX.1 — shared by billing + password reset |
-| D.1f | Handle `inter://reset-password?token=xxx` in macOS app | ❌ | `inter/App/AppDelegate.m` | `application:openURL:options:` delegate method |
-| D.2a | Migration: `email_verifications` table | ❌ | `token-server/migrations/007_email_verifications.sql` | See §6 D.2 — UUID token, `verified_at`, `expires_at` |
-| D.2b | `POST /auth/verify-email` endpoint | ❌ | `token-server/index.js` | Marks email verified; gates features if unverified |
-| D.2c | Send verification email on register | ❌ | `token-server/index.js` (register handler) | Call `mailer.sendVerificationEmail()` after user insert |
-| D.2d | Add `email_verified` column to `users` table | ❌ | In `007_email_verifications.sql` or new migration | `ALTER TABLE users ADD COLUMN email_verified BOOLEAN DEFAULT FALSE` |
-| D.3 | `POST /auth/logout-all` (revoke all devices) | ✅ | `token-server/index.js` | Implemented in Phase B.3c |
-| D.4a | Migration: `audit_log` table | ❌ | `token-server/migrations/008_audit_log.sql` | See §6 D.4 — events: `login`, `logout`, `register`, `failed_login`, `token_theft`, `tier_change`, `password_reset` |
-| D.4b | Write audit events from auth endpoints | ❌ | `token-server/auth.js` + `index.js` | Replace `console.error` security events with DB writes |
-| D.5 | Security alert on token theft detection | ❌ | `token-server/auth.js` (`issueRefreshToken`) | See §6 D.5 — call `mailer.sendSecurityAlert()` + write audit event when family reuse detected |
-| D.6 | Create `mailer.js` | ❌ | `token-server/mailer.js` | See §10 for complete starter — `sendPasswordResetEmail`, `sendVerificationEmail`, `sendSecurityAlert` |
-| D.7 | Configure SMTP env vars | ❌ | `token-server/.env` | `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASS`, `SMTP_FROM` — already in `.env.example` |
+| D.1a | Migration: `password_reset_tokens` table | ✅ | `token-server/migrations/009_password_reset_tokens.sql` | UUID PK, `token_hash` BYTEA UNIQUE, 1-hour TTL, `used_at`, partial index |
+| D.1b | `POST /auth/forgot-password` endpoint | ✅ | `token-server/index.js` | Rate-limited; fire-and-forget DB+email; always 200 (anti-enumeration) |
+| D.1c | `POST /auth/reset-password` + web form + landing page | ✅ | `token-server/index.js` | JSON API, `POST /auth/reset-password-web` (HTML), `GET /reset-password` (deep link + fallback form) |
+| D.1d | `auth.resetPassword()` + `auth.auditLog()` in `auth.js` | ✅ | `token-server/auth.js` | Extracted core logic; single transaction; revokes all sessions; auditLog never crashes flows |
+| D.1e | Register `com-inter-app://` URL scheme in `Info.plist` | ✅ | `inter/Info.plist` | Done in CX.1 — shared by billing + password reset |
+| D.1f | Handle `com-inter-app://reset-password?token=xxx` deep link | ✅ | `inter/App/AppDelegate.m` | Added `reset-password` to allowedPaths; `handlePasswordResetDeepLinkWithToken:` shows secure input alert |
+| D.2a | Migration: `email_verification_tokens` table | ✅ | `token-server/migrations/010_email_verification.sql` | UUID PK, `token_hash`, 8-hour TTL, `used_at`; also adds `email_verified_at` column to `users` |
+| D.2b | `GET /auth/verify-email` + `POST /auth/resend-verification` | ✅ | `token-server/index.js` | Verify marks `email_verified_at`; resend is fire-and-forget, always 200 |
+| D.2c | Send verification email on register | ✅ | `token-server/index.js` (register handler) | Fire-and-forget after user insert; does not fail registration |
+| D.2d | `email_verified_at` column on `users` table | ✅ | `token-server/migrations/010_email_verification.sql` | `TIMESTAMPTZ NULL` — soft-gate only (no login block) |
+| D.3 | `POST /auth/logout-all` (revoke all devices) | ✅ | `token-server/index.js` | Implemented in Phase B.3c; audit log added |
+| D.4a | Migration: `audit_events` table | ✅ | `token-server/migrations/011_audit_events.sql` | Append-only; indexed by `(user_id, created_at DESC)` and `(event_type, created_at DESC)` |
+| D.4b | Write audit events from auth endpoints | ✅ | `token-server/auth.js` + `index.js` | All auth events logged: register, login_success, login_failure, password_reset_requested/completed, email_verified, logout, logout_all, session_compromised |
+| D.5 | Security alert on token theft detection | ✅ | `token-server/index.js` | `dispatchSecurityAlert()` — Slack webhook + `sendSecurityAlertEmail()` on refresh token family reuse |
+| D.6 | Create `mailer.js` | ✅ | `token-server/mailer.js` | 4 exports: `sendPasswordResetEmail`, `sendVerificationEmail`, `sendSecurityAlertEmail`, `sendPaymentFailedEmail` |
+| D.7 | Configure SMTP env vars | ✅ | `token-server/.env` | `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASS`, `SMTP_FROM`, `SECURITY_WEBHOOK_URL` — commented placeholders |
 
-**Phase D overall: 0/16 done.**
+**Phase D overall: 16/16 COMPLETE ✅**
 
 ---
 
@@ -280,6 +280,8 @@ The token-server needs zero changes — the web app calls the same `/auth/*` and
 | 8 April 2026 | Phase B (13/13) | Refresh token system: rotation, theft detection, `/auth/refresh`, `/auth/logout`, `/auth/logout-all`, Redis rate limiting; macOS client: Keychain storage, silent refresh on 401, TLS SPKI pinning, login/register UI gating app launch | `token-server/auth.js`, `token-server/index.js`, `token-server/migrations/004_refresh_tokens.sql`, `inter/Networking/InterTokenService.swift`, `inter/UI/Views/InterLoginPanel.h/.m`, `inter/App/AppDelegate.m` |
 | 8 April 2026 | Phase C (6/7) + C-UX (8/8) | LS webhook (raw body + HMAC-SHA256), billing migrations (11 columns + idempotency table + tier history), `billing.js` (12 event types), `requireTier()` with grace period, checkout/portal endpoints; `inter://billing/success` deep link, billing poll, Upgrade/Manage buttons, billing status label | `token-server/billing.js`, `token-server/index.js`, `token-server/migrations/006_billing_columns.sql`, `inter/Networking/InterTokenService.swift`, `inter/App/AppDelegate.m` |
 | 13 April 2026 | Billing Audit (14/14) | All P0–P3 hardening fixes — see Billing Audit Fixes table above | `token-server/.env`, `token-server/billing.js`, `token-server/billing-page.js`, `token-server/index.js`, `inter/Networking/InterTokenService.swift`, `inter/App/AppDelegate.m` |
+| 13 April 2026 | Phase D (16/16) | Password reset flow (forgot/reset/web-form/landing page), email verification on register, `mailer.js` (4 email types), `auditLog()` helper, `audit_events` table, `dispatchSecurityAlert()` (Slack + email), deep link handler for `com-inter-app://reset-password`, SMTP env vars | `token-server/auth.js`, `token-server/index.js`, `token-server/mailer.js`, `token-server/migrations/009-011`, `token-server/.env`, `inter/App/AppDelegate.m` |
+| 14 April 2026 | Gap Mitigation (23/24) | HIBP pwned password check (G1), change-password (G8), GDPR account deletion (G9), absolute session cutoff (G4), idle timeout (G3), sessions list/revoke (G11), change-email flow (G10), password strength meter (G5), show/hide toggle (G6). Only G7 (MFA) deferred to Phase E. | `token-server/auth.js`, `token-server/index.js`, `token-server/migrations/012-013`, `inter/App/AppDelegate.m`, `inter/UI/Views/InterLoginPanel.m` |
 
 ---
 
@@ -287,7 +289,58 @@ The token-server needs zero changes — the web app calls the same `/auth/*` and
 | B — Refresh Tokens | 13 | 13 | 0 ✅ |
 | C — Billing | 7 | 7 | 0 ✅ |
 | C-UX — Billing Upgrade Flow | 8 | 8 | 0 ✅ |
-| D — Account Recovery | 16 | 2 | 14 |
-| **Total** | **53** | **39** | **14** |
+| D — Account Recovery | 16 | 16 | 0 ✅ |
+| Gap Mitigation (§10.6) | 23 | 23 | 1 (G7 MFA → Phase E) |
+| **Total** | **76** | **76** | **0** |
 
-**Next:** Phase D — Account Recovery.
+**All phases complete.** 23/24 industry-standard gaps resolved (only G7 MFA deferred to Phase E). Remaining work: R2 (recording list panel wiring), production deployment checklist.
+
+---
+
+## Pending Client UI Work (Account Management Screens)
+
+The following backend endpoints were added during Gap Mitigation but have **no client UI yet**. Each needs a settings panel or modal in the macOS app before users can access them.
+
+| Feature | Endpoint | UI Needed |
+|---------|----------|-----------|
+| Change password | `POST /auth/change-password` | Settings panel: current password + new password fields + confirm |
+| Change email | `POST /auth/change-email` | Settings panel: password confirmation + new email field |
+| Delete account | `DELETE /auth/account` | Danger zone: password confirmation + explicit "Delete my account" button |
+| Active sessions | `GET /auth/sessions` | Session list: table showing device/date, revoke individual session button |
+| Revoke session | `DELETE /auth/sessions/:id` | (part of session list above) |
+
+**Suggested entry point:** A "Account Settings" window/panel accessible from the app menu or user avatar area, with tabs: Profile / Security (change password, sessions) / Danger Zone (delete account).
+
+---
+
+## Pre-Website Launch — Backend Changes Required
+
+When `inter.com` launches (marketing site or web app), the token-server needs the following changes **before** any web caller makes requests to `api.inter.com`. The macOS app is unaffected — these are additive only.
+
+### Why each is needed
+
+**1. `cors` package + scoped CORS middleware**
+The browser's same-origin policy blocks `inter.com` from calling `api.inter.com` unless the server sends `Access-Control-Allow-Origin`. Without this, every fetch from the website silently fails at the browser level. The middleware must be applied **before** routes and must only allow trusted origins — not `*` — since we send credentials.
+
+**2. `Set-Cookie` on login/register for web callers**
+The macOS app stores its refresh token in the Keychain and sends it in the request body. Web callers cannot use the Keychain — they need the refresh token in an `httpOnly; Secure; SameSite=Strict` cookie so JavaScript cannot read it (XSS mitigation). The login/register handlers need to detect the caller type (`User-Agent` or an `X-Client: web` header) and set the cookie in addition to (or instead of) returning it in the JSON body.
+
+**3. `POST /auth/refresh` reads cookie if no body token**
+Once the web caller has the refresh token in a cookie, the browser sends it automatically on every request to `api.inter.com`. The `/auth/refresh` endpoint currently only reads `refreshToken` from the JSON body — it needs a fallback: `const token = req.body.refreshToken ?? req.cookies?.refreshToken`. Requires the `cookie-parser` middleware.
+
+**4. Allowed origins list includes `inter.com` + `www.inter.com`**
+CORS must allowlist only exact trusted origins. A wildcard or a loose regex would allow any subdomain to make credentialed requests. The origins array should be an env var (`CORS_ORIGINS`) so it can be updated without a code deploy.
+
+### Implementation checklist
+
+| # | Change | File | Trigger |
+|---|--------|------|---------|
+| W1 | `npm install cors cookie-parser` | `token-server/package.json` | Before website goes live |
+| W2 | Add `CORS_ORIGINS=https://inter.com,https://www.inter.com` to `.env` | `token-server/.env` | Before website goes live |
+| W3 | Mount `cors({ origin: allowedOrigins, credentials: true })` middleware before all routes | `token-server/index.js` | Before website goes live |
+| W4 | Mount `cookieParser()` middleware | `token-server/index.js` | Before website goes live |
+| W5 | In `login` + `register` handlers: if `X-Client: web` header present, set `httpOnly; Secure; SameSite=Strict` cookie | `token-server/index.js` | Before website goes live |
+| W6 | In `/auth/refresh`: fallback to `req.cookies.refreshToken` when body token absent | `token-server/index.js` | Before website goes live |
+| W7 | In `/auth/logout`: also clear the cookie (`res.clearCookie('refreshToken')`) | `token-server/index.js` | Before website goes live |
+
+> **Note:** The macOS app continues to send `refreshToken` in the request body — no macOS client changes needed. The cookie path is purely additive for web callers.

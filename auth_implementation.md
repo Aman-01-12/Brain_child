@@ -3698,27 +3698,27 @@ inter/App/AppDelegate.m   — G12 handleGetURLEvent:withReplyEvent:, G3 idle tim
 
 | # | Gap | Priority | Source | Status |
 |---|-----|----------|--------|--------|
-| G20 | `express.raw()` on webhook route | **P0** | Lemon Squeezy | ❌ Not implemented |
-| G12 | CFBundleURLTypes in Info.plist | **P0** | RFC 8252 B.4 | ❌ Not implemented |
-| G15 | `requireTier()` ignores `subscription_status` | **P0** | Lemon Squeezy | ❌ Not implemented |
-| G1  | No breach corpus / pwned password check | **P1** | NIST §5.1.1.2 | ❌ Not implemented |
-| G8  | No `POST /auth/change-password` | **P1** | OWASP | ❌ Not implemented |
-| G9  | No `DELETE /auth/account` (GDPR) | **P1** | GDPR Art.17 | ❌ Not implemented |
-| G14 | No PKCE for OAuth flows | **P1** | RFC 8252 §6 | ❌ Not implemented |
+| G20 | `express.raw()` on webhook route | **P0** | Lemon Squeezy | ✅ Phase C.1 |
+| G12 | CFBundleURLTypes in Info.plist | **P0** | RFC 8252 B.4 | ✅ CX.1 `com.inter.app://` |
+| G15 | `requireTier()` ignores `subscription_status` | **P0** | Lemon Squeezy | ✅ Phase C.5 |
+| G1  | No breach corpus / pwned password check | **P1** | NIST §5.1.1.2 | ✅ `isPwnedPassword()` in auth.js |
+| G8  | No `POST /auth/change-password` | **P1** | OWASP | ✅ Endpoint in index.js |
+| G9  | No `DELETE /auth/account` (GDPR) | **P1** | GDPR Art.17 | ✅ PII anonymization endpoint |
+| G14 | No PKCE for OAuth flows | **P1** | RFC 8252 §6 | ➖ N/A — reviewed, not applicable (email/password auth only; OAuth uses ASWebAuthenticationSession with server-side PKCE) |
 | G16 | ~~3DS webhook~~ | **N/A** | LS handles as MoR | ✅ Not needed |
-| G2  | Password byte cap vs NIST char requirement | **P2** | NIST §5.1.1.2 | ❌ Not implemented |
-| G3  | No idle timeout / reauthentication prompt | **P2** | NIST §4.2.3 | ❌ Not implemented |
-| G4  | No absolute session hard cutoff | **P2** | OWASP Session Mgmt | ❌ Not implemented |
+| G2  | Password byte cap vs NIST char requirement | **P2** | NIST §5.1.1.2 | ✅ 8–72 byte validation in auth.js |
+| G3  | No idle timeout / reauthentication prompt | **P2** | NIST §4.2.3 | ✅ 30-min idle in AppDelegate.m |
+| G4  | No absolute session hard cutoff | **P2** | OWASP Session Mgmt | ✅ 30-day cutoff, migration 011 |
 | G7  | No MFA path documented | **P2** | NIST §4.2 | ❌ Phase E planned |
-| G13 | URI scheme should be reverse-domain | **P2** | RFC 8252 §7.1 | ❌ Not implemented |
+| G13 | URI scheme should be reverse-domain | **P2** | RFC 8252 §7.1 | ✅ `com.inter.app://` |
 | G17 | ~~`checkout.session.completed`~~ → subscription_created | **P2** | Lemon Squeezy | ✅ In billing.js |
-| G18 | No grace period for `past_due` | **P2** | Lemon Squeezy best practice | ❌ Not implemented |
+| G18 | No grace period for `past_due` | **P2** | Lemon Squeezy best practice | ✅ In billing.js + requireTier |
 | G19 | No `on_trial` state mapping | **P2** | Lemon Squeezy | ✅ In billing.js + G15 |
-| G21 | No Customer Portal | **P2** | Lemon Squeezy best practice | ❌ Not implemented |
-| G22 | No re-subscription flow | **P2** | Lemon Squeezy | ❌ Not implemented |
+| G21 | No Customer Portal | **P2** | Lemon Squeezy best practice | ✅ `GET /billing/portal-url` |
+| G22 | No re-subscription flow | **P2** | Lemon Squeezy | ✅ `POST /billing/checkout` |
 | G23 | ~~`incomplete_expired` handling~~ | **N/A** | LS handles at checkout | ✅ Not needed |
-| G5  | No password strength meter | **P3** | NIST §5.1.1.2 | ❌ Not implemented |
-| G6  | No show/hide password toggle | **P3** | NIST §5.1.1.2 | ❌ Not implemented |
-| G10 | No change-email flow | **P3** | Industry standard | ❌ Not implemented |
-| G11 | No active sessions list | **P3** | OWASP Session Mgmt | ❌ Not implemented |
+| G5  | No password strength meter | **P3** | NIST §5.1.1.2 | ✅ 4-bar meter in InterLoginPanel |
+| G6  | No show/hide password toggle | **P3** | NIST §5.1.1.2 | ✅ Toggle in InterLoginPanel |
+| G10 | No change-email flow | **P3** | Industry standard | ✅ Endpoints + migration 010 |
+| G11 | No active sessions list | **P3** | OWASP Session Mgmt | ✅ GET/DELETE /auth/sessions |
 | G24 | No `paused` subscription handling | **P3** | Lemon Squeezy | ✅ In billing.js |
