@@ -580,6 +580,8 @@ private struct TokenCacheEntry {
         config.timeoutIntervalForRequest = 10.0
         config.timeoutIntervalForResource = 15.0
         config.waitsForConnectivity = false
+        config.urlCache = nil
+        config.requestCachePolicy = .reloadIgnoringLocalCacheData
         self.session = URLSession(configuration: config)
 
         // Auth session with TLS certificate pinning delegate
@@ -588,6 +590,8 @@ private struct TokenCacheEntry {
         authConfig.timeoutIntervalForRequest = 10.0
         authConfig.timeoutIntervalForResource = 15.0
         authConfig.waitsForConnectivity = false
+        authConfig.urlCache = nil
+        authConfig.requestCachePolicy = .reloadIgnoringLocalCacheData
         self.authSession = URLSession(configuration: authConfig,
                                       delegate: pinnedDelegate,
                                       delegateQueue: nil)
@@ -1205,6 +1209,240 @@ private struct TokenCacheEntry {
         }.resume()
     }
 
+    // MARK: - Phase 11: Scheduling
+
+    /// Fetch upcoming scheduled meetings for the authenticated user.
+    @objc public func fetchUpcomingMeetings(
+        completion: @escaping (_ hosted: [[String: Any]]?, _ invited: [[String: Any]]?, _ error: NSError?) -> Void
+    ) {
+        guard let serverURL = authServerBaseURL,
+              let accessToken = currentAccessToken else {
+            completeOnMain { completion(nil, nil, nil) }
+            return
+        }
+
+        performAuthHTTPRequest(
+            url: "\(serverURL)/meetings/upcoming",
+            method: "GET",
+            body: nil,
+            bearerToken: accessToken,
+            retryCount: 0
+        ) { [weak self] data, httpResponse, error in
+            guard let self = self else { return }
+            guard error == nil,
+                  let data = data,
+                  let httpResponse = httpResponse,
+                  httpResponse.statusCode == 200,
+                  let json = self.parseJSON(data) else {
+                self.completeOnMain { completion(nil, nil, error) }
+                return
+            }
+            let hosted  = json["hosted"]  as? [[String: Any]]
+            let invited = json["invited"] as? [[String: Any]]
+            self.completeOnMain { completion(hosted, invited, nil) }
+        }
+    }
+
+    /// Schedule a new meeting.
+    @objc public func scheduleMeeting(
+        title: String,
+        description: String?,
+        scheduledAt: Date,
+        durationMinutes: Int,
+        roomType: String,
+        hostTimezone: String,
+        password: String?,
+        lobbyEnabled: Bool,
+        completion: @escaping (_ meeting: [String: Any]?, _ error: NSError?) -> Void
+    ) {
+        guard let serverURL = authServerBaseURL,
+              let accessToken = currentAccessToken else {
+            completeOnMain { completion(nil, nil) }
+            return
+        }
+
+        let formatter = ISO8601DateFormatter()
+        var body: [String: Any] = [
+            "title": title,
+            "scheduledAt": formatter.string(from: scheduledAt),
+            "durationMinutes": durationMinutes,
+            "roomType": roomType,
+            "hostTimezone": hostTimezone,
+            "lobbyEnabled": lobbyEnabled,
+        ]
+        if let desc = description { body["description"] = desc }
+        if let pw = password { body["password"] = pw }
+
+        performAuthHTTPRequest(
+            url: "\(serverURL)/meetings/schedule",
+            method: "POST",
+            body: body,
+            bearerToken: accessToken,
+            retryCount: 0
+        ) { [weak self] data, httpResponse, error in
+            guard let self = self else { return }
+            guard error == nil,
+                  let data = data,
+                  let httpResponse = httpResponse,
+                  httpResponse.statusCode == 201,
+                  let json = self.parseJSON(data) else {
+                self.completeOnMain { completion(nil, error) }
+                return
+            }
+            self.completeOnMain { completion(json, nil) }
+        }
+    }
+
+    /// Cancel a scheduled meeting.
+    @objc public func cancelMeeting(
+        meetingId: String,
+        completion: @escaping (_ success: Bool, _ error: NSError?) -> Void
+    ) {
+        guard let serverURL = authServerBaseURL,
+              let accessToken = currentAccessToken else {
+            completeOnMain { completion(false, nil) }
+            return
+        }
+
+        performAuthHTTPRequest(
+            url: "\(serverURL)/meetings/\(meetingId)",
+            method: "DELETE",
+            body: nil,
+            bearerToken: accessToken,
+            retryCount: 0
+        ) { [weak self] _, httpResponse, error in
+            guard let self = self else { return }
+            let success = error == nil && httpResponse?.statusCode == 200
+            self.completeOnMain { completion(success, error) }
+        }
+    }
+
+    /// Start or join a scheduled meeting.
+    ///
+    /// Calls `POST /meetings/:id/start` on the token server. The server registers
+    /// the meeting's pre-assigned room code in Redis (if not already active) and
+    /// returns a LiveKit JWT with appropriate permissions: host-level grants for
+    /// the meeting host, participant-level grants for invited users.
+    ///
+    /// Returns the same `InterCreateRoomResponse` shape as `createRoom` so that
+    /// `InterRoomController` can call `handleTokenResponse` uniformly.
+    @objc public func startScheduledMeeting(
+        meetingId: String,
+        serverURL: String,
+        identity: String,
+        displayName: String,
+        completion: @escaping (InterCreateRoomResponse?, NSError?) -> Void
+    ) {
+        guard let accessToken = currentAccessToken else {
+            let error = InterNetworkErrorCode.authFailed.error(
+                message: "Not authenticated — cannot start scheduled meeting"
+            )
+            completeOnMain { completion(nil, error) }
+            return
+        }
+
+        let body: [String: Any] = [
+            "identity": identity,
+            "displayName": displayName
+        ]
+
+        interLogInfo(InterLog.networking, "Token: starting scheduled meeting (id=***)")
+
+        performAuthHTTPRequest(
+            url: "\(serverURL)/meetings/\(meetingId)/start",
+            method: "POST",
+            body: body,
+            bearerToken: accessToken,
+            retryCount: 0
+        ) { [weak self] data, httpResponse, error in
+            guard let self = self else { return }
+
+            if let error = error {
+                interLogError(InterLog.networking, "Token: /meetings/:id/start transport error: %{public}@",
+                              error.localizedDescription)
+                self.completeOnMain { completion(nil, error) }
+                return
+            }
+
+            guard let httpResponse = httpResponse else {
+                let err = InterNetworkErrorCode.tokenFetchFailed.error(message: "No response from start endpoint")
+                self.completeOnMain { completion(nil, err) }
+                return
+            }
+
+            if httpResponse.statusCode == 403 || httpResponse.statusCode == 404 || httpResponse.statusCode == 410 {
+                let msg: String
+                if httpResponse.statusCode == 404 { msg = "Meeting not found" }
+                else if httpResponse.statusCode == 410 { msg = "This meeting has been cancelled" }
+                else { msg = "You are not authorized to join this meeting" }
+                let err = InterNetworkErrorCode.roomCodeInvalid.error(message: msg)
+                interLogError(InterLog.networking, "Token: /meetings/:id/start rejected (%d)", httpResponse.statusCode)
+                self.completeOnMain { completion(nil, err) }
+                return
+            }
+
+            guard (200..<300).contains(httpResponse.statusCode),
+                  let data = data,
+                  let json = self.parseJSON(data),
+                  let roomCode = json["roomCode"] as? String,
+                  let roomName = json["roomName"] as? String,
+                  let token = json["token"] as? String,
+                  let wsURL = json["serverURL"] as? String else {
+                let err = InterNetworkErrorCode.tokenFetchFailed.error(
+                    message: "Malformed response from /meetings/:id/start"
+                )
+                interLogError(InterLog.networking, "Token: /meetings/:id/start malformed response")
+                self.completeOnMain { completion(nil, err) }
+                return
+            }
+
+            let responseRoomType = json["roomType"] as? String ?? "call"
+            self.cacheToken(token, forRoom: roomCode, identity: identity)
+
+            let response = InterCreateRoomResponse(
+                roomCode: roomCode,
+                roomName: roomName,
+                token: token,
+                serverURL: wsURL,
+                roomType: responseRoomType
+            )
+            interLogInfo(InterLog.networking, "Token: scheduled meeting started (code=***)")
+            self.completeOnMain { completion(response, nil) }
+        }
+    }
+
+    /// Send invitations for a scheduled meeting.
+    @objc public func inviteToMeeting(
+        meetingId: String,
+        invitees: [[String: String]],
+        completion: @escaping (_ result: [String: Any]?, _ error: NSError?) -> Void
+    ) {
+        guard let serverURL = authServerBaseURL,
+              let accessToken = currentAccessToken else {
+            completeOnMain { completion(nil, nil) }
+            return
+        }
+
+        performAuthHTTPRequest(
+            url: "\(serverURL)/meetings/\(meetingId)/invite",
+            method: "POST",
+            body: ["invitees": invitees],
+            bearerToken: accessToken,
+            retryCount: 0
+        ) { [weak self] data, httpResponse, error in
+            guard let self = self else { return }
+            guard error == nil,
+                  let data = data,
+                  let httpResponse = httpResponse,
+                  httpResponse.statusCode == 200,
+                  let json = self.parseJSON(data) else {
+                self.completeOnMain { completion(nil, error) }
+                return
+            }
+            self.completeOnMain { completion(json, nil) }
+        }
+    }
+
     // MARK: - Private: Network
 
     /// Perform a POST request with JSON body. Retries once on 5xx/timeout.
@@ -1362,6 +1600,8 @@ private struct TokenCacheEntry {
         if let nsError = nsError {
             let retryableCodes: Set<Int> = [
                 NSURLErrorTimedOut,
+                NSURLErrorCannotConnectToHost,
+                NSURLErrorCannotFindHost,
                 NSURLErrorNetworkConnectionLost,
                 NSURLErrorNotConnectedToInternet
             ]

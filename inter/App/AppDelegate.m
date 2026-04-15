@@ -21,6 +21,9 @@
 #import "InterQAPanel.h"
 #import "InterLobbyPanel.h"
 #import "InterRecordingIndicatorView.h"
+#import "InterRecordingListPanel.h"
+#import "InterRecordingConsentPanel.h"
+#import "InterSchedulePanel.h"
 
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #import <AuthenticationServices/AuthenticationServices.h>
@@ -30,7 +33,7 @@
 #import "inter-Swift.h"
 #endif
 
-@interface AppDelegate () <NSWindowDelegate, InterConnectionSetupPanelDelegate, InterLoginPanelDelegate, InterAuthSessionDelegate, InterParticipantOverlayDelegate, InterChatPanelDelegate, InterSpeakerQueuePanelDelegate, InterPollPanelDelegate, InterQAPanelDelegate, InterMediaWiringDelegate, InterModerationDelegate, InterLobbyPanelDelegate, InterRecordingCoordinatorDelegate, InterRecordingSignalDelegate, ASWebAuthenticationPresentationContextProviding>
+@interface AppDelegate () <NSWindowDelegate, InterConnectionSetupPanelDelegate, InterLoginPanelDelegate, InterAuthSessionDelegate, InterParticipantOverlayDelegate, InterChatPanelDelegate, InterSpeakerQueuePanelDelegate, InterPollPanelDelegate, InterQAPanelDelegate, InterMediaWiringDelegate, InterModerationDelegate, InterLobbyPanelDelegate, InterRecordingCoordinatorDelegate, InterRecordingSignalDelegate, InterRecordingListPanelDelegate, InterRecordingConsentPanelDelegate, InterSchedulePanelDelegate, ASWebAuthenticationPresentationContextProviding>
 @property (nonatomic, strong) NSMutableArray<CapWindow *> *capWindows;
 @property (nonatomic, strong) SecureWindowController *secureController;
 @property (nonatomic, strong) NSWindow *setupWindow;
@@ -84,6 +87,16 @@
 // [Phase 10] Recording
 @property (nonatomic, strong, nullable) InterRecordingCoordinator *normalRecordingCoordinator;
 @property (nonatomic, strong, nullable) InterRecordingIndicatorView *normalRecordingIndicatorView;
+@property (nonatomic, strong, nullable) InterRecordingListPanel *normalRecordingListPanel;
+@property (nonatomic, strong, nullable) NSWindow *normalRecordingListWindow;
+@property (nonatomic, strong, nullable) InterRecordingConsentPanel *normalRecordingConsentPanel;
+
+// [Phase 11] Scheduling
+@property (nonatomic, strong, nullable) InterSchedulePanel *normalSchedulePanel;
+@property (nonatomic, strong, nullable) NSWindow *normalScheduleWindow;
+
+// [Phase 11.1] Calendar service
+@property (nonatomic, strong, nullable) InterCalendarService *calendarService;
 
 // [2.5.2] Room controller — persists across mode transitions [G4]
 @property (nonatomic, strong, nullable) InterRoomController *roomController;
@@ -188,6 +201,9 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
     // [Phase 10] Create recording coordinator
     self.normalRecordingCoordinator = [[InterRecordingCoordinator alloc] init];
     self.normalRecordingCoordinator.delegate = self;
+
+    // [Phase 11.1] Create calendar service for EventKit integration
+    self.calendarService = [[InterCalendarService alloc] init];
 
     if (self.roomController) {
         self.roomController.chatController = self.chatController;
@@ -669,6 +685,18 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
     self.billingStatusLabel.bezeled = NO;
     self.billingStatusLabel.drawsBackground = NO;
     [overlayView addSubview:self.billingStatusLabel];
+
+    // [Phase 11] Schedule Meetings button — shown only for authenticated users
+    // Placed below the connection panel where there is empty space.
+    if (isAuth) {
+        CGFloat schedY = panelY - 34;
+        NSButton *scheduleButton = [[NSButton alloc] initWithFrame:NSMakeRect(panelX + (panelW - 160) / 2.0, schedY, 160, 26)];
+        scheduleButton.autoresizingMask = NSViewMinXMargin | NSViewMaxXMargin | NSViewMaxYMargin;
+        [scheduleButton setTitle:@"Schedule Meeting"];
+        [scheduleButton setTarget:self];
+        [scheduleButton setAction:@selector(handleShowSchedulePanel)];
+        [overlayView addSubview:scheduleButton];
+    }
 }
 
 /// Rebuild the auth-dependent chrome (Sign In/Out, Settings, Billing) in-place
@@ -692,6 +720,258 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
 /// Auth-gated action: user tapped Settings while not signed in.
 - (void)handleSettingsRequiresAuth {
     [self.connectionPanel setStatusText:@"Sign in to access settings."];
+}
+
+#pragma mark - Schedule Panel [Phase 11]
+
+/// Show or bring to front the scheduling floating window.
+- (void)handleShowSchedulePanel {
+    if (self.normalScheduleWindow) {
+        [self.normalScheduleWindow makeKeyAndOrderFront:nil];
+        [self reloadScheduleData];
+        return;
+    }
+
+    CGFloat panelWidth  = 360;
+    CGFloat panelHeight = 640;
+    NSRect screenFrame  = [[NSScreen mainScreen] visibleFrame];
+    CGFloat x = NSMidX(screenFrame) - panelWidth / 2.0;
+    CGFloat y = NSMidY(screenFrame) - panelHeight / 2.0;
+
+    self.normalSchedulePanel = [[InterSchedulePanel alloc] initWithFrame:NSMakeRect(0, 0, panelWidth, panelHeight)];
+    self.normalSchedulePanel.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+    self.normalSchedulePanel.delegate = self;
+
+    self.normalScheduleWindow = [[NSWindow alloc] initWithContentRect:NSMakeRect(x, y, panelWidth, panelHeight)
+                                                            styleMask:(NSWindowStyleMaskTitled |
+                                                                       NSWindowStyleMaskClosable |
+                                                                       NSWindowStyleMaskResizable |
+                                                                       NSWindowStyleMaskMiniaturizable)
+                                                              backing:NSBackingStoreBuffered
+                                                                defer:NO];
+    self.normalScheduleWindow.title = @"Schedule Meeting";
+    self.normalScheduleWindow.minSize = NSMakeSize(320, 480);
+    self.normalScheduleWindow.releasedWhenClosed = NO;
+    self.normalScheduleWindow.level = NSFloatingWindowLevel;
+    [self.normalScheduleWindow setAppearance:[NSAppearance appearanceNamed:NSAppearanceNameDarkAqua]];
+    self.normalScheduleWindow.contentView = self.normalSchedulePanel;
+    [self.normalScheduleWindow makeKeyAndOrderFront:nil];
+
+    [self reloadScheduleData];
+}
+
+/// Fetch upcoming meetings from the server and populate the panel.
+- (void)reloadScheduleData {
+    if (!self.normalSchedulePanel) return;
+    InterTokenService *ts = self.roomController.tokenService;
+    [ts fetchUpcomingMeetingsWithCompletion:^(NSArray<NSDictionary<NSString *,id> *> * _Nullable hostedArr, NSArray<NSDictionary<NSString *,id> *> * _Nullable invitedArr, NSError * _Nullable error) {
+        if (error) {
+            NSLog(@"[Schedule] Failed to fetch meetings: %@", error.localizedDescription);
+            return;
+        }
+
+        NSMutableArray<InterScheduledMeeting *> *hosted  = [NSMutableArray array];
+        NSMutableArray<InterScheduledMeeting *> *invited = [NSMutableArray array];
+
+        for (NSDictionary *dict in hostedArr) {
+            InterScheduledMeeting *m = [self meetingFromDictionary:dict];
+            if (m) [hosted addObject:m];
+        }
+        for (NSDictionary *dict in invitedArr) {
+            InterScheduledMeeting *m = [self meetingFromDictionary:dict];
+            if (m) [invited addObject:m];
+        }
+
+        [self.normalSchedulePanel setUpcomingMeetings:hosted];
+        [self.normalSchedulePanel setInvitedMeetings:invited];
+    }];
+}
+
+/// Parse a meeting JSON dictionary into an InterScheduledMeeting model.
+- (InterScheduledMeeting *)meetingFromDictionary:(NSDictionary *)dict {
+    InterScheduledMeeting *m = [[InterScheduledMeeting alloc] init];
+    m.meetingId          = dict[@"id"] ?: @"";
+    m.title              = dict[@"title"] ?: @"(untitled)";
+    m.meetingDescription = dict[@"description"];
+    m.durationMinutes    = [dict[@"durationMinutes"] integerValue];
+    m.roomType           = dict[@"roomType"] ?: @"call";
+    m.roomCode           = dict[@"roomCode"];
+    m.lobbyEnabled       = [dict[@"lobbyEnabled"] boolValue];
+    m.hostTimezone       = dict[@"hostTimezone"] ?: @"";
+    m.status             = dict[@"status"] ?: @"scheduled";
+    m.inviteeCount       = [dict[@"inviteeCount"] integerValue];
+
+    NSString *dateStr = dict[@"scheduledAt"];
+    if (dateStr) {
+        NSISO8601DateFormatter *fmt = [[NSISO8601DateFormatter alloc] init];
+        fmt.formatOptions = NSISO8601DateFormatWithInternetDateTime | NSISO8601DateFormatWithFractionalSeconds;
+        m.scheduledAt = [fmt dateFromString:dateStr];
+        if (!m.scheduledAt) {
+            // Retry without fractional seconds
+            fmt.formatOptions = NSISO8601DateFormatWithInternetDateTime;
+            m.scheduledAt = [fmt dateFromString:dateStr];
+        }
+    }
+    return m;
+}
+
+#pragma mark - InterSchedulePanelDelegate
+
+- (void)schedulePanel:(InterSchedulePanel *)panel
+   didScheduleMeetingWithTitle:(NSString *)title
+                   description:(NSString *)description
+                   scheduledAt:(NSDate *)scheduledAt
+               durationMinutes:(NSInteger)duration
+                      roomType:(NSString *)roomType
+                  hostTimezone:(NSString *)timezone
+                      password:(NSString *)password
+                  lobbyEnabled:(BOOL)lobbyEnabled
+             inviteeEmails:(NSArray<NSString *> *)emails {
+
+    InterTokenService *ts = self.roomController.tokenService;
+    [ts scheduleMeetingWithTitle:title
+                    description:description
+                    scheduledAt:scheduledAt
+                durationMinutes:duration
+                       roomType:roomType
+                   hostTimezone:timezone
+                       password:password
+                   lobbyEnabled:lobbyEnabled
+                     completion:^(NSDictionary * _Nullable result, NSError * _Nullable error) {
+        if (error) {
+            [panel setStatusText:error.localizedDescription];
+            panel.scheduleButton.enabled = YES;
+            return;
+        }
+        [panel resetForm];
+        panel.scheduleButton.enabled = YES;
+        [self reloadScheduleData];
+
+        NSString *meetingId = result[@"id"];
+        NSString *roomCode  = result[@"roomCode"];
+
+        // Send invitations if emails were provided
+        if (meetingId && emails.count > 0) {
+            [panel setStatusText:[NSString stringWithFormat:@"Meeting scheduled! Sending %lu invite%@…",
+                                  (unsigned long)emails.count, emails.count == 1 ? @"" : @"s"]];
+            [self schedulePanel:panel didRequestInviteForMeeting:meetingId emails:emails];
+        } else {
+            [panel setStatusText:@"Meeting scheduled!"];
+        }
+
+        // [Phase 11.1] Sync to Apple Calendar if authorized
+        if (meetingId && self.calendarService.isAuthorized) {
+            [self.calendarService createEventWithMeetingId:meetingId
+                                                    title:title
+                                                    notes:description
+                                                startDate:scheduledAt
+                                          durationMinutes:duration
+                                             hostTimezone:timezone
+                                                 roomCode:roomCode];
+        }
+    }];
+}
+
+- (void)schedulePanel:(InterSchedulePanel *)panel didRequestCancel:(NSString *)meetingId {
+    InterTokenService *ts = self.roomController.tokenService;
+    [ts cancelMeetingWithMeetingId:meetingId completion:^(BOOL success, NSError * _Nullable error) {
+        if (error || !success) {
+            NSLog(@"[Schedule] Cancel failed: %@", error.localizedDescription);
+            return;
+        }
+        [self reloadScheduleData];
+
+        // [Phase 11.1] Remove from Apple Calendar
+        [self.calendarService removeEventForMeetingId:meetingId];
+    }];
+}
+
+- (void)schedulePanel:(InterSchedulePanel *)panel didRequestJoin:(NSString *)roomCode meetingId:(NSString *)meetingId {
+    // Close the schedule window and switch to the connection panel.
+    [self.normalScheduleWindow orderOut:nil];
+    [self.connectionPanel setRoomCodeText:roomCode];
+    [self.connectionPanel setStatusText:@"Joining scheduled meeting…"];
+
+    InterRoomController *rc = self.roomController;
+    if (!rc) {
+        [self.connectionPanel setStatusText:@"Network unavailable — cannot join."];
+        return;
+    }
+
+    NSString *serverURL   = self.connectionPanel.serverURL;
+    NSString *tokenURL    = self.connectionPanel.tokenServerURL;
+    NSString *displayName = self.connectionPanel.displayName;
+
+    if (displayName.length == 0) {
+        [self.connectionPanel setStatusText:@"Enter a display name first."];
+        return;
+    }
+
+    [self.connectionPanel setActionsEnabled:NO];
+    [self.connectionPanel setIndicatorState:InterConnectionIndicatorStateConnecting];
+
+    NSString *identity = [[NSUUID UUID] UUIDString];
+    InterRoomConfiguration *config =
+        [[InterRoomConfiguration alloc] initWithServerURL:serverURL
+                                          tokenServerURL:tokenURL
+                                                roomCode:roomCode
+                                     participantIdentity:identity
+                                         participantName:displayName
+                                                  isHost:NO
+                                                roomType:@""
+                                        maxParticipants:50];
+    config.scheduledMeetingId = meetingId;
+
+    __weak typeof(self) weakSelf = self;
+    [rc connectWithConfiguration:config completion:^(NSError * _Nullable error) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            __strong typeof(weakSelf) strongSelf = weakSelf;
+            if (!strongSelf) return;
+            InterConnectionSetupPanel *p = strongSelf.connectionPanel;
+            if (error) {
+                [p setActionsEnabled:YES];
+                [p setIndicatorState:InterConnectionIndicatorStateError];
+                [p setStatusText:[strongSelf userFacingMessageForError:error]];
+                return;
+            }
+            [p setIndicatorState:InterConnectionIndicatorStateConnected];
+            [p setStatusText:@"Joined"];
+            [p setActionsEnabled:YES];
+            NSString *roomType = rc.roomType;
+            BOOL isInterviewRoom = [roomType isEqualToString:@"interview"];
+            if (isInterviewRoom) {
+                [strongSelf showIntervieweeConfirmationWithCompletion:^(BOOL accepted) {
+                    if (accepted) {
+                        [strongSelf enterMode:InterCallModeInterview role:InterInterviewRoleInterviewee];
+                    } else {
+                        [rc disconnect];
+                        [p setIndicatorState:InterConnectionIndicatorStateIdle];
+                        [p setStatusText:@"Disconnected — declined interview session."];
+                    }
+                }];
+            } else {
+                [strongSelf enterMode:InterCallModeNormal role:InterInterviewRoleNone];
+            }
+        });
+    }];
+}
+
+- (void)schedulePanel:(InterSchedulePanel *)panel didRequestInviteForMeeting:(NSString *)meetingId emails:(NSArray<NSString *> *)emails {
+    // Convert email strings to invitee dictionaries expected by the API
+    NSMutableArray<NSDictionary<NSString *, NSString *> *> *inviteesDicts = [NSMutableArray arrayWithCapacity:emails.count];
+    for (NSString *email in emails) {
+        [inviteesDicts addObject:@{@"email": email}];
+    }
+
+    InterTokenService *ts = self.roomController.tokenService;
+    [ts inviteToMeetingWithMeetingId:meetingId invitees:inviteesDicts completion:^(NSDictionary<NSString *,id> * _Nullable result, NSError * _Nullable error) {
+        if (error) {
+            NSLog(@"[Schedule] Invite failed: %@", error.localizedDescription);
+        } else {
+            NSLog(@"[Schedule] Invitations sent for meeting %@", meetingId);
+            [self reloadScheduleData];
+        }
+    }];
 }
 
 /// Auth-gated action: user tapped View Plans while not signed in.
@@ -1373,6 +1653,13 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
         [weakSelf handleRecordToggle];
     };
 
+    // [Phase 10 R2] View Recordings — visible to authenticated users
+    BOOL canViewRecordings = self.roomController.tokenService.isAuthenticated;
+    [self.normalControlPanel setViewRecordingsButtonHidden:!canViewRecordings];
+    self.normalControlPanel.viewRecordingsHandler = ^{
+        [weakSelf toggleNormalRecordingListPanel];
+    };
+
     // [3.4.4] Network quality signal bars in the control panel
     self.normalNetworkStatusView = [[InterNetworkStatusView alloc] initWithFrame:NSMakeRect(0, 0, 40, 16)];
     [self.normalControlPanel.networkStatusContainerView addSubview:self.normalNetworkStatusView];
@@ -2038,8 +2325,16 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
 // MARK: InterMediaWiringDelegate (Phase 8 — participant list sync)
 
 - (void)mediaWiringControllerDidChangePresenceState:(NSInteger)state {
-#pragma unused(state)
     [self refreshChatParticipantList];
+
+    // [Phase 10 R3] When a participant joins and the host is recording,
+    // re-broadcast the recording signal so the late joiner shows consent.
+    if (state == (NSInteger)InterParticipantPresenceStateParticipantJoined) {
+        if (self.roomController.isHost &&
+            self.normalRecordingCoordinator.state == InterRecordingStateRecording) {
+            [self.chatController broadcastRecordingSignalWithType:InterControlSignalTypeRecordingStarted];
+        }
+    }
 }
 
 - (void)refreshChatParticipantList {
@@ -2452,6 +2747,10 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
 - (void)recordingDidStart {
     self.normalRecordingIndicatorView.indicatorActive = YES;
     self.normalRecordingIndicatorView.indicatorPaused = NO;
+    // [Phase 10 R3] Show consent to non-host participants when remote recording starts
+    if (!self.roomController.isHost) {
+        [self showRecordingConsentOverlayForRemoteRecording];
+    }
 }
 
 - (void)recordingDidPause {
@@ -2465,6 +2764,132 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
 - (void)recordingDidStop {
     self.normalRecordingIndicatorView.indicatorActive = NO;
     [self.normalRecordingIndicatorView setElapsedDuration:0];
+}
+
+// ---------------------------------------------------------------------------
+#pragma mark - Recording List Panel (Phase 10 R2)
+// ---------------------------------------------------------------------------
+
+- (void)toggleNormalRecordingListPanel {
+    if (!self.normalRecordingListWindow) {
+        CGFloat panelWidth = 360;
+        CGFloat panelHeight = 420;
+        NSRect windowFrame = self.normalCallWindow.frame;
+        CGFloat x = NSMaxX(windowFrame) - panelWidth - 12;
+        CGFloat y = windowFrame.origin.y + 100;
+
+        self.normalRecordingListPanel = [[InterRecordingListPanel alloc] initWithFrame:NSMakeRect(0, 0, panelWidth, panelHeight)];
+        self.normalRecordingListPanel.delegate = self;
+        self.normalRecordingListPanel.serverBaseURL = self.roomController.tokenService.serverURL;
+
+        self.normalRecordingListWindow = [[NSWindow alloc] initWithContentRect:NSMakeRect(x, y, panelWidth, panelHeight)
+                                                                     styleMask:(NSWindowStyleMaskTitled |
+                                                                                NSWindowStyleMaskClosable |
+                                                                                NSWindowStyleMaskResizable)
+                                                                       backing:NSBackingStoreBuffered
+                                                                         defer:NO];
+        self.normalRecordingListWindow.title = @"Recordings";
+        self.normalRecordingListWindow.minSize = NSMakeSize(280, 260);
+        self.normalRecordingListWindow.releasedWhenClosed = NO;
+        self.normalRecordingListWindow.level = NSFloatingWindowLevel;
+        [self.normalRecordingListWindow setAppearance:[NSAppearance appearanceNamed:NSAppearanceNameDarkAqua]];
+        self.normalRecordingListWindow.contentView = self.normalRecordingListPanel;
+
+        [self.normalRecordingListPanel reloadRecordings];
+        [self.normalRecordingListWindow makeKeyAndOrderFront:nil];
+        return;
+    }
+
+    if (self.normalRecordingListWindow.isVisible) {
+        [self.normalRecordingListWindow orderOut:nil];
+    } else {
+        [self.normalRecordingListPanel reloadRecordings];
+        [self.normalRecordingListWindow makeKeyAndOrderFront:nil];
+    }
+}
+
+#pragma mark - InterRecordingListPanelDelegate (Phase 10 R2)
+
+- (void)recordingListPanel:(InterRecordingListPanel *)panel didRequestOpenLocal:(NSURL *)fileURL {
+    [[NSWorkspace sharedWorkspace] openURL:fileURL];
+}
+
+- (void)recordingListPanel:(InterRecordingListPanel *)panel didRequestDownload:(NSString *)recordingId {
+    NSString *baseURL = self.roomController.tokenService.serverURL;
+    if (!baseURL || !recordingId) return;
+
+    NSString *urlStr = [NSString stringWithFormat:@"%@/recordings/%@/download", baseURL, recordingId];
+    NSURL *url = [NSURL URLWithString:urlStr];
+    if (url) {
+        [[NSWorkspace sharedWorkspace] openURL:url];
+    }
+}
+
+- (void)recordingListPanel:(InterRecordingListPanel *)panel didRequestDelete:(NSString *)recordingId {
+    NSString *baseURL = self.roomController.tokenService.serverURL;
+    NSString *token = self.roomController.tokenService.currentAccessToken;
+    if (!baseURL || !token || !recordingId) return;
+
+    NSString *urlStr = [NSString stringWithFormat:@"%@/recordings/%@", baseURL, recordingId];
+    NSURL *url = [NSURL URLWithString:urlStr];
+    if (!url) return;
+
+    NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:url];
+    request.HTTPMethod = @"DELETE";
+    [request setValue:[NSString stringWithFormat:@"Bearer %@", token] forHTTPHeaderField:@"Authorization"];
+
+    __weak typeof(self) weakSelf = self;
+    [[[NSURLSession sharedSession] dataTaskWithRequest:request completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (error) {
+                NSAlert *alert = [NSAlert alertWithError:error];
+                [alert runModal];
+                return;
+            }
+            [weakSelf.normalRecordingListPanel reloadRecordings];
+        });
+    }] resume];
+}
+
+// ---------------------------------------------------------------------------
+#pragma mark - Recording Consent Panel (Phase 10 R3)
+// ---------------------------------------------------------------------------
+
+/// Show the consent overlay for a remote-initiated recording.
+- (void)showRecordingConsentOverlayForRemoteRecording {
+    if (self.normalRecordingConsentPanel) return; // already showing
+
+    NSView *contentView = self.normalCallWindow.contentView;
+    if (!contentView) return;
+
+    self.normalRecordingConsentPanel = [[InterRecordingConsentPanel alloc]
+        initWithFrame:contentView.bounds];
+    self.normalRecordingConsentPanel.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+    self.normalRecordingConsentPanel.delegate = self;
+    [contentView addSubview:self.normalRecordingConsentPanel];
+    [self.normalRecordingConsentPanel showConsentForMode:@"local_composed"];
+}
+
+- (void)dismissRecordingConsentOverlay {
+    if (self.normalRecordingConsentPanel) {
+        [self.normalRecordingConsentPanel dismiss];
+        [self.normalRecordingConsentPanel removeFromSuperview];
+        self.normalRecordingConsentPanel = nil;
+    }
+}
+
+#pragma mark - InterRecordingConsentPanelDelegate (Phase 10 R3)
+
+- (void)recordingConsentPanelDidAccept:(InterRecordingConsentPanel *)panel {
+    [self dismissRecordingConsentOverlay];
+}
+
+- (void)recordingConsentPanelDidDecline:(InterRecordingConsentPanel *)panel {
+    [self dismissRecordingConsentOverlay];
+    // Participant declined — leave the call
+    [self.roomController disconnect];
+    [self teardownActiveWindows];
+    [self launchSetupUI];
 }
 
 #pragma mark - Diagnostics [3.4.5]
@@ -2543,11 +2968,20 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
     }
     if (self.normalControlPanel) {
         self.normalControlPanel.recordToggleHandler = nil;
+        self.normalControlPanel.viewRecordingsHandler = nil;
     }
     if (self.normalRecordingIndicatorView) {
         [self.normalRecordingIndicatorView removeFromSuperview];
         self.normalRecordingIndicatorView = nil;
     }
+    // [Phase 10 R2] Tear down recording list window
+    if (self.normalRecordingListWindow) {
+        [self.normalRecordingListWindow orderOut:nil];
+        self.normalRecordingListWindow = nil;
+    }
+    self.normalRecordingListPanel = nil;
+    // [Phase 10 R3] Dismiss consent overlay
+    [self dismissRecordingConsentOverlay];
     self.chatController.recordingDelegate = nil;
 
     if (self.normalControlPanel) {
@@ -2609,6 +3043,13 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
     }
     self.normalLobbyPanel = nil;
     self.normalLobbyToggleButton = nil;
+
+    // [Phase 11] Tear down schedule window
+    if (self.normalScheduleWindow) {
+        [self.normalScheduleWindow orderOut:nil];
+        self.normalScheduleWindow = nil;
+    }
+    self.normalSchedulePanel = nil;
 
     // [3.2] Tear down remote video layout
     if (self.normalRemoteLayout) {

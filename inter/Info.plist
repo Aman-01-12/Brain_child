@@ -41,5 +41,9 @@
 	<string>NSApplication</string>
 	<key>NSScreenCaptureUsageDescription</key>
 	<string>Screen sharing captures this app's secure call surface.</string>
+	<key>NSCalendarsUsageDescription</key>
+	<string>Calendar access lets Inter show your schedule and sync meetings to your calendar.</string>
+	<key>NSCalendarsFullAccessUsageDescription</key>
+	<string>Calendar access lets Inter show your schedule and sync meetings to your calendar.</string>
 </dict>
 </plist>

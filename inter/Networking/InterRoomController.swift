@@ -184,7 +184,25 @@ import LiveKit
                      configuration.isHost ? 1 : 0, configuration.participantIdentity)
 
         // Step 1: Obtain a token from the token server
-        if configuration.isHost {
+        if !configuration.scheduledMeetingId.isEmpty {
+            // Scheduled meeting: /meetings/:id/start registers the room in Redis and
+            // returns the appropriate host or participant token based on the caller.
+            tokenService.startScheduledMeeting(
+                meetingId: configuration.scheduledMeetingId,
+                serverURL: configuration.tokenServerURL,
+                identity: configuration.participantIdentity,
+                displayName: configuration.participantName
+            ) { [weak self] response, error in
+                self?.handleTokenResponse(
+                    token: response?.token,
+                    serverURL: response?.serverURL ?? configuration.serverURL,
+                    roomCode: response?.roomCode,
+                    roomType: response?.roomType ?? "call",
+                    error: error,
+                    completion: completion
+                )
+            }
+        } else if configuration.isHost {
             tokenService.createRoom(
                 serverURL: configuration.tokenServerURL,
                 identity: configuration.participantIdentity,

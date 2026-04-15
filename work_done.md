@@ -1398,10 +1398,52 @@ NSString *tier = @"free"; // Phase 10C: read from auth profile
 
 ## Summary Table — Recording Resume Checklist
 
-| # | Task | Depends On | File(s) to Edit |
-|---|---|---|---|
-| R1 | Replace hardcoded `tier = @"free"` with real auth profile tier | Auth Phase B live + Keychain token | `inter/App/AppDelegate.m` line 1988 |
-| R2 | Wire `InterRecordingListPanel` into the call UI | Auth live (endpoint requires token) | `inter/App/AppDelegate.m`, `inter/UI/Views/InterLocalCallControlPanel.m` |
-| R3 | Wire `InterRecordingConsentPanel` to show on participant join during recording | No auth dependency | `inter/App/AppDelegate.m` (participant-join handler) |
+| # | Task | Depends On | File(s) to Edit | Status |
+|---|---|---|---|---|
+| R1 | Replace hardcoded `tier = @"free"` with real auth profile tier | Auth Phase B live + Keychain token | `inter/App/AppDelegate.m` line 1988 | ✅ DONE (uses `effectiveTier`) |
+| R2 | Wire `InterRecordingListPanel` into the call UI | Auth live (endpoint requires token) | `inter/App/AppDelegate.m`, `inter/UI/Views/InterLocalCallControlPanel.m` | ✅ DONE |
+| R3 | Wire `InterRecordingConsentPanel` to show on participant join during recording | No auth dependency | `inter/App/AppDelegate.m` (participant-join handler) | ✅ DONE |
 
-**When all 3 are done, recording is 100% feature-complete.**
+**All 3 done — recording is 100% feature-complete.**
+
+---
+
+# RECORDING RESUME — COMPLETION LOG (14 April 2026)
+
+## R1: Tier Gating — Already Fixed
+`handleRecordToggle` in `AppDelegate.m` already uses `self.roomController.tokenService.effectiveTier ?: @"free"` instead of the hardcoded `@"free"`. `effectiveTier` returns `meetingStartTier ?? currentTier` from `InterTokenService.swift`. No changes needed.
+
+## R2: Recording List Panel Wired Into Call UI
+
+### Changes to `InterLocalCallControlPanel.h/.m`:
+- Added `viewRecordingsHandler` block property
+- Added `viewRecordingsButton` (`📁 Recordings`) below the record button
+- Added `setViewRecordingsButtonHidden:` method
+- Added `handleViewRecordings:` action that invokes the handler
+
+### Changes to `AppDelegate.m`:
+- Added `normalRecordingListPanel`, `normalRecordingListWindow` properties
+- Added `InterRecordingListPanelDelegate` conformance
+- Wired `viewRecordingsHandler` in `launchNormalCallWindow` (visible to authenticated users)
+- `toggleNormalRecordingListPanel` — floating window pattern matching Lobby/Poll/Q&A panels
+- `didRequestOpenLocal:` → `[[NSWorkspace sharedWorkspace] openURL:fileURL]`
+- `didRequestDownload:` → opens `/recordings/:id/download` in browser
+- `didRequestDelete:` → `DELETE /recordings/:id` with Bearer token, then reloads list
+- Cleanup in `teardownActiveWindows` — closes window, nils panel + handler
+
+## R3: Recording Consent Panel Wired On Participant Join
+
+### Signal-Based Approach:
+The consent panel targets the **joiner's machine**, not the host's. Two triggers:
+1. **Real-time:** When `recordingDidStart` signal is received (via data channel), non-host participants see the consent overlay.
+2. **Late joiner:** When a new participant joins and host is recording, host re-broadcasts `InterControlSignalTypeRecordingStarted` via `broadcastRecordingSignalWithType:` so the late joiner receives it.
+
+### Changes to `AppDelegate.m`:
+- Added `normalRecordingConsentPanel` property
+- Added `InterRecordingConsentPanelDelegate` conformance
+- `recordingDidStart` (signal delegate) — if not host, shows consent overlay
+- `showRecordingConsentOverlayForRemoteRecording` — creates consent panel as full-bounds overlay on call window
+- `recordingConsentPanelDidAccept:` → dismisses overlay
+- `recordingConsentPanelDidDecline:` → dismisses overlay + disconnects + tears down to setup UI
+- `mediaWiringControllerDidChangePresenceState:` — when participant joins and host is recording, re-broadcasts `recordingStarted` signal
+- Cleanup in `teardownActiveWindows` — dismisses consent overlay

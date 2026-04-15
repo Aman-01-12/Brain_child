@@ -157,6 +157,10 @@ enum InterMicrophoneNetworkAction {
     /// Set from the token server response. Defaults to InterMaxParticipantsPerRoom.
     @objc public var maxParticipants: Int
 
+    /// Scheduled meeting ID. When non-empty, InterRoomController calls
+    /// POST /meetings/:id/start instead of /room/create or /room/join.
+    @objc public var scheduledMeetingId: String
+
     @objc public init(serverURL: String,
                       tokenServerURL: String,
                       roomCode: String = "",
@@ -173,6 +177,7 @@ enum InterMicrophoneNetworkAction {
         self.isHost = isHost
         self.roomType = roomType
         self.maxParticipants = maxParticipants
+        self.scheduledMeetingId = ""
         super.init()
     }
 
@@ -187,6 +192,7 @@ enum InterMicrophoneNetworkAction {
             roomType: roomType,
             maxParticipants: maxParticipants
         )
+        copy.scheduledMeetingId = scheduledMeetingId
         return copy
     }
 

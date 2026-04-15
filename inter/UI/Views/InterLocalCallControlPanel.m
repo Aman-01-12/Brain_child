@@ -17,6 +17,7 @@
 @property (nonatomic, strong) NSPopUpButton *audioInputPopUpButton;
 @property (nonatomic, strong) NSButton *shareSystemAudioButton;
 @property (nonatomic, strong) NSButton *recordButton;
+@property (nonatomic, strong) NSButton *viewRecordingsButton;
 @property (nonatomic, strong, readwrite) NSView *previewContainerView;
 @property (nonatomic, strong, readwrite) NSView *networkStatusContainerView;
 @property (nonatomic, assign) BOOL suppressAudioInputCallback;
@@ -188,6 +189,15 @@
     [self.recordButton setAction:@selector(handleRecordToggle:)];
     self.recordButton.hidden = YES; // Shown when user has permission
     [self addSubview:self.recordButton];
+
+    // [Phase 10 R2] View Recordings button — below the record button
+    self.viewRecordingsButton = [[NSButton alloc] initWithFrame:NSMakeRect(16, -10, self.bounds.size.width - 32, 30)];
+    self.viewRecordingsButton.autoresizingMask = NSViewWidthSizable | NSViewMaxYMargin;
+    [self.viewRecordingsButton setTitle:@"📁 Recordings"];
+    [self.viewRecordingsButton setTarget:self];
+    [self.viewRecordingsButton setAction:@selector(handleViewRecordings:)];
+    self.viewRecordingsButton.hidden = YES;
+    [self addSubview:self.viewRecordingsButton];
 
     self.shareButton = [[NSButton alloc] initWithFrame:NSMakeRect(16, 54, self.bounds.size.width - 32, 30)];
     self.shareButton.autoresizingMask = NSViewWidthSizable | NSViewMaxYMargin;
@@ -499,6 +509,22 @@
 
 - (void)setRecordingButtonHidden:(BOOL)hidden {
     self.recordButton.hidden = hidden;
+}
+
+// ---------------------------------------------------------------------------
+// MARK: - View Recordings Button (Phase 10 R2)
+// ---------------------------------------------------------------------------
+
+- (void)handleViewRecordings:(id)sender {
+#pragma unused(sender)
+    dispatch_block_t handler = self.viewRecordingsHandler;
+    if (handler) {
+        handler();
+    }
+}
+
+- (void)setViewRecordingsButtonHidden:(BOOL)hidden {
+    self.viewRecordingsButton.hidden = hidden;
 }
 
 @end

@@ -15,6 +15,7 @@ NS_ASSUME_NONNULL_BEGIN
 @property (nonatomic, copy, nullable) void (^shareSystemAudioChangedHandler)(BOOL enabled);
 @property (nonatomic, copy, nullable) void (^interviewToolChangedHandler)(InterInterviewToolKind toolKind);
 @property (nonatomic, copy, nullable) dispatch_block_t recordToggleHandler;
+@property (nonatomic, copy, nullable) dispatch_block_t viewRecordingsHandler;
 
 @property (nonatomic, strong, readonly) NSView *previewContainerView;
 
@@ -56,6 +57,9 @@ NS_ASSUME_NONNULL_BEGIN
 /// Update the recording button title and state.
 - (void)setRecordingActive:(BOOL)active;
 - (void)setRecordingButtonHidden:(BOOL)hidden;
+
+/// [Phase 10 R2] Show or hide the "View Recordings" button.
+- (void)setViewRecordingsButtonHidden:(BOOL)hidden;
 
 @end
 

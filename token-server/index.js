@@ -109,6 +109,18 @@ app.use((_req, res, next) => {
 // Apply optional auth middleware globally — attaches req.user if Bearer token present
 app.use(auth.authenticateToken);
 
+// [Phase 11] Mount scheduling router
+const schedulingRouter = require('./scheduling');
+app.use('/meetings', schedulingRouter);
+
+// [Phase 11.2.4/11.2.5] Mount calendar sync router
+const calendarRouter = require('./calendar');
+app.use('/calendar', calendarRouter);
+
+// [Phase 11.4] Mount teams router
+const teamsRouter = require('./teams');
+app.use('/teams', teamsRouter);
+
 // ---------------------------------------------------------------------------
 // Configuration — from environment or dev defaults
 // ---------------------------------------------------------------------------

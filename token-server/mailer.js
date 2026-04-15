@@ -196,9 +196,142 @@ async function sendPaymentFailedEmail(toEmail, updatePaymentUrl) {
   });
 }
 
+// ---------------------------------------------------------------------------
+// Meeting Invitation Email (Phase 11)
+// ---------------------------------------------------------------------------
+
+/**
+ * Send a meeting invitation email with join details and .ics calendar attachment.
+ *
+ * @param {string} toEmail — recipient email
+ * @param {object} details — { title, scheduledAt, duration, roomCode, hostName, hostTimezone, password }
+ */
+async function sendMeetingInvitationEmail(toEmail, details) {
+  const { title, scheduledAt, duration, roomCode, hostName, hostTimezone, password } = details;
+  const start = new Date(scheduledAt);
+  const end = new Date(start.getTime() + (duration || 60) * 60_000);
+
+  const dateOpts = { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric',
+                     hour: '2-digit', minute: '2-digit', timeZone: hostTimezone || 'UTC' };
+  const dateStr = start.toLocaleString('en-US', dateOpts);
+  const tzLabel = hostTimezone || 'UTC';
+
+  const joinUrl = `${baseUrl()}/join/${roomCode}`;
+
+  // Build minimal .ics (RFC 5545)
+  const uid = `${roomCode}-${start.getTime()}@inter.app`;
+  const icsContent = [
+    'BEGIN:VCALENDAR',
+    'VERSION:2.0',
+    'PRODID:-//Inter//Meeting//EN',
+    'CALSCALE:GREGORIAN',
+    'METHOD:REQUEST',
+    'BEGIN:VEVENT',
+    `UID:${uid}`,
+    `DTSTART:${toICSDate(start)}`,
+    `DTEND:${toICSDate(end)}`,
+    `SUMMARY:${icsEscape(title)}`,
+    `DESCRIPTION:Join: ${joinUrl}${password ? '\\nPassword: ' + icsEscape(password) : ''}`,
+    `ORGANIZER;CN=${icsEscape(hostName)}:mailto:noreply@inter.app`,
+    `URL:${joinUrl}`,
+    'STATUS:CONFIRMED',
+    'END:VEVENT',
+    'END:VCALENDAR',
+  ].join('\r\n');
+
+  await transporter.sendMail({
+    from:    FROM,
+    to:      toEmail,
+    subject: `Meeting Invitation: ${title}`,
+    text: [
+      `${hostName} has invited you to a meeting.`,
+      '',
+      `Title: ${title}`,
+      `When: ${dateStr} (${tzLabel})`,
+      `Duration: ${duration || 60} minutes`,
+      `Room Code: ${roomCode}`,
+      password ? `Password: ${password}` : null,
+      '',
+      `Join here: ${joinUrl}`,
+    ].filter(Boolean).join('\n'),
+    html: `
+      <div style="font-family:-apple-system,system-ui,sans-serif;max-width:480px">
+        <p><strong>${escHtml(hostName)}</strong> has invited you to a meeting.</p>
+        <table style="margin:16px 0;border-collapse:collapse">
+          <tr><td style="padding:4px 12px 4px 0;color:#666">Title</td><td>${escHtml(title)}</td></tr>
+          <tr><td style="padding:4px 12px 4px 0;color:#666">When</td><td>${escHtml(dateStr)} (${escHtml(tzLabel)})</td></tr>
+          <tr><td style="padding:4px 12px 4px 0;color:#666">Duration</td><td>${duration || 60} min</td></tr>
+          <tr><td style="padding:4px 12px 4px 0;color:#666">Room Code</td><td><code>${escHtml(roomCode)}</code></td></tr>
+          ${password ? `<tr><td style="padding:4px 12px 4px 0;color:#666">Password</td><td>${escHtml(password)}</td></tr>` : ''}
+        </table>
+        <p style="margin:24px 0">
+          <a href="${escHtml(joinUrl)}" style="background:#007AFF;color:#fff;padding:12px 24px;
+             border-radius:6px;text-decoration:none;font-weight:bold">
+            Join Meeting
+          </a>
+        </p>
+      </div>
+    `,
+    icalEvent: {
+      filename: 'meeting.ics',
+      method: 'REQUEST',
+      content: icsContent,
+    },
+  });
+}
+
+/** Format a Date to iCalendar UTC string (YYYYMMDDTHHMMSSZ). */
+function toICSDate(d) {
+  return d.toISOString().replace(/[-:]/g, '').replace(/\.\d{3}/, '');
+}
+
+/** Escape special characters in iCalendar text values. */
+function icsEscape(str) {
+  return String(str).replace(/[\\;,\n]/g, c => {
+    if (c === '\n') return '\\n';
+    return '\\' + c;
+  });
+}
+
+// ── [Phase 11.4] Team invitation email ──────────────────────────────────────
+/**
+ * Send a team invitation email.
+ *
+ * @param {string} toEmail — Recipient email
+ * @param {object} details — { teamName, inviterName }
+ */
+async function sendTeamInvitationEmail(toEmail, { teamName, inviterName }) {
+  if (!transporter) {
+    console.warn('[mailer] SMTP not configured — skipping team invitation email');
+    return;
+  }
+
+  await transporter.sendMail({
+    from: fromAddress,
+    to: toEmail,
+    subject: `You've been invited to join "${teamName}" on Inter`,
+    text: [
+      `${inviterName} has invited you to join the team "${teamName}" on Inter.`,
+      '',
+      'Open the Inter app and go to Settings → Teams to accept the invitation.',
+    ].join('\n'),
+    html: `
+      <div style="font-family:-apple-system,system-ui,sans-serif;max-width:480px">
+        <p><strong>${escHtml(inviterName)}</strong> has invited you to join the team
+           <strong>${escHtml(teamName)}</strong> on Inter.</p>
+        <p style="margin:24px 0;color:#666">
+          Open the Inter app and go to <strong>Settings → Teams</strong> to accept the invitation.
+        </p>
+      </div>
+    `,
+  });
+}
+
 module.exports = {
   sendPasswordResetEmail,
   sendVerificationEmail,
   sendSecurityAlertEmail,
   sendPaymentFailedEmail,
+  sendMeetingInvitationEmail,
+  sendTeamInvitationEmail,
 };
