@@ -542,10 +542,11 @@ interTests/             # Xcode unit and integration test target
 
 ## License
 
-[Add your license here]
+Copyright © 2026 Aman Verma. All rights reserved.
 
----
+This software and all associated source code, documentation, and assets are the exclusive property of Aman Verma. No part of this repository may be copied, modified, distributed, sublicensed, or used in any form — commercial or otherwise — without the explicit prior written permission of the owner.
 
-## Contributing
+Viewing this repository does not grant any rights or licenses to the code or concepts within it.
 
-[Add your contributing guidelines here]
+For licensing inquiries, contact the owner directly via GitHub: [@Aman-01-12]
+(https://github.com/Aman-01-12)
