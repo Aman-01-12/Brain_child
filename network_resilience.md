@@ -1,5 +1,5 @@
 # Network Resilience & Cybersecurity Standards
-### Brain_child — Complete Implementation Guide
+### inter — Complete Implementation Guide
 
 ---
 

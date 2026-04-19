@@ -430,7 +430,7 @@ static const CGFloat kHeaderHeight = 40.0;
                 NSLog(@"[Phase 10] Failed to delete recording at %@: %@", entry.recordingId, deleteError.localizedDescription);
                 NSAlert *errorAlert = [[NSAlert alloc] init];
                 errorAlert.messageText = @"Delete Failed";
-                errorAlert.informativeText = [NSString stringWithFormat:@"Could not delete the recording file: %@", deleteError.localizedDescription ?: @"Unknown error"];
+                errorAlert.informativeText = @"Could not delete the recording file. Please try again.";
                 [errorAlert addButtonWithTitle:@"OK"];
                 errorAlert.alertStyle = NSAlertStyleWarning;
                 [errorAlert runModal];

@@ -116,6 +116,10 @@ import LiveKit
     private var _stateLock = os_unfair_lock()
     private var _state: InterRecordingState = .idle
 
+    /// T8: Tracked in-flight network sessions for lifecycle cleanup.
+    private var inflightSessions = [URLSession]()
+    private let inflightLock = NSLock()
+
     /// Pipeline components — created during start, torn down during stop.
     private var recordingEngine: InterRecordingEngine?
     private var composedRenderer: InterComposedRenderer?
@@ -243,6 +247,13 @@ import LiveKit
         durationTimer?.cancel()
         diskSpaceTimer?.cancel()
         _speakerDebounceTimer?.cancel()
+
+        // T8: Cancel all in-flight network requests.
+        inflightLock.lock()
+        let sessions = inflightSessions
+        inflightSessions.removeAll()
+        inflightLock.unlock()
+        sessions.forEach { $0.invalidateAndCancel() }
     }
 
     // -----------------------------------------------------------------------
@@ -1568,7 +1579,11 @@ import LiveKit
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
 
-        let task = session.dataTask(with: request) { data, response, error in
+        let task = session.dataTask(with: request) { [weak self] data, response, error in
+            self?.inflightLock.lock()
+            self?.inflightSessions.removeAll { $0 === session }
+            self?.inflightLock.unlock()
+
             if let error = error {
                 let nsError = error as NSError
                 DispatchQueue.main.async { completion(false, nil, nil, nsError) }
@@ -1586,6 +1601,10 @@ import LiveKit
 
             DispatchQueue.main.async { completion(isRecording, egressId, mode, nil) }
         }
+
+        inflightLock.lock()
+        inflightSessions.append(session)
+        inflightLock.unlock()
         task.resume()
     }
 
@@ -1624,7 +1643,11 @@ import LiveKit
         config.timeoutIntervalForResource = 15.0
         let session = URLSession(configuration: config)
 
-        let task = session.dataTask(with: request) { data, response, error in
+        let task = session.dataTask(with: request) { [weak self] data, response, error in
+            self?.inflightLock.lock()
+            self?.inflightSessions.removeAll { $0 === session }
+            self?.inflightLock.unlock()
+
             if let error = error {
                 let nsError = NSError(domain: "InterRecording", code: -3,
                                       userInfo: [NSLocalizedDescriptionKey: "Network error: \(error.localizedDescription)",
@@ -1657,6 +1680,10 @@ import LiveKit
                 completion(.failure(nsError))
             }
         }
+
+        inflightLock.lock()
+        inflightSessions.append(session)
+        inflightLock.unlock()
         task.resume()
     }
 }

@@ -26,6 +26,7 @@ const https = require('https');
 const db = require('./db');
 const auth = require('./auth');
 const tokenCrypto = require('./crypto');
+const { requireIdempotencyKey } = require('./idempotency');
 
 // ---------------------------------------------------------------------------
 // Environment config
@@ -209,7 +210,7 @@ router.post('/google/disconnect', auth.requireAuth, async (req, res) => {
 });
 
 // POST /calendar/google/sync/:id — Create Google Calendar event for a meeting
-router.post('/google/sync/:id', auth.requireAuth, async (req, res) => {
+router.post('/google/sync/:id', auth.requireAuth, requireIdempotencyKey, async (req, res) => {
   try {
     // Fetch user's encrypted refresh token
     const userRow = await db.query(
@@ -435,7 +436,7 @@ router.post('/outlook/disconnect', auth.requireAuth, async (req, res) => {
 });
 
 // POST /calendar/outlook/sync/:id — Create Outlook Calendar event for a meeting
-router.post('/outlook/sync/:id', auth.requireAuth, async (req, res) => {
+router.post('/outlook/sync/:id', auth.requireAuth, requireIdempotencyKey, async (req, res) => {
   try {
     // Fetch user's encrypted refresh token
     const userRow = await db.query(

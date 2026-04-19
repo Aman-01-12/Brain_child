@@ -20,6 +20,7 @@ const db      = require('./db');
 const auth    = require('./auth');
 const redis   = require('./redis');
 const { AccessToken } = require('livekit-server-sdk');
+const { requireIdempotencyKey } = require('./idempotency');
 
 const router = express.Router();
 
@@ -82,7 +83,7 @@ function isValidTimezone(tz) {
 // ---------------------------------------------------------------------------
 // POST /meetings/schedule — Create a new scheduled meeting
 // ---------------------------------------------------------------------------
-router.post('/schedule', auth.requireAuth, async (req, res) => {
+router.post('/schedule', auth.requireAuth, requireIdempotencyKey, async (req, res) => {
   try {
     const {
       title,
@@ -360,7 +361,7 @@ router.delete('/:id', auth.requireAuth, async (req, res) => {
 // ---------------------------------------------------------------------------
 // POST /meetings/:id/invite — Send invitations for a meeting
 // ---------------------------------------------------------------------------
-router.post('/:id/invite', auth.requireAuth, async (req, res) => {
+router.post('/:id/invite', auth.requireAuth, requireIdempotencyKey, async (req, res) => {
   try {
     const { id } = req.params;
     const { invitees } = req.body; // [{ email, displayName? }]

@@ -24,6 +24,7 @@
 #import "InterRecordingListPanel.h"
 #import "InterRecordingConsentPanel.h"
 #import "InterSchedulePanel.h"
+#import "InterTeamsPanel.h"
 
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #import <AuthenticationServices/AuthenticationServices.h>
@@ -33,7 +34,7 @@
 #import "inter-Swift.h"
 #endif
 
-@interface AppDelegate () <NSWindowDelegate, InterConnectionSetupPanelDelegate, InterLoginPanelDelegate, InterAuthSessionDelegate, InterParticipantOverlayDelegate, InterChatPanelDelegate, InterSpeakerQueuePanelDelegate, InterPollPanelDelegate, InterQAPanelDelegate, InterMediaWiringDelegate, InterModerationDelegate, InterLobbyPanelDelegate, InterRecordingCoordinatorDelegate, InterRecordingSignalDelegate, InterRecordingListPanelDelegate, InterRecordingConsentPanelDelegate, InterSchedulePanelDelegate, ASWebAuthenticationPresentationContextProviding>
+@interface AppDelegate () <NSWindowDelegate, InterConnectionSetupPanelDelegate, InterLoginPanelDelegate, InterAuthSessionDelegate, InterParticipantOverlayDelegate, InterChatPanelDelegate, InterSpeakerQueuePanelDelegate, InterPollPanelDelegate, InterQAPanelDelegate, InterMediaWiringDelegate, InterModerationDelegate, InterLobbyPanelDelegate, InterRecordingCoordinatorDelegate, InterRecordingSignalDelegate, InterRecordingListPanelDelegate, InterRecordingConsentPanelDelegate, InterSchedulePanelDelegate, InterTeamsPanelDelegate, ASWebAuthenticationPresentationContextProviding>
 @property (nonatomic, strong) NSMutableArray<CapWindow *> *capWindows;
 @property (nonatomic, strong) SecureWindowController *secureController;
 @property (nonatomic, strong) NSWindow *setupWindow;
@@ -97,6 +98,16 @@
 
 // [Phase 11.1] Calendar service
 @property (nonatomic, strong, nullable) InterCalendarService *calendarService;
+
+// [Phase 11.4] Teams
+@property (nonatomic, strong, nullable) InterTeamsPanel *teamsPanel;
+@property (nonatomic, strong, nullable) NSWindow *teamsWindow;
+
+// Settings window — calendar connect/disconnect buttons (rebuilt each open)
+@property (nonatomic, strong, nullable) NSButton *settingsGoogleButton;
+@property (nonatomic, strong, nullable) NSButton *settingsOutlookButton;
+@property (nonatomic, strong, nullable) NSTextField *settingsGoogleStatusLabel;
+@property (nonatomic, strong, nullable) NSTextField *settingsOutlookStatusLabel;
 
 // [2.5.2] Room controller — persists across mode transitions [G4]
 @property (nonatomic, strong, nullable) InterRoomController *roomController;
@@ -227,13 +238,21 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
         }
         __weak typeof(self) weakSelf = self;
         [self.roomController.tokenService attemptSessionRestoreWithServerURL:tokenServerURL
-                                                                  completion:^(BOOL restored) {
+                                                                  completion:^(InterSessionRestoreResult result) {
             __strong typeof(weakSelf) strongSelf = weakSelf;
             if (!strongSelf) { return; }
-            if (restored) {
-                NSLog(@"[Auth] Session restored — tier=%@", strongSelf.roomController.tokenService.currentTier ?: @"unknown");
-            } else {
-                NSLog(@"[Auth] No saved session — launching in unauthenticated mode");
+            switch (result) {
+                case InterSessionRestoreResultRestored:
+                    NSLog(@"[Auth] Session restored — tier=%@",
+                          strongSelf.roomController.tokenService.currentTier ?: @"unknown");
+                    break;
+                case InterSessionRestoreResultOfflineWithPersistedSession:
+                    NSLog(@"[Auth] Server unreachable — entering offline mode (cached user=%@)",
+                          strongSelf.roomController.tokenService.currentDisplayName ?: @"unknown");
+                    break;
+                case InterSessionRestoreResultNoSession:
+                    NSLog(@"[Auth] No saved session — launching in unauthenticated mode");
+                    break;
             }
             [strongSelf launchSetupUI];
             [strongSelf preflightMediaPermissions];
@@ -590,6 +609,10 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
 ///   Billing (center — gated), billingStatusLabel.
 /// - Authenticated: "Sign Out" (left), Settings (right), Billing (functional),
 ///   billingStatusLabel.
+/// - Offline with persisted session: "Sign Out" (left), Settings (right),
+///   Billing (cached tier), billingStatusLabel shows "Offline — reconnecting…".
+///   The user sees their identity but server-dependent actions are unavailable
+///   until the background retry timer restores the session.
 ///
 /// This method removes any existing chrome view before building a new one,
 /// preserving the connection panel and its field values.
@@ -610,9 +633,10 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
     CGFloat panelY = (overlayView.bounds.size.height - panelH) / 2.0;
 
     BOOL isAuth = self.roomController.tokenService.isAuthenticated;
+    BOOL isOfflineWithSession = !isAuth && self.roomController.tokenService.hasPersistedSession;
 
     // Row 1: Left button + Right button (positioned above the connection panel)
-    if (isAuth) {
+    if (isAuth || isOfflineWithSession) {
         NSButton *signOutButton = [[NSButton alloc] initWithFrame:NSMakeRect(panelX, panelY + panelH + 8, 100, 26)];
         signOutButton.autoresizingMask = NSViewMaxXMargin | NSViewMinYMargin;
         [signOutButton setTitle:@"Sign Out"];
@@ -631,7 +655,7 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
         settingsButton.autoresizingMask = NSViewMaxXMargin | NSViewMinYMargin;
         [settingsButton setTitle:@"Settings"];
         [settingsButton setTarget:self];
-        [settingsButton setAction:@selector(handleSettingsRequiresAuth)];
+        [settingsButton setAction:@selector(openSettingsWindow)];
         [overlayView addSubview:settingsButton];
 
         NSButton *signInButton = [[NSButton alloc] initWithFrame:NSMakeRect(panelX + panelW - 140, panelY + panelH + 8, 140, 26)];
@@ -645,7 +669,7 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
     // Row 2: Billing buttons (centered, above row 1)
     CGFloat billingY = panelY + panelH + 42;
 
-    if (isAuth) {
+    if (isAuth || isOfflineWithSession) {
         NSString *currentTier = self.roomController.tokenService.currentTier ?: @"free";
         BOOL isPaid = ([currentTier isEqualToString:@"pro"] || [currentTier isEqualToString:@"pro+"]);
         NSLog(@"[Billing UI] Setting up buttons — currentTier=%@ isPaid=%@", currentTier, isPaid ? @"YES" : @"NO");
@@ -676,9 +700,7 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
 
     self.billingStatusLabel = [[NSTextField alloc] initWithFrame:NSMakeRect(panelX, panelY - 28, panelW, 20)];
     self.billingStatusLabel.autoresizingMask = NSViewMinXMargin | NSViewMaxXMargin | NSViewMinYMargin | NSViewMaxYMargin;
-    self.billingStatusLabel.stringValue = @"";
     self.billingStatusLabel.font = [NSFont systemFontOfSize:12 weight:NSFontWeightMedium];
-    self.billingStatusLabel.textColor = [NSColor secondaryLabelColor];
     self.billingStatusLabel.alignment = NSTextAlignmentCenter;
     self.billingStatusLabel.editable = NO;
     self.billingStatusLabel.selectable = NO;
@@ -686,9 +708,24 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
     self.billingStatusLabel.drawsBackground = NO;
     [overlayView addSubview:self.billingStatusLabel];
 
-    // [Phase 11] Schedule Meetings button — shown only for authenticated users
-    // Placed below the connection panel where there is empty space.
-    if (isAuth) {
+    // Show offline indicator when signed in but server is unreachable
+    if (isOfflineWithSession) {
+        NSString *displayName = self.roomController.tokenService.currentDisplayName ?: @"";
+        if (displayName.length > 0) {
+            self.billingStatusLabel.stringValue = [NSString stringWithFormat:@"%@ — Offline, reconnecting…", displayName];
+        } else {
+            self.billingStatusLabel.stringValue = @"Offline — reconnecting…";
+        }
+        self.billingStatusLabel.textColor = [NSColor systemOrangeColor];
+    } else {
+        self.billingStatusLabel.stringValue = @"";
+        self.billingStatusLabel.textColor = [NSColor secondaryLabelColor];
+    }
+
+    // [Phase 11] Schedule Meetings button — shown for authenticated users and
+    // offline-with-session (T5: role-based rendering, not connectivity-based).
+    // When offline, clicking opens the panel; the server call fails gracefully via T3.
+    if (isAuth || isOfflineWithSession) {
         CGFloat schedY = panelY - 34;
         NSButton *scheduleButton = [[NSButton alloc] initWithFrame:NSMakeRect(panelX + (panelW - 160) / 2.0, schedY, 160, 26)];
         scheduleButton.autoresizingMask = NSViewMinXMargin | NSViewMaxXMargin | NSViewMaxYMargin;
@@ -839,7 +876,7 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
                    lobbyEnabled:lobbyEnabled
                      completion:^(NSDictionary * _Nullable result, NSError * _Nullable error) {
         if (error) {
-            [panel setStatusText:error.localizedDescription];
+            [panel setStatusText:@"Could not schedule meeting. Please try again."];
             panel.scheduleButton.enabled = YES;
             return;
         }
@@ -859,15 +896,44 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
             [panel setStatusText:@"Meeting scheduled!"];
         }
 
-        // [Phase 11.1] Sync to Apple Calendar if authorized
-        if (meetingId && self.calendarService.isAuthorized) {
-            [self.calendarService createEventWithMeetingId:meetingId
-                                                    title:title
-                                                    notes:description
-                                                startDate:scheduledAt
-                                          durationMinutes:duration
-                                             hostTimezone:timezone
-                                                 roomCode:roomCode];
+        // [Phase 11.1] Sync to Apple Calendar — request permission if not yet granted,
+        // then create the event. The permission prompt fires contextually (first schedule).
+        if (meetingId) {
+            NSString *capMeetingId  = meetingId;
+            NSString *capTitle      = title;
+            NSString *capDesc       = description;
+            NSDate   *capStart      = scheduledAt;
+            NSInteger capDuration   = duration;
+            NSString *capTimezone   = timezone;
+            NSString *capRoomCode   = roomCode;
+            InterCalendarService *calSvc = self.calendarService;
+            void (^createBlock)(void) = ^{
+                [calSvc createEventWithMeetingId:capMeetingId
+                                          title:capTitle
+                                          notes:capDesc
+                                      startDate:capStart
+                                durationMinutes:capDuration
+                                   hostTimezone:capTimezone
+                                       roomCode:capRoomCode];
+            };
+            if (calSvc.isAuthorized) {
+                createBlock();
+            } else {
+                [calSvc requestAccessWithCompletion:^(BOOL granted) {
+                    if (granted) { createBlock(); }
+                }];
+            }
+        }
+
+        // [Phase 11.2.4/11.2.5] Fire-and-forget sync to Google + Outlook
+        if (meetingId) {
+            InterTokenService *syncTs = self.roomController.tokenService;
+            [syncTs syncMeetingToCalendarWithProvider:@"google" meetingId:meetingId completion:^(BOOL s, NSError *e) {
+                if (!s) NSLog(@"[Calendar] Google sync failed for %@: %@", meetingId, e.localizedDescription);
+            }];
+            [syncTs syncMeetingToCalendarWithProvider:@"outlook" meetingId:meetingId completion:^(BOOL s, NSError *e) {
+                if (!s) NSLog(@"[Calendar] Outlook sync failed for %@: %@", meetingId, e.localizedDescription);
+            }];
         }
     }];
 }
@@ -883,6 +949,9 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
 
         // [Phase 11.1] Remove from Apple Calendar
         [self.calendarService removeEventForMeetingId:meetingId];
+
+        // [Phase 11.2.4/11.2.5] No explicit calendar delete API — sync servers
+        // handle deletion via the server-side cancellation flag.
     }];
 }
 
@@ -970,6 +1039,114 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
         } else {
             NSLog(@"[Schedule] Invitations sent for meeting %@", meetingId);
             [self reloadScheduleData];
+        }
+    }];
+}
+
+// ============================================================================
+#pragma mark - InterTeamsPanelDelegate
+// ============================================================================
+
+- (void)teamsPanelDidRequestRefresh:(InterTeamsPanel *)panel {
+    [self reloadTeamsData];
+    // Also refresh members if a team is already selected
+    NSString *teamId = [panel selectedTeamId];
+    if (!teamId) return;
+    InterTokenService *ts = self.roomController.tokenService;
+    if (!ts) return;
+    __weak typeof(self) weakSelf = self;
+    [ts fetchTeamDetailsWithTeamId:teamId completion:^(NSDictionary<NSString *,id> *team, NSArray<NSDictionary<NSString *,id> *> *members, NSString *callerRole, NSError *error) {
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (error) {
+            [strongSelf.teamsPanel setStatusText:@"Could not load team details. Please try again."];
+            return;
+        }
+        [strongSelf.teamsPanel setCurrentTeamMembers:members ?: @[] callerRole:callerRole ?: @""];
+    }];
+}
+
+- (void)teamsPanel:(InterTeamsPanel *)panel
+  didRequestCreateTeamName:(NSString *)name
+               description:(NSString *)description {
+    InterTokenService *ts = self.roomController.tokenService;
+    if (!ts) return;
+    __weak typeof(self) weakSelf = self;
+    [ts createTeamWithName:name teamDescription:description completion:^(NSDictionary<NSString *,id> *team, NSError *error) {
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        [strongSelf.teamsPanel resetCreateButton];
+        if (error) {
+            [strongSelf.teamsPanel setStatusText:@"Could not create team. Please try again."];
+        } else {
+            [strongSelf.teamsPanel setStatusText:@"Team created!"];
+            [strongSelf reloadTeamsData];
+        }
+    }];
+}
+
+- (void)teamsPanel:(InterTeamsPanel *)panel
+didRequestInviteEmails:(NSArray<NSString *> *)emails
+            toTeamId:(NSString *)teamId {
+    InterTokenService *ts = self.roomController.tokenService;
+    if (!ts) return;
+    __weak typeof(self) weakSelf = self;
+    [ts inviteToTeamWithTeamId:teamId emails:emails completion:^(BOOL success, NSError *error) {
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        [strongSelf.teamsPanel resetInviteButton];
+        if (error || !success) {
+            [strongSelf.teamsPanel setStatusText:@"Could not send invitations. Please try again."];
+        } else {
+            [strongSelf.teamsPanel setStatusText:@"Invitations sent!"];
+        }
+    }];
+}
+
+- (void)teamsPanel:(InterTeamsPanel *)panel
+didRequestAcceptInvitationForTeamId:(NSString *)teamId {
+    InterTokenService *ts = self.roomController.tokenService;
+    if (!ts) return;
+    __weak typeof(self) weakSelf = self;
+    [ts acceptTeamInvitationWithTeamId:teamId completion:^(BOOL success, NSError *error) {
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        [strongSelf.teamsPanel resetAcceptButton];
+        if (error || !success) {
+            [strongSelf.teamsPanel setStatusText:@"Could not accept invitation. Please try again."];
+        } else {
+            [strongSelf.teamsPanel setStatusText:@"Joined team!"];
+            [strongSelf reloadTeamsData];
+        }
+    }];
+}
+
+- (void)teamsPanel:(InterTeamsPanel *)panel
+didRequestRemoveMemberId:(NSString *)memberId
+         fromTeamId:(NSString *)teamId {
+    InterTokenService *ts = self.roomController.tokenService;
+    if (!ts) return;
+    __weak typeof(self) weakSelf = self;
+    [ts removeTeamMemberWithTeamId:teamId memberId:memberId completion:^(BOOL success, NSError *error) {
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (error || !success) {
+            [strongSelf.teamsPanel setStatusText:@"Could not remove member. Please try again."];
+        } else {
+            [strongSelf.teamsPanel setStatusText:@"Member removed."];
+            [strongSelf teamsPanelDidRequestRefresh:panel];
+        }
+    }];
+}
+
+- (void)teamsPanel:(InterTeamsPanel *)panel
+didRequestDeleteTeamId:(NSString *)teamId {
+    InterTokenService *ts = self.roomController.tokenService;
+    if (!ts) return;
+    __weak typeof(self) weakSelf = self;
+    [ts deleteTeamWithTeamId:teamId completion:^(BOOL success, NSError *error) {
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        [strongSelf.teamsPanel resetDeleteButton];
+        if (error || !success) {
+            [strongSelf.teamsPanel setStatusText:@"Could not delete team. Please try again."];
+        } else {
+            [strongSelf.teamsPanel setStatusText:@"Team deleted."];
+            [strongSelf reloadTeamsData];
         }
     }];
 }
@@ -1086,7 +1263,12 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
         [panel setLoading:NO];
         [panel setActionsEnabled:YES];
         if (error) {
-            [panel showError:error.localizedDescription];
+            // Server auth errors (e.g. "Invalid credentials") are safe to display.
+            // Transport errors (code 1005) get a generic message (T3).
+            NSString *msg = (error.code == 1005)
+                ? @"Server unreachable. Check your connection."
+                : error.localizedDescription;
+            [panel showError:msg];
             return;
         }
         NSLog(@"[Auth] Login successful — user=%@ tier=%@", response.userId, response.tier);
@@ -1120,7 +1302,10 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
         [panel setLoading:NO];
         [panel setActionsEnabled:YES];
         if (error) {
-            [panel showError:error.localizedDescription];
+            NSString *msg = (error.code == 1005)
+                ? @"Server unreachable. Check your connection."
+                : error.localizedDescription;
+            [panel showError:msg];
             return;
         }
         NSLog(@"[Auth] Registration successful — user=%@ tier=%@", response.userId, response.tier);
@@ -1184,7 +1369,11 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
 
 - (void)setupPanelDidRequestHostCall:(InterConnectionSetupPanel *)panel {
     if (!self.roomController.tokenService.isAuthenticated) {
-        [panel setStatusText:@"Sign in to host a meeting."];
+        if (self.roomController.tokenService.hasPersistedSession) {
+            [panel setStatusText:@"Server unreachable — reconnecting…"];
+        } else {
+            [panel setStatusText:@"Sign in to host a meeting."];
+        }
         return;
     }
     [self connectAndEnterMode:InterCallModeNormal role:InterInterviewRoleNone panel:panel];
@@ -1192,7 +1381,11 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
 
 - (void)setupPanelDidRequestHostInterview:(InterConnectionSetupPanel *)panel {
     if (!self.roomController.tokenService.isAuthenticated) {
-        [panel setStatusText:@"Sign in to host an interview."];
+        if (self.roomController.tokenService.hasPersistedSession) {
+            [panel setStatusText:@"Server unreachable — reconnecting…"];
+        } else {
+            [panel setStatusText:@"Sign in to host an interview."];
+        }
         return;
     }
     [self connectAndEnterMode:InterCallModeInterview role:InterInterviewRoleInterviewer panel:panel];
@@ -1392,7 +1585,11 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
     if (code == 1010) return @"You are in the waiting room. The host will admit you shortly.";
     if (code == 1011) return @"This meeting requires a password.";
 
-    return error.localizedDescription ?: @"Connection failed.";
+    // T3: Never leak raw NSError descriptions to the user.
+    // Log the full error for debugging, return a generic safe string.
+    NSLog(@"[AppDelegate] Unmapped error (code=%ld, domain=%@): %@",
+          (long)code, error.domain, error.localizedDescription);
+    return @"Something went wrong. Please try again.";
 }
 
 - (void)launchNormalCallWindow {
@@ -2903,36 +3100,223 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
 #pragma mark - Settings
 
 - (void)openSettingsWindow {
-    if (!self.settingsWindow) {
-        self.settingsWindow =
-        [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 400, 140)
+    // Rebuild every time so calendar status is always fresh.
+    if (self.settingsWindow) {
+        [self.settingsWindow orderOut:nil];
+        self.settingsWindow = nil;
+        self.settingsGoogleButton = nil;
+        self.settingsOutlookButton = nil;
+        self.settingsGoogleStatusLabel = nil;
+        self.settingsOutlookStatusLabel = nil;
+    }
+
+    self.settingsWindow =
+        [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 420, 310)
                                     styleMask:(NSWindowStyleMaskTitled |
                                                NSWindowStyleMaskClosable)
                                       backing:NSBackingStoreBuffered
                                         defer:NO];
-        [self.settingsWindow setTitle:@"Settings"];
-        [self.settingsWindow setSharingType:NSWindowSharingNone];
+    [self.settingsWindow setTitle:@"Settings"];
+    [self.settingsWindow setSharingType:NSWindowSharingNone];
+    [self.settingsWindow setReleasedWhenClosed:NO];
 
-        NSView *contentView = [[NSView alloc] initWithFrame:self.settingsWindow.contentView.bounds];
-        contentView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
-        [self.settingsWindow setContentView:contentView];
+    NSView *cv = self.settingsWindow.contentView;
+    CGFloat w = 420.0;
 
-        NSTextField *placeholderLabel = [NSTextField labelWithString:@"No configurable settings yet."];
-        placeholderLabel.frame = NSMakeRect(24, 72, 352, 24);
-        placeholderLabel.font = [NSFont systemFontOfSize:13];
-        placeholderLabel.textColor = [NSColor secondaryLabelColor];
-        [contentView addSubview:placeholderLabel];
+    // ---- Section: Calendar Sync -------------------------------------------
+    NSTextField *calHeader = [NSTextField labelWithString:@"Calendar Sync"];
+    calHeader.frame = NSMakeRect(20, 250, 200, 20);
+    calHeader.font  = [NSFont boldSystemFontOfSize:13];
+    [cv addSubview:calHeader];
 
-        NSButton *closeButton = [[NSButton alloc] initWithFrame:NSMakeRect(284, 24, 92, 34)];
-        [closeButton setTitle:@"Close"];
-        [closeButton setTarget:self];
-        [closeButton setAction:@selector(closeSettingsWindow)];
-        [contentView addSubview:closeButton];
-    }
+    // Google row
+    NSTextField *googleLabel = [NSTextField labelWithString:@"Google Calendar"];
+    googleLabel.frame = NSMakeRect(20, 218, 160, 18);
+    googleLabel.font = [NSFont systemFontOfSize:12];
+    [cv addSubview:googleLabel];
+
+    self.settingsGoogleStatusLabel = [NSTextField labelWithString:@"Checking…"];
+    self.settingsGoogleStatusLabel.frame = NSMakeRect(20, 200, 200, 14);
+    self.settingsGoogleStatusLabel.font = [NSFont systemFontOfSize:11];
+    self.settingsGoogleStatusLabel.textColor = [NSColor secondaryLabelColor];
+    [cv addSubview:self.settingsGoogleStatusLabel];
+
+    self.settingsGoogleButton = [[NSButton alloc] initWithFrame:NSMakeRect(w - 120, 212, 100, 28)];
+    [self.settingsGoogleButton setTitle:@"Connect"];
+    [self.settingsGoogleButton setBezelStyle:NSBezelStyleRounded];
+    [self.settingsGoogleButton setTarget:self];
+    [self.settingsGoogleButton setAction:@selector(handleGoogleCalendarButtonTapped:)];
+    [cv addSubview:self.settingsGoogleButton];
+
+    // Separator
+    NSBox *calSep = [[NSBox alloc] initWithFrame:NSMakeRect(20, 194, w - 40, 1)];
+    calSep.boxType = NSBoxSeparator;
+    [cv addSubview:calSep];
+
+    // Outlook row
+    NSTextField *outlookLabel = [NSTextField labelWithString:@"Outlook Calendar"];
+    outlookLabel.frame = NSMakeRect(20, 170, 160, 18);
+    outlookLabel.font = [NSFont systemFontOfSize:12];
+    [cv addSubview:outlookLabel];
+
+    self.settingsOutlookStatusLabel = [NSTextField labelWithString:@"Checking…"];
+    self.settingsOutlookStatusLabel.frame = NSMakeRect(20, 152, 200, 14);
+    self.settingsOutlookStatusLabel.font = [NSFont systemFontOfSize:11];
+    self.settingsOutlookStatusLabel.textColor = [NSColor secondaryLabelColor];
+    [cv addSubview:self.settingsOutlookStatusLabel];
+
+    self.settingsOutlookButton = [[NSButton alloc] initWithFrame:NSMakeRect(w - 120, 164, 100, 28)];
+    [self.settingsOutlookButton setTitle:@"Connect"];
+    [self.settingsOutlookButton setBezelStyle:NSBezelStyleRounded];
+    [self.settingsOutlookButton setTarget:self];
+    [self.settingsOutlookButton setAction:@selector(handleOutlookCalendarButtonTapped:)];
+    [cv addSubview:self.settingsOutlookButton];
+
+    // ---- Section separator ------------------------------------------------
+    NSBox *teamsSep = [[NSBox alloc] initWithFrame:NSMakeRect(20, 142, w - 40, 1)];
+    teamsSep.boxType = NSBoxSeparator;
+    [cv addSubview:teamsSep];
+
+    // ---- Section: Teams ---------------------------------------------------
+    NSTextField *teamsHeader = [NSTextField labelWithString:@"Teams"];
+    teamsHeader.frame = NSMakeRect(20, 114, 200, 20);
+    teamsHeader.font  = [NSFont boldSystemFontOfSize:13];
+    [cv addSubview:teamsHeader];
+
+    NSButton *teamsButton = [[NSButton alloc] initWithFrame:NSMakeRect(w - 150, 108, 130, 28)];
+    [teamsButton setTitle:@"Manage Teams…"];
+    [teamsButton setBezelStyle:NSBezelStyleRounded];
+    [teamsButton setTarget:self];
+    [teamsButton setAction:@selector(openTeamsPanel:)];
+    [cv addSubview:teamsButton];
+
+    // ---- Close button -----------------------------------------------------
+    NSBox *bottomSep = [[NSBox alloc] initWithFrame:NSMakeRect(0, 56, w, 1)];
+    bottomSep.boxType = NSBoxSeparator;
+    [cv addSubview:bottomSep];
+
+    NSButton *closeButton = [[NSButton alloc] initWithFrame:NSMakeRect(w - 112, 16, 92, 34)];
+    [closeButton setTitle:@"Close"];
+    [closeButton setBezelStyle:NSBezelStyleRounded];
+    [closeButton setTarget:self];
+    [closeButton setAction:@selector(closeSettingsWindow)];
+    [cv addSubview:closeButton];
 
     [self.settingsWindow center];
     [self.settingsWindow makeKeyAndOrderFront:nil];
     [NSApp activateIgnoringOtherApps:YES];
+
+    // Fetch live calendar connection status
+    [self refreshSettingsCalendarStatus];
+}
+
+- (void)refreshSettingsCalendarStatus {
+    InterTokenService *ts = self.roomController.tokenService;
+    if (!ts) return;
+    __weak typeof(self) weakSelf = self;
+    [ts fetchCalendarStatusWithCompletion:^(NSDictionary<NSString *, id> *status, NSError *error) {
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf || !status) return;
+        NSDictionary *google  = status[@"google"]  ?: @{};
+        NSDictionary *outlook = status[@"outlook"] ?: @{};
+        BOOL gConnected = [google[@"connected"] boolValue];
+        BOOL oConnected = [outlook[@"connected"] boolValue];
+        BOOL gReauth    = [google[@"reauthRequired"]  boolValue];
+        BOOL oReauth    = [outlook[@"reauthRequired"] boolValue];
+
+        NSString *gStatus = gConnected ? (gReauth ? @"Connected (re-auth required)" : @"Connected") : @"Not connected";
+        NSString *oStatus = oConnected ? (oReauth ? @"Connected (re-auth required)" : @"Connected") : @"Not connected";
+
+        strongSelf.settingsGoogleStatusLabel.stringValue  = gStatus;
+        strongSelf.settingsOutlookStatusLabel.stringValue = oStatus;
+        [strongSelf.settingsGoogleButton  setTitle:gConnected ? @"Disconnect" : @"Connect"];
+        [strongSelf.settingsOutlookButton setTitle:oConnected ? @"Disconnect" : @"Connect"];
+    }];
+}
+
+- (void)handleGoogleCalendarButtonTapped:(id)sender {
+#pragma unused(sender)
+    [self handleCalendarButtonTappedForProvider:@"google" button:self.settingsGoogleButton];
+}
+
+- (void)handleOutlookCalendarButtonTapped:(id)sender {
+#pragma unused(sender)
+    [self handleCalendarButtonTappedForProvider:@"outlook" button:self.settingsOutlookButton];
+}
+
+- (void)handleCalendarButtonTappedForProvider:(NSString *)provider button:(NSButton *)button {
+    InterTokenService *ts = self.roomController.tokenService;
+    if (!ts) return;
+
+    BOOL isDisconnect = [button.title isEqualToString:@"Disconnect"];
+    button.enabled = NO;
+
+    __weak typeof(self) weakSelf = self;
+
+    if (isDisconnect) {
+        [ts disconnectCalendarWithProvider:provider completion:^(BOOL success, NSError *error) {
+            __strong typeof(weakSelf) strongSelf = weakSelf;
+            button.enabled = YES;
+            if (success) {
+                [strongSelf refreshSettingsCalendarStatus];
+            } else {
+                NSLog(@"[Calendar] Disconnect failed for %@: %@", provider, error.localizedDescription);
+            }
+        }];
+    } else {
+        [ts requestCalendarConnectURLWithProvider:provider completion:^(NSString *authUrl, NSError *error) {
+            button.enabled = YES;
+            if (authUrl.length > 0) {
+                NSURL *url = [NSURL URLWithString:authUrl];
+                if (url) [[NSWorkspace sharedWorkspace] openURL:url];
+            } else {
+                NSLog(@"[Calendar] Failed to get connect URL for %@: %@", provider, error.localizedDescription);
+            }
+        }];
+    }
+}
+
+- (void)openTeamsPanel:(id)sender {
+#pragma unused(sender)
+    if (!self.teamsWindow) {
+        self.teamsPanel = [[InterTeamsPanel alloc] initWithFrame:NSMakeRect(0, 0, 640, 460)];
+        self.teamsPanel.delegate = self;
+
+        self.teamsWindow = [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 640, 460)
+                                                        styleMask:(NSWindowStyleMaskTitled |
+                                                                   NSWindowStyleMaskClosable |
+                                                                   NSWindowStyleMaskResizable)
+                                                          backing:NSBackingStoreBuffered
+                                                            defer:NO];
+        [self.teamsWindow setTitle:@"Teams"];
+        [self.teamsWindow setSharingType:NSWindowSharingNone];
+        [self.teamsWindow setReleasedWhenClosed:NO];
+        [self.teamsWindow setContentView:self.teamsPanel];
+        [self.teamsWindow setDelegate:self];
+        self.teamsPanel.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+    }
+    [self.teamsWindow center];
+    [self.teamsWindow makeKeyAndOrderFront:nil];
+    [NSApp activateIgnoringOtherApps:YES];
+    // Initial load
+    [self reloadTeamsData];
+}
+
+- (void)reloadTeamsData {
+    InterTokenService *ts = self.roomController.tokenService;
+    if (!ts || !self.teamsPanel) return;
+    [self.teamsPanel setLoading:YES];
+    __weak typeof(self) weakSelf = self;
+    [ts fetchTeamsWithCompletion:^(NSArray<NSDictionary<NSString *, id> *> *teams, NSError *error) {
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        [strongSelf.teamsPanel setLoading:NO];
+        if (error) {
+            [strongSelf.teamsPanel setStatusText:@"Could not load teams. Please try again."];
+            return;
+        }
+        [strongSelf.teamsPanel setTeams:teams ?: @[]];
+        [strongSelf.teamsPanel setStatusText:@""];
+    }];
 }
 
 - (void)closeSettingsWindow {

@@ -25,6 +25,7 @@ const router = express.Router();
 const db = require('./db');
 const auth = require('./auth');
 const { sendTeamInvitationEmail } = require('./mailer');
+const { requireIdempotencyKey } = require('./idempotency');
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -61,7 +62,7 @@ function formatMember(row) {
 // ---------------------------------------------------------------------------
 
 // POST /teams — Create a new team
-router.post('/', auth.requireAuth, async (req, res) => {
+router.post('/', auth.requireAuth, requireIdempotencyKey, async (req, res) => {
   try {
     const { name, description } = req.body;
 
@@ -79,7 +80,7 @@ router.post('/', auth.requireAuth, async (req, res) => {
       `INSERT INTO teams (name, owner_user_id, description)
        VALUES ($1, $2, $3)
        RETURNING *`,
-      [name.trim(), req.user.id, description?.trim() || null]
+      [name.trim(), req.user.userId, description?.trim() || null]
     );
 
     const team = result.rows[0];
@@ -88,7 +89,7 @@ router.post('/', auth.requireAuth, async (req, res) => {
     await db.query(
       `INSERT INTO team_members (team_id, user_id, email, role, status, joined_at)
        VALUES ($1, $2, $3, 'owner', 'active', NOW())`,
-      [team.id, req.user.id, req.user.email]
+      [team.id, req.user.userId, req.user.email]
     );
 
     return res.status(201).json(formatTeam({ ...team, member_count: '1' }));
@@ -108,7 +109,7 @@ router.get('/', auth.requireAuth, async (req, res) => {
        LEFT JOIN team_members tm2 ON tm2.team_id = t.id AND tm2.status = 'active'
        GROUP BY t.id
        ORDER BY t.created_at DESC`,
-      [req.user.id]
+      [req.user.userId]
     );
 
     return res.json({ teams: result.rows.map(formatTeam) });
@@ -125,7 +126,7 @@ router.get('/:id', auth.requireAuth, async (req, res) => {
     const memberCheck = await db.query(
       `SELECT role FROM team_members
        WHERE team_id = $1 AND user_id = $2 AND status = 'active'`,
-      [req.params.id, req.user.id]
+      [req.params.id, req.user.userId]
     );
 
     if (memberCheck.rows.length === 0) {
@@ -167,7 +168,7 @@ router.patch('/:id', auth.requireAuth, async (req, res) => {
     const memberCheck = await db.query(
       `SELECT role FROM team_members
        WHERE team_id = $1 AND user_id = $2 AND status = 'active' AND role IN ('owner', 'admin')`,
-      [req.params.id, req.user.id]
+      [req.params.id, req.user.userId]
     );
 
     if (memberCheck.rows.length === 0) {
@@ -227,7 +228,7 @@ router.delete('/:id', auth.requireAuth, async (req, res) => {
     const memberCheck = await db.query(
       `SELECT role FROM team_members
        WHERE team_id = $1 AND user_id = $2 AND role = 'owner'`,
-      [req.params.id, req.user.id]
+      [req.params.id, req.user.userId]
     );
 
     if (memberCheck.rows.length === 0) {
@@ -243,13 +244,13 @@ router.delete('/:id', auth.requireAuth, async (req, res) => {
 });
 
 // POST /teams/:id/members — Invite member(s)
-router.post('/:id/members', auth.requireAuth, async (req, res) => {
+router.post('/:id/members', auth.requireAuth, requireIdempotencyKey, async (req, res) => {
   try {
     // Only owner or admin can invite
     const memberCheck = await db.query(
       `SELECT role FROM team_members
        WHERE team_id = $1 AND user_id = $2 AND status = 'active' AND role IN ('owner', 'admin')`,
-      [req.params.id, req.user.id]
+      [req.params.id, req.user.userId]
     );
 
     if (memberCheck.rows.length === 0) {
@@ -298,7 +299,7 @@ router.post('/:id/members', auth.requireAuth, async (req, res) => {
         if (typeof sendTeamInvitationEmail === 'function') {
           sendTeamInvitationEmail(normalized, {
             teamName: teamRow.rows[0].name,
-            inviterName: req.user.display_name || req.user.email,
+            inviterName: req.user.displayName || req.user.email,
           }).catch(err => console.error('[Teams] Invitation email failed:', err));
         }
       } catch (err) {
@@ -320,7 +321,7 @@ router.patch('/:id/members/:mid', auth.requireAuth, async (req, res) => {
     const ownerCheck = await db.query(
       `SELECT role FROM team_members
        WHERE team_id = $1 AND user_id = $2 AND role = 'owner'`,
-      [req.params.id, req.user.id]
+      [req.params.id, req.user.userId]
     );
 
     if (ownerCheck.rows.length === 0) {
@@ -364,7 +365,7 @@ router.delete('/:id/members/:mid', auth.requireAuth, async (req, res) => {
     const callerCheck = await db.query(
       `SELECT role FROM team_members
        WHERE team_id = $1 AND user_id = $2 AND status = 'active'`,
-      [req.params.id, req.user.id]
+      [req.params.id, req.user.userId]
     );
 
     if (callerCheck.rows.length === 0) {
@@ -389,7 +390,7 @@ router.delete('/:id/members/:mid', auth.requireAuth, async (req, res) => {
     }
 
     // Members can only remove themselves
-    const isSelf = target.user_id === req.user.id;
+    const isSelf = target.user_id === req.user.userId;
     if (callerRole === 'member' && !isSelf) {
       return res.status(403).json({ error: 'Only owner or admin can remove other members' });
     }
@@ -414,7 +415,7 @@ router.post('/:id/members/accept', auth.requireAuth, async (req, res) => {
        SET status = 'active', user_id = $1, joined_at = NOW()
        WHERE team_id = $2 AND LOWER(email) = LOWER($3) AND status = 'pending'
        RETURNING *`,
-      [req.user.id, req.params.id, req.user.email]
+      [req.user.userId, req.params.id, req.user.email]
     );
 
     if (result.rows.length === 0) {

@@ -77,6 +77,22 @@ import CryptoKit
     func authSessionDidAuthenticate(userId: String, tier: String)
 }
 
+// MARK: - Session Restore Result
+
+/// Tri-state result of session restore at launch — enables "signed in but offline" UX.
+@objc public enum InterSessionRestoreResult: Int {
+    /// Session fully restored — access token obtained, user is online and authenticated.
+    case restored = 0
+    /// Server was unreachable but local credentials (Keychain + UserDefaults) exist.
+    /// The app should show the user as "signed in (offline)" with cached profile data.
+    /// A background retry timer will silently restore the full session when the server
+    /// becomes reachable.
+    case offlineWithPersistedSession = 1
+    /// No stored credentials exist — the user has never signed in or has explicitly
+    /// signed out. Show the unauthenticated (Sign In / Sign Up) UI.
+    case noSession = 2
+}
+
 // MARK: - Auth Response Model
 
 /// Parsed response from /auth/login or /auth/register.
@@ -103,6 +119,142 @@ import CryptoKit
 }
 
 // MARK: - Token Cache Entry
+
+// MARK: - Circuit Breaker (T9)
+
+/// Three-state circuit breaker with exponential backoff for network resilience.
+///
+/// States:
+///   CLOSED    → Normal operation. All requests go through.
+///   OPEN      → Server unreachable. Requests fail immediately with cached error.
+///   HALF_OPEN → Probe state. One request allowed through to test recovery.
+///
+/// Backoff schedule (with ±500ms jitter):
+///   After 1st failure:  2s → 2nd: 4s → 3rd: 8s → 4th+: 16s (capped)
+private class InterCircuitBreaker {
+
+    enum State {
+        case closed
+        case open
+        case halfOpen
+    }
+
+    /// Serial queue protecting mutable state.
+    private let queue = DispatchQueue(label: "inter.circuitBreaker")
+
+    /// Current circuit state.
+    private(set) var state: State = .closed
+
+    /// Consecutive failure count.
+    private var failureCount = 0
+
+    /// Number of consecutive failures required to trip the circuit.
+    private let failureThreshold: Int
+
+    /// Timer that transitions from OPEN → HALF_OPEN after backoff delay.
+    private var recoveryTimer: DispatchSourceTimer?
+
+    /// Backoff base in seconds.
+    private let baseBackoff: TimeInterval = 2.0
+
+    /// Maximum backoff cap in seconds.
+    private let maxBackoff: TimeInterval = 16.0
+
+    /// Called (off the main queue) when the circuit transitions to half-open.
+    /// The owner can use this to trigger an immediate retry probe.
+    var onHalfOpen: (() -> Void)?
+
+    init(failureThreshold: Int = 3) {
+        self.failureThreshold = failureThreshold
+    }
+
+    /// Check whether a request should proceed.
+    /// Returns `true` if the request is allowed, `false` if the circuit is OPEN.
+    func shouldAllow() -> Bool {
+        return queue.sync {
+            switch state {
+            case .closed:
+                return true
+            case .halfOpen:
+                // Allow one probe request through
+                return true
+            case .open:
+                return false
+            }
+        }
+    }
+
+    /// Record a successful request. Resets the circuit to CLOSED.
+    func recordSuccess() {
+        queue.sync {
+            failureCount = 0
+            state = .closed
+            recoveryTimer?.cancel()
+            recoveryTimer = nil
+        }
+    }
+
+    /// Record a failed request. If threshold is reached, trips the circuit.
+    func recordFailure() {
+        queue.sync {
+            failureCount += 1
+
+            if state == .halfOpen {
+                // Probe failed — re-open with increased backoff
+                state = .open
+                scheduleRecoveryProbe()
+                return
+            }
+
+            if failureCount >= failureThreshold {
+                state = .open
+                scheduleRecoveryProbe()
+            }
+        }
+    }
+
+    /// Reset the breaker (e.g., on logout or explicit user retry).
+    func reset() {
+        queue.sync {
+            failureCount = 0
+            state = .closed
+            recoveryTimer?.cancel()
+            recoveryTimer = nil
+        }
+    }
+
+    /// Whether the circuit is currently open (failing fast).
+    var isOpen: Bool {
+        return queue.sync { state == .open }
+    }
+
+    // Must be called while holding `queue`.
+    private func scheduleRecoveryProbe() {
+        recoveryTimer?.cancel()
+
+        // Exponential backoff: 2s, 4s, 8s, 16s (capped)
+        let attempt = failureCount - failureThreshold + 1
+        let delay = min(baseBackoff * pow(2.0, Double(max(0, attempt - 1))), maxBackoff)
+        // Jitter: ±500ms
+        let jitter = Double.random(in: -0.5...0.5)
+        let actualDelay = max(0.5, delay + jitter)
+
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now() + actualDelay)
+        timer.setEventHandler { [weak self] in
+            guard let self = self else { return }
+            // Transition to half-open — next request will be a probe
+            self.state = .halfOpen
+            interLogInfo(InterLog.networking, "CircuitBreaker: half-open probe after %{public}.1fs", actualDelay)
+            self.onHalfOpen?()
+        }
+        timer.resume()
+        recoveryTimer = timer
+
+        interLogInfo(InterLog.networking, "CircuitBreaker: OPEN — recovery probe in %{public}.1fs (failures=%{public}d)",
+                     actualDelay, failureCount)
+    }
+}
 
 /// Internal cache entry holding a token and its expiration time.
 private struct TokenCacheEntry {
@@ -152,6 +304,78 @@ private struct TokenCacheEntry {
 
     /// Maximum number of retries for 5xx/timeout errors.
     private let maxRetries = 1
+
+    /// Circuit breaker for auth network calls (T9).
+    /// Trips after 3 consecutive failures, probes with exponential backoff.
+    private let circuitBreaker = InterCircuitBreaker(failureThreshold: 3)
+
+    // MARK: - Task Tracking (T8)
+
+    /// In-flight URLSessionDataTasks tracked for lifecycle cleanup.
+    /// Protected by `inflightLock`.
+    private var inflightTasks = Set<URLSessionDataTask>()
+
+    /// Lock protecting the inflight task set.
+    private let inflightLock = NSLock()
+
+    /// Track a task before resuming it. Must be paired with `untrackTask` in the completion handler.
+    private func trackTask(_ task: URLSessionDataTask) {
+        inflightLock.lock()
+        inflightTasks.insert(task)
+        inflightLock.unlock()
+    }
+
+    /// Remove a task from tracking after its completion handler fires.
+    private func untrackTask(_ task: URLSessionDataTask) {
+        inflightLock.lock()
+        inflightTasks.remove(task)
+        inflightLock.unlock()
+    }
+
+    /// Cancel all in-flight network requests. Called from `clearAuthState()` and `deinit`.
+    @objc public func cancelPendingRequests() {
+        inflightLock.lock()
+        let tasks = inflightTasks
+        inflightTasks.removeAll()
+        inflightLock.unlock()
+        tasks.forEach { $0.cancel() }
+    }
+
+    deinit {
+        cancelPendingRequests()
+        refreshTimer?.invalidate()
+        sessionRetryTimer?.invalidate()
+    }
+
+    // MARK: - Refresh Coalescing (T7)
+
+    /// Whether a token refresh HTTP request is currently in-flight.
+    /// Protected by `refreshCoalesceQueue`.
+    private var isRefreshInFlight = false
+
+    /// Queued completion handlers waiting for the in-flight refresh to finish.
+    /// Protected by `refreshCoalesceQueue`.
+    private var pendingRefreshCompletions: [(RefreshOutcome) -> Void] = []
+
+    /// Serial queue protecting refresh coalescing state.
+    private let refreshCoalesceQueue = DispatchQueue(label: "inter.tokenService.refreshCoalesce")
+
+    /// Deliver the refresh outcome to the original caller and all queued waiters,
+    /// then reset the in-flight flag so the next refresh can proceed.
+    private func drainRefreshCompletions(outcome: RefreshOutcome, originalCompletion: @escaping (RefreshOutcome) -> Void) {
+        let waiters: [(RefreshOutcome) -> Void] = refreshCoalesceQueue.sync {
+            let queued = pendingRefreshCompletions
+            pendingRefreshCompletions.removeAll()
+            isRefreshInFlight = false
+            return queued
+        }
+        completeOnMain {
+            originalCompletion(outcome)
+            for waiter in waiters {
+                waiter(outcome)
+            }
+        }
+    }
 
     // MARK: - Auth Properties
 
@@ -573,6 +797,14 @@ private struct TokenCacheEntry {
     /// UserDefaults key for persisting the current user ID across launches.
     private static let userIdDefaultsKey = "InterCurrentAuthUserId"
 
+    /// UserDefaults keys for caching user profile across launches (offline mode).
+    private static let emailDefaultsKey       = "InterCurrentAuthEmail"
+    private static let displayNameDefaultsKey = "InterCurrentAuthDisplayName"
+    private static let tierDefaultsKey        = "InterCurrentAuthTier"
+
+    /// Timer for retrying session restore when server was unreachable at launch.
+    private var sessionRetryTimer: Timer?
+
     // MARK: - Init
 
     @objc public override init() {
@@ -596,6 +828,14 @@ private struct TokenCacheEntry {
                                       delegate: pinnedDelegate,
                                       delegateQueue: nil)
         super.init()
+
+        // When the circuit breaker enters half-open, kick the session retry
+        // immediately so the probe window isn't wasted waiting on the timer.
+        circuitBreaker.onHalfOpen = { [weak self] in
+            DispatchQueue.main.async {
+                self?.fireImmediateSessionRetryProbe()
+            }
+        }
     }
 
     /// Initializer accepting an injected URLSession (for testing).
@@ -604,6 +844,12 @@ private struct TokenCacheEntry {
         self.pinnedDelegate = InterPinnedSessionDelegate()
         self.authSession = session // In tests, bypass pinning
         super.init()
+
+        circuitBreaker.onHalfOpen = { [weak self] in
+            DispatchQueue.main.async {
+                self?.fireImmediateSessionRetryProbe()
+            }
+        }
     }
 
     // MARK: - Public API
@@ -636,7 +882,8 @@ private struct TokenCacheEntry {
         performRequest(
             url: "\(serverURL)/room/create",
             body: body,
-            retryCount: 0
+            retryCount: 0,
+            idempotencyKey: UUID().uuidString
         ) { [weak self] result in
             switch result {
             case .success(let data):
@@ -973,11 +1220,51 @@ private struct TokenCacheEntry {
         }
     }
 
+    /// Outcome of a token refresh attempt.
+    /// Internal-only — external callers use the `Bool` overload.
+    private enum RefreshOutcome {
+        /// Token refreshed successfully.
+        case success
+        /// Server was unreachable or returned a transient error (5xx, 429, timeout).
+        /// The local session (Keychain + UserDefaults) is still intact and valid.
+        case networkError
+        /// The server definitively rejected the refresh token (expired, revoked,
+        /// compromised). Local auth state has already been cleared.
+        case invalidSession
+    }
+
     /// Silently refresh the access token using the stored refresh token.
     ///
     /// Calls `POST /auth/refresh`. Rotates the refresh token in Keychain.
     /// On `SESSION_COMPROMISED`, clears all auth state and notifies delegate.
     @objc public func refreshAccessToken(completion: ((Bool) -> Void)?) {
+        refreshAccessTokenWithOutcome { outcome in
+            completion?(outcome == .success)
+        }
+    }
+
+    /// Internal refresh that reports the full outcome — used by `attemptSessionRestore`
+    /// to distinguish "server unreachable" from "session invalid".
+    ///
+    /// **Coalescing (T7):** If a refresh is already in-flight, the completion is
+    /// queued and will be called with the in-flight request's outcome. This prevents
+    /// concurrent 401 handlers from spawning multiple refresh calls (which would
+    /// present an already-rotated refresh token → SESSION_COMPROMISED).
+    private func refreshAccessTokenWithOutcome(completion: @escaping (RefreshOutcome) -> Void) {
+        // Coalesce: if a refresh is already in-flight, queue this completion.
+        let shouldStart: Bool = refreshCoalesceQueue.sync {
+            if isRefreshInFlight {
+                pendingRefreshCompletions.append(completion)
+                return false
+            }
+            isRefreshInFlight = true
+            return true
+        }
+
+        guard shouldStart else {
+            interLogInfo(InterLog.networking, "Auth: refresh coalesced — waiting for in-flight request")
+            return
+        }
         // Snapshot all shared state reads here, on whatever thread calls us (main for
         // the proactive timer; background for URLSession retry via performAuthenticatedRequest).
         // This avoids reading the properties from the URLSession callback thread below.
@@ -989,7 +1276,7 @@ private struct TokenCacheEntry {
               let serverURL = serverURL,
               let refreshToken = refreshToken else {
             interLogError(InterLog.networking, "Auth: refresh skipped — no stored session")
-            completeOnMain { completion?(false) }
+            drainRefreshCompletions(outcome: .invalidSession, originalCompletion: completion)
             return
         }
 
@@ -1002,18 +1289,18 @@ private struct TokenCacheEntry {
         performAuthHTTPRequest(url: "\(serverURL)/auth/refresh", method: "POST",
                                body: body, bearerToken: nil, retryCount: 0) { [weak self] data, httpResponse, error in
             guard let self = self else {
-                DispatchQueue.main.async { completion?(false) }
+                DispatchQueue.main.async { completion(.networkError) }
                 return
             }
 
             if let error = error {
                 interLogError(InterLog.networking, "Auth: refresh network error (%{public}@)", error.localizedDescription)
-                self.completeOnMain { completion?(false) }
+                self.drainRefreshCompletions(outcome: .networkError, originalCompletion: completion)
                 return
             }
 
             guard let httpResponse = httpResponse, let data = data else {
-                self.completeOnMain { completion?(false) }
+                self.drainRefreshCompletions(outcome: .networkError, originalCompletion: completion)
                 return
             }
 
@@ -1042,7 +1329,7 @@ private struct TokenCacheEntry {
                 guard self.storeRefreshToken(newRefreshToken) else {
                     interLogError(InterLog.networking,
                                   "Auth: Keychain rotation failed — aborting token rotation; existing session preserved")
-                    self.completeOnMain { completion?(false) }
+                    self.drainRefreshCompletions(outcome: .networkError, originalCompletion: completion)
                     return
                 }
 
@@ -1057,16 +1344,21 @@ private struct TokenCacheEntry {
                     if let v = newDisplayName { self.currentDisplayName = v }
                     if let v = newTier        { self.currentTier = v }
                     self.isAuthenticated = true
+                    // Update cached profile in UserDefaults for offline mode
+                    if let v = newEmail       { UserDefaults.standard.set(v, forKey: Self.emailDefaultsKey) }
+                    if let v = newDisplayName { UserDefaults.standard.set(v, forKey: Self.displayNameDefaultsKey) }
+                    if let v = newTier        { UserDefaults.standard.set(v, forKey: Self.tierDefaultsKey) }
                 }
                 if Thread.isMainThread { writeWork() } else { DispatchQueue.main.async(execute: writeWork) }
 
                 self.scheduleProactiveRefresh(expiresIn: expiresIn)
 
                 interLogInfo(InterLog.networking, "Auth: access token refreshed (TTL=%{public}ds)", Int(expiresIn))
+                // Notify delegate first, then drain all queued completions.
                 self.completeOnMain {
                     self.authDelegate?.authSessionDidAuthenticate(userId: userId, tier: self.currentTier ?? "free")
-                    completion?(true)
                 }
+                self.drainRefreshCompletions(outcome: .success, originalCompletion: completion)
             } else {
                 // Check error code for specific handling
                 let json = self.parseJSON(data)
@@ -1077,23 +1369,23 @@ private struct TokenCacheEntry {
                     self.clearAuthState()
                     self.completeOnMain {
                         self.authDelegate?.authSessionDidExpire()
-                        completion?(false)
                     }
+                    self.drainRefreshCompletions(outcome: .invalidSession, originalCompletion: completion)
                 } else if httpResponse.statusCode == 429 || httpResponse.statusCode >= 500 {
                     // Transient server errors — do NOT clear auth state.
                     // The proactive timer or next performAuthenticatedRequest retry will
                     // try again. Expiring the session here would force a needless re-login.
                     interLogError(InterLog.networking, "Auth: refresh transient failure (%{public}d) — will retry",
                                   httpResponse.statusCode)
-                    self.completeOnMain { completion?(false) }
+                    self.drainRefreshCompletions(outcome: .networkError, originalCompletion: completion)
                 } else {
                     interLogError(InterLog.networking, "Auth: refresh failed (%{public}d, code=%{public}@)",
                                   httpResponse.statusCode, code ?? "none")
                     self.clearAuthState()
                     self.completeOnMain {
                         self.authDelegate?.authSessionDidExpire()
-                        completion?(false)
                     }
+                    self.drainRefreshCompletions(outcome: .invalidSession, originalCompletion: completion)
                 }
             }
         }
@@ -1135,7 +1427,18 @@ private struct TokenCacheEntry {
     ///
     /// Reads userId from UserDefaults and refresh token from Keychain.
     /// If both exist, calls `refreshAccessToken` to obtain a fresh access token.
-    @objc public func attemptSessionRestore(serverURL: String, completion: @escaping (Bool) -> Void) {
+    ///
+    /// **Network resilience (Zoom-style)**: If the server is unreachable at launch,
+    /// the local session is preserved and the user is shown as "signed in (offline)"
+    /// using cached profile data from UserDefaults. A background retry timer
+    /// silently attempts to restore the full session every 15 seconds, and on
+    /// success notifies the delegate so the UI updates seamlessly.
+    ///
+    /// - Returns: `.restored` on full restore, `.offlineWithPersistedSession` when
+    ///   credentials exist but the server is unreachable, `.noSession` when no
+    ///   stored credentials exist.
+    @objc public func attemptSessionRestore(serverURL: String,
+                                            completion: @escaping (InterSessionRestoreResult) -> Void) {
         // Always store the server URL so billing/plans and other public
         // endpoints are reachable even when no session exists.
         self.authServerBaseURL = serverURL
@@ -1143,17 +1446,131 @@ private struct TokenCacheEntry {
         guard let userId = UserDefaults.standard.string(forKey: Self.userIdDefaultsKey),
               loadRefreshToken() != nil else {
             interLogInfo(InterLog.networking, "Auth: no stored session to restore")
-            completeOnMain { completion(false) }
+            completeOnMain { completion(.noSession) }
             return
         }
 
         self.currentUserId = userId
 
-        refreshAccessToken { [weak self] success in
-            if !success {
-                self?.clearAuthState()
+        refreshAccessTokenWithOutcome { [weak self] outcome in
+            guard let self = self else { return }
+            switch outcome {
+            case .success:
+                self.completeOnMain { completion(.restored) }
+
+            case .networkError:
+                // Server unreachable — populate in-memory profile from cached UserDefaults
+                // so the UI can display the user's identity in offline mode.
+                let cachedEmail       = UserDefaults.standard.string(forKey: Self.emailDefaultsKey)
+                let cachedDisplayName = UserDefaults.standard.string(forKey: Self.displayNameDefaultsKey)
+                let cachedTier        = UserDefaults.standard.string(forKey: Self.tierDefaultsKey)
+
+                let loadCachedWork = {
+                    self.currentEmail       = cachedEmail
+                    self.currentDisplayName = cachedDisplayName
+                    self.currentTier        = cachedTier
+                    // isAuthenticated stays false — no valid access token exists.
+                    // The UI checks hasPersistedSession to distinguish offline vs signed-out.
+                }
+                if Thread.isMainThread { loadCachedWork() } else { DispatchQueue.main.async(execute: loadCachedWork) }
+
+                interLogInfo(InterLog.networking,
+                             "Auth: session restore failed (server unreachable) — entering offline mode with cached profile")
+                self.scheduleSessionRetry()
+                self.completeOnMain { completion(.offlineWithPersistedSession) }
+
+            case .invalidSession:
+                // Server definitively rejected the token — clearAuthState() was already
+                // called inside refreshAccessTokenWithOutcome. Nothing more to do.
+                interLogInfo(InterLog.networking,
+                             "Auth: session restore failed (invalid session) — local credentials cleared")
+                self.completeOnMain { completion(.noSession) }
             }
-            self?.completeOnMain { completion(success) }
+        }
+    }
+
+    /// Whether a persisted session exists in Keychain + UserDefaults, even if
+    /// the server is currently unreachable. Used by the UI to distinguish
+    /// "signed in but offline" from "not signed in".
+    @objc public var hasPersistedSession: Bool {
+        return UserDefaults.standard.string(forKey: Self.userIdDefaultsKey) != nil
+            && loadRefreshToken() != nil
+    }
+
+    // MARK: - Private: Session Retry Timer
+
+    /// Consecutive retry attempt count for exponential backoff (T9).
+    private var sessionRetryAttempt = 0
+
+    /// Schedule a background timer that attempts to restore the session
+    /// when the server becomes reachable. Uses exponential backoff (T9):
+    /// 2s → 4s → 8s → 10s (capped) with ±0.5s jitter.
+    /// The circuit breaker's `onHalfOpen` callback also triggers immediate
+    /// probes, so the timer acts as a fallback rather than the primary driver.
+    private func scheduleSessionRetry() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            self.sessionRetryTimer?.invalidate()
+            self.sessionRetryAttempt = 0
+            self.scheduleNextSessionRetryTick()
+        }
+    }
+
+    /// Schedule one retry tick with backoff delay. Must be called on main thread.
+    private func scheduleNextSessionRetryTick() {
+        let attempt = sessionRetryAttempt
+        let delay = min(2.0 * pow(2.0, Double(attempt)), 10.0)
+        let jitter = Double.random(in: -0.5...0.5)
+        let actualDelay = max(1.0, delay + jitter)
+
+        sessionRetryTimer = Timer.scheduledTimer(withTimeInterval: actualDelay,
+                                                  repeats: false) { [weak self] _ in
+            self?.executeSessionRetryProbe(label: "timer", attempt: attempt + 1)
+        }
+    }
+
+    /// Called by the circuit breaker's `onHalfOpen` callback to trigger an
+    /// immediate session retry without waiting for the backoff timer.
+    /// Must be called on main thread.
+    private func fireImmediateSessionRetryProbe() {
+        guard sessionRetryTimer != nil else { return }     // Only if we're in retry mode
+        guard !isAuthenticated else { return }
+        sessionRetryTimer?.invalidate()
+        executeSessionRetryProbe(label: "circuit-breaker probe", attempt: sessionRetryAttempt + 1)
+    }
+
+    /// Shared retry logic used by both the timer tick and the circuit-breaker probe.
+    /// Must be called on main thread.
+    private func executeSessionRetryProbe(label: String, attempt: Int) {
+        guard !self.isAuthenticated else {
+            self.sessionRetryTimer?.invalidate()
+            self.sessionRetryTimer = nil
+            return
+        }
+        interLogInfo(InterLog.networking, "Auth: session retry attempt %{public}d (%{public}@)…",
+                     attempt, label)
+        self.refreshAccessTokenWithOutcome { [weak self] outcome in
+            guard let self = self else { return }
+            if outcome == .success {
+                interLogInfo(InterLog.networking, "Auth: session retry succeeded — online mode restored")
+                DispatchQueue.main.async {
+                    self.sessionRetryTimer?.invalidate()
+                    self.sessionRetryTimer = nil
+                    self.sessionRetryAttempt = 0
+                }
+            } else if outcome == .invalidSession {
+                interLogInfo(InterLog.networking, "Auth: session retry — session invalid, stopping retries")
+                DispatchQueue.main.async {
+                    self.sessionRetryTimer?.invalidate()
+                    self.sessionRetryTimer = nil
+                }
+            } else {
+                // .networkError — schedule next retry with increased backoff
+                DispatchQueue.main.async {
+                    self.sessionRetryAttempt += 1
+                    self.scheduleNextSessionRetryTick()
+                }
+            }
         }
     }
 
@@ -1168,8 +1585,10 @@ private struct TokenCacheEntry {
             authedRequest.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         }
 
-        authSession.dataTask(with: authedRequest) { [weak self] data, response, error in
+        var outerTaskRef: URLSessionDataTask?
+        let outerTask = authSession.dataTask(with: authedRequest) { [weak self] data, response, error in
             guard let self = self else { return }
+            if let t = outerTaskRef { self.untrackTask(t) }
 
             if let error = error {
                 self.completeOnMain { completion(nil, response, error as NSError) }
@@ -1192,9 +1611,14 @@ private struct TokenCacheEntry {
                     if success, let newToken = self.currentAccessToken {
                         var retried = request
                         retried.setValue("Bearer \(newToken)", forHTTPHeaderField: "Authorization")
-                        self.authSession.dataTask(with: retried) { data, response, error in
-                            self.completeOnMain { completion(data, response, error as NSError?) }
-                        }.resume()
+                        var retryTaskRef: URLSessionDataTask?
+                        let retryTask = self.authSession.dataTask(with: retried) { [weak self] data, response, error in
+                            if let t = retryTaskRef { self?.untrackTask(t) }
+                            self?.completeOnMain { completion(data, response, error as NSError?) }
+                        }
+                        retryTaskRef = retryTask
+                        self.trackTask(retryTask)
+                        retryTask.resume()
                     } else {
                         self.completeOnMain {
                             self.authDelegate?.authSessionDidExpire()
@@ -1206,7 +1630,11 @@ private struct TokenCacheEntry {
             } else {
                 self.completeOnMain { completion(data, response, nil) }
             }
-        }.resume()
+        }
+
+        outerTaskRef = outerTask
+        trackTask(outerTask)
+        outerTask.resume()
     }
 
     // MARK: - Phase 11: Scheduling
@@ -1278,7 +1706,8 @@ private struct TokenCacheEntry {
             method: "POST",
             body: body,
             bearerToken: accessToken,
-            retryCount: 0
+            retryCount: 0,
+            idempotencyKey: UUID().uuidString
         ) { [weak self] data, httpResponse, error in
             guard let self = self else { return }
             guard error == nil,
@@ -1428,7 +1857,8 @@ private struct TokenCacheEntry {
             method: "POST",
             body: ["invitees": invitees],
             bearerToken: accessToken,
-            retryCount: 0
+            retryCount: 0,
+            idempotencyKey: UUID().uuidString
         ) { [weak self] data, httpResponse, error in
             guard let self = self else { return }
             guard error == nil,
@@ -1443,15 +1873,394 @@ private struct TokenCacheEntry {
         }
     }
 
+    // MARK: - Calendar Sync
+
+    /// Fetch Google + Outlook connection status.
+    /// Completion called on main queue with dict: `{google: {connected, reauthRequired}, outlook: {connected, reauthRequired}}`.
+    @objc public func fetchCalendarStatus(
+        completion: @escaping (_ status: [String: Any]?, _ error: NSError?) -> Void
+    ) {
+        guard let serverURL = authServerBaseURL,
+              let accessToken = currentAccessToken else {
+            completeOnMain { completion(nil, nil) }
+            return
+        }
+
+        guard let url = URL(string: "\(serverURL)/calendar/status") else {
+            completeOnMain { completion(nil, nil) }
+            return
+        }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+
+        var taskRef: URLSessionDataTask?
+        let task = session.dataTask(with: request) { [weak self] data, response, error in
+            guard let self = self else { return }
+            if let t = taskRef { self.untrackTask(t) }
+            guard error == nil,
+                  let data = data,
+                  let json = self.parseJSON(data) else {
+                self.completeOnMain { completion(nil, error as NSError?) }
+                return
+            }
+            self.completeOnMain { completion(json, nil) }
+        }
+        taskRef = task
+        trackTask(task)
+        task.resume()
+    }
+
+    /// Request an OAuth connect URL for Google or Outlook calendar.
+    /// `provider` is `"google"` or `"outlook"`.
+    /// Completion called on main queue with the authUrl string.
+    @objc public func requestCalendarConnectURL(
+        provider: String,
+        completion: @escaping (_ authUrl: String?, _ error: NSError?) -> Void
+    ) {
+        guard let serverURL = authServerBaseURL,
+              let accessToken = currentAccessToken else {
+            completeOnMain { completion(nil, nil) }
+            return
+        }
+
+        performAuthHTTPRequest(
+            url: "\(serverURL)/calendar/\(provider)/connect",
+            method: "POST",
+            body: [:],
+            bearerToken: accessToken,
+            retryCount: 0
+        ) { [weak self] data, httpResponse, error in
+            guard let self = self else { return }
+            guard error == nil,
+                  let data = data,
+                  let json = self.parseJSON(data),
+                  let authUrl = json["authUrl"] as? String else {
+                self.completeOnMain { completion(nil, error) }
+                return
+            }
+            self.completeOnMain { completion(authUrl, nil) }
+        }
+    }
+
+    /// Disconnect Google or Outlook calendar.
+    /// `provider` is `"google"` or `"outlook"`.
+    @objc public func disconnectCalendar(
+        provider: String,
+        completion: @escaping (_ success: Bool, _ error: NSError?) -> Void
+    ) {
+        guard let serverURL = authServerBaseURL,
+              let accessToken = currentAccessToken else {
+            completeOnMain { completion(false, nil) }
+            return
+        }
+
+        performAuthHTTPRequest(
+            url: "\(serverURL)/calendar/\(provider)/disconnect",
+            method: "POST",
+            body: [:],
+            bearerToken: accessToken,
+            retryCount: 0
+        ) { [weak self] data, httpResponse, error in
+            guard let self = self else { return }
+            let ok = error == nil && (httpResponse?.statusCode ?? 0) == 200
+            self.completeOnMain { completion(ok, error) }
+        }
+    }
+
+    /// Sync a scheduled meeting to Google or Outlook calendar.
+    /// `provider` is `"google"` or `"outlook"`.
+    @objc public func syncMeetingToCalendar(
+        provider: String,
+        meetingId: String,
+        completion: @escaping (_ success: Bool, _ error: NSError?) -> Void
+    ) {
+        guard let serverURL = authServerBaseURL,
+              let accessToken = currentAccessToken else {
+            completeOnMain { completion(false, nil) }
+            return
+        }
+
+        performAuthHTTPRequest(
+            url: "\(serverURL)/calendar/\(provider)/sync/\(meetingId)",
+            method: "POST",
+            body: [:],
+            bearerToken: accessToken,
+            retryCount: 0,
+            idempotencyKey: UUID().uuidString
+        ) { [weak self] data, httpResponse, error in
+            guard let self = self else { return }
+            let ok = error == nil && (httpResponse?.statusCode ?? 0) == 200
+            self.completeOnMain { completion(ok, error) }
+        }
+    }
+
+    // MARK: - Teams
+
+    /// Fetch all teams the current user belongs to.
+    @objc public func fetchTeams(
+        completion: @escaping (_ teams: [[String: Any]]?, _ error: NSError?) -> Void
+    ) {
+        guard let serverURL = authServerBaseURL,
+              let accessToken = currentAccessToken else {
+            completeOnMain { completion(nil, nil) }
+            return
+        }
+
+        guard let url = URL(string: "\(serverURL)/teams") else {
+            completeOnMain { completion(nil, nil) }
+            return
+        }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+
+        var taskRef: URLSessionDataTask?
+        let task = session.dataTask(with: request) { [weak self] data, response, error in
+            guard let self = self else { return }
+            if let t = taskRef { self.untrackTask(t) }
+            guard error == nil,
+                  let data = data,
+                  let json = self.parseJSON(data),
+                  let teams = json["teams"] as? [[String: Any]] else {
+                self.completeOnMain { completion(nil, error as NSError?) }
+                return
+            }
+            self.completeOnMain { completion(teams, nil) }
+        }
+        taskRef = task
+        trackTask(task)
+        task.resume()
+    }
+
+    /// Create a new team.
+    @objc public func createTeam(
+        name: String,
+        teamDescription: String?,
+        completion: @escaping (_ team: [String: Any]?, _ error: NSError?) -> Void
+    ) {
+        guard let serverURL = authServerBaseURL,
+              let accessToken = currentAccessToken else {
+            completeOnMain { completion(nil, nil) }
+            return
+        }
+
+        var body: [String: Any] = ["name": name]
+        if let desc = teamDescription, !desc.isEmpty {
+            body["description"] = desc
+        }
+
+        performAuthHTTPRequest(
+            url: "\(serverURL)/teams",
+            method: "POST",
+            body: body,
+            bearerToken: accessToken,
+            retryCount: 0,
+            idempotencyKey: UUID().uuidString
+        ) { [weak self] data, httpResponse, error in
+            guard let self = self else { return }
+            guard error == nil,
+                  let data = data,
+                  let json = self.parseJSON(data),
+                  let team = json["team"] as? [String: Any] else {
+                self.completeOnMain { completion(nil, error) }
+                return
+            }
+            self.completeOnMain { completion(team, nil) }
+        }
+    }
+
+    /// Fetch full details for a team (members list + caller's role).
+    @objc public func fetchTeamDetails(
+        teamId: String,
+        completion: @escaping (_ team: [String: Any]?, _ members: [[String: Any]]?, _ callerRole: String?, _ error: NSError?) -> Void
+    ) {
+        guard let serverURL = authServerBaseURL,
+              let accessToken = currentAccessToken else {
+            completeOnMain { completion(nil, nil, nil, nil) }
+            return
+        }
+
+        guard let url = URL(string: "\(serverURL)/teams/\(teamId)") else {
+            completeOnMain { completion(nil, nil, nil, nil) }
+            return
+        }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+
+        var taskRef: URLSessionDataTask?
+        let task = session.dataTask(with: request) { [weak self] data, response, error in
+            guard let self = self else { return }
+            if let t = taskRef { self.untrackTask(t) }
+            guard error == nil,
+                  let data = data,
+                  let json = self.parseJSON(data) else {
+                self.completeOnMain { completion(nil, nil, nil, error as NSError?) }
+                return
+            }
+            let team = json["team"] as? [String: Any]
+            let members = json["members"] as? [[String: Any]]
+            let callerRole = json["callerRole"] as? String
+            self.completeOnMain { completion(team, members, callerRole, nil) }
+        }
+        taskRef = task
+        trackTask(task)
+        task.resume()
+    }
+
+    /// Invite users to a team by email.
+    @objc public func inviteToTeam(
+        teamId: String,
+        emails: [String],
+        completion: @escaping (_ success: Bool, _ error: NSError?) -> Void
+    ) {
+        guard let serverURL = authServerBaseURL,
+              let accessToken = currentAccessToken else {
+            completeOnMain { completion(false, nil) }
+            return
+        }
+
+        let invitees = emails.map { ["email": $0] }
+        performAuthHTTPRequest(
+            url: "\(serverURL)/teams/\(teamId)/members",
+            method: "POST",
+            body: ["invitees": invitees],
+            bearerToken: accessToken,
+            retryCount: 0,
+            idempotencyKey: UUID().uuidString
+        ) { [weak self] data, httpResponse, error in
+            guard let self = self else { return }
+            let ok = error == nil && (httpResponse?.statusCode ?? 0) == 200
+            self.completeOnMain { completion(ok, error) }
+        }
+    }
+
+    /// Accept a pending team invitation (called by the invitee).
+    @objc public func acceptTeamInvitation(
+        teamId: String,
+        completion: @escaping (_ success: Bool, _ error: NSError?) -> Void
+    ) {
+        guard let serverURL = authServerBaseURL,
+              let accessToken = currentAccessToken else {
+            completeOnMain { completion(false, nil) }
+            return
+        }
+
+        performAuthHTTPRequest(
+            url: "\(serverURL)/teams/\(teamId)/members/accept",
+            method: "POST",
+            body: [:],
+            bearerToken: accessToken,
+            retryCount: 0
+        ) { [weak self] data, httpResponse, error in
+            guard let self = self else { return }
+            let ok = error == nil && (httpResponse?.statusCode ?? 0) == 200
+            self.completeOnMain { completion(ok, error) }
+        }
+    }
+
+    /// Update a team member's role. `role` must be `"admin"` or `"member"`.
+    @objc public func updateTeamMemberRole(
+        teamId: String,
+        memberId: String,
+        role: String,
+        completion: @escaping (_ success: Bool, _ error: NSError?) -> Void
+    ) {
+        guard let serverURL = authServerBaseURL,
+              let accessToken = currentAccessToken else {
+            completeOnMain { completion(false, nil) }
+            return
+        }
+
+        performAuthHTTPRequest(
+            url: "\(serverURL)/teams/\(teamId)/members/\(memberId)",
+            method: "PATCH",
+            body: ["role": role],
+            bearerToken: accessToken,
+            retryCount: 0
+        ) { [weak self] data, httpResponse, error in
+            guard let self = self else { return }
+            let ok = error == nil && (httpResponse?.statusCode ?? 0) == 200
+            self.completeOnMain { completion(ok, error) }
+        }
+    }
+
+    /// Remove a member from a team.
+    @objc public func removeTeamMember(
+        teamId: String,
+        memberId: String,
+        completion: @escaping (_ success: Bool, _ error: NSError?) -> Void
+    ) {
+        guard let serverURL = authServerBaseURL,
+              let accessToken = currentAccessToken else {
+            completeOnMain { completion(false, nil) }
+            return
+        }
+
+        performAuthHTTPRequest(
+            url: "\(serverURL)/teams/\(teamId)/members/\(memberId)",
+            method: "DELETE",
+            body: [:],
+            bearerToken: accessToken,
+            retryCount: 0
+        ) { [weak self] data, httpResponse, error in
+            guard let self = self else { return }
+            let ok = error == nil && (httpResponse?.statusCode ?? 0) == 200
+            self.completeOnMain { completion(ok, error) }
+        }
+    }
+
+    /// Delete a team (owner only).
+    @objc public func deleteTeam(
+        teamId: String,
+        completion: @escaping (_ success: Bool, _ error: NSError?) -> Void
+    ) {
+        guard let serverURL = authServerBaseURL,
+              let accessToken = currentAccessToken else {
+            completeOnMain { completion(false, nil) }
+            return
+        }
+
+        performAuthHTTPRequest(
+            url: "\(serverURL)/teams/\(teamId)",
+            method: "DELETE",
+            body: [:],
+            bearerToken: accessToken,
+            retryCount: 0
+        ) { [weak self] data, httpResponse, error in
+            guard let self = self else { return }
+            let ok = error == nil && (httpResponse?.statusCode ?? 0) == 200
+            self.completeOnMain { completion(ok, error) }
+        }
+    }
+
     // MARK: - Private: Network
 
     /// Perform a POST request with JSON body. Retries once on 5xx/timeout.
+    /// Circuit breaker (T9): fails fast when server is confirmed unreachable.
     private func performRequest(
         url urlString: String,
         body: [String: Any],
         retryCount: Int,
+        idempotencyKey: String? = nil,
         completion: @escaping (Result<Data, NSError>) -> Void
     ) {
+        // T9: Circuit breaker — fail fast if server is confirmed unreachable.
+        if !circuitBreaker.shouldAllow() {
+            let error = InterNetworkErrorCode.serverUnreachable.error(
+                message: "Server temporarily unavailable. Reconnecting…"
+            )
+            completion(.failure(error))
+            return
+        }
+
         guard let url = URL(string: urlString) else {
             let error = InterNetworkErrorCode.serverUnreachable.error(
                 message: "Invalid token server URL: \(urlString)"
@@ -1464,6 +2273,10 @@ private struct TokenCacheEntry {
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
 
+        if let key = idempotencyKey {
+            request.setValue(key, forHTTPHeaderField: "X-Idempotency-Key")
+        }
+
         do {
             request.httpBody = try JSONSerialization.data(withJSONObject: body)
         } catch {
@@ -1475,21 +2288,25 @@ private struct TokenCacheEntry {
             return
         }
 
+        var taskRef: URLSessionDataTask?
         let task = session.dataTask(with: request) { [weak self] data, response, error in
             guard let self = self else { return }
+            if let t = taskRef { self.untrackTask(t) }
 
             // Handle transport error (timeout, network down, etc.)
             if let error = error {
                 let nsError = error as NSError
                 if self.shouldRetry(statusCode: nil, nsError: nsError, retryCount: retryCount) {
                     interLogInfo(InterLog.networking, "Token: retrying after transport error (%{public}@)", nsError.localizedDescription)
-                    self.performRequest(url: urlString, body: body, retryCount: retryCount + 1, completion: completion)
+                    self.performRequest(url: urlString, body: body, retryCount: retryCount + 1,
+                                        idempotencyKey: idempotencyKey, completion: completion)
                     return
                 }
                 let wrappedError = InterNetworkErrorCode.serverUnreachable.error(
                     message: "Token server unreachable: \(nsError.localizedDescription)",
                     underlyingError: nsError
                 )
+                self.circuitBreaker.recordFailure()
                 completion(.failure(wrappedError))
                 return
             }
@@ -1507,6 +2324,7 @@ private struct TokenCacheEntry {
 
             // Success
             if (200..<300).contains(statusCode) {
+                self.circuitBreaker.recordSuccess()
                 completion(.success(data))
                 return
             }
@@ -1583,9 +2401,12 @@ private struct TokenCacheEntry {
             let error = InterNetworkErrorCode.tokenFetchFailed.error(
                 message: "Token server returned \(statusCode)"
             )
+            self.circuitBreaker.recordFailure()
             completion(.failure(error))
         }
 
+        taskRef = task
+        trackTask(task)
         task.resume()
     }
 
@@ -1684,14 +2505,25 @@ private struct TokenCacheEntry {
     // MARK: - Private: Auth HTTP
 
     /// Low-level HTTP request for auth operations. Returns raw data + response for caller interpretation.
+    ///
+    /// - Parameter idempotencyKey: Optional UUID string sent as `X-Idempotency-Key` header
+    ///   for state-mutating requests (T1 — Two Generals' Problem).
     private func performAuthHTTPRequest(
         url urlString: String,
         method: String,
         body: [String: Any]?,
         bearerToken: String?,
         retryCount: Int,
+        idempotencyKey: String? = nil,
         completion: @escaping (Data?, HTTPURLResponse?, NSError?) -> Void
     ) {
+        // T9: Circuit breaker — fail fast if server is confirmed unreachable.
+        if !circuitBreaker.shouldAllow() {
+            completion(nil, nil, InterNetworkErrorCode.serverUnreachable.error(
+                message: "Server temporarily unavailable. Reconnecting…"))
+            return
+        }
+
         guard let url = URL(string: urlString) else {
             completion(nil, nil, InterNetworkErrorCode.serverUnreachable.error(message: "Invalid URL: \(urlString)"))
             return
@@ -1709,19 +2541,27 @@ private struct TokenCacheEntry {
             request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         }
 
-        authSession.dataTask(with: request) { [weak self] data, response, error in
+        if let key = idempotencyKey {
+            request.setValue(key, forHTTPHeaderField: "X-Idempotency-Key")
+        }
+
+        var taskRef: URLSessionDataTask?
+        let task = authSession.dataTask(with: request) { [weak self] data, response, error in
             guard let self = self else { return }
+            if let t = taskRef { self.untrackTask(t) }
 
             if let error = error {
                 let nsError = error as NSError
                 if self.shouldRetry(statusCode: nil, nsError: nsError, retryCount: retryCount) {
                     self.performAuthHTTPRequest(url: urlString, method: method, body: body,
                                                 bearerToken: bearerToken, retryCount: retryCount + 1,
+                                                idempotencyKey: idempotencyKey,
                                                 completion: completion)
                     return
                 }
                 completion(nil, nil, InterNetworkErrorCode.serverUnreachable.error(
                     message: "Server unreachable: \(nsError.localizedDescription)", underlyingError: nsError))
+                self.circuitBreaker.recordFailure()
                 return
             }
 
@@ -1730,8 +2570,20 @@ private struct TokenCacheEntry {
                 return
             }
 
+            // T9: Record success for circuit breaker on any valid HTTP response.
+            // 4xx errors are client-side issues, not server failures.
+            if httpResponse.statusCode < 500 {
+                self.circuitBreaker.recordSuccess()
+            } else {
+                self.circuitBreaker.recordFailure()
+            }
+
             completion(data, httpResponse, nil)
-        }.resume()
+        }
+
+        taskRef = task
+        trackTask(task)
+        task.resume()
     }
 
     // MARK: - Private: Auth Response Parsing
@@ -1781,6 +2633,9 @@ private struct TokenCacheEntry {
             self.authServerBaseURL = serverURL
             self.isAuthenticated = true
             UserDefaults.standard.set(userId, forKey: Self.userIdDefaultsKey)
+            UserDefaults.standard.set(email, forKey: Self.emailDefaultsKey)
+            UserDefaults.standard.set(displayName, forKey: Self.displayNameDefaultsKey)
+            UserDefaults.standard.set(safeTier, forKey: Self.tierDefaultsKey)
         }
         if Thread.isMainThread { writeWork() } else { DispatchQueue.main.async(execute: writeWork) }
 
@@ -1823,20 +2678,33 @@ private struct TokenCacheEntry {
     /// All mutations are dispatched to the main queue to avoid races with
     /// URLSession callbacks that call this from background threads.
     private func clearAuthState() {
+        // T9: Reset circuit breaker on auth state clear (thread-safe internally).
+        circuitBreaker.reset()
+
+        // T8: Cancel all in-flight network requests.
+        cancelPendingRequests()
+
         let work = { [weak self] in
             guard let self = self else { return }
             self.refreshTimer?.invalidate()
             self.refreshTimer = nil
+            self.sessionRetryTimer?.invalidate()
+            self.sessionRetryTimer = nil
             self.currentAccessToken = nil
             self.currentUserId = nil
             self.currentEmail = nil
             self.currentDisplayName = nil
             self.currentTier = nil
             self.meetingStartTier = nil
-            self.authServerBaseURL = nil
+            // authServerBaseURL is server configuration, not a credential — do not clear it.
+            // Clearing it causes public endpoints (billing plans, OAuth) to fail silently
+            // if the session restore fails because the server was unreachable at launch.
             self.isAuthenticated = false
             self.deleteRefreshToken()
             UserDefaults.standard.removeObject(forKey: Self.userIdDefaultsKey)
+            UserDefaults.standard.removeObject(forKey: Self.emailDefaultsKey)
+            UserDefaults.standard.removeObject(forKey: Self.displayNameDefaultsKey)
+            UserDefaults.standard.removeObject(forKey: Self.tierDefaultsKey)
         }
         if Thread.isMainThread {
             work()

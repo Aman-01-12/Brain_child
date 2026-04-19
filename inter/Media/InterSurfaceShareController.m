@@ -127,7 +127,7 @@
             return;
         }
 
-        NSString *status = error.localizedDescription ?: @"Sharing source failed.";
+        NSString *status = @"Screen sharing encountered an error.";
         [weakSelf teardownSharingResourcesEmitStatus:NO];
         [weakSelf emitStatusText:status];
     };

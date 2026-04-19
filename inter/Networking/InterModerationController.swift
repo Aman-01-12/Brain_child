@@ -132,6 +132,10 @@ import LiveKit
     private var roomCode: String = ""
     private let session: URLSession
 
+    /// T8: Tracked in-flight URLSession tasks for lifecycle cleanup.
+    private var inflightTasks = Set<URLSessionDataTask>()
+    private let inflightLock = NSLock()
+
     // MARK: - Init
 
     @objc public override init() {
@@ -140,6 +144,15 @@ import LiveKit
         config.timeoutIntervalForResource = 15.0
         self.session = URLSession(configuration: config)
         super.init()
+    }
+
+    deinit {
+        inflightLock.lock()
+        let tasks = inflightTasks
+        inflightTasks.removeAll()
+        inflightLock.unlock()
+        tasks.forEach { $0.cancel() }
+        session.invalidateAndCancel()
     }
 
     // MARK: - Attach / Detach
@@ -883,6 +896,11 @@ import LiveKit
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
 
+        // T6: Send auth token — server requires JWT for moderation endpoints.
+        if let token = roomController?.tokenService.currentAccessToken {
+            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        }
+
         do {
             request.httpBody = try JSONSerialization.data(withJSONObject: body)
         } catch {
@@ -890,7 +908,14 @@ import LiveKit
             return
         }
 
-        let task = session.dataTask(with: request) { data, response, error in
+        var taskRef: URLSessionDataTask?
+        let task = session.dataTask(with: request) { [weak self] data, response, error in
+            if let t = taskRef {
+                self?.inflightLock.lock()
+                self?.inflightTasks.remove(t)
+                self?.inflightLock.unlock()
+            }
+
             if let error = error {
                 completion(.failure(error as NSError))
                 return
@@ -898,7 +923,7 @@ import LiveKit
 
             guard let httpResponse = response as? HTTPURLResponse,
                   let data = data else {
-                completion(.failure(self.makeError("No response from server")))
+                completion(.failure(self?.makeError("No response from server") ?? NSError(domain: "InterModeration", code: -1)))
                 return
             }
 
@@ -906,10 +931,15 @@ import LiveKit
                 completion(.success(data))
             } else {
                 let bodyStr = String(data: data, encoding: .utf8) ?? ""
-                let errorMsg = self.parseJSON(data)?["error"] as? String ?? "Server error \(httpResponse.statusCode)"
-                completion(.failure(self.makeError(errorMsg)))
+                let errorMsg = self?.parseJSON(data)?["error"] as? String ?? "Server error \(httpResponse.statusCode)"
+                completion(.failure(self?.makeError(errorMsg) ?? NSError(domain: "InterModeration", code: -1)))
             }
         }
+
+        taskRef = task
+        inflightLock.lock()
+        inflightTasks.insert(task)
+        inflightLock.unlock()
         task.resume()
     }
 

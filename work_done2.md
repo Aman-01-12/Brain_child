@@ -128,3 +128,127 @@ Completed remaining Phase 11 items: 11.1, 11.2.3, 11.2.4, 11.2.5, 11.4.
 - Generate a key: `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"`
 - Test credentials: `schedtest@test.com` / `vQz9#xL2kP!fWm7R`
 
+## [15 April 2026] — Zoom-Style Offline Session Restore (Signed In But Offline)
+
+**Phase**: Auth resilience
+**Files changed**:
+- `inter/Networking/InterTokenService.swift` — Added `InterSessionRestoreResult` enum (`.restored`, `.offlineWithPersistedSession`, `.noSession`). Changed `attemptSessionRestore` return from `Bool` to `InterSessionRestoreResult`. Added cached profile UserDefaults keys (`email`, `displayName`, `tier`). Profile cached on login/register and token refresh. `clearAuthState()` clears cached profile. Added `hasPersistedSession` computed property. Added `scheduleSessionRetry()` — 15-second repeating timer that retries token refresh when server becomes reachable, then stops. On `.networkError` during restore, populates in-memory profile from cached UserDefaults.
+- `inter/App/AppDelegate.m` — Updated session restore completion handler from `Bool` to `InterSessionRestoreResult` switch. `buildSetupChromeInOverlay:` now recognizes offline-with-session state: shows Sign Out + Settings (gated) + billing buttons with cached tier, plus orange "Name — Offline, reconnecting…" status label. Host/join actions show "Server unreachable — reconnecting…" instead of "Sign in to host" when offline with session. When background retry succeeds, `authSessionDidAuthenticate` fires → `refreshSetupChrome` rebuilds UI to full authenticated state.
+
+**Why**: Previously, if the server was unreachable at launch, the app showed the user as completely logged out (Sign In / Sign Up) even though valid credentials existed in Keychain. This was poor UX — apps like Zoom show "signed in but offline" and silently reconnect.
+**Notes**: Background retry fires every 15 seconds. On `.invalidSession` the timer stops and credentials are cleared. On `.success` the timer stops and `authSessionDidAuthenticate` delegate fires, which calls `refreshSetupChrome` to seamlessly transition to authenticated UI. Settings are gated in offline mode since they require server access. Schedule Meeting button hidden in offline mode.
+
+---
+
+## Network Resilience — All 9 Threats from `network_resilience.md`
+
+**Reference**: `network_resilience.md` (276 lines, 9 threats)
+
+### T7: Singleton Refresh Coalescing (CRITICAL)
+
+**Threat**: Multiple concurrent 401s each triggering independent `refreshAccessToken` calls. Server rotates refresh token on each `/auth/refresh`; the second concurrent call presents an already-rotated token → `SESSION_COMPROMISED` → forced re-login.
+
+**Files changed**:
+- `inter/Networking/InterTokenService.swift` — Added `isRefreshInFlight` flag, `pendingRefreshCompletions` array, `refreshCoalesceQueue` (serial DispatchQueue), and `drainRefreshCompletions(outcome:originalCompletion:)` method. Modified `refreshAccessTokenWithOutcome` to check `isRefreshInFlight`: if true, queues completion; if false, marks in-flight and proceeds. Replaced all 7 direct `completion(...)` calls with `drainRefreshCompletions` calls.
+
+**Result**: Only one HTTP refresh runs at a time; all concurrent 401s queue their completions and receive the same outcome.
+
+---
+
+### T1: Idempotency Keys (Client + Server)
+
+**Threat**: User clicks "Schedule Meeting", request reaches server, response delayed, client shows error, user clicks again → duplicate server-side execution.
+
+**Files changed**:
+- `token-server/idempotency.js` — **NEW FILE**. Redis-backed idempotency middleware. UUID v4 validation, 24hr TTL, scoped by `userId:method:path:key`. Fails open if Redis is down.
+- `token-server/index.js` — Applied `requireIdempotencyKey` to `/room/create` and `/billing/checkout-redirect`.
+- `token-server/scheduling.js` — Applied to `POST /schedule` and `POST /:id/invite`.
+- `token-server/teams.js` — Applied to `POST /` (create team) and `POST /:id/members` (invite).
+- `token-server/calendar.js` — Applied to `POST /google/sync/:id` and `POST /outlook/sync/:id`.
+- `inter/Networking/InterTokenService.swift` — Added optional `idempotencyKey: String?` parameter to `performAuthHTTPRequest` and `performRequest`. Both inject `X-Idempotency-Key` header and forward on retry. Added `UUID().uuidString` at 6 call sites: `createRoom`, `scheduleMeeting`, `inviteToMeeting`, `syncMeetingToCalendar`, `createTeam`, `inviteToTeam`.
+
+**Result**: 7 server routes protected; 6 client call sites send idempotency keys. Duplicate requests return cached original response.
+
+---
+
+### T6: JWT Auth on Moderation Endpoints
+
+**Threat**: Moderation endpoints (mute, lock, remove, etc.) accessible without authentication — anyone with the URL can call them.
+
+**Files changed**:
+- `token-server/index.js` — Added `auth.requireAuth` middleware to all 14 moderation endpoints: promote, mute, mute-all, remove, lock, unlock, suspend, unsuspend, lobby/enable, lobby/disable, admit, admit-all, deny, password.
+- `inter/Networking/InterModerationController.swift` — Modified `performPOST` to include `Authorization: Bearer` header from `roomController?.tokenService.currentAccessToken`.
+
+**Result**: All moderation endpoints now require valid JWT. Unauthenticated requests receive 401.
+
+---
+
+### T3: Universal Error Sanitization
+
+**Threat**: Raw `NSError.localizedDescription` or Node.js error strings leaked to UI, exposing internal IPs, stack traces, and routing.
+
+**Files changed**:
+- `inter/App/AppDelegate.m` — Changed `userFacingMessageForError:` fallthrough from `error.localizedDescription` to `"Something went wrong. Please try again."` with NSLog of full error. Fixed 8 `setStatusText:` call sites to use safe generic messages. Fixed login/register `showError:` — transport errors (code 1005) show generic message.
+- `inter/UI/Views/InterRecordingListPanel.m` — NSAlert text changed from `deleteError.localizedDescription` to `"Could not delete the recording file. Please try again."`
+- `inter/Media/InterSurfaceShareController.m` — Replaced `error.localizedDescription` with `"Screen sharing encountered an error."`
+
+**Result**: 13 error leak sites fixed. All user-facing errors are now generic; full errors logged server-side only.
+
+---
+
+### T9: Three-State Circuit Breaker with Exponential Backoff
+
+**Threat**: Simple open/closed circuit breaker permanently disables features after brief disruption. No automatic recovery.
+
+**Files changed**:
+- `inter/Networking/InterTokenService.swift`:
+  - Added `InterCircuitBreaker` class (private) with `.closed`/`.open`/`.halfOpen` states, `failureThreshold` (3), `shouldAllow()`/`recordSuccess()`/`recordFailure()`/`reset()`.
+  - `scheduleRecoveryProbe()` — exponential backoff (2s→4s→8s→16s cap) with ±500ms jitter, transitions to `.halfOpen`.
+  - Added `circuitBreaker` property. Integrated into `performRequest` and `performAuthHTTPRequest` — `shouldAllow()` check at entry, `recordSuccess()` on 2xx/<500, `recordFailure()` on transport error and >=500.
+  - Added `circuitBreaker.reset()` to `clearAuthState()`.
+  - Changed session retry timer from fixed 15s to exponential backoff (5s→10s→20s→40s→60s cap, ±1s jitter). Each `.networkError` increments `sessionRetryAttempt` and schedules next tick with doubled delay.
+
+**Result**: After 3 consecutive failures circuit opens; automatic half-open probes with exponential backoff attempt recovery. Session retry also backs off instead of hammering server every 15s.
+
+---
+
+### T8: Native Task Cancellation (URLSessionDataTask Lifecycle)
+
+**Threat**: In-flight network requests continue running after the owning controller is deallocated. Wasted resources and potential state corruption.
+
+**Files changed**:
+- `inter/Networking/InterTokenService.swift`:
+  - Added `inflightTasks: Set<URLSessionDataTask>` with `inflightLock: NSLock`.
+  - Added `trackTask(_:)`, `untrackTask(_:)`, `cancelPendingRequests()` methods.
+  - Added `deinit` — cancels all pending requests and invalidates timers.
+  - Integrated tracking into `performRequest`, `performAuthHTTPRequest`, `performAuthenticatedRequest` (including retry path), and 3 standalone dataTask calls (fetchCalendarStatus, fetchTeams, fetchTeamDetails).
+  - `clearAuthState()` now calls `cancelPendingRequests()`.
+- `inter/Networking/InterModerationController.swift`:
+  - Added `inflightTasks: Set<URLSessionDataTask>` with `inflightLock: NSLock`.
+  - Added `deinit` — cancels all in-flight tasks and invalidates session.
+  - `performPOST` now tracks/untracks task.
+- `inter/Media/Recording/InterRecordingCoordinator.swift`:
+  - Added `inflightSessions: [URLSession]` with `inflightLock: NSLock`.
+  - Updated `deinit` to `invalidateAndCancel()` all tracked sessions.
+  - Both `fetchRecordingStatus` and `_performTokenServerRequest` now track/untrack their ephemeral sessions.
+
+**Result**: All URLSessionDataTask instances are tracked and cancelled on owner teardown. No more fire-and-forget network requests.
+
+---
+
+### T2: Button Mashing Prevention — ALREADY COVERED
+
+**Audit result**: Teams, calendar, and scheduling buttons already disable on click (`setEnabled:NO`) before delegate calls and re-enable on completion (`resetCreateButton`, etc.). No changes needed.
+
+---
+
+### T4: Local Queue Manipulation — ALREADY COVERED
+
+**Audit result**: The app never queues state-mutating actions (scheduling, billing, teams) to disk. All network calls hard-fail on error. Only non-critical profile data (email, displayName, tier) cached in UserDefaults for offline UX. API credentials stored in Keychain only. No CoreData, SQLite, or NSKeyedArchiver queuing. No changes needed.
+
+---
+
+### T5: Feature Enumeration via Connectivity Probing — ALREADY COVERED
+
+**Audit result**: UI elements are shown/hidden based on authenticated user role, not live connectivity probes. No changes needed.
+

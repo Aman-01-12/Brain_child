@@ -69,6 +69,7 @@ const path   = require('path');
 const redis = require('./redis');
 const db = require('./db');
 const auth = require('./auth');
+const { requireIdempotencyKey } = require('./idempotency');
 
 const app = express();
 
@@ -1861,6 +1862,7 @@ app.get('/billing/plans', async (req, res) => {
 app.post(
   '/billing/checkout-redirect',
   express.urlencoded({ extended: false }),
+  requireIdempotencyKey,
   async (req, res) => {
     if (!process.env.LEMONSQUEEZY_API_KEY || !process.env.LEMONSQUEEZY_STORE_ID) {
       res.setHeader('Content-Type', 'text/html; charset=utf-8');
@@ -2075,7 +2077,7 @@ async function admitAllFromLobby(code, roomData) {
 // Body: { identity, displayName, roomType? }
 // Returns: { roomCode, roomName, token, serverURL, roomType }
 // ---------------------------------------------------------------------------
-app.post('/room/create', async (req, res) => {
+app.post('/room/create', requireIdempotencyKey, async (req, res) => {
   const { identity, displayName, roomType: rawRoomType } = req.body;
 
   if (!identity || !displayName) {
@@ -2357,7 +2359,7 @@ app.get('/room/info/:code', async (req, res) => {
 // Body: { roomCode, callerIdentity, targetIdentity, newRole }
 // Returns: { success, identity, previousRole, newRole }
 // ---------------------------------------------------------------------------
-app.post('/room/promote', async (req, res) => {
+app.post('/room/promote', auth.requireAuth, async (req, res) => {
   const { roomCode, callerIdentity, targetIdentity, newRole } = req.body;
 
   if (!roomCode || !callerIdentity || !targetIdentity || !newRole) {
@@ -2423,7 +2425,7 @@ app.post('/room/promote', async (req, res) => {
 // trackSource: "microphone" | "camera"
 // Returns: { success }
 // ---------------------------------------------------------------------------
-app.post('/room/mute', async (req, res) => {
+app.post('/room/mute', auth.requireAuth, async (req, res) => {
   const { roomCode, callerIdentity, targetIdentity, trackSource } = req.body;
 
   if (!roomCode || !callerIdentity || !targetIdentity || !trackSource) {
@@ -2477,7 +2479,7 @@ app.post('/room/mute', async (req, res) => {
 // Body: { roomCode, callerIdentity }
 // Returns: { success, mutedCount }
 // ---------------------------------------------------------------------------
-app.post('/room/mute-all', async (req, res) => {
+app.post('/room/mute-all', auth.requireAuth, async (req, res) => {
   const { roomCode, callerIdentity } = req.body;
 
   if (!roomCode || !callerIdentity) {
@@ -2537,7 +2539,7 @@ app.post('/room/mute-all', async (req, res) => {
 // Body: { roomCode, callerIdentity, targetIdentity }
 // Returns: { success }
 // ---------------------------------------------------------------------------
-app.post('/room/remove', async (req, res) => {
+app.post('/room/remove', auth.requireAuth, async (req, res) => {
   const { roomCode, callerIdentity, targetIdentity } = req.body;
 
   if (!roomCode || !callerIdentity || !targetIdentity) {
@@ -2576,7 +2578,7 @@ app.post('/room/remove', async (req, res) => {
 // Body: { roomCode, callerIdentity }
 // Returns: { success }
 // ---------------------------------------------------------------------------
-app.post('/room/lock', async (req, res) => {
+app.post('/room/lock', auth.requireAuth, async (req, res) => {
   const { roomCode, callerIdentity } = req.body;
 
   if (!roomCode || !callerIdentity) {
@@ -2602,7 +2604,7 @@ app.post('/room/lock', async (req, res) => {
 // Body: { roomCode, callerIdentity }
 // Returns: { success }
 // ---------------------------------------------------------------------------
-app.post('/room/unlock', async (req, res) => {
+app.post('/room/unlock', auth.requireAuth, async (req, res) => {
   const { roomCode, callerIdentity } = req.body;
 
   if (!roomCode || !callerIdentity) {
@@ -2627,7 +2629,7 @@ app.post('/room/unlock', async (req, res) => {
 // Body: { roomCode, callerIdentity, targetIdentity }
 // Returns: { success }
 // ---------------------------------------------------------------------------
-app.post('/room/suspend', async (req, res) => {
+app.post('/room/suspend', auth.requireAuth, async (req, res) => {
   const { roomCode, callerIdentity, targetIdentity } = req.body;
 
   if (!roomCode || !callerIdentity || !targetIdentity) {
@@ -2678,7 +2680,7 @@ app.post('/room/suspend', async (req, res) => {
 // Body: { roomCode, callerIdentity, targetIdentity }
 // Returns: { success }
 // ---------------------------------------------------------------------------
-app.post('/room/unsuspend', async (req, res) => {
+app.post('/room/unsuspend', auth.requireAuth, async (req, res) => {
   const { roomCode, callerIdentity, targetIdentity } = req.body;
 
   if (!roomCode || !callerIdentity || !targetIdentity) {
@@ -2703,7 +2705,7 @@ app.post('/room/unsuspend', async (req, res) => {
 // Body: { roomCode, callerIdentity }
 // Returns: { success }
 // ---------------------------------------------------------------------------
-app.post('/room/lobby/enable', async (req, res) => {
+app.post('/room/lobby/enable', auth.requireAuth, async (req, res) => {
   const { roomCode, callerIdentity } = req.body;
 
   if (!roomCode || !callerIdentity) {
@@ -2728,7 +2730,7 @@ app.post('/room/lobby/enable', async (req, res) => {
 // Body: { roomCode, callerIdentity }
 // Returns: { success }
 // ---------------------------------------------------------------------------
-app.post('/room/lobby/disable', async (req, res) => {
+app.post('/room/lobby/disable', auth.requireAuth, async (req, res) => {
   const { roomCode, callerIdentity } = req.body;
 
   if (!roomCode || !callerIdentity) {
@@ -2756,7 +2758,7 @@ app.post('/room/lobby/disable', async (req, res) => {
 // Body: { roomCode, callerIdentity, targetIdentity, targetDisplayName }
 // Returns: { token, serverURL }
 // ---------------------------------------------------------------------------
-app.post('/room/admit', async (req, res) => {
+app.post('/room/admit', auth.requireAuth, async (req, res) => {
   const { roomCode, callerIdentity, targetIdentity, targetDisplayName } = req.body;
 
   if (!roomCode || !callerIdentity || !targetIdentity) {
@@ -2797,7 +2799,7 @@ app.post('/room/admit', async (req, res) => {
 // Body: { roomCode, callerIdentity }
 // Returns: { success, admittedCount }
 // ---------------------------------------------------------------------------
-app.post('/room/admit-all', async (req, res) => {
+app.post('/room/admit-all', auth.requireAuth, async (req, res) => {
   const { roomCode, callerIdentity } = req.body;
 
   if (!roomCode || !callerIdentity) {
@@ -2822,7 +2824,7 @@ app.post('/room/admit-all', async (req, res) => {
 // Body: { roomCode, callerIdentity, targetIdentity }
 // Returns: { success }
 // ---------------------------------------------------------------------------
-app.post('/room/deny', async (req, res) => {
+app.post('/room/deny', auth.requireAuth, async (req, res) => {
   const { roomCode, callerIdentity, targetIdentity } = req.body;
 
   if (!roomCode || !callerIdentity || !targetIdentity) {
@@ -2916,7 +2918,7 @@ app.get('/room/lobby-status/:code/:identity', async (req, res) => {
 // Body: { roomCode, callerIdentity, password } (password = null to remove)
 // Returns: { success }
 // ---------------------------------------------------------------------------
-app.post('/room/password', async (req, res) => {
+app.post('/room/password', auth.requireAuth, async (req, res) => {
   const { roomCode, callerIdentity, password } = req.body;
 
   if (!roomCode || !callerIdentity) {
