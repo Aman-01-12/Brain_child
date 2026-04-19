@@ -3037,6 +3037,7 @@ didRequestDeleteTeamId:(NSString *)teamId {
     request.HTTPMethod = @"DELETE";
     [request setValue:[NSString stringWithFormat:@"Bearer %@", token] forHTTPHeaderField:@"Authorization"];
 
+    __weak typeof(self) weakSelf = self;
     [[[NSURLSession sharedSession] dataTaskWithRequest:request completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
         dispatch_async(dispatch_get_main_queue(), ^{
             if (error) {
@@ -3054,7 +3055,6 @@ didRequestDeleteTeamId:(NSString *)teamId {
             }
             [weakSelf.normalRecordingListPanel reloadRecordings];
         });
-    }] resume];
     }] resume];
 }
 
@@ -3859,13 +3859,7 @@ static const NSTimeInterval kIdleTimeoutSeconds = 30 * 60; // 30 minutes
                 [self refreshSetupChrome];
             } else {
                 [self launchSetupUI];
-        if (!password.length || !email.length) {
-            NSAlert *errAlert = [[NSAlert alloc] init];
-            errAlert.messageText = @"Cannot Unlock";
-            errAlert.informativeText = password.length ? @"Session data unavailable. Please log out and sign in again."
-                                                       : @"Please enter your password.";
-            [errAlert addButtonWithTitle:@"OK"];
-            [errAlert runModal];
+            }
             self.isIdleLocked = NO;
             return;
         }
@@ -3875,6 +3869,12 @@ static const NSTimeInterval kIdleTimeoutSeconds = 30 * 60; // 30 minutes
         NSString *email = self.roomController.tokenService.currentEmail;
 
         if (!password.length || !email.length) {
+            NSAlert *errAlert = [[NSAlert alloc] init];
+            errAlert.messageText = @"Cannot Unlock";
+            errAlert.informativeText = password.length ? @"Session data unavailable. Please log out and sign in again."
+                                                       : @"Please enter your password.";
+            [errAlert addButtonWithTitle:@"OK"];
+            [errAlert runModal];
             self.isIdleLocked = NO;
             return;
         }
