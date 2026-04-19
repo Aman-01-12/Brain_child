@@ -125,19 +125,48 @@ Additionally, if the app naively retries the request with the same expired token
 **Mitigation (Transparent token refresh interceptor):** Implement a single centralized HTTP interceptor that catches 401 responses before they reach any component. The interceptor silently requests a new access token using the refresh token, then replays the original failed request exactly once with the new credential. Only if the refresh itself fails (expired refresh token, revoked session) should an auth error be surfaced to the user — and even then, via a clean "Your session has expired, please sign in again" message, not a raw error.
 
 ```js
-// Axios interceptor example
+// Module-scoped singleton — shared across every concurrent 401
+let refreshPromise = null
+
 axiosInstance.interceptors.response.use(
   response => response,
   async error => {
     const original = error.config
+
     if (error.response?.status === 401 && !original._retry) {
       original._retry = true
-      const newToken = await authService.refreshAccessToken()
-      axiosInstance.defaults.headers.common['Authorization'] = `Bearer ${newToken}`
-      original.headers['Authorization'] = `Bearer ${newToken}`
-      return axiosInstance(original)
+
+      // If no refresh is in flight, start one wrapped in a hard timeout.
+      // Every subsequent 401 that arrives while the refresh is pending
+      // awaits the same promise instead of spawning a second refresh call.
+      if (!refreshPromise) {
+        refreshPromise = new Promise((resolve, reject) => {
+          const timer = setTimeout(
+            () => reject(new Error('Token refresh timed out')),
+            10_000   // adjust to match your auth SLA
+          )
+          authService.refreshAccessToken()
+            .then(token => { clearTimeout(timer); resolve(token) })
+            .catch(err  => { clearTimeout(timer); reject(err)   })
+        }).finally(() => {
+          // Always clear after settlement so the next genuine
+          // session expiry starts a fresh refresh cycle.
+          refreshPromise = null
+        })
+      }
+
+      try {
+        const newToken = await refreshPromise
+        axiosInstance.defaults.headers.common['Authorization'] = `Bearer ${newToken}`
+        original.headers['Authorization'] = `Bearer ${newToken}`
+        return axiosInstance(original)
+      } catch {
+        // Refresh failed or timed out — surface a safe message (see Threat 3)
+        return Promise.reject(mapToSafeError(error))
+      }
     }
-    // Map to safe user-facing error (see Threat 3 mitigation)
+
+    // Non-401 errors or already-retried requests
     return Promise.reject(mapToSafeError(error))
   }
 )
@@ -159,7 +188,16 @@ This must be implemented at a single point — not duplicated per feature — so
 // React hook pattern
 useEffect(() => {
   const controller = new AbortController()
-  const timeoutId = setTimeout(() => controller.abort(), 8000)
+
+  // Flag set before the timeout calls controller.abort() so the catch block
+  // can tell apart a circuit-breaker abort (needs UX) from a silent
+  // unmount/user-cancel abort (must be discarded without surfacing anything).
+  let isTimeoutAbort = false
+
+  const timeoutId = setTimeout(() => {
+    isTimeoutAbort = true   // mark before abort so the flag is set when catch runs
+    controller.abort()
+  }, 8000)
 
   fetch('/api/v1/schedule', {
     method: 'POST',
@@ -168,12 +206,22 @@ useEffect(() => {
   })
     .then(handleSuccess)
     .catch(err => {
-      if (err.name === 'AbortError') return  // clean cancellation — do not surface
-      handleNetworkError(err)                // map to safe user message (Threat 3)
+      if (err.name === 'AbortError') {
+        if (isTimeoutAbort) {
+          // Circuit breaker fired — stop the spinner and show the non-intrusive
+          // toast described in Part 1 ("Taking longer than expected…").
+          handleNetworkError(err)
+        }
+        // Otherwise: unmount or explicit user cancel — discard silently,
+        // no toast, no state update on a component that no longer exists.
+        return
+      }
+      handleNetworkError(err)  // map to safe user message (Threat 3)
     })
     .finally(() => clearTimeout(timeoutId))
 
   return () => {
+    // isTimeoutAbort stays false here, so the catch above stays silent.
     controller.abort()    // fires on unmount, navigating away, or re-render
     clearTimeout(timeoutId)
   }
@@ -226,5 +274,3 @@ The user should be shown a passive, non-blocking indicator during the half-open 
 | 9 | Incomplete circuit breaker — no recovery state | Medium | **Appended: Three-state breaker with backoff** |
 
 ---
-
-*Threats 1–4 were present in the original document. Threats 5–9 have been appended based on gap analysis against OWASP standards, Nielsen usability heuristics, and zero-trust architecture requirements.*
