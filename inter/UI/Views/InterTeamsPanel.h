@@ -79,6 +79,7 @@ didRequestDeleteTeamId:(NSString *)teamId;
 - (void)resetInviteButton;
 - (void)resetAcceptButton;
 - (void)resetDeleteButton;
+- (void)resetRemoveButton;
 
 /// Returns the `id` of the currently selected team, or nil.
 - (nullable NSString *)selectedTeamId;

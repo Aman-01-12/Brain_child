@@ -58,9 +58,13 @@ function requireIdempotencyKey(req, res, next) {
     .then((cached) => {
       if (cached) {
         // Cache hit — return the stored response without re-executing.
-        const { statusCode, body } = JSON.parse(cached);
-        res.status(statusCode).json(body);
-        return;
+        try {
+          const { statusCode, body } = JSON.parse(cached);
+          return res.status(statusCode).json(body);
+        } catch (parseErr) {
+          console.error('[idempotency] Corrupted cache entry, treating as miss:', parseErr.message);
+          // Fall through to execute handler
+        }
       }
 
       // Cache miss — intercept res.json to capture the response.

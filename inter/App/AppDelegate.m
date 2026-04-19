@@ -3015,7 +3015,8 @@ didRequestDeleteTeamId:(NSString *)teamId {
     NSString *baseURL = self.roomController.tokenService.serverURL;
     if (!baseURL || !recordingId) return;
 
-    NSString *urlStr = [NSString stringWithFormat:@"%@/recordings/%@/download", baseURL, recordingId];
+    NSString *encodedId = [recordingId stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLPathAllowedCharacterSet]];
+    NSString *urlStr = [NSString stringWithFormat:@"%@/recordings/%@/download", baseURL, encodedId];
     NSURL *url = [NSURL URLWithString:urlStr];
     if (url) {
         [[NSWorkspace sharedWorkspace] openURL:url];
@@ -3027,7 +3028,8 @@ didRequestDeleteTeamId:(NSString *)teamId {
     NSString *token = self.roomController.tokenService.currentAccessToken;
     if (!baseURL || !token || !recordingId) return;
 
-    NSString *urlStr = [NSString stringWithFormat:@"%@/recordings/%@", baseURL, recordingId];
+    NSString *encodedId = [recordingId stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLPathAllowedCharacterSet]];
+    NSString *urlStr = [NSString stringWithFormat:@"%@/recordings/%@", baseURL, encodedId];
     NSURL *url = [NSURL URLWithString:urlStr];
     if (!url) return;
 
@@ -3035,7 +3037,6 @@ didRequestDeleteTeamId:(NSString *)teamId {
     request.HTTPMethod = @"DELETE";
     [request setValue:[NSString stringWithFormat:@"Bearer %@", token] forHTTPHeaderField:@"Authorization"];
 
-    __weak typeof(self) weakSelf = self;
     [[[NSURLSession sharedSession] dataTaskWithRequest:request completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
         dispatch_async(dispatch_get_main_queue(), ^{
             if (error) {
@@ -3043,8 +3044,17 @@ didRequestDeleteTeamId:(NSString *)teamId {
                 [alert runModal];
                 return;
             }
+            NSHTTPURLResponse *httpResponse = (NSHTTPURLResponse *)response;
+            if (httpResponse.statusCode < 200 || httpResponse.statusCode >= 300) {
+                NSAlert *alert = [[NSAlert alloc] init];
+                alert.messageText = @"Delete Failed";
+                alert.informativeText = @"Could not delete recording. Please try again.";
+                [alert runModal];
+                return;
+            }
             [weakSelf.normalRecordingListPanel reloadRecordings];
         });
+    }] resume];
     }] resume];
 }
 
@@ -3849,7 +3859,13 @@ static const NSTimeInterval kIdleTimeoutSeconds = 30 * 60; // 30 minutes
                 [self refreshSetupChrome];
             } else {
                 [self launchSetupUI];
-            }
+        if (!password.length || !email.length) {
+            NSAlert *errAlert = [[NSAlert alloc] init];
+            errAlert.messageText = @"Cannot Unlock";
+            errAlert.informativeText = password.length ? @"Session data unavailable. Please log out and sign in again."
+                                                       : @"Please enter your password.";
+            [errAlert addButtonWithTitle:@"OK"];
+            [errAlert runModal];
             self.isIdleLocked = NO;
             return;
         }

@@ -307,11 +307,12 @@ static NSTextField *makePlaceholderField(NSString *placeholder, CGFloat size) {
 #pragma mark - Public API
 
 - (void)setTeams:(NSArray<NSDictionary<NSString *,id> *> *)teams {
-    _teams = teams ?: @[];
-    _selectedTeamRow = -1;
-    _currentMembers = @[];
-    _callerRole = @"";
+    NSArray *snapshot = teams ?: @[];
     dispatch_async(dispatch_get_main_queue(), ^{
+        _teams = snapshot;
+        _selectedTeamRow = -1;
+        _currentMembers = @[];
+        _callerRole = @"";
         [self.teamsTable reloadData];
         [self refreshDetailVisibility];
     });
@@ -319,9 +320,11 @@ static NSTextField *makePlaceholderField(NSString *placeholder, CGFloat size) {
 
 - (void)setCurrentTeamMembers:(NSArray<NSDictionary<NSString *,id> *> *)members
                    callerRole:(NSString *)callerRole {
-    _currentMembers = members ?: @[];
-    _callerRole = callerRole ?: @"";
+    NSArray *membersSnapshot = members ?: @[];
+    NSString *roleSnapshot = callerRole ?: @"";
     dispatch_async(dispatch_get_main_queue(), ^{
+        _currentMembers = membersSnapshot;
+        _callerRole = roleSnapshot;
         [self.membersTable reloadData];
         [self refreshDetailVisibility];
     });

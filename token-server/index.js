@@ -74,6 +74,19 @@ const { requireIdempotencyKey } = require('./idempotency');
 const app = express();
 
 // ---------------------------------------------------------------------------
+// escapeHtml — prevent XSS when interpolating user-derived strings into HTML
+// ---------------------------------------------------------------------------
+function escapeHtml(str) {
+  return String(str == null ? '' : str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#x27;')
+    .replace(/\//g, '&#x2F;');
+}
+
+// ---------------------------------------------------------------------------
 // Lemon Squeezy webhook — MUST be mounted BEFORE express.json()
 // The raw body bytes are required for HMAC-SHA256 signature verification.
 // express.json() would parse the body and destroy the original byte sequence.
@@ -965,7 +978,7 @@ app.post('/auth/reset-password-web', express.urlencoded({ extended: false }), as
     auth.auditLog(userId, 'password_reset_completed', req.ip, { via: 'web' });
     res.send('<p>Password updated. You can close this page and log in to the Inter app.</p>');
   } catch (err) {
-    res.status(400).send(`<p>Error: ${err.message}. Please request a new reset link.</p>`);
+    res.status(400).send(`<p>Error: ${escapeHtml(err.message)}. Please request a new reset link.</p>`);
   }
 });
 
