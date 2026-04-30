@@ -12,6 +12,8 @@
 #import "InterSecureToolHostView.h"
 #import "InterSecureInterviewStageView.h"
 #import "InterViewSnapshotVideoSource.h"
+#import "InterChatPanel.h"
+#import <objc/runtime.h>
 
 // [2.6] Swift module import for networking layer
 #if __has_include("inter-Swift.h")
@@ -27,7 +29,7 @@ static const CGFloat InterSecureTopMargin = 40.0;
 static const CGFloat InterSecureLeftMargin = 40.0;
 static const CGFloat InterSecureBottomWorkspaceMargin = 100.0;
 
-@interface SecureWindowController () <InterParticipantOverlayDelegate>
+@interface SecureWindowController () <InterParticipantOverlayDelegate, InterChatPanelDelegate, InterChatControllerDelegate>
 @property (nonatomic, strong) MetalSurfaceView *renderView;
 @property (nonatomic, strong) InterSecureInterviewStageView *stageView;
 @property (nonatomic, strong) InterSecureToolHostView *toolHostView;
@@ -38,9 +40,22 @@ static const CGFloat InterSecureBottomWorkspaceMargin = 100.0;
 @property (nonatomic, strong, nullable) InterTrackRendererBridge *trackRendererBridge;
 @property (nonatomic, strong, nullable) InterNetworkStatusView *networkStatusView;
 @property (nonatomic, strong, nullable) InterMediaWiringController *mediaWiring;
+
+// Chat overlay (floating panel window sitting above the secure window)
+@property (nonatomic, strong, nullable) NSPanel *chatOverlayWindow;
+@property (nonatomic, strong, nullable) InterChatPanel *secureChatPanel;
+@property (nonatomic, strong, nullable) NSButton *chatToggleButton;
 @end
 
 @implementation SecureWindowController
+
+// When chatController is set after the chat overlay is already created, wire the delegate immediately.
+- (void)setChatController:(InterChatController *)chatController {
+    _chatController = chatController;
+    if (chatController && self.secureChatPanel) {
+        chatController.chatDelegate = self;
+    }
+}
 
 - (void)createSecureWindow {
 
@@ -107,13 +122,102 @@ static const CGFloat InterSecureBottomWorkspaceMargin = 100.0;
     [exitButton setAction:@selector(exitSession)];
 
     [view addSubview:exitButton];
+
+    // Chat toggle button — sits to the right of the exit button
+    self.chatToggleButton = [[NSButton alloc] initWithFrame:NSMakeRect(200, 40, 44, 44)];
+    self.chatToggleButton.autoresizingMask = NSViewMaxXMargin | NSViewMaxYMargin;
+    [self.chatToggleButton setImage:[NSImage imageWithSystemSymbolName:@"bubble.left.and.bubble.right"
+                                              accessibilityDescription:@"Chat"]];
+    [self.chatToggleButton setImagePosition:NSImageOnly];
+    [self.chatToggleButton setBordered:NO];
+    self.chatToggleButton.contentTintColor = [NSColor colorWithWhite:0.8 alpha:1.0];
+    self.chatToggleButton.toolTip = @"Toggle chat (⌘⇧C)";
+    [self.chatToggleButton setKeyEquivalent:@"c"];
+    [self.chatToggleButton setKeyEquivalentModifierMask:NSEventModifierFlagCommand | NSEventModifierFlagShift];
+    [self.chatToggleButton setTarget:self];
+    [self.chatToggleButton setAction:@selector(toggleChatOverlay)];
+    [view addSubview:self.chatToggleButton];
+
+    [self setupChatOverlayWindow];
     [self.secureWindow makeKeyAndOrderFront:nil];
+}
+
+- (void)setupChatOverlayWindow {
+    // The secure window is fullscreen borderless at NSScreenSaverWindowLevel.
+    // The chat panel lives in an NSPanel one level above so it floats on top.
+    NSScreen *targetScreen = self.secureWindow.screen ?: [NSScreen mainScreen];
+    NSRect screenFrame = targetScreen.frame;
+    CGFloat panelW = 320.0;
+    CGFloat panelH = screenFrame.size.height * 0.7;
+    CGFloat panelX = NSMaxX(screenFrame) - panelW - 20.0;
+    CGFloat panelY = NSMidY(screenFrame) - panelH / 2.0;
+
+    self.chatOverlayWindow = [[NSPanel alloc] initWithContentRect:NSMakeRect(panelX, panelY, panelW, panelH)
+                                                        styleMask:(NSWindowStyleMaskTitled |
+                                                                   NSWindowStyleMaskResizable |
+                                                                   NSWindowStyleMaskClosable)
+                                                          backing:NSBackingStoreBuffered
+                                                            defer:NO];
+    [self.chatOverlayWindow setLevel:NSScreenSaverWindowLevel + 1];
+    [self.chatOverlayWindow setReleasedWhenClosed:NO];
+    [self.chatOverlayWindow setTitle:@"Chat"];
+    [self.chatOverlayWindow setOpaque:YES];
+    [self.chatOverlayWindow setHidesOnDeactivate:NO];
+
+    // InterChatPanel fills the window's content view (always expanded in overlay mode)
+    NSView *contentView = self.chatOverlayWindow.contentView;
+    self.secureChatPanel = [[InterChatPanel alloc] initWithFrame:contentView.bounds];
+    self.secureChatPanel.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+    self.secureChatPanel.delegate = self;
+    [contentView addSubview:self.secureChatPanel];
+
+    // Force the panel open immediately (it slides in; force-expand so it's always visible)
+    [self.secureChatPanel expandPanel];
+
+    // Wire to the chat controller if already set
+    if (self.chatController) {
+        self.chatController.chatDelegate = self;
+    }
+}
+
+- (void)toggleChatOverlay {
+    if (!self.chatOverlayWindow) return;
+
+    if (self.chatOverlayWindow.isVisible) {
+        [self.chatOverlayWindow orderOut:nil];
+        self.chatController.isChatVisible = NO;
+        self.chatToggleButton.contentTintColor = [NSColor colorWithWhite:0.8 alpha:1.0];
+    } else {
+        [self.chatOverlayWindow makeKeyAndOrderFront:nil];
+        self.chatController.isChatVisible = YES;  // setting YES resets unreadCount inside Swift
+        [self.secureChatPanel setUnreadBadge:0];
+        self.chatToggleButton.contentTintColor = [NSColor systemBlueColor];
+    }
 }
 
 - (void)exitSession {
     dispatch_block_t exitHandler = self.exitSessionHandler;
-    if (exitHandler) {
-        exitHandler();
+    if (!exitHandler) {
+        return;
+    }
+
+    NSAlert *alert = [[NSAlert alloc] init];
+    alert.messageText = @"Are you sure you want to end this session?";
+    alert.alertStyle = NSAlertStyleWarning;
+    [alert addButtonWithTitle:@"End Session"];
+    [alert addButtonWithTitle:@"Cancel"];
+
+    NSWindow *targetWindow = self.secureWindow ?: [NSApp keyWindow];
+    if (targetWindow) {
+        [alert beginSheetModalForWindow:targetWindow completionHandler:^(NSModalResponse response) {
+            if (response == NSAlertFirstButtonReturn) {
+                exitHandler();
+            }
+        }];
+    } else {
+        if ([alert runModal] == NSAlertFirstButtonReturn) {
+            exitHandler();
+        }
     }
 }
 
@@ -175,6 +279,15 @@ static const CGFloat InterSecureBottomWorkspaceMargin = 100.0;
 
     [self.renderView removeFromSuperview];
     self.renderView = nil;
+
+    // Tear down chat overlay
+    if (self.chatOverlayWindow) {
+        self.chatController.chatDelegate = nil;
+        [self.chatOverlayWindow orderOut:nil];
+        self.chatOverlayWindow = nil;
+        self.secureChatPanel = nil;
+    }
+    self.chatToggleButton = nil;
 
     [self.secureWindow orderOut:nil];
     self.secureWindow = nil;
@@ -377,14 +490,10 @@ static const CGFloat InterSecureBottomWorkspaceMargin = 100.0;
     [self.controlPanel setSelectedInterviewToolKind:toolKind];
 
     if (self.surfaceShareController.isSharing && toolKind == InterInterviewToolKindNone) {
-        // Interview sharing should never keep streaming a placeholder once the
-        // user explicitly turns tools off. Stop the share so the main stage can
-        // return to remote video immediately.
-        [self.roomController.publisher unpublishScreenShareWithCompletion:nil];
-        [self.surfaceShareController stopSharingFromSurfaceView:self.renderView];
-        self.surfaceShareController.networkPublishSink = nil;
-        [self.controlPanel setShareStartPending:self.surfaceShareController.isStartPending];
-        [self.controlPanel setSharingEnabled:self.surfaceShareController.isSharing];
+        // Keep the share pipeline alive — the user is just switching away from
+        // the tool view, not ending the share session. The share button remains
+        // the authoritative toggle for starting/stopping the share.
+        [self.controlPanel setShareStatusText:@"Sharing is paused — select a tool to resume."];
         [self updateSecureWorkspacePresentationAnimated:YES];
         return;
     }
@@ -538,14 +647,83 @@ static const CGFloat InterSecureBottomWorkspaceMargin = 100.0;
 
 #pragma mark - Diagnostics [3.4.5]
 
-// TODO: [Phase 8.1.5] Add chat panel / hand-raise UI to secure interviewee mode.
-// The chatController is already attached via AppDelegate.enterMode: so data flows.
-// Secure mode needs a minimal chat UI (or at least a notification badge).
+// [Phase 8.1.5] Chat panel implemented: floating NSPanel overlay above secure window.
+// Wire chatController by setting .chatController before createSecureWindow.
 
 /// [B1] Trampoline: gesture recognizer target must be self; forward to wiring controller.
 - (void)forwardDiagnosticTripleClick:(NSClickGestureRecognizer *)recognizer {
 #pragma unused(recognizer)
     [self.mediaWiring handleDiagnosticTripleClick];
+}
+
+#pragma mark - InterChatControllerDelegate
+
+- (void)chatController:(InterChatController *)controller
+      didReceiveMessage:(InterChatMessageInfo *)message {
+    [self.secureChatPanel appendMessage:message];
+    if (!self.chatOverlayWindow.isVisible) {
+        NSInteger unread = controller.unreadCount;
+        [self.secureChatPanel setUnreadBadge:unread];
+        // Tint the toggle button to signal unread messages
+        if (unread > 0) {
+            self.chatToggleButton.contentTintColor = [NSColor systemOrangeColor];
+        }
+    }
+}
+
+- (void)chatController:(InterChatController *)controller
+   didUpdateUnreadCount:(NSInteger)count {
+    if (!self.chatOverlayWindow.isVisible) {
+        [self.secureChatPanel setUnreadBadge:count];
+        self.chatToggleButton.contentTintColor = count > 0
+            ? [NSColor systemOrangeColor]
+            : [NSColor colorWithWhite:0.8 alpha:1.0];
+    }
+}
+
+#pragma mark - InterChatPanelDelegate (secure mode)
+
+- (void)chatPanel:(InterChatPanel *)panel didSubmitMessage:(NSString *)text {
+#pragma unused(panel)
+    [self.chatController sendPublicMessage:text];
+}
+
+- (void)chatPanelDidRequestExport:(InterChatPanel *)panel {
+#pragma unused(panel)
+    // Export not available inside the secure kiosk — silently ignore.
+}
+
+- (void)chatPanel:(InterChatPanel *)panel didSelectRecipient:(NSString *)recipientIdentity {
+#pragma unused(panel, recipientIdentity)
+    // DM selection not supported in secure mode (single-channel chat only).
+}
+
+- (void)chatPanelDidRequestFileAttach:(InterChatPanel *)panel {
+#pragma unused(panel)
+    // File uploads from secure (interviewee kiosk) mode are not permitted —
+    // the kiosk has restricted file-system access and no token server credentials.
+    NSAlert *alert = [[NSAlert alloc] init];
+    alert.messageText   = @"File Sharing Unavailable";
+    alert.informativeText = @"File sharing is not available in secure interview mode.";
+    [alert addButtonWithTitle:@"OK"];
+    [alert beginSheetModalForWindow:self.chatOverlayWindow ?: [NSApp keyWindow]
+                  completionHandler:nil];
+}
+
+- (void)chatPanel:(InterChatPanel *)panel didRequestDownloadFileMessage:(InterChatMessageInfo *)message {
+#pragma unused(panel)
+    // Files shared by the interviewer (who is in normal mode and has credentials) can
+    // be downloaded by the interviewee. The interviewee has no leaveToken — so they
+    // cannot authenticate against the server's download endpoint. Show a notice.
+    NSAlert *alert = [[NSAlert alloc] init];
+    alert.messageText   = @"File Download Unavailable";
+    NSString *fname = message.fileName.length > 0 ? message.fileName : @"file";
+    alert.informativeText = [NSString stringWithFormat:
+        @"\"%@\" was shared by the interviewer but cannot be downloaded during a secure session.",
+        fname];
+    [alert addButtonWithTitle:@"OK"];
+    [alert beginSheetModalForWindow:self.chatOverlayWindow ?: [NSApp keyWindow]
+                  completionHandler:nil];
 }
 
 @end

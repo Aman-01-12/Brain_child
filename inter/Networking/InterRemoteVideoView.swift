@@ -84,6 +84,10 @@ enum DetectedFormat {
     /// Used for remote camera feeds so they appear natural to the viewer.
     @objc public var isMirrored: Bool = false
 
+    /// When YES, video fills the view by cropping to aspect-fill (no black bars).
+    /// When NO (default), video fits with letterbox/pillarbox bars.
+    @objc public var aspectFill: Bool = false
+
     // MARK: - Metal State
 
     private var device: MTLDevice!
@@ -407,13 +411,14 @@ enum DetectedFormat {
             encoder.setFragmentBytes(ptr.baseAddress!, length: MemoryLayout<Float>.stride * 16, index: 0)
         }
 
-        // Pass aspect-fit uniforms [1.11.9]
+        // Pass aspect-fit/fill uniforms [1.11.9]
         var aspectUniforms = computeAspectFitUniforms(
             videoWidth: Float(width),
             videoHeight: Float(height),
             viewWidth: Float(drawable.texture.width),
             viewHeight: Float(drawable.texture.height),
-            mirrored: isMirrored
+            mirrored: isMirrored,
+            fill: aspectFill
         )
         encoder.setVertexBytes(&aspectUniforms, length: MemoryLayout<AspectFitUniforms>.stride, index: 0)
 
@@ -459,13 +464,14 @@ enum DetectedFormat {
         encoder.setRenderPipelineState(pipeline)
         encoder.setFragmentTexture(texture, index: 0)
 
-        // Aspect-fit uniforms [1.11.9]
+        // Aspect-fit/fill uniforms [1.11.9]
         var aspectUniforms = computeAspectFitUniforms(
             videoWidth: Float(width),
             videoHeight: Float(height),
             viewWidth: Float(drawable.texture.width),
             viewHeight: Float(drawable.texture.height),
-            mirrored: isMirrored
+            mirrored: isMirrored,
+            fill: aspectFill
         )
         encoder.setVertexBytes(&aspectUniforms, length: MemoryLayout<AspectFitUniforms>.stride, index: 0)
 
@@ -669,12 +675,17 @@ enum DetectedFormat {
     // MARK: - Aspect Fit [1.11.9]
 
     struct AspectFitUniforms {
-        var scaleX: Float
-        var scaleY: Float
-        var offsetX: Float
-        var offsetY: Float
-        var mirrorX: Float   // 1.0 = normal, -1.0 = horizontally mirrored
-        var _pad1: Float = 0 // padding to 24 bytes (6 floats)
+        var scaleX: Float        // NDC quad scale X (1.0 for fill mode)
+        var scaleY: Float        // NDC quad scale Y (1.0 for fill mode)
+        var offsetX: Float       // reserved, always 0
+        var offsetY: Float       // reserved, always 0
+        var mirrorX: Float       // 1.0 = normal, -1.0 = horizontally mirrored
+        var _pad1: Float = 0
+        // UV crop for aspect-fill mode (identity for aspect-fit)
+        var uvScaleX: Float = 1  // UV width of crop window [0..1]
+        var uvScaleY: Float = 1  // UV height of crop window [0..1]
+        var uvOffsetX: Float = 0 // UV left edge of crop window
+        var uvOffsetY: Float = 0 // UV bottom edge of crop window
     }
 
     func computeAspectFitUniforms(
@@ -682,7 +693,8 @@ enum DetectedFormat {
         videoHeight: Float,
         viewWidth: Float,
         viewHeight: Float,
-        mirrored: Bool = false
+        mirrored: Bool = false,
+        fill: Bool = false
     ) -> AspectFitUniforms {
         guard videoWidth > 0, videoHeight > 0, viewWidth > 0, viewHeight > 0 else {
             return AspectFitUniforms(scaleX: 1, scaleY: 1, offsetX: 0, offsetY: 0,
@@ -690,21 +702,39 @@ enum DetectedFormat {
         }
 
         let videoAspect = videoWidth / videoHeight
-        let viewAspect = viewWidth / viewHeight
+        let viewAspect  = viewWidth  / viewHeight
 
-        var scaleX: Float = 1
-        var scaleY: Float = 1
-
-        if videoAspect > viewAspect {
-            // Video wider than view: letterbox (bars top/bottom)
-            scaleY = viewAspect / videoAspect
+        if fill {
+            // Quad fills the full drawable; crop UV to preserve aspect ratio.
+            var uvScaleX: Float = 1
+            var uvScaleY: Float = 1
+            var uvOffsetX: Float = 0
+            var uvOffsetY: Float = 0
+            if videoAspect > viewAspect {
+                // Video wider → crop sides, show full height
+                uvScaleX  = viewAspect / videoAspect
+                uvOffsetX = (1.0 - uvScaleX) / 2.0
+            } else if videoAspect < viewAspect {
+                // Video taller → crop top/bottom, show full width
+                uvScaleY  = videoAspect / viewAspect
+                uvOffsetY = (1.0 - uvScaleY) / 2.0
+            }
+            return AspectFitUniforms(scaleX: 1, scaleY: 1, offsetX: 0, offsetY: 0,
+                                     mirrorX: mirrored ? -1.0 : 1.0,
+                                     uvScaleX: uvScaleX, uvScaleY: uvScaleY,
+                                     uvOffsetX: uvOffsetX, uvOffsetY: uvOffsetY)
         } else {
-            // Video taller than view: pillarbox (bars left/right)
-            scaleX = videoAspect / viewAspect
+            // Aspect-fit: shrink the NDC quad; UV stays [0, 1].
+            var scaleX: Float = 1
+            var scaleY: Float = 1
+            if videoAspect > viewAspect {
+                scaleY = viewAspect / videoAspect  // letterbox
+            } else {
+                scaleX = videoAspect / viewAspect  // pillarbox
+            }
+            return AspectFitUniforms(scaleX: scaleX, scaleY: scaleY, offsetX: 0, offsetY: 0,
+                                     mirrorX: mirrored ? -1.0 : 1.0)
         }
-
-        return AspectFitUniforms(scaleX: scaleX, scaleY: scaleY, offsetX: 0, offsetY: 0,
-                                 mirrorX: mirrored ? -1.0 : 1.0)
     }
 
     // MARK: - Format Detection [G3 / 1.11.8]
@@ -745,12 +775,17 @@ enum DetectedFormat {
     using namespace metal;
 
     struct AspectFitUniforms {
-        float scaleX;
-        float scaleY;
-        float offsetX;
-        float offsetY;
-        float mirrorX;   // 1.0 = normal, -1.0 = mirrored
+        float scaleX;      // NDC quad scale X (1.0 for fill mode)
+        float scaleY;      // NDC quad scale Y (1.0 for fill mode)
+        float offsetX;     // reserved
+        float offsetY;     // reserved
+        float mirrorX;     // 1.0 = normal, -1.0 = mirrored
         float _pad1;
+        // UV crop window for aspect-fill (identity = no crop)
+        float uvScaleX;    // UV width  of crop window
+        float uvScaleY;    // UV height of crop window
+        float uvOffsetX;   // UV left   of crop window
+        float uvOffsetY;   // UV bottom of crop window
     };
 
     struct VertexOut {
@@ -759,8 +794,11 @@ enum DetectedFormat {
     };
 
     // Quad vertex shader: 4 vertices forming a triangle strip.
-    // Positions are scaled by aspect-fit uniforms; UVs map exactly [0,1].
-    // mirrorX flips the texture horizontally for mirrored camera feeds.
+    // For aspect-fit:  positions are scaled so the quad is smaller than the drawable
+    //                  (black bars show through), UVs are full [0, 1].
+    // For aspect-fill: positions fill the drawable (scaleX=1, scaleY=1),
+    //                  UVs are cropped via uvScale/uvOffset to preserve aspect ratio.
+    // mirrorX flips the U coordinate for mirrored camera feeds.
     vertex VertexOut interRemoteVertexShader(
         uint vertexID [[vertex_id]],
         constant AspectFitUniforms &uniforms [[buffer(0)]]
@@ -784,11 +822,16 @@ enum DetectedFormat {
         pos.x *= uniforms.scaleX;
         pos.y *= uniforms.scaleY;
         out.position = float4(pos, 0.0, 1.0);
+
         float2 tc = texCoords[vertexID];
-        // Mirror: flip U coordinate around 0.5 center
+        // Mirror: flip U coordinate around 0.5 before UV crop so the crop
+        // window is always centered regardless of mirroring.
         if (uniforms.mirrorX < 0.0) {
             tc.x = 1.0 - tc.x;
         }
+        // Apply UV crop (identity when uvScaleX==1, uvScaleY==1, offsets==0)
+        tc.x = tc.x * uniforms.uvScaleX + uniforms.uvOffsetX;
+        tc.y = tc.y * uniforms.uvScaleY + uniforms.uvOffsetY;
         out.texCoord = tc;
         return out;
     }

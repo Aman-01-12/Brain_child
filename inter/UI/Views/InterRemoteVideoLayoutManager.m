@@ -1,5 +1,6 @@
 #import "InterRemoteVideoLayoutManager.h"
 #import "InterParticipantOverlayView.h"
+#import <AVFoundation/AVFoundation.h>
 
 #if __has_include("inter-Swift.h")
 #import "inter-Swift.h"
@@ -9,6 +10,8 @@
 // Internal tile key helpers
 // ---------------------------------------------------------------------------
 static NSString *const kScreenShareTileKey = @"__screenshare__";
+static NSString *const kLocalSelfTileKey   = @"__localself__";
+static NSString *const kInterPreferGridLayoutKey = @"InterPreferGridLayout";
 
 // ---------------------------------------------------------------------------
 // InterRemoteVideoTileView — wrapper around InterRemoteVideoView that adds:
@@ -221,6 +224,28 @@ static NSString *const kScreenShareTileKey = @"__screenshare__";
 /// Timer to revert auto-speaker-spotlight 3s after speaker stops. [Phase 7.4.2]
 @property (nonatomic, strong, nullable) NSTimer *autoSpotlightRevertTimer;
 
+/// When YES the user has explicitly clicked a filmstrip tile to pin a specific
+/// participant in the main stage. Auto-spotlight will NOT override the stage tile
+/// while this is set. The pin clears when the pinned participant leaves or the
+/// layout mode is toggled.
+@property (nonatomic, assign) BOOL spotlightIsPinnedByUser;
+
+/// Identity of the last participant who was the active speaker.
+/// Used as the stage-mode spotlight fallback so the last speaker stays in the main
+/// stage even after they stop speaking (until a new speaker takes over).
+@property (nonatomic, copy, nullable) NSString *lastActiveSpeakerIdentity;
+
+// -- Grid mode: local self-view tile --
+
+/// AVCaptureVideoPreviewLayer powering the local self-view tile.
+@property (nonatomic, strong, nullable) AVCaptureVideoPreviewLayer *localPreviewLayer;
+/// Container NSView for the local self-view tile.
+@property (nonatomic, strong, nullable) NSView *localSelfTileView;
+/// "You" name label inside the self-view tile.
+@property (nonatomic, strong, nullable) NSTextField *localSelfNameLabel;
+/// Floating toggle button (top-right) for switching between Grid and Stage views.
+@property (nonatomic, strong, nullable) NSButton *layoutToggleButton;
+
 @end
 
 // ---------------------------------------------------------------------------
@@ -270,7 +295,7 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
     self.participantOverlay.hidden = YES;
     [self addSubview:self.participantOverlay];
 
-    // Participant count badge — top-right corner
+    // Participant count badge — top-LEFT corner (keeps it away from the toggle button)
     self.participantCountBadge = [NSTextField labelWithString:@""];
     self.participantCountBadge.font = [NSFont systemFontOfSize:11 weight:NSFontWeightSemibold];
     self.participantCountBadge.textColor = [NSColor whiteColor];
@@ -314,8 +339,20 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
 
     self.layoutMode = InterRemoteVideoLayoutModeNone;
     self.allowsManualSpotlightSelection = YES;
-    self.preferStageLayoutForMultipleCameras = NO;
     self.compactPreviewMode = NO;
+    // Enable auto-spotlight by default so active speaker is always promoted to
+    // the main stage in stage+filmstrip mode, matching screen-share behaviour.
+    self.autoSpotlightActiveSpeaker = YES;
+
+    // Load persisted grid layout preference (default YES = equal grid).
+    [[NSUserDefaults standardUserDefaults] registerDefaults:@{kInterPreferGridLayoutKey: @YES}];
+    BOOL preferGrid = [[NSUserDefaults standardUserDefaults] boolForKey:kInterPreferGridLayoutKey];
+    _gridLayoutEnabled = preferGrid;
+    _preferStageLayoutForMultipleCameras = !preferGrid;
+
+    // Floating layout toggle button (top-right of the video area).
+    [self setupLayoutToggleButton];
+
     return self;
 }
 
@@ -323,6 +360,180 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
 
 - (NSUInteger)remoteCameraCount {
     return self.remoteCameraViews.count;
+}
+
+#pragma mark - Grid Layout Toggle
+
+- (void)setGridLayoutEnabled:(BOOL)gridLayoutEnabled {
+    if (_gridLayoutEnabled == gridLayoutEnabled) return;
+    _gridLayoutEnabled = gridLayoutEnabled;
+    // Write directly to ivars so we don't trigger redundant layout passes.
+    _preferStageLayoutForMultipleCameras = !gridLayoutEnabled;
+    [[NSUserDefaults standardUserDefaults] setBool:gridLayoutEnabled forKey:kInterPreferGridLayoutKey];
+
+    // Cancel any pending auto-spotlight revert timer — the saved pre-auto key belongs
+    // to the previous mode and would restore the wrong tile after the switch.
+    // Also release any user pin since the user is explicitly choosing a new layout.
+    [self.autoSpotlightRevertTimer invalidate];
+    self.autoSpotlightRevertTimer = nil;
+    self.preAutoSpotlightKey = nil;
+    self.spotlightIsPinnedByUser = NO;
+
+    [self updateLayoutToggleButton];
+    [self updateLayoutAnimated:YES];
+}
+
+/// Custom setter: creates the AVCaptureVideoPreviewLayer immediately so it
+/// attaches to the session once, before any layout pass. Creating it lazily
+/// inside arrangeCameraGridInRect: (called during layout) would briefly contend
+/// with the camera capture thread and back up the CMIO stream queue.
+- (void)setLocalCaptureSession:(AVCaptureSession *)localCaptureSession {
+    if (_localCaptureSession == localCaptureSession) return;
+
+    // Tear down old tile and preview layer.
+    if (self.localPreviewLayer) {
+        [self.localPreviewLayer removeFromSuperlayer];
+        self.localPreviewLayer = nil;
+    }
+    if (self.localSelfTileView) {
+        [self.localSelfTileView removeFromSuperview];
+        self.localSelfTileView  = nil;
+        self.localSelfNameLabel = nil;
+    }
+
+    // If the user had pinned themselves in the spotlight, release the pin now
+    // so the layout doesn't try to render a torn-down tile.
+    if ([self.spotlightedTileKey isEqualToString:kLocalSelfTileKey]) {
+        self.spotlightIsPinnedByUser = NO;
+        [self updateManualSpotlightTileKey:nil];
+    }
+
+    _localCaptureSession = localCaptureSession;
+
+    // Pre-create the preview layer so it is attached to the session now,
+    // not inside a layout pass later.
+    if (localCaptureSession) {
+        AVCaptureVideoPreviewLayer *preview = [AVCaptureVideoPreviewLayer layerWithSession:localCaptureSession];
+        preview.videoGravity = AVLayerVideoGravityResizeAspect;
+        preview.frame = CGRectMake(0, 0, 1, 1);  // sized during tile placement
+        self.localPreviewLayer = preview;
+    }
+
+    // Re-layout so computeLayoutMode picks up the new effective camera count.
+    [self updateLayoutAnimated:NO];
+}
+
+- (void)setupLayoutToggleButton {
+    self.layoutToggleButton = [[NSButton alloc] initWithFrame:NSZeroRect];
+    self.layoutToggleButton.bezelStyle = NSBezelStyleRounded;
+    self.layoutToggleButton.font = [NSFont systemFontOfSize:11 weight:NSFontWeightMedium];
+    self.layoutToggleButton.wantsLayer = YES;
+    [self.layoutToggleButton setTarget:self];
+    [self.layoutToggleButton setAction:@selector(handleLayoutToggle:)];
+    self.layoutToggleButton.hidden = YES;
+    // Place the toggle button as the TOPMOST subview — above the badge and overlay
+    // so nothing can ever sit in front of it and prevent clicks.
+    [self addSubview:self.layoutToggleButton positioned:NSWindowAbove relativeTo:nil];
+    [self updateLayoutToggleButton];
+    [self repositionLayoutToggleButton];
+}
+
+- (void)updateLayoutToggleButton {
+    // Count ALL renderable video tiles: remote cameras + local self-view.
+    // 1 remote + self-view = 2 tiles → toggle is meaningful (grid shows both
+    // tiles; stage collapses to 1 full-screen remote + empty filmstrip).
+    // 0 or 1 tile total → both modes are identical, hide the toggle.
+    NSUInteger tileCount = self.remoteCameraViews.count
+                         + (self.localCaptureSession != nil ? 1 : 0);
+    BOOL shouldShow = (tileCount >= 2 &&
+                       !self.compactPreviewMode &&
+                       !self.screenShareParticipantId);
+    self.layoutToggleButton.hidden = !shouldShow;
+    // Title describes the mode the user will SWITCH TO.
+    self.layoutToggleButton.title = self.gridLayoutEnabled ? @"Stage" : @"Grid";
+}
+
+- (void)repositionLayoutToggleButton {
+    CGFloat btnW = 62.0, btnH = 24.0, margin = 10.0;
+
+    // In camera-only stage mode the filmstrip occupies the right side.
+    // Keep the button within the main stage area so it never overlaps
+    // the filmstrip thumbnails (which would block interaction on both).
+    // Stage mode: grid is off and there are enough renderable tiles.
+    // Counts as stage when there are 2+ remote cameras, OR 1 remote camera plus
+    // the local self-view (which appears in the filmstrip in stage mode).
+    BOOL hasStageTileCount = (self.remoteCameraViews.count >= 2 ||
+                              (self.remoteCameraViews.count >= 1 && self.localCaptureSession != nil));
+    BOOL isStageMode = (!self.gridLayoutEnabled &&
+                        !self.screenShareParticipantId &&
+                        hasStageTileCount &&
+                        !self.compactPreviewMode);
+
+    CGFloat rightBound;
+    if (isStageMode) {
+        CGFloat filmstripW = self.bounds.size.width * kFilmstripWidthFraction;
+        filmstripW = MAX(filmstripW, kFilmstripMinWidth);
+        filmstripW = MIN(filmstripW, kFilmstripMaxWidth);
+        // Place button flush against the filmstrip left edge.
+        rightBound = self.bounds.size.width - filmstripW - margin;
+    } else {
+        rightBound = self.bounds.size.width - margin;
+    }
+
+    self.layoutToggleButton.frame = NSMakeRect(
+        rightBound - btnW,
+        self.bounds.size.height - btnH - margin,
+        btnW, btnH);
+}
+
+- (IBAction)handleLayoutToggle:(id)sender {
+    self.gridLayoutEnabled = !self.gridLayoutEnabled;
+}
+
+#pragma mark - Local Self-View Tile
+
+- (void)setupLocalSelfTileIfNeeded {
+    // Guard: tile already built, or preview layer not yet ready.
+    if (self.localSelfTileView || !self.localPreviewLayer) return;
+
+    NSView *tile = [[NSView alloc] initWithFrame:NSZeroRect];
+    tile.wantsLayer = YES;
+    tile.layer.backgroundColor = [NSColor blackColor].CGColor;
+    tile.layer.cornerRadius = 8.0;
+    tile.layer.masksToBounds = YES;
+
+    // Preview layer was already created eagerly in setLocalCaptureSession:.
+    // Just attach it to the tile's backing layer.
+    AVCaptureVideoPreviewLayer *preview = self.localPreviewLayer;
+    preview.autoresizingMask = kCALayerWidthSizable | kCALayerHeightSizable;
+    [tile.layer addSublayer:preview];
+
+    NSTextField *label = [NSTextField labelWithString:@"You"];
+    label.font        = [NSFont systemFontOfSize:11 weight:NSFontWeightMedium];
+    label.textColor   = [NSColor whiteColor];
+    label.backgroundColor = [NSColor colorWithWhite:0.0 alpha:0.55];
+    label.drawsBackground = YES;
+    label.alignment   = NSTextAlignmentCenter;
+    label.wantsLayer  = YES;
+    label.layer.cornerRadius = 4.0;
+    label.layer.masksToBounds = YES;
+    [tile addSubview:label];
+
+    // Click gesture — promotes the local self-view into the main stage spotlight,
+    // exactly like clicking any remote participant tile in the filmstrip.
+    NSClickGestureRecognizer *tap = [[NSClickGestureRecognizer alloc]
+                                        initWithTarget:self
+                                                action:@selector(handleLocalSelfTileClicked:)];
+    [tile addGestureRecognizer:tap];
+    tile.wantsLayer = YES;   // ensure hit-testing works through the CALayer
+
+    self.localSelfTileView  = tile;
+    self.localSelfNameLabel = label;
+}
+
+/// Tap handler wired to the local self-view tile's NSClickGestureRecognizer.
+- (void)handleLocalSelfTileClicked:(NSClickGestureRecognizer *)recognizer {
+    [self handleTileClicked:kLocalSelfTileKey];
 }
 
 #pragma mark - Tile Factory
@@ -450,8 +661,13 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
     // Remove from visible set
     [self.visibleParticipantIds removeObject:participantId];
 
-    // If the removed camera was spotlighted, reset to auto
+    // If the removed camera was spotlighted, reset to auto and release any
+    // user pin so the layout reverts to speaker-auto immediately.
     if ([self.spotlightedTileKey isEqualToString:participantId]) {
+        self.spotlightIsPinnedByUser = NO;
+        [self.autoSpotlightRevertTimer invalidate];
+        self.autoSpotlightRevertTimer = nil;
+        self.preAutoSpotlightKey = nil;
         [self updateManualSpotlightTileKey:nil];
     }
 }
@@ -551,6 +767,15 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
         return;
     }
 
+    // Pin the spotlight: the user has made an explicit choice. Cancel any
+    // pending auto-revert timer and clear the saved pre-auto key so that if
+    // the pin is later released the layout falls back to speaker-auto, not
+    // to some stale tile from before this interaction.
+    self.spotlightIsPinnedByUser = YES;
+    [self.autoSpotlightRevertTimer invalidate];
+    self.autoSpotlightRevertTimer = nil;
+    self.preAutoSpotlightKey = nil;
+
     [self updateManualSpotlightTileKey:tileKey];
     [self updateLayoutAnimated:YES];
 }
@@ -571,6 +796,8 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
         [self applyCurrentLayoutAnimated:NO];
     }
 
+    [self updateLayoutToggleButton];
+
     dispatch_block_t handler = self.layoutStateChangedHandler;
     if (handler) {
         handler();
@@ -587,7 +814,15 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
     if (hasScreenShare) {
         return InterRemoteVideoLayoutModeScreenShareOnly;
     }
-    if (camCount > 1) {
+
+    // Count the local self-view tile as an extra camera in BOTH grid mode and stage
+    // mode so that 1 remote + self-view is never treated as a single-camera fill.
+    // In grid mode it produces a 2×1 grid; in stage mode it produces stage+filmstrip.
+    BOOL addLocalSelf = (self.localCaptureSession != nil && camCount >= 1 &&
+                         (self.gridLayoutEnabled || self.preferStageLayoutForMultipleCameras));
+    NSUInteger effectiveCamCount = camCount + (addLocalSelf ? 1 : 0);
+
+    if (effectiveCamCount > 1) {
         if (self.preferStageLayoutForMultipleCameras) {
             return InterRemoteVideoLayoutModeScreenShareWithCameras;
         }
@@ -603,21 +838,38 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
 - (NSString *)effectiveSpotlightKey {
     NSString *key = self.spotlightedTileKey;
 
-    // Validate that the key still references a live tile
+    // Validate that the key still references a live tile.
     if ([key isEqualToString:kScreenShareTileKey]) {
         return self.screenShareParticipantId ? key : nil;
+    }
+    if ([key isEqualToString:kLocalSelfTileKey]) {
+        return self.localCaptureSession ? key : nil;
     }
     if (key && self.remoteCameraViews[key]) {
         return key;
     }
 
-    // Auto: spotlight screen share if present
+    // --- Auto-resolution (no valid manual spotlight) ---
+
+    // Screen share always takes the main stage when present.
     if (self.screenShareParticipantId) {
         return kScreenShareTileKey;
     }
+
+    // In stage (non-grid) mode, pick the best default spotlight:
+    // 1. Current active speaker (most relevant person right now)
+    // 2. Last active speaker (keeps the last talker on stage after they stop)
+    // 3. First-joined as a last-resort fallback
     if (self.preferStageLayoutForMultipleCameras && self.cameraParticipantOrder.firstObject != nil) {
+        if (_activeSpeakerIdentity.length > 0 && self.remoteCameraViews[_activeSpeakerIdentity]) {
+            return _activeSpeakerIdentity;
+        }
+        if (self.lastActiveSpeakerIdentity.length > 0 && self.remoteCameraViews[self.lastActiveSpeakerIdentity]) {
+            return self.lastActiveSpeakerIdentity;
+        }
         return self.cameraParticipantOrder.firstObject;
     }
+
     return nil;
 }
 
@@ -648,6 +900,7 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
             InterRemoteVideoView *camView = self.remoteCameraViews[pid];
             if (!camView) break;
 
+            camView.aspectFill = NO;
             InterRemoteVideoTileView *tile = [self tileForKey:pid videoView:camView];
             tile.nameLabel.hidden = YES; // no label in full-view mode
             tile.layer.cornerRadius = 0;
@@ -685,6 +938,13 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
             [self applyStageAndFilmstripLayoutAnimated:animated];
             break;
         }
+    }
+
+    // Always keep the toggle button as the topmost subview so nothing
+    // (tiles, filmstrip, badge) can ever render in front of it.
+    if (self.layoutToggleButton) {
+        [self addSubview:self.layoutToggleButton positioned:NSWindowAbove relativeTo:nil];
+        [self repositionLayoutToggleButton];
     }
 }
 
@@ -755,32 +1015,62 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
         }
     }
 
-    // --- Main stage ---
-    InterRemoteVideoView *spotlightVideoView = nil;
-    if ([spotlightKey isEqualToString:kScreenShareTileKey]) {
-        spotlightVideoView = self.remoteScreenShareView;
-    } else if (spotlightKey) {
-        spotlightVideoView = self.remoteCameraViews[spotlightKey];
+    // Local self-view goes in the filmstrip unless it is the current spotlight.
+    BOOL selfIsSpotlight = [kLocalSelfTileKey isEqualToString:spotlightKey];
+    if (self.localCaptureSession && !selfIsSpotlight) {
+        [self setupLocalSelfTileIfNeeded];
+        if (self.localSelfTileView) {
+            [filmstripKeys addObject:kLocalSelfTileKey];
+        }
     }
 
-    if (spotlightVideoView) {
-        InterRemoteVideoTileView *stageTile = [self tileForKey:spotlightKey videoView:spotlightVideoView];
-        stageTile.nameLabel.hidden = NO;
-        stageTile.layer.cornerRadius = 8.0;
-        if (![spotlightKey isEqualToString:kScreenShareTileKey]) {
-            stageTile.isSpeaking = [spotlightKey isEqualToString:self.activeSpeakerIdentity];
+    // --- Main stage ---
+    NSRect stageFrame = NSMakeRect(0, kFilmstripPadding,
+                                   stageW - kFilmstripPadding, H - 2 * kFilmstripPadding);
+
+    if (selfIsSpotlight) {
+        // Local self-view in the main stage.
+        [self setupLocalSelfTileIfNeeded];
+        NSView *selfTile = self.localSelfTileView;
+        if (selfTile) {
+            [self addSubview:selfTile positioned:NSWindowBelow relativeTo:self.filmstripScrollView];
+            selfTile.hidden = NO;
+            if (animated) {
+                selfTile.animator.frame = stageFrame;
+            } else {
+                selfTile.frame = stageFrame;
+            }
+            // Keep the preview layer in sync with the new stage bounds.
+            self.localPreviewLayer.frame = CGRectMake(0, 0, stageFrame.size.width, stageFrame.size.height);
+            CGFloat lblH = 20.0, lblPad = 8.0;
+            self.localSelfNameLabel.frame = NSMakeRect(lblPad, lblPad,
+                                                       MIN(80.0, stageFrame.size.width - 2 * lblPad), lblH);
         }
-        [self addSubview:stageTile positioned:NSWindowBelow relativeTo:self.filmstripScrollView];
-        stageTile.hidden = NO;
-        spotlightVideoView.hidden = NO;
+    } else {
+        InterRemoteVideoView *spotlightVideoView = nil;
+        if ([spotlightKey isEqualToString:kScreenShareTileKey]) {
+            spotlightVideoView = self.remoteScreenShareView;
+        } else if (spotlightKey) {
+            spotlightVideoView = self.remoteCameraViews[spotlightKey];
+        }
 
-        NSRect stageFrame = NSMakeRect(0, kFilmstripPadding,
-                                       stageW - kFilmstripPadding, H - 2 * kFilmstripPadding);
-        [self setTile:stageTile frame:stageFrame animated:animated];
+        if (spotlightVideoView) {
+            InterRemoteVideoTileView *stageTile = [self tileForKey:spotlightKey videoView:spotlightVideoView];
+            stageTile.nameLabel.hidden = NO;
+            stageTile.layer.cornerRadius = 8.0;
+            if (![spotlightKey isEqualToString:kScreenShareTileKey]) {
+                stageTile.isSpeaking = [spotlightKey isEqualToString:self.activeSpeakerIdentity];
+            }
+            [self addSubview:stageTile positioned:NSWindowBelow relativeTo:self.filmstripScrollView];
+            stageTile.hidden = NO;
+            spotlightVideoView.hidden = NO;
 
-        // Phase 7.3.4: Request high-res for spotlighted view
-        if (![spotlightKey isEqualToString:kScreenShareTileKey]) {
-            [self notifyDimensionsChange:CGSizeMake(1280, 720) forParticipant:spotlightKey];
+            [self setTile:stageTile frame:stageFrame animated:animated];
+
+            // Phase 7.3.4: Request high-res for spotlighted view
+            if (![spotlightKey isEqualToString:kScreenShareTileKey]) {
+                [self notifyDimensionsChange:CGSizeMake(1280, 720) forParticipant:spotlightKey];
+            }
         }
     }
 
@@ -830,8 +1120,33 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
     // Stack tiles top-to-bottom. NSView y=0 is bottom, so we invert.
     for (NSUInteger i = 0; i < filmstripKeys.count; i++) {
         NSString *key = filmstripKeys[i];
-        InterRemoteVideoView *videoView = nil;
+        NSUInteger visualIndex = itemIndex + i;
+        CGFloat y = totalH - kFilmstripPadding - (visualIndex + 1) * tileH - visualIndex * kFilmstripTileGap;
+        NSRect tileFrame = NSMakeRect(kFilmstripPadding, y, tileW, tileH);
 
+        // --- Local self-view tile ---
+        if ([key isEqualToString:kLocalSelfTileKey]) {
+            NSView *selfTile = self.localSelfTileView;
+            if (!selfTile) continue;
+            selfTile.hidden = NO;
+            // Keep preview layer filling the tile
+            self.localPreviewLayer.frame = CGRectMake(0, 0, tileW, tileH);
+            // Name label: bottom-left pill
+            CGFloat lblH = 20.0, lblPad = 6.0;
+            self.localSelfNameLabel.frame = NSMakeRect(lblPad, lblPad, MIN(60.0, tileW - 2 * lblPad), lblH);
+            [self.filmstripContentView addSubview:selfTile];
+            if (animated) {
+                selfTile.animator.frame = tileFrame;
+            } else {
+                selfTile.frame = tileFrame;
+            }
+            // Update preview layer to match new tile bounds
+            self.localPreviewLayer.frame = CGRectMake(0, 0, tileFrame.size.width, tileFrame.size.height);
+            continue;
+        }
+
+        // --- Remote camera / screen share tile ---
+        InterRemoteVideoView *videoView = nil;
         if ([key isEqualToString:kScreenShareTileKey]) {
             videoView = self.remoteScreenShareView;
         } else {
@@ -850,10 +1165,6 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
             tile.isSpeaking = [key isEqualToString:self.activeSpeakerIdentity];
         }
 
-        NSUInteger visualIndex = itemIndex + i;
-        CGFloat y = totalH - kFilmstripPadding - (visualIndex + 1) * tileH - visualIndex * kFilmstripTileGap;
-        NSRect tileFrame = NSMakeRect(kFilmstripPadding, y, tileW, tileH);
-
         [self.filmstripContentView addSubview:tile];
         if (animated) {
             tile.animator.frame = tileFrame;
@@ -861,9 +1172,12 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
             tile.frame = tileFrame;
         }
 
-        // Phase 7.3.4: Request low-res for filmstrip tiles
+        // Phase 7.3.4: Request reduced-res for filmstrip tiles.
+        // 480×270 matches a typical WebRTC simulcast medium-low tier and avoids
+        // requesting 320×180 which can cause the SFU to stall frame delivery
+        // while switching to the lowest simulcast layer.
         if (![key isEqualToString:kScreenShareTileKey]) {
-            [self notifyDimensionsChange:CGSizeMake(320, 180) forParticipant:key];
+            [self notifyDimensionsChange:CGSizeMake(480, 270) forParticipant:key];
         }
     }
 }
@@ -933,13 +1247,19 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
 }
 
 - (void)arrangeCameraGridInRect:(NSRect)rect animated:(BOOL)animated {
-    NSArray<NSString *> *allParticipants = [self.cameraParticipantOrder copy];
+    // Build the participant list. In grid mode, append the local self-view tile last.
+    NSMutableArray<NSString *> *allParticipants = [self.cameraParticipantOrder mutableCopy];
+    BOOL includeLocalSelf = (self.gridLayoutEnabled && self.localCaptureSession != nil);
+    if (includeLocalSelf) {
+        [allParticipants addObject:kLocalSelfTileKey];
+    }
+
     NSUInteger totalCount = allParticipants.count;
     if (totalCount == 0) return;
 
     NSUInteger maxPerPage = self.maxTilesPerPage;
     BOOL isPaginated = (totalCount > maxPerPage);
-    NSUInteger pages = self.totalGridPages;
+    NSUInteger pages = isPaginated ? (totalCount + maxPerPage - 1) / maxPerPage : 1;
 
     // Clamp current page to valid range
     if (self.currentGridPage >= pages) {
@@ -952,8 +1272,11 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
     NSArray<NSString *> *pageParticipants = [allParticipants subarrayWithRange:NSMakeRange(startIdx, endIdx - startIdx)];
     NSUInteger count = pageParticipants.count;
 
-    // Phase 7.3.3: Track visibility changes for paged-out participants
-    NSMutableSet<NSString *> *newVisibleSet = [NSMutableSet setWithArray:pageParticipants];
+    // Phase 7.3.3: Track visibility changes for paged-out remote participants
+    NSMutableSet<NSString *> *newVisibleSet = [NSMutableSet set];
+    for (NSString *pid in pageParticipants) {
+        if (![pid isEqualToString:kLocalSelfTileKey]) [newVisibleSet addObject:pid];
+    }
     [self notifyVisibilityChangesFrom:self.visibleParticipantIds to:newVisibleSet];
     self.visibleParticipantIds = newVisibleSet;
 
@@ -982,41 +1305,28 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
     NSUInteger lastRowCount = lastRowIncomplete ? (count % cols) : cols;
     NSUInteger lastRow = (count > 0) ? ((count - 1) / cols) : 0;
 
-    // Phase 7.3.4: Determine quality based on tile size for stage vs filmstrip
-    CGSize tileDimensions = CGSizeMake(cellW, cellH);
+    // Phase 7.3.4: Determine quality based on tile count
     CGSize qualityDimensions;
     if (count <= 4) {
-        qualityDimensions = CGSizeMake(1280, 720);  // High quality for few participants
+        qualityDimensions = CGSizeMake(1280, 720);
     } else if (count <= 9) {
-        qualityDimensions = CGSizeMake(640, 360);  // Medium quality
+        qualityDimensions = CGSizeMake(640, 360);
     } else if (count <= 16) {
-        qualityDimensions = CGSizeMake(480, 270);  // Lower quality
+        qualityDimensions = CGSizeMake(480, 270);
     } else {
-        qualityDimensions = CGSizeMake(320, 180);  // Thumbnail quality for 17-25 per page
+        qualityDimensions = CGSizeMake(320, 180);
     }
 
     for (NSUInteger i = 0; i < count; i++) {
         NSString *pid = pageParticipants[i];
-        InterRemoteVideoView *view = self.remoteCameraViews[pid];
-        if (!view) continue;
 
-        InterRemoteVideoTileView *tile = [self tileForKey:pid videoView:view];
-        tile.nameLabel.hidden = NO;
-        tile.layer.cornerRadius = 8.0;
-        [self addSubview:tile positioned:NSWindowBelow relativeTo:self.participantOverlay];
-        tile.hidden = NO;
-        view.hidden = NO;
-
-        // Apply active speaker highlight
-        tile.isSpeaking = [pid isEqualToString:self.activeSpeakerIdentity];
-
+        // --- Compute frame (common for all tile types) ---
         NSUInteger col = i % cols;
         NSUInteger row = i / cols;
 
         CGFloat x, y;
         y = gridRect.origin.y + (rows - 1 - row) * (cellH + gap);
 
-        // Center the last row if it has fewer tiles than cols
         if (row == lastRow && lastRowIncomplete) {
             CGFloat lastRowTotalW = lastRowCount * cellW + (lastRowCount - 1) * gap;
             CGFloat offsetX = (gridRect.size.width - lastRowTotalW) / 2.0;
@@ -1026,9 +1336,48 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
         }
 
         NSRect frame = NSMakeRect(x, y, cellW, cellH);
-        [self setTile:tile frame:frame animated:animated];
 
-        // Phase 7.3.4: Request appropriate quality for this tile
+        // --- Local self-view tile ---
+        if ([pid isEqualToString:kLocalSelfTileKey]) {
+            [self setupLocalSelfTileIfNeeded];
+            NSView *selfTile = self.localSelfTileView;
+            if (!selfTile) continue;
+
+            [self addSubview:selfTile positioned:NSWindowBelow relativeTo:self.participantOverlay];
+            selfTile.hidden = NO;
+
+            // Keep preview layer filling the tile
+            self.localPreviewLayer.frame = CGRectMake(0, 0, cellW, cellH);
+
+            // Name label: bottom-left pill
+            CGFloat lblH = 20.0, lblPad = 6.0;
+            self.localSelfNameLabel.frame = NSMakeRect(lblPad, lblPad,
+                                                       MIN(60.0, cellW - 2 * lblPad), lblH);
+            if (animated) {
+                selfTile.animator.frame = frame;
+            } else {
+                selfTile.frame = frame;
+            }
+            // Keep the preview layer in sync with the tile's new bounds.
+            self.localPreviewLayer.frame = CGRectMake(0, 0, frame.size.width, frame.size.height);
+            continue;
+        }
+
+        // --- Remote camera tile ---
+        InterRemoteVideoView *view = self.remoteCameraViews[pid];
+        if (!view) continue;
+
+        view.aspectFill = NO; // aspect-fit: downscale 2x keeps compression artifacts invisible
+        InterRemoteVideoTileView *tile = [self tileForKey:pid videoView:view];
+        tile.nameLabel.hidden = NO;
+        tile.layer.cornerRadius = 8.0;
+        [self addSubview:tile positioned:NSWindowBelow relativeTo:self.participantOverlay];
+        tile.hidden = NO;
+        view.hidden = NO;
+
+        tile.isSpeaking = [pid isEqualToString:self.activeSpeakerIdentity];
+
+        [self setTile:tile frame:frame animated:animated];
         [self notifyDimensionsChange:qualityDimensions forParticipant:pid];
     }
 }
@@ -1107,6 +1456,10 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
         [tile removeFromSuperview];
         tile.hidden = YES;
     }
+    if (self.localSelfTileView) {
+        [self.localSelfTileView removeFromSuperview];
+        self.localSelfTileView.hidden = YES;
+    }
 }
 
 #pragma mark - Resize
@@ -1115,6 +1468,7 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
     [super setFrame:frame];
     [self applyCurrentLayoutAnimated:NO];
     [self updateParticipantCountBadge];
+    [self repositionLayoutToggleButton];
 }
 
 #pragma mark - Keyboard Navigation (Phase 7)
@@ -1179,6 +1533,8 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
     [self.autoSpotlightRevertTimer invalidate];
     self.autoSpotlightRevertTimer = nil;
     self.preAutoSpotlightKey = nil;
+    self.lastActiveSpeakerIdentity = nil;
+    self.spotlightIsPinnedByUser = NO;
 
     self.participantOverlay.hidden = YES;
     self.layoutMode = InterRemoteVideoLayoutModeNone;
@@ -1193,6 +1549,12 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
 
     NSString *previousSpeaker = _activeSpeakerIdentity;
     _activeSpeakerIdentity = [activeSpeakerIdentity copy];
+
+    // Track last active speaker so the stage spotlight fallback keeps the most
+    // recently speaking participant on stage (not just insertion-order first).
+    if (previousSpeaker.length > 0) {
+        self.lastActiveSpeakerIdentity = previousSpeaker;
+    }
 
     // Remove highlight from previous speaker's tile
     if (previousSpeaker.length > 0) {
@@ -1210,8 +1572,11 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
         }
     }
 
-    // Phase 7.4.2: Auto-spotlight active speaker in stage+filmstrip mode
+    // Phase 7.4.2: Auto-spotlight active speaker in stage+filmstrip mode.
+    // Skipped when the user has manually pinned a tile — their explicit choice
+    // always takes priority over the automatic speaker-follow behaviour.
     if (self.autoSpotlightActiveSpeaker &&
+        !self.spotlightIsPinnedByUser &&
         (self.layoutMode == InterRemoteVideoLayoutModeScreenShareWithCameras ||
          (self.layoutMode == InterRemoteVideoLayoutModeMultiCamera && self.preferStageLayoutForMultipleCameras))) {
 
@@ -1252,29 +1617,42 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
 - (void)setRemoteParticipantCount:(NSUInteger)remoteParticipantCount {
     _remoteParticipantCount = remoteParticipantCount;
     [self updateParticipantCountBadge];
+    // Re-evaluate the toggle: participant count affects whether the call has
+    // enough people to make a layout switch meaningful, even before video
+    // frames have arrived from all participants.
+    [self updateLayoutToggleButton];
 }
 
 - (void)updateParticipantCountBadge {
-    // Show badge when 2+ remote participants (i.e. 3+ total in call)
+    // Show badge for any multi-person call (2+ total, i.e. 1+ remote).
     NSUInteger count = self.remoteParticipantCount;
-    if (count <= 1) {
+    if (count < 1) {
         self.participantCountBadge.hidden = YES;
         return;
     }
 
-    // +1 for local participant
+    // +1 for the local participant.
     NSUInteger totalCount = count + 1;
     self.participantCountBadge.stringValue = [NSString stringWithFormat:@" 👥 %lu ", (unsigned long)totalCount];
     self.participantCountBadge.hidden = NO;
 
-    // Position top-right
     [self.participantCountBadge sizeToFit];
     NSSize badgeSize = self.participantCountBadge.frame.size;
-    badgeSize.width = MAX(badgeSize.width + 8, 44);
+    badgeSize.width  = MAX(badgeSize.width + 8, 44);
     badgeSize.height = MAX(badgeSize.height, 22);
-    CGFloat x = self.bounds.size.width - badgeSize.width - 12;
+
+    // Position top-LEFT so it never overlaps the toggle button (top-right area).
+    // In stage mode the filmstrip is on the right, so top-left is always clear.
+    CGFloat x = 12;
     CGFloat y = self.bounds.size.height - badgeSize.height - 12;
     self.participantCountBadge.frame = NSMakeRect(x, y, badgeSize.width, badgeSize.height);
+
+    // Ensure badge is below the toggle button in z-order.
+    if (self.layoutToggleButton) {
+        [self addSubview:self.participantCountBadge
+              positioned:NSWindowBelow
+              relativeTo:self.layoutToggleButton];
+    }
 }
 
 #pragma mark - Spotlight State

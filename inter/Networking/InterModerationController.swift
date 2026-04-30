@@ -540,6 +540,95 @@ import LiveKit
 
     // MARK: - Lobby Management (9.3)
 
+    /// Poll the server for the current list of lobby waiting participants.
+    /// Calls `GET /room/lobby/list/:code?callerIdentity=...` and updates
+    /// `lobbyWaitingParticipants`. Notifies the delegate for each newly-seen identity.
+    @objc public func pollLobbyList(completion: @escaping (Bool) -> Void) {
+        guard InterPermissionMatrix.role(localRole, hasPermission: .canAdmitFromLobby) else {
+            completion(false)
+            return
+        }
+
+        guard !roomCode.isEmpty, !localIdentity.isEmpty else {
+            completion(false)
+            return
+        }
+
+        let encodedIdentity = localIdentity.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? localIdentity
+        let encodedRoomCode = roomCode.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? roomCode
+        let urlString = "\(serverURL)/room/lobby/list/\(encodedRoomCode)?callerIdentity=\(encodedIdentity)"
+        guard let url = URL(string: urlString) else {
+            completion(false)
+            return
+        }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        if let token = roomController?.tokenService.currentAccessToken {
+            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        }
+
+        var taskRef: URLSessionDataTask?
+        let task = session.dataTask(with: request) { [weak self] data, response, error in
+            if let t = taskRef {
+                self?.inflightLock.lock()
+                self?.inflightTasks.remove(t)
+                self?.inflightLock.unlock()
+            }
+
+            guard let self = self else { return }
+
+            if error != nil || data == nil {
+                self.completeOnMain { completion(false) }
+                return
+            }
+
+            guard let httpResp = response as? HTTPURLResponse,
+                  (200..<300).contains(httpResp.statusCode),
+                  let json = self.parseJSON(data!) else {
+                self.completeOnMain { completion(false) }
+                return
+            }
+
+            guard let participantsArr = json["participants"] as? [[String: Any]] else {
+                self.completeOnMain { completion(false) }
+                return
+            }
+
+            self.completeOnMain {
+                let knownIdentities = Set(self.lobbyWaitingParticipants.compactMap { $0["identity"] })
+                var updated: [[String: String]] = []
+
+                for dict in participantsArr {
+                    guard let ident = dict["identity"] as? String else { continue }
+                    let name = dict["displayName"] as? String ?? ident
+                    updated.append(["identity": ident, "displayName": name])
+
+                    if !knownIdentities.contains(ident) {
+                        // New participant — notify delegate
+                        self.delegate?.moderationController?(self, lobbyParticipantJoined: ident, displayName: name)
+                    }
+                }
+
+                // Remove departed participants from the delegate
+                let serverIdentities = Set(updated.compactMap { $0["identity"] })
+                for known in self.lobbyWaitingParticipants {
+                    if let ident = known["identity"], !serverIdentities.contains(ident) {
+                        // Participant no longer in lobby — was admitted/denied outside our UI
+                    }
+                }
+
+                self.lobbyWaitingParticipants = updated
+                completion(true)
+            }
+        }
+        taskRef = task
+        inflightLock.lock()
+        inflightTasks.insert(task)
+        inflightLock.unlock()
+        task.resume()
+    }
+
     /// Admit a participant from the lobby. Server-authoritative.
     @objc public func admitFromLobby(identity: String,
                                      displayName: String,

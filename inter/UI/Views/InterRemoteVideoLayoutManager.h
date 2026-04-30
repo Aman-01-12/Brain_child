@@ -1,4 +1,5 @@
 #import <Cocoa/Cocoa.h>
+#import <AVFoundation/AVFoundation.h>
 
 NS_ASSUME_NONNULL_BEGIN
 
@@ -118,6 +119,16 @@ typedef NS_ENUM(NSUInteger, InterRemoteVideoLayoutMode) {
 /// screen-share track.
 @property (nonatomic, assign) BOOL preferStageLayoutForMultipleCameras;
 
+/// When YES, all remote cameras (plus the local self-view) are shown in an
+/// equal-size grid. When NO, uses stage+filmstrip. Only applies to multi-camera
+/// situations — screen share always takes the main stage regardless.
+/// Initialised from and persisted to NSUserDefaults key "InterPreferGridLayout".
+@property (nonatomic, assign) BOOL gridLayoutEnabled;
+
+/// The local camera capture session used to render a self-view tile in grid mode.
+/// Set by the caller (AppDelegate) once the capture session is running.
+@property (nonatomic, strong, nullable) AVCaptureSession *localCaptureSession;
+
 /// Collapses the layout into a single spotlighted remote tile that fills the
 /// available bounds, hiding the internal filmstrip. Secure interview mode uses
 /// this when the local secure tool already owns the primary center stage and
@@ -159,6 +170,10 @@ typedef NS_ENUM(NSUInteger, InterRemoteVideoLayoutMode) {
 /// Once registered, tiles for this participant show the display name
 /// instead of the raw identity string (UUID).
 - (void)registerDisplayName:(NSString *)displayName forParticipant:(NSString *)participantId;
+
+/// Look up the registered display name for a tile key.
+/// Returns the registered display name, or the raw tile key if none was registered.
+- (NSString *)displayNameForTileKey:(NSString *)tileKey;
 
 /// [Phase 8.2.3] Show or hide the raised-hand badge (✋) on a participant's tile.
 - (void)setHandRaised:(BOOL)raised forParticipant:(NSString *)participantId;

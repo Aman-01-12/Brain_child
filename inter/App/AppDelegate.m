@@ -20,6 +20,7 @@
 #import "InterPollPanel.h"
 #import "InterQAPanel.h"
 #import "InterLobbyPanel.h"
+#import "InterLobbyWaitingView.h"
 #import "InterRecordingIndicatorView.h"
 #import "InterRecordingListPanel.h"
 #import "InterRecordingConsentPanel.h"
@@ -34,7 +35,7 @@
 #import "inter-Swift.h"
 #endif
 
-@interface AppDelegate () <NSWindowDelegate, InterConnectionSetupPanelDelegate, InterLoginPanelDelegate, InterAuthSessionDelegate, InterParticipantOverlayDelegate, InterChatPanelDelegate, InterSpeakerQueuePanelDelegate, InterPollPanelDelegate, InterQAPanelDelegate, InterMediaWiringDelegate, InterModerationDelegate, InterLobbyPanelDelegate, InterRecordingCoordinatorDelegate, InterRecordingSignalDelegate, InterRecordingListPanelDelegate, InterRecordingConsentPanelDelegate, InterSchedulePanelDelegate, InterTeamsPanelDelegate, ASWebAuthenticationPresentationContextProviding>
+@interface AppDelegate () <NSWindowDelegate, InterConnectionSetupPanelDelegate, InterLoginPanelDelegate, InterAuthSessionDelegate, InterParticipantOverlayDelegate, InterChatPanelDelegate, InterSpeakerQueuePanelDelegate, InterPollPanelDelegate, InterQAPanelDelegate, InterMediaWiringDelegate, InterModerationDelegate, InterLobbyPanelDelegate, InterRecordingCoordinatorDelegate, InterRecordingSignalDelegate, InterRecordingListPanelDelegate, InterRecordingConsentPanelDelegate, InterSchedulePanelDelegate, InterTeamsPanelDelegate, InterLobbyWaitingViewDelegate, ASWebAuthenticationPresentationContextProviding>
 @property (nonatomic, strong) NSMutableArray<CapWindow *> *capWindows;
 @property (nonatomic, strong) SecureWindowController *secureController;
 @property (nonatomic, strong) NSWindow *setupWindow;
@@ -79,6 +80,18 @@
 @property (nonatomic, strong, nullable) NSWindow *normalLobbyWindow;
 @property (nonatomic, strong, nullable) NSButton *normalLobbyToggleButton;
 @property (nonatomic, strong, nullable) NSButton *normalModerationButton;
+@property (nonatomic, strong, nullable) NSTimer *lobbyPollTimer;
+
+// Participant-side lobby waiting state
+@property (nonatomic, strong, nullable) NSWindow *lobbyWaitingWindow;
+@property (nonatomic, strong, nullable) InterLobbyWaitingView *lobbyWaitingView;
+@property (nonatomic, strong, nullable) NSTimer *lobbyStatusPollTimer;
+@property (nonatomic, copy, nullable) NSString *lobbyPollToken;
+@property (nonatomic, copy, nullable) NSString *lobbyRoomCode;
+@property (nonatomic, copy, nullable) NSString *lobbyIdentity;
+@property (nonatomic, copy, nullable) NSString *lobbyTokenServerURL;
+@property (nonatomic, copy, nullable) NSString *lobbyServerURL;
+@property (nonatomic, copy, nullable) NSString *lobbyDisplayName;
 @property (nonatomic, copy, nullable) NSString *normalChatSelectedRecipient;
 @property (nonatomic, assign) BOOL normalShareSystemAudioEnabled;
 @property (nonatomic, assign) BOOL isScreenObserverRegistered;
@@ -441,8 +454,44 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
 
 - (void)requestExitCurrentMode {
     dispatch_async(dispatch_get_main_queue(), ^{
-        [self exitCurrentMode];
+        if (self.currentCallMode == InterCallModeNone) {
+            [self exitCurrentMode];
+            return;
+        }
+        // Ask the user before tearing down the call.
+        [self confirmEndCallWithMessage:@"Are you sure you want to end this call?"
+                     confirmButtonTitle:@"End Call"
+                             completion:^{ [self exitCurrentMode]; }];
     });
+}
+
+/// Shared helper: presents an NSAlert on the main queue with a destructive confirm button
+/// and a Cancel button. Calls `completion` only if the user confirms.
+- (void)confirmEndCallWithMessage:(NSString *)message
+               confirmButtonTitle:(NSString *)confirmTitle
+                       completion:(dispatch_block_t)completion {
+    NSAlert *alert = [[NSAlert alloc] init];
+    alert.messageText = message;
+    alert.alertStyle = NSAlertStyleWarning;
+    [alert addButtonWithTitle:confirmTitle];
+    [alert addButtonWithTitle:@"Cancel"];
+
+    // Run as a sheet anchored to whichever call window is key, so the app doesn't
+    // lose focus and the rest of the UI stays visible behind the alert.
+    NSWindow *targetWindow = self.normalCallWindow ?: [NSApp keyWindow];
+    if (targetWindow) {
+        [alert beginSheetModalForWindow:targetWindow completionHandler:^(NSModalResponse response) {
+            if (response == NSAlertFirstButtonReturn) {
+                completion();
+            }
+        }];
+    } else {
+        // Fallback: no window to attach to (should not happen in practice).
+        NSModalResponse response = [alert runModal];
+        if (response == NSAlertFirstButtonReturn) {
+            completion();
+        }
+    }
 }
 
 - (void)enterMode:(InterCallMode)mode role:(InterInterviewRole)role {
@@ -518,6 +567,8 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
         self.secureController = [[SecureWindowController alloc] init];
         // [2.6.1] Pass room controller reference to secure window
         self.secureController.roomController = self.roomController;
+        // [8.1.5] Pass chat controller so the chat overlay can receive/send messages
+        self.secureController.chatController = self.chatController;
         __weak typeof(self) weakSelf = self;
         self.secureController.exitSessionHandler = ^{
             [weakSelf requestExitCurrentMode];
@@ -530,6 +581,7 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
     [NSApp setPresentationOptions:NSApplicationPresentationDefault];
     [self stopScreenMonitoring];
     [self launchNormalCallWindow];
+    [self startLobbyPollingIfHost];
     [self.sessionCoordinator markActive];
 }
 
@@ -1510,6 +1562,29 @@ didRequestDeleteTeamId:(NSString *)teamId {
             if (!strongSelf) return;
 
             if (error) {
+                // Phase 9.3 — Lobby waiting: show waiting room UI and start polling
+                if (error.code == 1010) {
+                    NSString *pollToken = error.userInfo[@"pollToken"];
+                    NSInteger position  = [error.userInfo[@"position"] integerValue];
+                    if (!pollToken.length) {
+                        [panel setActionsEnabled:YES];
+                        [panel setIndicatorState:InterConnectionIndicatorStateError];
+                        [panel setStatusText:@"Lobby error — please try again."];
+                        return;
+                    }
+                    [panel setActionsEnabled:YES];
+                    [panel setIndicatorState:InterConnectionIndicatorStateIdle];
+                    [panel setStatusText:@""];
+                    [strongSelf showLobbyWaitingWithRoomCode:code
+                                                   identity:identity
+                                                displayName:displayName
+                                                  serverURL:serverURL
+                                             tokenServerURL:tokenURL
+                                                  pollToken:pollToken
+                                                   position:position];
+                    return;
+                }
+
                 [panel setActionsEnabled:YES];
                 [panel setIndicatorState:InterConnectionIndicatorStateError];
                 [panel setStatusText:[strongSelf userFacingMessageForError:error]];
@@ -1659,6 +1734,10 @@ didRequestDeleteTeamId:(NSString *)teamId {
     // [B1] Wire media + surface share AFTER startNormalLocalMediaFlow creates them
     self.normalMediaWiring.mediaController = self.normalMediaController;
     self.normalMediaWiring.surfaceShareController = self.normalSurfaceShareController;
+
+    // Pass the capture session so the layout manager can show a self-view tile
+    // in grid mode (AVCaptureVideoPreviewLayer — zero CPU, hardware accelerated).
+    self.normalRemoteLayout.localCaptureSession = self.normalMediaController.captureSession;
 
     [self.normalControlPanel setCameraEnabled:self.normalMediaController.isCameraEnabled];
     [self.normalControlPanel setMicrophoneEnabled:self.normalMediaController.isMicrophoneEnabled];
@@ -2373,6 +2452,106 @@ didRequestDeleteTeamId:(NSString *)teamId {
     self.normalChatSelectedRecipient = recipientIdentity;
 }
 
+- (void)chatPanelDidRequestFileAttach:(InterChatPanel *)panel {
+#pragma unused(panel)
+    NSOpenPanel *openPanel = [NSOpenPanel openPanel];
+    openPanel.allowsMultipleSelection = NO;
+    openPanel.canChooseDirectories    = NO;
+    openPanel.canChooseFiles          = YES;
+    openPanel.message = @"Select a file to share (max 10 MB)";
+
+    __weak typeof(self) weakSelf = self;
+    [openPanel beginSheetModalForWindow:self.normalCallWindow completionHandler:^(NSModalResponse result) {
+        if (result != NSModalResponseOK || !openPanel.URL) return;
+        NSURL *fileURL = openPanel.URL;
+
+        // Enforce client-side size guard (server also enforces, but fail fast)
+        NSNumber *fileSize = nil;
+        [fileURL getResourceValue:&fileSize forKey:NSURLFileSizeKey error:nil];
+        if (fileSize && fileSize.longLongValue > 10 * 1024 * 1024) {
+            NSAlert *alert = [[NSAlert alloc] init];
+            alert.messageText   = @"File Too Large";
+            alert.informativeText = @"Please select a file smaller than 10 MB.";
+            [alert addButtonWithTitle:@"OK"];
+            [alert beginSheetModalForWindow:self.normalCallWindow completionHandler:nil];
+            return;
+        }
+
+        [weakSelf uploadChatFile:fileURL];
+    }];
+}
+
+- (void)uploadChatFile:(NSURL *)fileURL {
+    NSString *roomCode = self.roomController.roomCode;
+    NSString *identity = self.roomController.localParticipantIdentity;
+    NSString *serverURL = self.roomController.tokenServerURL;
+
+    if (!roomCode.length || !identity.length || !serverURL.length) {
+        NSLog(@"[Chat] File upload skipped — not in an active room");
+        return;
+    }
+
+    [self.normalChatPanel setUploadInProgress:YES];
+
+    __weak typeof(self) weakSelf = self;
+    [self.roomController.tokenService uploadChatFile:fileURL
+                                           serverURL:serverURL
+                                            roomCode:roomCode
+                                            identity:identity
+                                          completion:^(NSString *fileId,
+                                                       NSString *originalName,
+                                                       NSString *mimeType,
+                                                       int64_t sizeBytes,
+                                                       NSError *error) {
+        [weakSelf.normalChatPanel setUploadInProgress:NO];
+        if (error || !fileId.length) {
+            NSAlert *alert = [[NSAlert alloc] init];
+            alert.messageText    = @"Upload Failed";
+            alert.informativeText = error.localizedDescription ?: @"Could not upload the file.";
+            [alert addButtonWithTitle:@"OK"];
+            [alert beginSheetModalForWindow:weakSelf.normalCallWindow completionHandler:nil];
+            return;
+        }
+        [weakSelf.chatController sendFileMessageWithFileId:fileId
+                                                  fileName:originalName ?: fileURL.lastPathComponent
+                                             fileSizeBytes:sizeBytes
+                                                  mimeType:mimeType ?: @"application/octet-stream"];
+    }];
+}
+
+- (void)chatPanel:(InterChatPanel *)panel didRequestDownloadFileMessage:(InterChatMessageInfo *)message {
+#pragma unused(panel)
+    NSSavePanel *savePanel = [NSSavePanel savePanel];
+    [savePanel setNameFieldStringValue:message.fileName ?: @"file"];
+
+    __weak typeof(self) weakSelf = self;
+    [savePanel beginSheetModalForWindow:self.normalCallWindow completionHandler:^(NSModalResponse result) {
+        if (result != NSModalResponseOK || !savePanel.URL) return;
+        NSURL *destination = savePanel.URL;
+
+        NSString *roomCode  = weakSelf.roomController.roomCode;
+        NSString *identity  = weakSelf.roomController.localParticipantIdentity;
+        NSString *serverURL = weakSelf.roomController.tokenServerURL;
+
+        if (!roomCode.length || !identity.length || !serverURL.length) return;
+
+        [weakSelf.roomController.tokenService downloadChatFile:message.fileId
+                                                     serverURL:serverURL
+                                                      roomCode:roomCode
+                                                      identity:identity
+                                                   destination:destination
+                                                    completion:^(NSError *dlError) {
+            if (dlError) {
+                NSAlert *alert = [[NSAlert alloc] init];
+                alert.messageText    = @"Download Failed";
+                alert.informativeText = dlError.localizedDescription ?: @"Could not download the file.";
+                [alert addButtonWithTitle:@"OK"];
+                [alert beginSheetModalForWindow:weakSelf.normalCallWindow completionHandler:nil];
+            }
+        }];
+    }];
+}
+
 // MARK: InterSpeakerQueuePanelDelegate
 
 - (void)speakerQueuePanel:(InterSpeakerQueuePanel *)panel didDismissParticipant:(NSString *)identity {
@@ -2656,6 +2835,258 @@ didRequestDeleteTeamId:(NSString *)teamId {
     }
 }
 
+// MARK: - Phase 9 — Participant-Side Lobby Waiting
+
+/// Show the waiting room window and start polling for admission.
+- (void)showLobbyWaitingWithRoomCode:(NSString *)roomCode
+                            identity:(NSString *)identity
+                         displayName:(NSString *)displayName
+                           serverURL:(NSString *)serverURL
+                      tokenServerURL:(NSString *)tokenServerURL
+                           pollToken:(NSString *)pollToken
+                            position:(NSInteger)position {
+
+    // Store state for polling
+    self.lobbyRoomCode      = roomCode;
+    self.lobbyIdentity      = identity;
+    self.lobbyDisplayName   = displayName;
+    self.lobbyServerURL     = serverURL;
+    self.lobbyTokenServerURL = tokenServerURL;
+    self.lobbyPollToken     = pollToken;
+
+    // Create waiting room window
+    CGFloat w = 400, h = 360;
+    NSRect screenFrame = [NSScreen mainScreen].visibleFrame;
+    CGFloat x = NSMidX(screenFrame) - w / 2;
+    CGFloat y = NSMidY(screenFrame) - h / 2;
+
+    self.lobbyWaitingView = [[InterLobbyWaitingView alloc] initWithFrame:NSMakeRect(0, 0, w, h)];
+    self.lobbyWaitingView.delegate = self;
+    [self.lobbyWaitingView setPosition:position];
+
+    self.lobbyWaitingWindow = [[NSWindow alloc] initWithContentRect:NSMakeRect(x, y, w, h)
+                                                          styleMask:(NSWindowStyleMaskTitled |
+                                                                     NSWindowStyleMaskClosable)
+                                                            backing:NSBackingStoreBuffered
+                                                              defer:NO];
+    self.lobbyWaitingWindow.title = @"Waiting Room";
+    self.lobbyWaitingWindow.releasedWhenClosed = NO;
+    self.lobbyWaitingWindow.level = NSFloatingWindowLevel;
+    [self.lobbyWaitingWindow setAppearance:[NSAppearance appearanceNamed:NSAppearanceNameDarkAqua]];
+    self.lobbyWaitingWindow.contentView = self.lobbyWaitingView;
+    [self.lobbyWaitingWindow makeKeyAndOrderFront:nil];
+
+    // Start polling every 3 seconds
+    [self.lobbyStatusPollTimer invalidate];
+    __weak typeof(self) weakSelf = self;
+    self.lobbyStatusPollTimer = [NSTimer scheduledTimerWithTimeInterval:3.0
+                                                               repeats:YES
+                                                                 block:^(NSTimer *timer) {
+        [weakSelf _pollLobbyStatus];
+    }];
+    // Fire immediately for responsiveness
+    [self _pollLobbyStatus];
+}
+
+/// Poll GET /room/lobby-status/:code/:identity for admission status.
+- (void)_pollLobbyStatus {
+    NSString *code     = self.lobbyRoomCode;
+    NSString *identity = self.lobbyIdentity;
+    NSString *pollToken = self.lobbyPollToken;
+    NSString *tokenURL  = self.lobbyTokenServerURL;
+
+    if (!code || !identity || !pollToken || !tokenURL) return;
+
+    NSString *encodedIdentity = [identity stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLPathAllowedCharacterSet]];
+    NSString *urlStr = [NSString stringWithFormat:@"%@/room/lobby-status/%@/%@", tokenURL, code, encodedIdentity];
+    NSURL *url = [NSURL URLWithString:urlStr];
+    if (!url) return;
+
+    NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:url];
+    [request setValue:pollToken forHTTPHeaderField:@"x-poll-token"];
+    [request setTimeoutInterval:10.0];
+
+    __weak typeof(self) weakSelf = self;
+    [[[NSURLSession sharedSession] dataTaskWithRequest:request completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            __strong typeof(weakSelf) strongSelf = weakSelf;
+            if (!strongSelf) return;
+
+            if (error || !data) return; // Silently retry next tick
+
+            NSDictionary *json = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+            if (![json isKindOfClass:[NSDictionary class]]) return;
+
+            NSString *status = json[@"status"];
+
+            if ([status isEqualToString:@"admitted"]) {
+                // Admitted! Connect to the room with the token from the server
+                [strongSelf.lobbyStatusPollTimer invalidate];
+                strongSelf.lobbyStatusPollTimer = nil;
+
+                [strongSelf.lobbyWaitingView showAdmitted];
+
+                NSString *token     = json[@"token"];
+                NSString *wsURL     = json[@"serverURL"];
+                NSString *roomName  = json[@"roomName"];
+                NSString *roomType  = json[@"roomType"] ?: @"call";
+
+                // Brief delay so user sees the "You're In!" message
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                    [strongSelf lobbyAdmittedWithToken:token
+                                            serverURL:wsURL
+                                             roomCode:code
+                                             roomName:roomName
+                                             roomType:roomType];
+                });
+
+            } else if ([status isEqualToString:@"denied"]) {
+                [strongSelf.lobbyStatusPollTimer invalidate];
+                strongSelf.lobbyStatusPollTimer = nil;
+                [strongSelf.lobbyWaitingView showDenied];
+
+            } else if ([status isEqualToString:@"room_full"]) {
+                [strongSelf.lobbyStatusPollTimer invalidate];
+                strongSelf.lobbyStatusPollTimer = nil;
+                [strongSelf.lobbyWaitingView setStatusMessage:@"The meeting is full. Please try again later."];
+                [strongSelf.lobbyWaitingView showDenied];
+
+            } else if ([status isEqualToString:@"not_found"]) {
+                [strongSelf.lobbyStatusPollTimer invalidate];
+                strongSelf.lobbyStatusPollTimer = nil;
+                [strongSelf.lobbyWaitingView setStatusMessage:@"The meeting has ended or your request expired."];
+                [strongSelf.lobbyWaitingView showDenied];
+
+            } else if ([status isEqualToString:@"waiting"]) {
+                NSInteger position = [json[@"position"] integerValue];
+                [strongSelf.lobbyWaitingView setPosition:position];
+            }
+        });
+    }] resume];
+}
+
+/// Handle successful admission from the lobby — connect to the room.
+- (void)lobbyAdmittedWithToken:(NSString *)token
+                     serverURL:(NSString *)wsURL
+                      roomCode:(NSString *)roomCode
+                      roomName:(NSString *)roomName
+                      roomType:(NSString *)roomType {
+    [self.lobbyWaitingWindow orderOut:nil];
+    self.lobbyWaitingWindow = nil;
+    self.lobbyWaitingView = nil;
+
+    // Build config and connect through the room controller
+    InterRoomController *rc = self.roomController;
+    if (!rc || !token.length || !wsURL.length) {
+        NSLog(@"[Phase 9] Lobby admitted but missing token/URL — cannot connect");
+        return;
+    }
+
+    InterRoomConfiguration *config =
+        [[InterRoomConfiguration alloc] initWithServerURL:wsURL
+                                          tokenServerURL:self.lobbyTokenServerURL ?: @""
+                                                roomCode:roomCode
+                                     participantIdentity:self.lobbyIdentity ?: @""
+                                         participantName:self.lobbyDisplayName ?: @""
+                                                  isHost:NO
+                                                roomType:roomType
+                                        maxParticipants:50];
+
+    // The token was already generated server-side during admission,
+    // so we connect directly with it.
+    __weak typeof(self) weakSelf = self;
+    [rc connectWithToken:token serverURL:wsURL configuration:config completion:^(NSError * _Nullable error) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            __strong typeof(weakSelf) strongSelf = weakSelf;
+            if (!strongSelf) return;
+
+            if (error) {
+                NSLog(@"[Phase 9] Lobby admitted but connect failed: %@", error.localizedDescription);
+                NSAlert *alert = [[NSAlert alloc] init];
+                alert.messageText = @"Connection Failed";
+                alert.informativeText = @"You were admitted but the connection failed. Please try joining again.";
+                [alert addButtonWithTitle:@"OK"];
+                [alert runModal];
+                return;
+            }
+
+            BOOL isInterview = [roomType isEqualToString:@"interview"];
+            if (isInterview) {
+                [strongSelf showIntervieweeConfirmationWithCompletion:^(BOOL accepted) {
+                    if (accepted) {
+                        [strongSelf enterMode:InterCallModeInterview role:InterInterviewRoleInterviewee];
+                    } else {
+                        [rc disconnect];
+                    }
+                }];
+            } else {
+                [strongSelf enterMode:InterCallModeNormal role:InterInterviewRoleNone];
+            }
+        });
+    }];
+
+    // Clear lobby state
+    self.lobbyPollToken = nil;
+    self.lobbyRoomCode = nil;
+    self.lobbyIdentity = nil;
+    self.lobbyDisplayName = nil;
+}
+
+- (void)lobbyWaitingViewDidCancel:(InterLobbyWaitingView *)view {
+#pragma unused(view)
+    [self.lobbyStatusPollTimer invalidate];
+    self.lobbyStatusPollTimer = nil;
+    [self.lobbyWaitingWindow orderOut:nil];
+    self.lobbyWaitingWindow = nil;
+    self.lobbyWaitingView = nil;
+    self.lobbyPollToken = nil;
+    self.lobbyRoomCode = nil;
+    self.lobbyIdentity = nil;
+    self.lobbyDisplayName = nil;
+    self.lobbyServerURL = nil;
+    self.lobbyTokenServerURL = nil;
+}
+
+// MARK: - Phase 9 — Host-Side Lobby Polling
+
+/// Start polling for lobby participants. Called when a host enters a call.
+- (void)startLobbyPollingIfHost {
+    if (!self.roomController.isHost) return;
+    [self.lobbyPollTimer invalidate];
+    __weak typeof(self) weakSelf = self;
+    self.lobbyPollTimer = [NSTimer scheduledTimerWithTimeInterval:4.0
+                                                         repeats:YES
+                                                           block:^(NSTimer *timer) {
+        [weakSelf _pollHostLobbyList];
+    }];
+    // Fire immediately
+    [self _pollHostLobbyList];
+}
+
+/// Stop host-side lobby polling (on disconnect).
+- (void)stopLobbyPolling {
+    [self.lobbyPollTimer invalidate];
+    self.lobbyPollTimer = nil;
+}
+
+/// Poll GET /room/lobby/list/:code from the server and update the lobby panel.
+- (void)_pollHostLobbyList {
+    if (!self.moderationController) return;
+    __weak typeof(self) weakSelf = self;
+    [self.moderationController pollLobbyListWithCompletion:^(BOOL success) {
+        if (!success) return;
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf) return;
+        // Update lobby button badge count
+        NSUInteger count = strongSelf.moderationController.lobbyWaitingParticipants.count;
+        if (count > 0) {
+            [strongSelf.normalLobbyToggleButton setTitle:[NSString stringWithFormat:@"🚪 Lobby (%lu)", (unsigned long)count]];
+        } else {
+            [strongSelf.normalLobbyToggleButton setTitle:@"🚪 Lobby"];
+        }
+    }];
+}
+
 // MARK: - Phase 9 — Moderation Menu
 
 - (void)showModerationMenu:(NSButton *)sender {
@@ -2900,10 +3331,70 @@ didRequestDeleteTeamId:(NSString *)teamId {
     if (state == InterRecordingStateIdle || state == InterRecordingStateFinalized) {
         if (!self.normalMediaController || !self.normalSurfaceShareController) return;
         NSString *tier = self.roomController.tokenService.effectiveTier ?: @"free";
-        [coordinator startLocalRecordingWithScreenShareSource:self.normalSurfaceShareController
-                                                   subscriber:self.roomController.subscriber
-                                          localMediaController:self.normalMediaController
-                                                     userTier:tier];
+
+        // Free tier: local recording only (no choice)
+        if ([tier isEqualToString:@"free"]) {
+            [coordinator startLocalRecordingWithScreenShareSource:self.normalSurfaceShareController
+                                                       subscriber:self.roomController.subscriber
+                                              localMediaController:self.normalMediaController
+                                                         userTier:tier];
+            return;
+        }
+
+        // Paid tiers (pro / pro+ / hiring): present mode selection
+        NSAlert *modeAlert = [[NSAlert alloc] init];
+        modeAlert.messageText = @"Recording Mode";
+        modeAlert.informativeText = @"Choose where to save the recording.\n\nLocal: saved to your Mac.\nCloud: recorded server-side and available for download.";
+        [modeAlert addButtonWithTitle:@"Record Locally"];
+        [modeAlert addButtonWithTitle:@"Record to Cloud"];
+        [modeAlert addButtonWithTitle:@"Cancel"];
+        modeAlert.alertStyle = NSAlertStyleInformational;
+
+        NSModalResponse response = [modeAlert runModal];
+
+        if (response == NSAlertFirstButtonReturn) {
+            // Local recording
+            [coordinator startLocalRecordingWithScreenShareSource:self.normalSurfaceShareController
+                                                       subscriber:self.roomController.subscriber
+                                              localMediaController:self.normalMediaController
+                                                         userTier:tier];
+        } else if (response == NSAlertSecondButtonReturn) {
+            // Cloud recording via Egress
+            NSString *serverURL = self.roomController.tokenServerURL;
+            NSString *roomCode  = self.roomController.roomCode;
+            NSString *identity  = self.roomController.localParticipantIdentity;
+
+            if (serverURL.length == 0 || roomCode.length == 0 || identity.length == 0) {
+                NSLog(@"[Recording] Cloud recording missing required parameters — serverURL:%@ roomCode:%@ identity:%@",
+                      serverURL, roomCode, identity);
+                return;
+            }
+
+            __weak typeof(self) weakSelf = self;
+            [coordinator startCloudRecordingWithServerURL:serverURL
+                                                roomCode:roomCode
+                                          callerIdentity:identity
+                                estimatedDurationMinutes:60
+                                                    mode:@"cloud_composed"
+                                              completion:^(NSString *egressId, NSString *sessionId, NSError *error) {
+                if (error) {
+                    NSLog(@"[Recording] Cloud recording start failed: %@", error.localizedDescription);
+                    NSAlert *errAlert = [[NSAlert alloc] init];
+                    errAlert.messageText = @"Cloud Recording Failed";
+                    errAlert.informativeText = error.localizedDescription ?: @"Could not start cloud recording.";
+                    [errAlert addButtonWithTitle:@"OK"];
+                    errAlert.alertStyle = NSAlertStyleWarning;
+                    [errAlert runModal];
+                } else {
+                    NSLog(@"[Recording] Cloud recording started (egress=%@, session=%@)", egressId, sessionId);
+                    __strong typeof(weakSelf) strongSelf = weakSelf;
+                    if (strongSelf) {
+                        strongSelf.normalRecordingIndicatorView.indicatorActive = YES;
+                    }
+                }
+            }];
+        }
+        // NSAlertThirdButtonReturn (Cancel) — do nothing
     } else if (state == InterRecordingStateRecording) {
         [coordinator pauseRecording];
     } else if (state == InterRecordingStatePaused) {
@@ -2978,6 +3469,7 @@ didRequestDeleteTeamId:(NSString *)teamId {
         self.normalRecordingListPanel = [[InterRecordingListPanel alloc] initWithFrame:NSMakeRect(0, 0, panelWidth, panelHeight)];
         self.normalRecordingListPanel.delegate = self;
         self.normalRecordingListPanel.serverBaseURL = self.roomController.tokenService.serverURL;
+        self.normalRecordingListPanel.accessToken = self.roomController.tokenService.currentAccessToken;
 
         self.normalRecordingListWindow = [[NSWindow alloc] initWithContentRect:NSMakeRect(x, y, panelWidth, panelHeight)
                                                                      styleMask:(NSWindowStyleMaskTitled |
@@ -3000,6 +3492,7 @@ didRequestDeleteTeamId:(NSString *)teamId {
     if (self.normalRecordingListWindow.isVisible) {
         [self.normalRecordingListWindow orderOut:nil];
     } else {
+        self.normalRecordingListPanel.accessToken = self.roomController.tokenService.currentAccessToken;
         [self.normalRecordingListPanel reloadRecordings];
         [self.normalRecordingListWindow makeKeyAndOrderFront:nil];
     }
@@ -3121,7 +3614,7 @@ didRequestDeleteTeamId:(NSString *)teamId {
     }
 
     self.settingsWindow =
-        [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 420, 310)
+        [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 420, 370)
                                     styleMask:(NSWindowStyleMaskTitled |
                                                NSWindowStyleMaskClosable)
                                       backing:NSBackingStoreBuffered
@@ -3132,6 +3625,24 @@ didRequestDeleteTeamId:(NSString *)teamId {
 
     NSView *cv = self.settingsWindow.contentView;
     CGFloat w = 420.0;
+
+    // ---- Section: Account -------------------------------------------------
+    NSTextField *accountHeader = [NSTextField labelWithString:@"Account"];
+    accountHeader.frame = NSMakeRect(20, 310, 200, 20);
+    accountHeader.font  = [NSFont boldSystemFontOfSize:13];
+    [cv addSubview:accountHeader];
+
+    NSString *signedInEmail = self.roomController.tokenService.currentEmail ?: @"Not signed in";
+    NSTextField *emailLabel = [NSTextField labelWithString:signedInEmail];
+    emailLabel.frame = NSMakeRect(20, 288, w - 40, 16);
+    emailLabel.font  = [NSFont monospacedSystemFontOfSize:11 weight:NSFontWeightRegular];
+    emailLabel.textColor = [NSColor secondaryLabelColor];
+    emailLabel.lineBreakMode = NSLineBreakByTruncatingMiddle;
+    [cv addSubview:emailLabel];
+
+    NSBox *accountSep = [[NSBox alloc] initWithFrame:NSMakeRect(20, 280, w - 40, 1)];
+    accountSep.boxType = NSBoxSeparator;
+    [cv addSubview:accountSep];
 
     // ---- Section: Calendar Sync -------------------------------------------
     NSTextField *calHeader = [NSTextField labelWithString:@"Calendar Sync"];
@@ -3341,7 +3852,11 @@ didRequestDeleteTeamId:(NSString *)teamId {
     }
 
     if (sender == self.normalCallWindow && self.currentCallMode != InterCallModeNone) {
-        [self requestExitCurrentMode];
+        // Show a confirmation before destroying the call — the user may have
+        // clicked the red button by mistake.
+        [self confirmEndCallWithMessage:@"Closing this window will end the call. Are you sure?"
+                     confirmButtonTitle:@"End Call"
+                             completion:^{ [self exitCurrentMode]; }];
         return NO;
     }
 
@@ -3438,6 +3953,15 @@ didRequestDeleteTeamId:(NSString *)teamId {
     self.normalLobbyPanel = nil;
     self.normalLobbyToggleButton = nil;
 
+    // [Phase 9] Tear down lobby waiting window (participant side)
+    [self.lobbyStatusPollTimer invalidate];
+    self.lobbyStatusPollTimer = nil;
+    if (self.lobbyWaitingWindow) {
+        [self.lobbyWaitingWindow orderOut:nil];
+        self.lobbyWaitingWindow = nil;
+    }
+    self.lobbyWaitingView = nil;
+
     // [Phase 11] Tear down schedule window
     if (self.normalScheduleWindow) {
         [self.normalScheduleWindow orderOut:nil];
@@ -3501,6 +4025,9 @@ didRequestDeleteTeamId:(NSString *)teamId {
     // Unlock the meeting tier lock so that any tier changes that arrived
     // during the meeting now take effect.
     [self.roomController.tokenService unlockTierFromMeeting];
+
+    // Stop host-side lobby polling
+    [self stopLobbyPolling];
 
     [NSApp setPresentationOptions:NSApplicationPresentationDefault];
     [self stopScreenMonitoring];

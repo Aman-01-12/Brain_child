@@ -387,6 +387,22 @@ extension InterLiveKitSubscriber: RoomDelegate {
         interLogInfo(InterLog.media, "Subscriber: stream state change source=%d state=%d",
                      track.source.rawValue, streamState.rawValue)
     }
+
+    /// A participant's display name changed (e.g. after token refresh with correct name).
+    public nonisolated func room(
+        _ room: Room,
+        participant: Participant,
+        didUpdateName name: String
+    ) {
+        guard let remote = participant as? RemoteParticipant else { return }
+        let participantId = remote.identity?.stringValue ?? "(unknown)"
+        let displayName = name.isEmpty ? participantId : name
+
+        interLogInfo(InterLog.media, "Subscriber: name updated participant=%{public}@ name=%{public}@",
+                     participantId, displayName)
+
+        trackRenderer?.remoteParticipantDidUpdateDisplayName?(displayName, forParticipant: participantId)
+    }
 }
 
 // MARK: - RemoteFrameRenderer (Internal VideoRenderer)

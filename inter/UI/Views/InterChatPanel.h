@@ -5,7 +5,7 @@ NS_ASSUME_NONNULL_BEGIN
 @class InterChatMessageInfo;
 @class InterChatPanel;
 
-/// Delegate for chat panel actions (send, toggle, export).
+/// Delegate for chat panel actions (send, toggle, export, file sharing).
 @protocol InterChatPanelDelegate <NSObject>
 @optional
 /// User submitted a message via the input field.
@@ -14,6 +14,12 @@ NS_ASSUME_NONNULL_BEGIN
 - (void)chatPanelDidRequestExport:(InterChatPanel *)panel;
 /// User selected a participant for DM. Pass nil to switch back to public.
 - (void)chatPanel:(InterChatPanel *)panel didSelectRecipient:(nullable NSString *)recipientIdentity;
+/// User clicked the "Attach file" button. The delegate should show an NSOpenPanel
+/// and call -uploadFile:inPanel: or handle the upload externally.
+- (void)chatPanelDidRequestFileAttach:(InterChatPanel *)panel;
+/// User clicked "Download" on a received file message.
+/// The delegate handles the NSSavePanel and actual download.
+- (void)chatPanel:(InterChatPanel *)panel didRequestDownloadFileMessage:(InterChatMessageInfo *)message;
 @end
 
 /// [Phase 8.1.3] In-meeting chat panel.
@@ -21,7 +27,7 @@ NS_ASSUME_NONNULL_BEGIN
 /// Slide-in panel from the right edge. Contains:
 ///   - Message list (NSScrollView + NSTableView)
 ///   - Recipient selector (Everyone / specific participant)
-///   - Text input field + send button
+///   - Text input field + send button + attach file button
 ///   - Unread badge
 ///   - Dark theme matching the app
 ///
@@ -57,6 +63,9 @@ NS_ASSUME_NONNULL_BEGIN
 
 /// Display a system message in the chat panel (Phase 9 — moderation).
 - (void)displaySystemMessage:(NSString *)text;
+
+/// Show or hide a "uploading…" progress indicator on the attach button.
+- (void)setUploadInProgress:(BOOL)inProgress;
 
 @end
 

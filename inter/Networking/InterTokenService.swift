@@ -299,6 +299,10 @@ private struct TokenCacheEntry {
     /// Token cache keyed by "roomCode:identity".
     private var tokenCache: [String: TokenCacheEntry] = [:]
 
+    /// Leave tokens keyed by room code. Issued by the server on create/join.
+    /// Consumed (single-use) when calling /room/leave. Protected by cacheQueue.
+    private var leaveTokenStore: [String: String] = [:]
+
     /// Serial queue protecting the token cache.
     private let cacheQueue = DispatchQueue(label: "inter.tokenService.cache", qos: .userInitiated)
 
@@ -906,6 +910,11 @@ private struct TokenCacheEntry {
                 // Cache the token
                 self?.cacheToken(token, forRoom: roomCode, identity: identity)
 
+                // Store leave token (single-use, required for /room/leave)
+                if let leaveToken = json["leaveToken"] as? String, !leaveToken.isEmpty {
+                    self?.cacheQueue.async { self?.leaveTokenStore[roomCode] = leaveToken }
+                }
+
                 let response = InterCreateRoomResponse(
                     roomCode: roomCode,
                     roomName: roomName,
@@ -967,10 +976,20 @@ private struct TokenCacheEntry {
                 // Phase 9.3 — Lobby/waiting room response
                 if let status = json["status"] as? String, status == "waiting" {
                     let position = json["position"] as? Int ?? 0
-                    let error = InterNetworkErrorCode.lobbyWaiting.error(
-                        message: "You are in the waiting room (position \(position)). The host will admit you shortly."
+                    let pollToken = json["pollToken"] as? String ?? ""
+                    var userInfo: [String: Any] = [
+                        NSLocalizedDescriptionKey: "You are in the waiting room (position \(position)). The host will admit you shortly.",
+                        "position": position,
+                    ]
+                    if !pollToken.isEmpty {
+                        userInfo["pollToken"] = pollToken
+                    }
+                    let error = NSError(
+                        domain: InterNetworkErrorDomain,
+                        code: InterNetworkErrorCode.lobbyWaiting.rawValue,
+                        userInfo: userInfo
                     )
-                    interLogInfo(InterLog.networking, "Token: /room/join → lobby waiting (position=%d)", position)
+                    interLogInfo(InterLog.networking, "Token: /room/join → lobby waiting (position=%d, hasPollToken=%d)", position, pollToken.isEmpty ? 0 : 1)
                     self?.completeOnMain { completion(nil, error) }
                     return
                 }
@@ -991,6 +1010,11 @@ private struct TokenCacheEntry {
 
                 self?.cacheToken(token, forRoom: roomCode, identity: identity)
 
+                // Store leave token (single-use, required for /room/leave)
+                if let leaveToken = json["leaveToken"] as? String, !leaveToken.isEmpty {
+                    self?.cacheQueue.async { self?.leaveTokenStore[roomCode] = leaveToken }
+                }
+
                 let response = InterJoinRoomResponse(
                     roomName: roomName,
                     token: token,
@@ -1005,6 +1029,222 @@ private struct TokenCacheEntry {
                 self?.completeOnMain { completion(nil, error) }
             }
         }
+    }
+
+    /// Notify the server that this participant is leaving the room.
+    /// Fire-and-forget — failures are logged but not surfaced to the caller.
+    /// Guests (no access token) send the request without an Authorization header;
+    /// the /room/leave endpoint does not require authentication.
+    @objc public func leaveRoom(serverURL: String,
+                                roomCode: String,
+                                identity: String) {
+        // Consume the leave token (single-use) atomically on the cache queue
+        let leaveToken: String? = cacheQueue.sync {
+            let token = leaveTokenStore[roomCode]
+            leaveTokenStore.removeValue(forKey: roomCode)
+            return token
+        }
+
+        var body: [String: Any] = [
+            "roomCode": roomCode,
+            "identity": identity
+        ]
+        if let token = leaveToken {
+            body["leaveToken"] = token
+        }
+
+        interLogInfo(InterLog.networking, "Token: notifying server of room leave (code=***, identity=%{private}@)", identity)
+
+        // Pass the access token if available; nil is fine — the server accepts
+        // unauthenticated leave requests so guests are cleaned up correctly.
+        let accessToken = currentAccessToken
+
+        performAuthHTTPRequest(
+            url: "\(serverURL)/room/leave",
+            method: "POST",
+            body: body,
+            bearerToken: accessToken,
+            retryCount: 0
+        ) { data, httpResponse, error in
+            if let error = error {
+                interLogError(InterLog.networking, "Token: /room/leave failed — %{public}@", error.localizedDescription)
+            } else {
+                interLogInfo(InterLog.networking, "Token: /room/leave succeeded (HTTP %d)", httpResponse?.statusCode ?? 0)
+            }
+        }
+    }
+
+    // MARK: - Chat File Sharing
+
+    /// Upload a file to the token server for sharing in the chat.
+    ///
+    /// - Parameters:
+    ///   - fileURL:    Local URL of the file to upload.
+    ///   - serverURL:  LiveKit/token-server base URL.
+    ///   - roomCode:   The 6-character room code.
+    ///   - identity:   The caller's participant identity.
+    ///   - completion: Called on the main queue with (fileId, originalName, mimeType, sizeBytes, error).
+    @objc(uploadChatFile:serverURL:roomCode:identity:completion:)
+    public func uploadChatFile(fileURL: URL,
+                                     serverURL: String,
+                                     roomCode: String,
+                                     identity: String,
+                                     completion: @escaping (String?, String?, String?, Int64, NSError?) -> Void) {
+        let leaveToken: String? = cacheQueue.sync { leaveTokenStore[roomCode] }
+        guard let leaveToken = leaveToken else {
+            let err = InterNetworkErrorCode.tokenFetchFailed.error(message: "No leave token available for file upload")
+            DispatchQueue.main.async { completion(nil, nil, nil, 0, err) }
+            return
+        }
+
+        guard let fileData = try? Data(contentsOf: fileURL) else {
+            let err = InterNetworkErrorCode.tokenFetchFailed.error(message: "Could not read file from disk")
+            DispatchQueue.main.async { completion(nil, nil, nil, 0, err) }
+            return
+        }
+
+        let boundary = "Boundary-\(UUID().uuidString)"
+        var body = Data()
+        let CRLF = "\r\n"
+
+        func append(_ string: String) { body.append(Data(string.utf8)) }
+
+        // identity field
+        append("--\(boundary)\(CRLF)")
+        append("Content-Disposition: form-data; name=\"identity\"\(CRLF)\(CRLF)")
+        append("\(identity)\(CRLF)")
+
+        // leaveToken field
+        append("--\(boundary)\(CRLF)")
+        append("Content-Disposition: form-data; name=\"leaveToken\"\(CRLF)\(CRLF)")
+        append("\(leaveToken)\(CRLF)")
+
+        // file field
+        // Sanitize the filename before embedding it in the Content-Disposition header.
+        // Strip any CR/LF/control characters (which would split the header) and
+        // escape double-quotes so the header value cannot be malformed by a
+        // user-controlled filename. Fall back to a UUID if nothing printable remains.
+        let rawFileName = fileURL.lastPathComponent
+        let sanitized = rawFileName
+            .unicodeScalars
+            .filter { $0.value >= 0x20 && $0.value != 0x7F
+                      && $0.value != 0x0D && $0.value != 0x0A }  // strip control chars + CRLF
+            .reduce(into: "") { $0 += String($1) }
+            .replacingOccurrences(of: "\"", with: "'")           // escape double-quotes → single-quote
+        let sanitizedFileName = sanitized.isEmpty ? UUID().uuidString : sanitized
+        append("--\(boundary)\(CRLF)")
+        append("Content-Disposition: form-data; name=\"file\"; filename=\"\(sanitizedFileName)\"\(CRLF)")
+        append("Content-Type: application/octet-stream\(CRLF)\(CRLF)")
+        body.append(fileData)
+        append("\(CRLF)--\(boundary)--\(CRLF)")
+
+        guard let url = URL(string: "\(serverURL)/room/\(roomCode.uppercased())/file/upload") else {
+            let err = InterNetworkErrorCode.tokenFetchFailed.error(message: "Invalid upload URL")
+            DispatchQueue.main.async { completion(nil, nil, nil, 0, err) }
+            return
+        }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
+        request.httpBody = body
+
+        interLogInfo(InterLog.networking, "Token: uploading chat file (%d bytes) to room %{public}@", fileData.count, roomCode)
+
+        session.dataTask(with: request) { [weak self] data, response, error in
+            if let error = error {
+                let nsErr = error as NSError
+                DispatchQueue.main.async { completion(nil, nil, nil, 0, nsErr) }
+                return
+            }
+            guard let http = response as? HTTPURLResponse, http.statusCode == 200,
+                  let data = data,
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                let err = InterNetworkErrorCode.tokenFetchFailed.error(message: "File upload failed")
+                DispatchQueue.main.async { completion(nil, nil, nil, 0, err) }
+                return
+            }
+            let fileId   = json["fileId"]       as? String ?? ""
+            let origName = json["originalName"] as? String ?? sanitizedFileName
+            let mime     = json["mimeType"]     as? String ?? ""
+            let sizeBytes: Int64
+            if let n = json["sizeBytes"] as? NSNumber {
+                sizeBytes = n.int64Value
+            } else {
+                sizeBytes = Int64(json["sizeBytes"] as? Int ?? 0)
+            }
+            interLogInfo(InterLog.networking, "Token: file uploaded fileId=%{public}@", fileId)
+            _ = self  // suppress unused-capture warning
+            DispatchQueue.main.async { completion(fileId, origName, mime, sizeBytes, nil) }
+        }.resume()
+    }
+
+    /// Download a chat file and save it to the given destination URL.
+    ///
+    /// - Parameters:
+    ///   - fileId:      The server-assigned file ID.
+    ///   - serverURL:   Token-server base URL.
+    ///   - roomCode:    The room code.
+    ///   - identity:    The caller's participant identity.
+    ///   - destination: Local file URL to write the downloaded data to.
+    ///   - completion:  Called on the main queue with an error, or nil on success.
+    @objc(downloadChatFile:serverURL:roomCode:identity:destination:completion:)
+    public func downloadChatFile(fileId: String,
+                                       serverURL: String,
+                                       roomCode: String,
+                                       identity: String,
+                                       destination: URL,
+                                       completion: @escaping (NSError?) -> Void) {
+        let leaveToken: String? = cacheQueue.sync { leaveTokenStore[roomCode] }
+        guard let leaveToken = leaveToken else {
+            let err = InterNetworkErrorCode.tokenFetchFailed.error(message: "No leave token for download")
+            DispatchQueue.main.async { completion(err) }
+            return
+        }
+
+        guard var components = URLComponents(string: "\(serverURL)/room/\(roomCode.uppercased())/file/\(fileId)") else {
+            let err = InterNetworkErrorCode.tokenFetchFailed.error(message: "Invalid download URL")
+            DispatchQueue.main.async { completion(err) }
+            return
+        }
+        // Only non-sensitive params go in the query string; leaveToken goes in a header.
+        components.queryItems = [
+            URLQueryItem(name: "identity", value: identity),
+        ]
+
+        guard let url = components.url else {
+            let err = InterNetworkErrorCode.tokenFetchFailed.error(message: "Invalid download URL")
+            DispatchQueue.main.async { completion(err) }
+            return
+        }
+
+        var downloadRequest = URLRequest(url: url)
+        downloadRequest.setValue(leaveToken, forHTTPHeaderField: "Leave-Token")
+
+        interLogInfo(InterLog.networking, "Token: downloading chat file fileId=%{public}@", fileId)
+
+        session.downloadTask(with: downloadRequest) { tempURL, response, error in
+            if let error = error {
+                DispatchQueue.main.async { completion(error as NSError) }
+                return
+            }
+            guard let http = response as? HTTPURLResponse, http.statusCode == 200,
+                  let tempURL = tempURL else {
+                let err = InterNetworkErrorCode.tokenFetchFailed.error(message: "File download failed")
+                DispatchQueue.main.async { completion(err) }
+                return
+            }
+            do {
+                if FileManager.default.fileExists(atPath: destination.path) {
+                    try FileManager.default.removeItem(at: destination)
+                }
+                try FileManager.default.moveItem(at: tempURL, to: destination)
+                interLogInfo(InterLog.networking, "Token: file saved to %{public}@", destination.path)
+                DispatchQueue.main.async { completion(nil) }
+            } catch {
+                DispatchQueue.main.async { completion(error as NSError) }
+            }
+        }.resume()
     }
 
     /// Refresh a token for an active participant. [G7]
@@ -1827,6 +2067,11 @@ private struct TokenCacheEntry {
 
             let responseRoomType = json["roomType"] as? String ?? "call"
             self.cacheToken(token, forRoom: roomCode, identity: identity)
+
+            // Store leave token if the scheduled-meeting endpoint returns one
+            if let leaveToken = json["leaveToken"] as? String, !leaveToken.isEmpty {
+                self.cacheQueue.async { self.leaveTokenStore[roomCode] = leaveToken }
+            }
 
             let response = InterCreateRoomResponse(
                 roomCode: roomCode,

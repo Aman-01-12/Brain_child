@@ -25,6 +25,8 @@ import Foundation
     case directMessage = 1
     /// System-generated announcement (e.g. "Alice joined the room").
     case system = 2
+    /// A file shared in the chat — carries fileId, fileName, fileSizeBytes, mimeType.
+    case fileMessage = 3
 }
 
 // MARK: - Control Signal Type
@@ -104,11 +106,25 @@ public struct InterChatMessage: Codable, Identifiable, Equatable {
     /// Unix timestamp (seconds since epoch) when the message was created.
     public let timestamp: TimeInterval
 
-    /// Message type (public, DM, system).
+    /// Message type (public, DM, system, file).
     public let type: InterChatMessageType
 
-    /// For DMs: the recipient's participant identity. Empty for public/system.
+    /// For DMs: the recipient's participant identity. Empty for public/system/file.
     public let recipientIdentity: String
+
+    // MARK: - File message fields (type == .fileMessage)
+
+    /// Server-assigned file ID (UUID string). Empty for non-file messages.
+    public let fileId: String
+
+    /// Original sanitised filename (e.g. "report.pdf"). Empty for non-file messages.
+    public let fileName: String
+
+    /// File size in bytes. 0 for non-file messages.
+    public let fileSizeBytes: Int64
+
+    /// Detected MIME type (e.g. "application/pdf"). Empty for non-file messages.
+    public let mimeType: String
 
     // MARK: - Init
 
@@ -119,7 +135,11 @@ public struct InterChatMessage: Codable, Identifiable, Equatable {
         text: String,
         timestamp: TimeInterval = Date().timeIntervalSince1970,
         type: InterChatMessageType = .publicMessage,
-        recipientIdentity: String = ""
+        recipientIdentity: String = "",
+        fileId: String = "",
+        fileName: String = "",
+        fileSizeBytes: Int64 = 0,
+        mimeType: String = ""
     ) {
         self.id = id
         self.senderIdentity = senderIdentity
@@ -128,6 +148,10 @@ public struct InterChatMessage: Codable, Identifiable, Equatable {
         self.timestamp = timestamp
         self.type = type
         self.recipientIdentity = recipientIdentity
+        self.fileId = fileId
+        self.fileName = fileName
+        self.fileSizeBytes = fileSizeBytes
+        self.mimeType = mimeType
     }
 
     // MARK: - Serialization
@@ -214,6 +238,12 @@ public struct InterControlSignal: Codable {
     @objc public let messageType: InterChatMessageType
     @objc public let recipientIdentity: String
 
+    // File message fields (only populated when messageType == .fileMessage)
+    @objc public let fileId: String
+    @objc public let fileName: String
+    @objc public let fileSizeBytes: Int64
+    @objc public let mimeType: String
+
     /// Whether this is a message sent by the local participant.
     @objc public var isFromLocalUser: Bool = false
 
@@ -225,6 +255,10 @@ public struct InterControlSignal: Codable {
         self.timestamp = message.timestamp
         self.messageType = message.type
         self.recipientIdentity = message.recipientIdentity
+        self.fileId = message.fileId
+        self.fileName = message.fileName
+        self.fileSizeBytes = message.fileSizeBytes
+        self.mimeType = message.mimeType
         self.isFromLocalUser = isLocal
         super.init()
     }
@@ -235,6 +269,14 @@ public struct InterControlSignal: Codable {
         let formatter = DateFormatter()
         formatter.dateFormat = "HH:mm"
         return formatter.string(from: date)
+    }
+
+    /// Human-readable file size string (e.g. "2.4 MB").
+    @objc public var formattedFileSize: String {
+        let bytes = fileSizeBytes
+        if bytes < 1024 { return "\(bytes) B" }
+        if bytes < 1024 * 1024 { return String(format: "%.1f KB", Double(bytes) / 1024.0) }
+        return String(format: "%.1f MB", Double(bytes) / (1024.0 * 1024.0))
     }
 
     /// Convenience initializer for system messages (used by moderation UI).

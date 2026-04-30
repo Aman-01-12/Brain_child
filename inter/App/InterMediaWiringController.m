@@ -44,18 +44,29 @@ static void *InterWiringParticipantCountContext = &InterWiringParticipantCountCo
 @implementation InterMediaWiringController
 
 // Custom setter: when the layout manager is (re-)assigned, immediately push
-// the current active-speaker identity so that any KVO change that arrived
-// while remoteLayout was nil is not silently dropped.  This fixes the
-// "missing green border on first speaker" race in the normal-call path
-// where setupRoomControllerKVO runs at launch but remoteLayout is only
-// wired when the call window is created later.
+// current state so that any KVO changes that arrived while remoteLayout was
+// nil are not silently dropped.  This fixes two races in the normal-call path
+// where setupRoomControllerKVO runs at launch but remoteLayout is only wired
+// when the call window is created later:
+//   • "missing green border on first speaker" — activeSpeakerIdentity
+//   • "badge/toggle missing for late joiners" — remoteParticipantCount
 - (void)setRemoteLayout:(InterRemoteVideoLayoutManager *)remoteLayout {
     _remoteLayout = remoteLayout;
 
     if (remoteLayout) {
+        // Push active speaker so the first speaker highlight is correct.
         NSString *currentSpeaker = self.roomController.activeSpeakerIdentity;
         if (currentSpeaker.length > 0) {
             [remoteLayout setActiveSpeakerIdentity:currentSpeaker];
+        }
+
+        // Push participant count so the badge and toggle show immediately.
+        // Without this, a participant joining a room that already has 2+ people
+        // (so remoteParticipantCount > 0 when KVO first fires) would see an
+        // empty badge because handleParticipantCountChanged: found remoteLayout=nil.
+        NSInteger currentCount = self.roomController.remoteParticipantCount;
+        if (currentCount > 0) {
+            [remoteLayout setRemoteParticipantCount:(NSUInteger)currentCount];
         }
     }
 }

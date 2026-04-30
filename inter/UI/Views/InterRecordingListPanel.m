@@ -3,7 +3,7 @@
 // inter
 //
 // Phase 10D.4 — Recording list management UI panel.
-// Displays local + cloud recordings in a table with download/delete actions.
+// Displays local + cloud recordings in separate sections with download/delete.
 //
 // ISOLATION INVARIANT [G8]:
 // This view has NO side effects on media, recording pipelines, or networking.
@@ -20,12 +20,38 @@
 @end
 
 // ============================================================================
+// Section header sentinel — represents a section header row in the flat model.
+// ============================================================================
+
+@interface _InterRecordingSectionHeader : NSObject
+@property (nonatomic, copy) NSString *title;
+@end
+
+@implementation _InterRecordingSectionHeader
+@end
+
+// ============================================================================
 // InterRecordingListPanel
 // ============================================================================
 
-static const CGFloat kPanelWidth   = 400.0;
-static const CGFloat kRowHeight    = 64.0;
-static const CGFloat kHeaderHeight = 40.0;
+static const CGFloat kPanelWidth          = 400.0;
+static const CGFloat kRowHeight           = 64.0;
+static const CGFloat kSectionHeaderHeight = 28.0;
+static const CGFloat kHeaderHeight        = 40.0;
+
+/// Returns nil when value is absent or [NSNull null]; otherwise returns the
+/// value cast to NSString (or stringified if it is a non-string scalar).
+static NSString *safeStringFromJSON(id value) {
+    if (!value || value == [NSNull null]) return nil;
+    if ([value isKindOfClass:[NSString class]]) return (NSString *)value;
+    return [NSString stringWithFormat:@"%@", value];
+}
+
+/// Returns nil when value is absent or [NSNull null]; otherwise returns value.
+static id safeNumberFromJSON(id value) {
+    if (!value || value == [NSNull null]) return nil;
+    return value;
+}
 
 @interface InterRecordingListPanel () <NSTableViewDataSource, NSTableViewDelegate>
 @property (nonatomic, strong) NSScrollView *scrollView;
@@ -34,7 +60,12 @@ static const CGFloat kHeaderHeight = 40.0;
 @property (nonatomic, strong) NSTextField  *emptyLabel;
 @property (nonatomic, strong) NSButton     *closeButton;
 @property (nonatomic, strong) NSButton     *refreshButton;
-@property (nonatomic, strong) NSMutableArray<InterRecordingListEntry *> *entries;
+/// Local recordings (from filesystem)
+@property (nonatomic, strong) NSMutableArray<InterRecordingListEntry *> *localEntries;
+/// Cloud recordings (from token server)
+@property (nonatomic, strong) NSMutableArray<InterRecordingListEntry *> *cloudEntries;
+/// Flat table model: interleaves _InterRecordingSectionHeader and InterRecordingListEntry objects.
+@property (nonatomic, strong) NSMutableArray *flatRows;
 @end
 
 @implementation InterRecordingListPanel
@@ -46,7 +77,9 @@ static const CGFloat kHeaderHeight = 40.0;
 - (instancetype)initWithFrame:(NSRect)frameRect {
     self = [super initWithFrame:frameRect];
     if (self) {
-        _entries = [NSMutableArray array];
+        _localEntries = [NSMutableArray array];
+        _cloudEntries = [NSMutableArray array];
+        _flatRows     = [NSMutableArray array];
         [self _setupUI];
     }
     return self;
@@ -135,25 +168,74 @@ static const CGFloat kHeaderHeight = 40.0;
 }
 
 // ---------------------------------------------------------------------------
+// MARK: - Flat Row Model
+// ---------------------------------------------------------------------------
+
+/// Rebuild the flat row array from local + cloud entries.  Each non-empty
+/// section gets a header row followed by its sorted entries.
+- (void)_rebuildFlatRows {
+    [self.flatRows removeAllObjects];
+
+    if (self.localEntries.count > 0) {
+        _InterRecordingSectionHeader *hdr = [[_InterRecordingSectionHeader alloc] init];
+        hdr.title = [NSString stringWithFormat:@"Local Recordings (%lu)", (unsigned long)self.localEntries.count];
+        [self.flatRows addObject:hdr];
+        [self.flatRows addObjectsFromArray:self.localEntries];
+    }
+
+    if (self.cloudEntries.count > 0) {
+        _InterRecordingSectionHeader *hdr = [[_InterRecordingSectionHeader alloc] init];
+        hdr.title = [NSString stringWithFormat:@"Cloud Recordings (%lu)", (unsigned long)self.cloudEntries.count];
+        [self.flatRows addObject:hdr];
+        [self.flatRows addObjectsFromArray:self.cloudEntries];
+    }
+
+    [self.tableView reloadData];
+    self.emptyLabel.hidden = self.flatRows.count > 0;
+}
+
+// ---------------------------------------------------------------------------
+// MARK: - Sorting helper
+// ---------------------------------------------------------------------------
+
+static NSComparisonResult _sortNewestFirst(InterRecordingListEntry *a, InterRecordingListEntry *b, void *ctx) {
+#pragma unused(ctx)
+    if (!a.startedAt && !b.startedAt) return NSOrderedSame;
+    if (!a.startedAt) return NSOrderedDescending;
+    if (!b.startedAt) return NSOrderedAscending;
+    return [b.startedAt compare:a.startedAt];
+}
+
+// ---------------------------------------------------------------------------
 // MARK: - Public API
 // ---------------------------------------------------------------------------
 
 - (NSUInteger)recordingCount {
-    return self.entries.count;
+    return self.localEntries.count + self.cloudEntries.count;
 }
 
 - (void)setRecordings:(NSArray<InterRecordingListEntry *> *)recordings {
-    [self.entries removeAllObjects];
-    [self.entries addObjectsFromArray:recordings];
-    // Sort newest first
-    [self.entries sortUsingComparator:^NSComparisonResult(InterRecordingListEntry *a, InterRecordingListEntry *b) {
-        if (!a.startedAt && !b.startedAt) return NSOrderedSame;
-        if (!a.startedAt) return NSOrderedDescending;
-        if (!b.startedAt) return NSOrderedAscending;
-        return [b.startedAt compare:a.startedAt];
-    }];
-    [self.tableView reloadData];
-    self.emptyLabel.hidden = self.entries.count > 0;
+    [self.localEntries removeAllObjects];
+    [self.cloudEntries removeAllObjects];
+
+    for (InterRecordingListEntry *entry in recordings) {
+        if ([entry.recordingMode isEqualToString:@"local_composed"]) {
+            [self.localEntries addObject:entry];
+        } else {
+            [self.cloudEntries addObject:entry];
+        }
+    }
+
+    [self.localEntries sortUsingFunction:_sortNewestFirst context:NULL];
+    [self.cloudEntries sortUsingFunction:_sortNewestFirst context:NULL];
+    [self _rebuildFlatRows];
+}
+
+- (void)setCloudRecordings:(NSArray<InterRecordingListEntry *> *)recordings {
+    [self.cloudEntries removeAllObjects];
+    [self.cloudEntries addObjectsFromArray:recordings ?: @[]];
+    [self.cloudEntries sortUsingFunction:_sortNewestFirst context:NULL];
+    [self _rebuildFlatRows];
 }
 
 - (void)addLocalRecordings:(NSArray<NSURL *> *)fileURLs {
@@ -170,20 +252,14 @@ static const CGFloat kHeaderHeight = 40.0;
             entry.fileSizeBytes = [attrs[NSFileSize] longLongValue];
         }
 
-        [self.entries addObject:entry];
+        [self.localEntries addObject:entry];
     }
-    [self.entries sortUsingComparator:^NSComparisonResult(InterRecordingListEntry *a, InterRecordingListEntry *b) {
-        if (!a.startedAt && !b.startedAt) return NSOrderedSame;
-        if (!a.startedAt) return NSOrderedDescending;
-        if (!b.startedAt) return NSOrderedAscending;
-        return [b.startedAt compare:a.startedAt];
-    }];
-    [self.tableView reloadData];
-    self.emptyLabel.hidden = self.entries.count > 0;
+    [self.localEntries sortUsingFunction:_sortNewestFirst context:NULL];
+    [self _rebuildFlatRows];
 }
 
 - (void)reloadRecordings {
-    // Scan local recordings directory
+    // 1. Scan local recordings directory
     NSURL *documentsURL = [[NSFileManager defaultManager] URLsForDirectory:NSDocumentDirectory inDomains:NSUserDomainMask].firstObject;
     NSURL *recordingsDir = [documentsURL URLByAppendingPathComponent:@"Inter Recordings" isDirectory:YES];
 
@@ -198,8 +274,107 @@ static const CGFloat kHeaderHeight = 40.0;
         }
     }
 
-    [self.entries removeAllObjects];
-    [self addLocalRecordings:localFiles];
+    [self.localEntries removeAllObjects];
+    for (NSURL *url in localFiles) {
+        InterRecordingListEntry *entry = [[InterRecordingListEntry alloc] init];
+        entry.recordingId = url.path;
+        entry.roomName = [url.lastPathComponent stringByDeletingPathExtension];
+        entry.recordingMode = @"local_composed";
+        entry.status = @"completed";
+        NSDictionary *attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:url.path error:nil];
+        if (attrs) {
+            entry.startedAt = attrs[NSFileCreationDate];
+            entry.fileSizeBytes = [attrs[NSFileSize] longLongValue];
+        }
+        [self.localEntries addObject:entry];
+    }
+    [self.localEntries sortUsingFunction:_sortNewestFirst context:NULL];
+
+    // 2. Fetch cloud recordings from the token server
+    if (self.serverBaseURL.length > 0 && self.accessToken.length > 0) {
+        NSString *urlStr = [NSString stringWithFormat:@"%@/recordings?limit=50", self.serverBaseURL];
+        NSURL *url = [NSURL URLWithString:urlStr];
+        if (url) {
+            NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:url];
+            [request setValue:[NSString stringWithFormat:@"Bearer %@", self.accessToken]
+           forHTTPHeaderField:@"Authorization"];
+            [request setTimeoutInterval:15.0];
+
+            __weak typeof(self) weakSelf = self;
+            [[[NSURLSession sharedSession] dataTaskWithRequest:request
+                                            completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    __strong typeof(weakSelf) strongSelf = weakSelf;
+                    if (!strongSelf) return;
+
+                    if (error || !data) {
+                        NSLog(@"[Recordings] Cloud fetch failed: %@", error.localizedDescription);
+                        [strongSelf _rebuildFlatRows];
+                        return;
+                    }
+                    NSHTTPURLResponse *httpResp = (NSHTTPURLResponse *)response;
+                    if (httpResp.statusCode < 200 || httpResp.statusCode >= 300) {
+                        NSLog(@"[Recordings] Cloud fetch returned status %ld", (long)httpResp.statusCode);
+                        [strongSelf _rebuildFlatRows];
+                        return;
+                    }
+
+                    NSDictionary *json = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+                    NSArray *recordingsArr = json[@"recordings"];
+                    if (![recordingsArr isKindOfClass:[NSArray class]]) {
+                        [strongSelf _rebuildFlatRows];
+                        return;
+                    }
+
+                    NSMutableArray<InterRecordingListEntry *> *parsed = [NSMutableArray array];
+                    for (NSDictionary *dict in recordingsArr) {
+                        if (![dict isKindOfClass:[NSDictionary class]]) continue;
+                        InterRecordingListEntry *entry = [[InterRecordingListEntry alloc] init];
+                        entry.recordingId   = safeStringFromJSON(dict[@"id"]) ?: @"";
+                        entry.roomName      = safeStringFromJSON(dict[@"room_name"]) ?: @"Recording";
+                        entry.roomCode      = safeStringFromJSON(dict[@"room_code"]) ?: @"";
+                        entry.recordingMode = safeStringFromJSON(dict[@"recording_mode"]) ?: @"cloud_composed";
+                        entry.status        = safeStringFromJSON(dict[@"status"]) ?: @"completed";
+                        id durationVal = safeNumberFromJSON(dict[@"duration_seconds"]);
+                        entry.durationSeconds = durationVal ? [durationVal integerValue] : 0;
+                        id fileSizeVal = safeNumberFromJSON(dict[@"file_size_bytes"]);
+                        entry.fileSizeBytes   = fileSizeVal ? [fileSizeVal longLongValue] : 0;
+                        id watermarkedVal = safeNumberFromJSON(dict[@"watermarked"]);
+                        entry.watermarked     = watermarkedVal ? [watermarkedVal boolValue] : NO;
+
+                        // Parse ISO-8601 dates
+                        NSString *startedStr = dict[@"started_at"];
+                        if ([startedStr isKindOfClass:[NSString class]]) {
+                            NSISO8601DateFormatter *fmt = [[NSISO8601DateFormatter alloc] init];
+                            fmt.formatOptions = NSISO8601DateFormatWithInternetDateTime | NSISO8601DateFormatWithFractionalSeconds;
+                            entry.startedAt = [fmt dateFromString:startedStr];
+                            if (!entry.startedAt) {
+                                fmt.formatOptions = NSISO8601DateFormatWithInternetDateTime;
+                                entry.startedAt = [fmt dateFromString:startedStr];
+                            }
+                        }
+                        NSString *endedStr = dict[@"ended_at"];
+                        if ([endedStr isKindOfClass:[NSString class]]) {
+                            NSISO8601DateFormatter *fmt = [[NSISO8601DateFormatter alloc] init];
+                            fmt.formatOptions = NSISO8601DateFormatWithInternetDateTime | NSISO8601DateFormatWithFractionalSeconds;
+                            entry.endedAt = [fmt dateFromString:endedStr];
+                        }
+
+                        [parsed addObject:entry];
+                    }
+
+                    [strongSelf.cloudEntries removeAllObjects];
+                    [strongSelf.cloudEntries addObjectsFromArray:parsed];
+                    [strongSelf.cloudEntries sortUsingFunction:_sortNewestFirst context:NULL];
+                    [strongSelf _rebuildFlatRows];
+                });
+            }] resume];
+            return; // _rebuildFlatRows called in completion
+        }
+    }
+
+    // No cloud server configured — just show local entries
+    [self _rebuildFlatRows];
 }
 
 // ---------------------------------------------------------------------------
@@ -207,17 +382,55 @@ static const CGFloat kHeaderHeight = 40.0;
 // ---------------------------------------------------------------------------
 
 - (NSInteger)numberOfRowsInTableView:(NSTableView *)tableView {
-    return (NSInteger)self.entries.count;
+    return (NSInteger)self.flatRows.count;
 }
 
 // ---------------------------------------------------------------------------
 // MARK: - NSTableViewDelegate
 // ---------------------------------------------------------------------------
 
-- (NSView *)tableView:(NSTableView *)tableView viewForTableColumn:(NSTableColumn *)tableColumn row:(NSInteger)row {
-    if (row < 0 || (NSUInteger)row >= self.entries.count) return nil;
+- (CGFloat)tableView:(NSTableView *)tableView heightOfRow:(NSInteger)row {
+    if (row < 0 || (NSUInteger)row >= self.flatRows.count) return kRowHeight;
+    id item = self.flatRows[(NSUInteger)row];
+    if ([item isKindOfClass:[_InterRecordingSectionHeader class]]) {
+        return kSectionHeaderHeight;
+    }
+    return kRowHeight;
+}
 
-    InterRecordingListEntry *entry = self.entries[(NSUInteger)row];
+- (BOOL)tableView:(NSTableView *)tableView isGroupRow:(NSInteger)row {
+    if (row < 0 || (NSUInteger)row >= self.flatRows.count) return NO;
+    return [self.flatRows[(NSUInteger)row] isKindOfClass:[_InterRecordingSectionHeader class]];
+}
+
+- (BOOL)tableView:(NSTableView *)tableView shouldSelectRow:(NSInteger)row {
+    if (row < 0 || (NSUInteger)row >= self.flatRows.count) return NO;
+    return ![self.flatRows[(NSUInteger)row] isKindOfClass:[_InterRecordingSectionHeader class]];
+}
+
+- (NSView *)tableView:(NSTableView *)tableView viewForTableColumn:(NSTableColumn *)tableColumn row:(NSInteger)row {
+    if (row < 0 || (NSUInteger)row >= self.flatRows.count) return nil;
+
+    id item = self.flatRows[(NSUInteger)row];
+
+    // Section header row
+    if ([item isKindOfClass:[_InterRecordingSectionHeader class]]) {
+        _InterRecordingSectionHeader *section = item;
+        NSTextField *headerView = [tableView makeViewWithIdentifier:@"SectionHeader" owner:self];
+        if (!headerView) {
+            headerView = [NSTextField labelWithString:@""];
+            headerView.identifier = @"SectionHeader";
+            headerView.font = [NSFont boldSystemFontOfSize:11];
+            headerView.textColor = [NSColor secondaryLabelColor];
+            headerView.wantsLayer = YES;
+            headerView.layer.backgroundColor = [[NSColor colorWithWhite:0.15 alpha:1.0] CGColor];
+        }
+        headerView.stringValue = [NSString stringWithFormat:@"  %@", section.title];
+        return headerView;
+    }
+
+    // Entry row
+    InterRecordingListEntry *entry = (InterRecordingListEntry *)item;
 
     NSTableCellView *cellView = [tableView makeViewWithIdentifier:@"RecordingCell" owner:self];
     if (!cellView) {
@@ -383,11 +596,18 @@ static const CGFloat kHeaderHeight = 40.0;
     [self reloadRecordings];
 }
 
-- (void)_actionButtonClicked:(NSButton *)sender {
+/// Map a button click back to the corresponding entry in the flat model.
+- (InterRecordingListEntry *)_entryForButtonSender:(NSButton *)sender {
     NSInteger row = [self.tableView rowForView:sender];
-    if (row < 0 || (NSUInteger)row >= self.entries.count) return;
+    if (row < 0 || (NSUInteger)row >= self.flatRows.count) return nil;
+    id item = self.flatRows[(NSUInteger)row];
+    if (![item isKindOfClass:[InterRecordingListEntry class]]) return nil;
+    return item;
+}
 
-    InterRecordingListEntry *entry = self.entries[(NSUInteger)row];
+- (void)_actionButtonClicked:(NSButton *)sender {
+    InterRecordingListEntry *entry = [self _entryForButtonSender:sender];
+    if (!entry) return;
 
     if ([entry.recordingMode isEqualToString:@"local_composed"]) {
         // Open local file
@@ -404,10 +624,8 @@ static const CGFloat kHeaderHeight = 40.0;
 }
 
 - (void)_deleteButtonClicked:(NSButton *)sender {
-    NSInteger row = [self.tableView rowForView:sender];
-    if (row < 0 || (NSUInteger)row >= self.entries.count) return;
-
-    InterRecordingListEntry *entry = self.entries[(NSUInteger)row];
+    InterRecordingListEntry *entry = [self _entryForButtonSender:sender];
+    if (!entry) return;
 
     // Confirmation alert
     NSAlert *alert = [[NSAlert alloc] init];
@@ -423,9 +641,8 @@ static const CGFloat kHeaderHeight = 40.0;
             NSError *deleteError = nil;
             BOOL deleted = [[NSFileManager defaultManager] removeItemAtPath:entry.recordingId error:&deleteError];
             if (deleted) {
-                [self.entries removeObjectAtIndex:(NSUInteger)row];
-                [self.tableView reloadData];
-                self.emptyLabel.hidden = self.entries.count > 0;
+                [self.localEntries removeObject:entry];
+                [self _rebuildFlatRows];
             } else {
                 NSLog(@"[Phase 10] Failed to delete recording at %@: %@", entry.recordingId, deleteError.localizedDescription);
                 NSAlert *errorAlert = [[NSAlert alloc] init];

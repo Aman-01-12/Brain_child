@@ -46,6 +46,17 @@ const ABSOLUTE_SESSION_TTL_DAYS = parseInt(process.env.ABSOLUTE_SESSION_TTL_DAYS
 const BCRYPT_ROUNDS = 12;
 
 // ---------------------------------------------------------------------------
+// Concurrent session limits per tier.
+// When a new login exceeds the limit, the oldest sessions are revoked.
+// ---------------------------------------------------------------------------
+const MAX_SESSIONS_BY_TIER = {
+  free:   2,
+  pro:    3,
+  'pro+': 3,
+  hiring: 3,
+};
+
+// ---------------------------------------------------------------------------
 // Timing normalization — pre-computed dummy hash used to equalize response
 // times on early-exit paths (email-not-found in login, email-taken in register).
 // Without this, an attacker can enumerate valid emails by timing alone.
@@ -219,6 +230,64 @@ async function issueRefreshToken(userId, clientId, dbClient) {
 }
 
 // ---------------------------------------------------------------------------
+// enforceSessionLimit(userId, tier, currentFamilyId, dbClient)
+//
+// Ensures the user does not exceed MAX_SESSIONS_BY_TIER concurrent sessions.
+// Revokes the oldest sessions (by issued_at) that exceed the cap, skipping
+// the just-created session (currentFamilyId). Must be called within the same
+// transaction that issued the new token.
+// ---------------------------------------------------------------------------
+async function enforceSessionLimit(userId, tier, currentFamilyId, dbClient) {
+  const maxSessions = MAX_SESSIONS_BY_TIER[tier] || MAX_SESSIONS_BY_TIER.free;
+
+  // Lock all active session rows for this user before counting/evicting.
+  // Because all callers invoke this inside an open transaction, the FOR UPDATE
+  // row locks are held until that transaction commits. A concurrent login that
+  // reaches this point will block until the first transaction commits, then
+  // re-acquire the locks and see the first transaction's evictions — serializing
+  // the count-and-evict pair and preventing session-limit bypass.
+  // NOTE: FOR UPDATE cannot be combined with COUNT(DISTINCT) in PostgreSQL, so
+  // the distinct family count is derived from the locked rows in JS instead.
+  const { rows: activeRows } = await dbClient.query(
+    `SELECT family_id
+     FROM refresh_tokens
+     WHERE user_id = $1 AND revoked_at IS NULL AND expires_at > NOW()
+     FOR UPDATE`,
+    [userId]
+  );
+
+  const activeCount = new Set(activeRows.map(r => r.family_id)).size;
+  if (activeCount <= maxSessions) return 0;
+
+  const excess = activeCount - maxSessions;
+
+  // Find the oldest sessions to evict (by earliest issued_at within each family),
+  // excluding the session we just created.
+  const { rows: toEvict } = await dbClient.query(
+    `SELECT family_id
+     FROM refresh_tokens
+     WHERE user_id = $1 AND revoked_at IS NULL AND expires_at > NOW()
+       AND family_id != $2
+     GROUP BY family_id
+     ORDER BY MIN(issued_at) ASC
+     LIMIT $3`,
+    [userId, currentFamilyId, excess]
+  );
+
+  if (toEvict.length > 0) {
+    const familyIds = toEvict.map(r => r.family_id);
+    await dbClient.query(
+      `UPDATE refresh_tokens SET revoked_at = NOW()
+       WHERE user_id = $1 AND family_id = ANY($2) AND revoked_at IS NULL`,
+      [userId, familyIds]
+    );
+    console.log(`[session-limit] Evicted ${familyIds.length} oldest session(s) for user=${userId} tier=${tier} max=${maxSessions}`);
+  }
+
+  return toEvict.length;
+}
+
+// ---------------------------------------------------------------------------
 // Revoke all active refresh tokens for a user (logout-all-devices).
 // ---------------------------------------------------------------------------
 async function revokeAllForUser(userId) {
@@ -295,6 +364,9 @@ async function register(email, password, displayName) {
     const user = result.rows[0];
     const { rawToken, familyId } = await issueRefreshToken(user.id, null, dbClient);
 
+    // Enforce concurrent session cap (new user is always 'free')
+    await enforceSessionLimit(user.id, user.tier || 'free', familyId, dbClient);
+
     await dbClient.query('COMMIT');
 
     const accessToken = generateAccessToken(user, familyId);
@@ -361,6 +433,10 @@ async function login(email, password) {
   try {
     await dbClient.query('BEGIN');
     const { rawToken, familyId } = await issueRefreshToken(user.id, null, dbClient);
+
+    // Enforce concurrent session cap based on user's tier
+    await enforceSessionLimit(user.id, user.tier || 'free', familyId, dbClient);
+
     await dbClient.query('COMMIT');
 
     const accessToken = generateAccessToken(user, familyId);
@@ -626,6 +702,7 @@ module.exports = {
   signRefreshToken,
   verifyRefreshToken,
   issueRefreshToken,
+  enforceSessionLimit,
   revokeAllForUser,
   resetPassword,
   auditLog,
@@ -633,4 +710,5 @@ module.exports = {
   parseTTLtoSeconds,
   REFRESH_TOKEN_DAYS,
   BCRYPT_ROUNDS,
+  MAX_SESSIONS_BY_TIER,
 };

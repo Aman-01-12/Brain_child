@@ -225,9 +225,10 @@ typedef NS_ENUM(NSUInteger, InterSecureInterviewCenterContent) {
 
     CVPixelBufferRetain(pixelBuffer);
     dispatch_async(dispatch_get_main_queue(), ^{
+        NSString *displayName = [self.remoteLayoutManager displayNameForTileKey:participantId] ?: @"Participant";
         [self ingestRemoteFrame:pixelBuffer
                          tileKey:participantId
-                           title:participantId
+                           title:displayName
                    screenShareID:nil];
         CVPixelBufferRelease(pixelBuffer);
     });
@@ -476,7 +477,7 @@ typedef NS_ENUM(NSUInteger, InterSecureInterviewCenterContent) {
     if ([tileKey isEqualToString:InterSecureStageScreenShareTileKey]) {
         return @"Screen Share";
     }
-    return tileKey ?: @"Participant";
+    return [self.remoteLayoutManager displayNameForTileKey:tileKey] ?: @"Participant";
 }
 
 - (void)handleRemotePreviewSelectionForTileKey:(NSString *)tileKey {

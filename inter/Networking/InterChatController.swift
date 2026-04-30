@@ -267,6 +267,61 @@ import LiveKit
         return true
     }
 
+    // MARK: - File Message (chat file sharing)
+
+    /// Broadcast a file-shared message to all participants.
+    ///
+    /// Call this AFTER a successful upload to `POST /room/:code/file/upload`.
+    /// The fileId, fileName, fileSizeBytes, and mimeType come from the server response.
+    ///
+    /// - Returns: true if the message was published.
+    @objc @discardableResult
+    public func sendFileMessage(fileId: String,
+                                fileName: String,
+                                fileSizeBytes: Int64,
+                                mimeType: String) -> Bool {
+        guard !fileId.isEmpty, !fileName.isEmpty else { return false }
+
+        guard let rc = roomController, rc.connectionState == .connected else {
+            interLogError(InterLog.room, "ChatController: cannot send file message — not connected")
+            return false
+        }
+
+        let message = InterChatMessage(
+            senderIdentity: localIdentity,
+            senderName: localDisplayName,
+            text: "",   // text is unused for file messages; UI uses fileName
+            type: .fileMessage,
+            fileId: fileId,
+            fileName: fileName,
+            fileSizeBytes: fileSizeBytes,
+            mimeType: mimeType
+        )
+
+        guard let data = message.toJSONData() else {
+            interLogError(InterLog.room, "ChatController: failed to encode file message")
+            return false
+        }
+
+        Task {
+            do {
+                let localParticipant = rc.publisher.localParticipant
+                try await localParticipant?.publish(data: data, options: DataPublishOptions(
+                    topic: Self.chatTopic,
+                    reliable: true
+                ))
+                interLogDebug(InterLog.room, "ChatController: sent file message fileId=%{public}@", fileId)
+            } catch {
+                interLogError(InterLog.room, "ChatController: file message publish failed: %{public}@",
+                              error.localizedDescription)
+            }
+        }
+
+        // Add to local message list immediately (optimistic)
+        appendMessage(message, isLocal: true)
+        return true
+    }
+
     // MARK: - Raise Hand (8.2.1)
 
     /// Raise the local participant's hand.
@@ -362,7 +417,11 @@ import LiveKit
                 text: info.text,
                 timestamp: info.timestamp,
                 type: info.messageType,
-                recipientIdentity: info.recipientIdentity
+                recipientIdentity: info.recipientIdentity,
+                fileId: info.fileId,
+                fileName: info.fileName,
+                fileSizeBytes: info.fileSizeBytes,
+                mimeType: info.mimeType
             )
         }
 

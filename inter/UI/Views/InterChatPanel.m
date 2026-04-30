@@ -1,8 +1,12 @@
 #import "InterChatPanel.h"
+#import <objc/runtime.h>
 
 #if __has_include("inter-Swift.h")
 #import "inter-Swift.h"
 #endif
+
+/// Stable pointer used as the associated-object key for file messages on download buttons.
+static char kFileMessageKey;
 
 static const CGFloat InterChatPanelWidth = 300.0;
 static const CGFloat InterChatInputHeight = 36.0;
@@ -22,12 +26,14 @@ static const CGFloat InterChatAnimationDuration = 0.25;
 @property (nonatomic, strong) NSTableView *tableView;
 @property (nonatomic, strong) NSTextField *inputField;
 @property (nonatomic, strong) NSButton *sendButton;
+@property (nonatomic, strong) NSButton *attachButton;
 @property (nonatomic, strong) NSPopUpButton *recipientSelector;
 @property (nonatomic, strong) NSView *unreadBadgeView;
 @property (nonatomic, strong) NSTextField *unreadLabel;
 @property (nonatomic, strong) NSMutableArray<InterChatMessageInfo *> *displayMessages;
 @property (nonatomic, assign) BOOL expanded;
 @property (nonatomic, copy, nullable) NSString *selectedRecipient;
+@property (nonatomic, assign) BOOL chatInputEnabled;
 
 @end
 
@@ -38,6 +44,7 @@ static const CGFloat InterChatAnimationDuration = 0.25;
     if (self) {
         _displayMessages = [NSMutableArray array];
         _expanded = NO;
+        _chatInputEnabled = YES;
         [self setupViews];
     }
     return self;
@@ -191,10 +198,28 @@ static const CGFloat InterChatAnimationDuration = 0.25;
 
 - (void)setupInputArea {
     CGFloat containerW = InterChatPanelWidth;
+    CGFloat attachW = 32.0;
     CGFloat sendW = 48.0;
-    CGFloat inputW = containerW - InterChatPadding * 3 - sendW;
+    CGFloat inputW = containerW - InterChatPadding * 4 - attachW - sendW;
 
-    self.inputField = [[NSTextField alloc] initWithFrame:NSMakeRect(InterChatPadding,
+    // Attach file button (paperclip icon)
+    self.attachButton = [[NSButton alloc] initWithFrame:NSMakeRect(InterChatPadding,
+                                                                    InterChatPadding,
+                                                                    attachW,
+                                                                    InterChatInputHeight)];
+    [self.attachButton setImage:[NSImage imageWithSystemSymbolName:@"paperclip"
+                                          accessibilityDescription:@"Attach file"]];
+    [self.attachButton setImagePosition:NSImageOnly];
+    [self.attachButton setBordered:NO];
+    self.attachButton.contentTintColor = [NSColor colorWithWhite:0.7 alpha:1.0];
+    self.attachButton.autoresizingMask = NSViewMaxXMargin | NSViewMaxYMargin;
+    self.attachButton.toolTip = @"Share a file (max 10 MB)";
+    [self.attachButton setTarget:self];
+    [self.attachButton setAction:@selector(attachAction:)];
+    [self.containerView addSubview:self.attachButton];
+
+    CGFloat inputX = InterChatPadding * 2 + attachW;
+    self.inputField = [[NSTextField alloc] initWithFrame:NSMakeRect(inputX,
                                                                      InterChatPadding,
                                                                      inputW,
                                                                      InterChatInputHeight)];
@@ -210,7 +235,8 @@ static const CGFloat InterChatAnimationDuration = 0.25;
     self.inputField.autoresizingMask = NSViewWidthSizable | NSViewMaxYMargin;
     [self.containerView addSubview:self.inputField];
 
-    self.sendButton = [[NSButton alloc] initWithFrame:NSMakeRect(InterChatPadding * 2 + inputW,
+    CGFloat sendX = inputX + inputW + InterChatPadding;
+    self.sendButton = [[NSButton alloc] initWithFrame:NSMakeRect(sendX,
                                                                   InterChatPadding,
                                                                   sendW,
                                                                   InterChatInputHeight)];
@@ -350,6 +376,13 @@ static const CGFloat InterChatAnimationDuration = 0.25;
     [self.delegate chatPanel:self didSubmitMessage:text];
 }
 
+- (void)attachAction:(id)sender {
+#pragma unused(sender)
+    if ([self.delegate respondsToSelector:@selector(chatPanelDidRequestFileAttach:)]) {
+        [self.delegate chatPanelDidRequestFileAttach:self];
+    }
+}
+
 - (void)closeAction:(id)sender {
 #pragma unused(sender)
     [self collapsePanel];
@@ -407,6 +440,17 @@ static const CGFloat InterChatAnimationDuration = 0.25;
 - (NSView *)tableView:(NSTableView *)tableView viewForTableColumn:(NSTableColumn *)tableColumn row:(NSInteger)row {
 #pragma unused(tableColumn)
 
+    InterChatMessageInfo *message = self.displayMessages[row];
+
+    if (message.messageType == InterChatMessageTypeFileMessage) {
+        return [self fileCellForRow:row inTableView:tableView message:message];
+    }
+    return [self textCellForRow:row inTableView:tableView message:message];
+}
+
+/// Build a text/DM/system message cell.
+- (NSView *)textCellForRow:(NSInteger)row inTableView:(NSTableView *)tableView message:(InterChatMessageInfo *)message {
+#pragma unused(row)
     static NSString *const kCellIdentifier = @"ChatMessageCell";
 
     NSTableCellView *cell = [tableView makeViewWithIdentifier:kCellIdentifier owner:nil];
@@ -414,7 +458,6 @@ static const CGFloat InterChatAnimationDuration = 0.25;
         cell = [[NSTableCellView alloc] initWithFrame:NSMakeRect(0, 0, InterChatPanelWidth, InterChatMessageRowMinHeight)];
         cell.identifier = kCellIdentifier;
 
-        // Name + time label
         NSTextField *nameLabel = [NSTextField labelWithString:@""];
         nameLabel.tag = 100;
         nameLabel.font = [NSFont boldSystemFontOfSize:10];
@@ -423,7 +466,6 @@ static const CGFloat InterChatAnimationDuration = 0.25;
         nameLabel.autoresizingMask = NSViewWidthSizable | NSViewMinYMargin;
         [cell addSubview:nameLabel];
 
-        // Message text label
         NSTextField *textLabel = [NSTextField labelWithString:@""];
         textLabel.tag = 101;
         textLabel.font = [NSFont systemFontOfSize:12];
@@ -435,12 +477,9 @@ static const CGFloat InterChatAnimationDuration = 0.25;
         [cell addSubview:textLabel];
     }
 
-    InterChatMessageInfo *message = self.displayMessages[row];
-
     NSTextField *nameLabel = [cell viewWithTag:100];
     NSTextField *textLabel = [cell viewWithTag:101];
 
-    // Format header line
     switch (message.messageType) {
         case InterChatMessageTypePublicMessage: {
             NSString *header = [NSString stringWithFormat:@"%@ · %@",
@@ -468,11 +507,12 @@ static const CGFloat InterChatAnimationDuration = 0.25;
             textLabel.textColor = [NSColor colorWithWhite:0.55 alpha:1.0];
             break;
         }
+        default:
+            break;
     }
 
     textLabel.stringValue = message.text;
 
-    // Layout
     CGFloat cellW = tableView.bounds.size.width;
     CGFloat textW = cellW - InterChatPadding * 2;
     nameLabel.frame = NSMakeRect(InterChatPadding, cell.bounds.size.height - 14, textW, 14);
@@ -481,20 +521,125 @@ static const CGFloat InterChatAnimationDuration = 0.25;
     return cell;
 }
 
+/// Build a file-message cell with a download button.
+- (NSView *)fileCellForRow:(NSInteger)row inTableView:(NSTableView *)tableView message:(InterChatMessageInfo *)message {
+#pragma unused(row)
+    static NSString *const kFileCellId = @"ChatFileCell";
+
+    NSTableCellView *cell = [tableView makeViewWithIdentifier:kFileCellId owner:nil];
+    if (!cell) {
+        cell = [[NSTableCellView alloc] initWithFrame:NSMakeRect(0, 0, InterChatPanelWidth, 54)];
+        cell.identifier = kFileCellId;
+
+        // Sender + time header
+        NSTextField *senderLabel = [NSTextField labelWithString:@""];
+        senderLabel.tag = 200;
+        senderLabel.font = [NSFont boldSystemFontOfSize:10];
+        senderLabel.textColor = [NSColor colorWithWhite:0.6 alpha:1.0];
+        senderLabel.autoresizingMask = NSViewWidthSizable | NSViewMinYMargin;
+        [cell addSubview:senderLabel];
+
+        // Paper icon
+        NSImageView *iconView = [[NSImageView alloc] initWithFrame:NSMakeRect(InterChatPadding, 0, 18, 18)];
+        iconView.tag = 201;
+        iconView.image = [NSImage imageWithSystemSymbolName:@"doc.fill" accessibilityDescription:@"File"];
+        iconView.contentTintColor = [NSColor systemTealColor];
+        iconView.autoresizingMask = NSViewMaxXMargin | NSViewMaxYMargin;
+        [cell addSubview:iconView];
+
+        // File name label
+        NSTextField *nameLabel = [NSTextField labelWithString:@""];
+        nameLabel.tag = 202;
+        nameLabel.font = [NSFont systemFontOfSize:12];
+        nameLabel.textColor = [NSColor colorWithWhite:0.92 alpha:1.0];
+        nameLabel.lineBreakMode = NSLineBreakByTruncatingMiddle;
+        nameLabel.maximumNumberOfLines = 1;
+        nameLabel.autoresizingMask = NSViewWidthSizable | NSViewMaxYMargin;
+        [cell addSubview:nameLabel];
+
+        // File size label
+        NSTextField *sizeLabel = [NSTextField labelWithString:@""];
+        sizeLabel.tag = 203;
+        sizeLabel.font = [NSFont systemFontOfSize:10];
+        sizeLabel.textColor = [NSColor colorWithWhite:0.5 alpha:1.0];
+        sizeLabel.autoresizingMask = NSViewWidthSizable | NSViewMaxYMargin;
+        [cell addSubview:sizeLabel];
+
+        // Download button
+        NSButton *dlButton = [[NSButton alloc] init];
+        dlButton.tag = 204;
+        [dlButton setTitle:@"Save…"];
+        dlButton.font = [NSFont systemFontOfSize:10 weight:NSFontWeightMedium];
+        dlButton.bezelStyle = NSBezelStyleRounded;
+        dlButton.autoresizingMask = NSViewMinXMargin | NSViewMaxYMargin;
+        dlButton.toolTip = @"Save file to disk";
+        [cell addSubview:dlButton];
+    }
+
+    CGFloat cellW = tableView.bounds.size.width;
+    CGFloat iconW = 18.0, iconH = 18.0;
+    CGFloat dlW = 52.0, dlH = 20.0;
+    CGFloat textX = InterChatPadding * 2 + iconW;
+    CGFloat textW = cellW - textX - dlW - InterChatPadding * 2;
+
+    // Header (top)
+    NSTextField *senderLabel = [cell viewWithTag:200];
+    NSString *prefix = message.isFromLocalUser ? @"You" : message.senderName;
+    senderLabel.stringValue = [NSString stringWithFormat:@"%@ shared a file · %@", prefix, message.formattedTime];
+    senderLabel.frame = NSMakeRect(InterChatPadding, cell.bounds.size.height - 14, cellW - InterChatPadding * 2, 14);
+
+    // Icon (middle-left)
+    NSImageView *iconView = [cell viewWithTag:201];
+    iconView.frame = NSMakeRect(InterChatPadding, cell.bounds.size.height - 36, iconW, iconH);
+
+    // File name (middle)
+    NSTextField *nameLabel = [cell viewWithTag:202];
+    nameLabel.stringValue = message.fileName;
+    nameLabel.frame = NSMakeRect(textX, cell.bounds.size.height - 32, textW, 16);
+
+    // File size (below name)
+    NSTextField *sizeLabel = [cell viewWithTag:203];
+    sizeLabel.stringValue = message.formattedFileSize;
+    sizeLabel.frame = NSMakeRect(textX, cell.bounds.size.height - 48, textW, 14);
+
+    // Download button (right side)
+    NSButton *dlButton = [cell viewWithTag:204];
+    dlButton.frame = NSMakeRect(cellW - dlW - InterChatPadding,
+                                cell.bounds.size.height - 36,
+                                dlW, dlH);
+    // Store message reference for action
+    objc_setAssociatedObject(dlButton, &kFileMessageKey, message, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    [dlButton setTarget:self];
+    [dlButton setAction:@selector(downloadFileAction:)];
+
+    return cell;
+}
+
+- (void)downloadFileAction:(NSButton *)sender {
+    InterChatMessageInfo *message = objc_getAssociatedObject(sender, &kFileMessageKey);
+    if (!message) return;
+    if ([self.delegate respondsToSelector:@selector(chatPanel:didRequestDownloadFileMessage:)]) {
+        [self.delegate chatPanel:self didRequestDownloadFileMessage:message];
+    }
+}
+
 - (CGFloat)tableView:(NSTableView *)tableView heightOfRow:(NSInteger)row {
 #pragma unused(tableView)
 
     InterChatMessageInfo *message = self.displayMessages[row];
-    CGFloat textW = InterChatPanelWidth - InterChatPadding * 2;
 
-    // Estimate text height
+    if (message.messageType == InterChatMessageTypeFileMessage) {
+        return 58.0; // fixed height for file cells
+    }
+
+    CGFloat textW = InterChatPanelWidth - InterChatPadding * 2;
     NSDictionary *attrs = @{NSFontAttributeName: [NSFont systemFontOfSize:12]};
     NSRect boundingRect = [message.text boundingRectWithSize:NSMakeSize(textW, CGFLOAT_MAX)
                                                      options:NSStringDrawingUsesLineFragmentOrigin
                                                   attributes:attrs
                                                      context:nil];
     CGFloat textHeight = ceil(boundingRect.size.height);
-    return MAX(InterChatMessageRowMinHeight, textHeight + 20.0); // 14 for header + 6 padding
+    return MAX(InterChatMessageRowMinHeight, textHeight + 20.0);
 }
 
 #pragma mark - Layout
@@ -517,8 +662,10 @@ static const CGFloat InterChatAnimationDuration = 0.25;
 #pragma mark - Phase 9: Moderation
 
 - (void)setChatInputEnabled:(BOOL)enabled {
+    self.chatInputEnabled = enabled;
     self.inputField.enabled = enabled;
     self.sendButton.enabled = enabled;
+    self.attachButton.enabled = enabled;
     if (!enabled) {
         self.inputField.placeholderString = @"Chat is disabled";
     } else if (self.selectedRecipient) {
@@ -526,6 +673,21 @@ static const CGFloat InterChatAnimationDuration = 0.25;
         self.inputField.placeholderString = [NSString stringWithFormat:@"DM to %@…", displayName];
     } else {
         self.inputField.placeholderString = @"Type a message…";
+    }
+}
+
+- (void)setUploadInProgress:(BOOL)inProgress {
+    // Only re-enable the attach button when chat input is also enabled;
+    // setUploadInProgress:NO must not override a prior setChatInputEnabled:NO.
+    self.attachButton.enabled = !inProgress && self.chatInputEnabled;
+    if (inProgress) {
+        [self.attachButton setImage:[NSImage imageWithSystemSymbolName:@"clock"
+                                              accessibilityDescription:@"Uploading…"]];
+        self.attachButton.toolTip = @"Uploading…";
+    } else {
+        [self.attachButton setImage:[NSImage imageWithSystemSymbolName:@"paperclip"
+                                              accessibilityDescription:@"Attach file"]];
+        self.attachButton.toolTip = @"Share a file (max 10 MB)";
     }
 }
 

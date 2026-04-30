@@ -30,16 +30,22 @@ NS_ASSUME_NONNULL_BEGIN
 @end
 
 /// Panel displaying the user's recording history.
-/// Fetches recordings from the token server and shows them in a table view.
+/// Shows two distinct sections: Local Recordings and Cloud Recordings.
 @interface InterRecordingListPanel : NSView
 
 @property (nonatomic, weak, nullable) id<InterRecordingListPanelDelegate> delegate;
 
-/// Reload the recording list from the server.
+/// Reload the recording list (local filesystem scan + cloud fetch from server).
 - (void)reloadRecordings;
 
 /// Set the base URL for the token server (e.g. "http://localhost:3000").
 @property (nonatomic, copy, nullable) NSString *serverBaseURL;
+
+/// Set the access token for cloud recording API calls.
+@property (nonatomic, copy, nullable) NSString *accessToken;
+
+/// Set cloud recordings fetched from the server (replaces cloud section only).
+- (void)setCloudRecordings:(NSArray<InterRecordingListEntry *> *)recordings;
 
 /// Set recordings from a fetched array (called by the coordinator/AppDelegate).
 - (void)setRecordings:(NSArray<InterRecordingListEntry *> *)recordings;
@@ -47,7 +53,7 @@ NS_ASSUME_NONNULL_BEGIN
 /// Add local recordings from the filesystem.
 - (void)addLocalRecordings:(NSArray<NSURL *> *)fileURLs;
 
-/// Total number of recordings displayed.
+/// Total number of recordings displayed (local + cloud).
 @property (nonatomic, readonly) NSUInteger recordingCount;
 
 @end

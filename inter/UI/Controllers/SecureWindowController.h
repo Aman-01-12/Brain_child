@@ -3,6 +3,7 @@
 NS_ASSUME_NONNULL_BEGIN
 
 @class InterRoomController;
+@class InterChatController;
 
 @interface SecureWindowController : NSObject
 
@@ -13,13 +14,13 @@ NS_ASSUME_NONNULL_BEGIN
 /// Set by AppDelegate before createSecureWindow is called.
 @property (nonatomic, weak, nullable) InterRoomController *roomController;
 
+/// Chat controller for in-session messaging. Set by AppDelegate after attach.
+@property (nonatomic, weak, nullable) InterChatController *chatController;
+
 - (void)createSecureWindow;
 - (void)destroySecureWindow;
 
 /// Immediately hide the secure window without tearing down room/media objects.
-/// This also quiesces the secure renderer first so exit cannot race the
-/// CAMetalLayer/drawable lifecycle while the heavier destroySecureWindow
-/// cleanup runs.
 - (void)hideSecureWindow;
 
 @end

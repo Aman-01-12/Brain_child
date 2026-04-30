@@ -237,6 +237,43 @@ import LiveKit
         }
     }
 
+    /// Connect directly with an existing token (used after lobby admission).
+    ///
+    /// Bypasses the token-server fetch since the token was already obtained
+    /// during the lobby admission flow.
+    @objc public func connect(
+        withToken token: String,
+        serverURL: String,
+        configuration: InterRoomConfiguration,
+        completion: @escaping (NSError?) -> Void
+    ) {
+        guard connectionState == .disconnected || connectionState == .disconnectedWithError else {
+            completion(InterNetworkErrorCode.connectionFailed.error(message: "Already connected or connecting"))
+            return
+        }
+        guard !isConnecting else {
+            completion(InterNetworkErrorCode.connectionFailed.error(message: "Connection already in progress"))
+            return
+        }
+
+        isConnecting = true
+        self.configuration = configuration.copy() as? InterRoomConfiguration
+        connectStartTime = CFAbsoluteTimeGetCurrent()
+        setConnectionState(.connecting)
+
+        interLogInfo(InterLog.networking, "RoomController: connecting with existing token (lobby admitted, identity=%{public}@)",
+                     configuration.participantIdentity)
+
+        handleTokenResponse(
+            token: token,
+            serverURL: serverURL,
+            roomCode: configuration.roomCode,
+            roomType: configuration.roomType.isEmpty ? "call" : configuration.roomType,
+            error: nil,
+            completion: completion
+        )
+    }
+
     /// Handle the token server response and connect to the LiveKit room.
     private func handleTokenResponse(
         token: String?,
@@ -250,7 +287,10 @@ import LiveKit
             interLogError(InterLog.networking, "RoomController: token fetch failed: %{public}@",
                           error.localizedDescription)
             isConnecting = false
-            setConnectionState(.disconnectedWithError)
+            // Lobby waiting (1010) is not a connection failure — use .disconnected
+            // so the media wiring controller does not show a "Connection Lost" alert.
+            let isLobbyWaiting = error.code == 1010
+            setConnectionState(isLobbyWaiting ? .disconnected : .disconnectedWithError)
             completion(error)
             return
         }
@@ -380,6 +420,16 @@ import LiveKit
         guard connectionState != .disconnected else { return }
 
         interLogInfo(InterLog.networking, "RoomController: disconnecting (reason=%{public}@)", reason)
+
+        // Notify the server so the participant count is updated immediately
+        if let config = configuration, !config.roomCode.isEmpty {
+            let identity = room?.localParticipant.identity?.stringValue ?? config.participantIdentity
+            tokenService.leaveRoom(
+                serverURL: config.tokenServerURL,
+                roomCode: config.roomCode,
+                identity: identity
+            )
+        }
 
         // Stop stats collector and export data
         if let collector = statsCollector {
