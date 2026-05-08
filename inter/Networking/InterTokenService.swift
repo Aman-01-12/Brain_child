@@ -2486,6 +2486,236 @@ private struct TokenCacheEntry {
         }
     }
 
+    // MARK: - Account Management
+
+    /// Change the authenticated user's password.
+    ///
+    /// Calls `POST /auth/change-password`. On success the server revokes all sessions
+    /// except the current one — the caller stays logged in.
+    @objc(changePassword:newPassword:completion:)
+    public func changePassword(
+        currentPassword: String,
+        newPassword: String,
+        completion: @escaping (NSError?) -> Void
+    ) {
+        guard let serverURL = authServerBaseURL,
+              let accessToken = currentAccessToken else {
+            let err = InterNetworkErrorCode.authFailed.error(message: "Not authenticated")
+            completeOnMain { completion(err) }
+            return
+        }
+
+        performAuthHTTPRequest(
+            url: "\(serverURL)/auth/change-password",
+            method: "POST",
+            body: ["currentPassword": currentPassword, "newPassword": newPassword],
+            bearerToken: accessToken,
+            retryCount: 0
+        ) { [weak self] data, httpResponse, error in
+            guard let self = self else { return }
+            if let error = error {
+                self.completeOnMain { completion(error) }
+                return
+            }
+            guard let httpResponse = httpResponse else {
+                self.completeOnMain {
+                    completion(InterNetworkErrorCode.authFailed.error(message: "No response"))
+                }
+                return
+            }
+            if httpResponse.statusCode == 200 {
+                self.completeOnMain { completion(nil) }
+            } else {
+                let msg = (data.flatMap { self.parseJSON($0) })?["error"] as? String
+                       ?? "Password change failed (\(httpResponse.statusCode))"
+                self.completeOnMain { completion(InterNetworkErrorCode.authFailed.error(message: msg)) }
+            }
+        }
+    }
+
+    /// Initiate an email address change.
+    ///
+    /// Calls `POST /auth/change-email`. The server sends a verification link to the
+    /// new address — the change is not committed until the link is clicked.
+    @objc(changeEmail:newEmail:completion:)
+    public func changeEmail(
+        password: String,
+        newEmail: String,
+        completion: @escaping (NSError?) -> Void
+    ) {
+        guard let serverURL = authServerBaseURL,
+              let accessToken = currentAccessToken else {
+            let err = InterNetworkErrorCode.authFailed.error(message: "Not authenticated")
+            completeOnMain { completion(err) }
+            return
+        }
+
+        performAuthHTTPRequest(
+            url: "\(serverURL)/auth/change-email",
+            method: "POST",
+            body: ["password": password, "newEmail": newEmail],
+            bearerToken: accessToken,
+            retryCount: 0
+        ) { [weak self] data, httpResponse, error in
+            guard let self = self else { return }
+            if let error = error {
+                self.completeOnMain { completion(error) }
+                return
+            }
+            guard let httpResponse = httpResponse else {
+                self.completeOnMain {
+                    completion(InterNetworkErrorCode.authFailed.error(message: "No response"))
+                }
+                return
+            }
+            if httpResponse.statusCode == 200 {
+                self.completeOnMain { completion(nil) }
+            } else {
+                let msg = (data.flatMap { self.parseJSON($0) })?["error"] as? String
+                       ?? "Email change failed (\(httpResponse.statusCode))"
+                self.completeOnMain { completion(InterNetworkErrorCode.authFailed.error(message: msg)) }
+            }
+        }
+    }
+
+    /// List all active sessions for the current user.
+    ///
+    /// Calls `GET /auth/sessions`. Each dict in the returned array contains:
+    /// `{ id, clientId, createdAt, lastUsedAt, isCurrent }`.
+    @objc public func listSessions(
+        completion: @escaping (_ sessions: [[String: Any]]?, _ error: NSError?) -> Void
+    ) {
+        guard let serverURL = authServerBaseURL,
+              let accessToken = currentAccessToken else {
+            completeOnMain { completion(nil, nil) }
+            return
+        }
+
+        performAuthHTTPRequest(
+            url: "\(serverURL)/auth/sessions",
+            method: "GET",
+            body: nil,
+            bearerToken: accessToken,
+            retryCount: 0
+        ) { [weak self] data, httpResponse, error in
+            guard let self = self else { return }
+            if let error = error {
+                self.completeOnMain { completion(nil, error) }
+                return
+            }
+            guard let httpResponse = httpResponse,
+                  httpResponse.statusCode == 200,
+                  let data = data,
+                  let json = self.parseJSON(data),
+                  let sessions = json["sessions"] as? [[String: Any]] else {
+                let code = httpResponse?.statusCode ?? 0
+                let msg = "Could not load sessions (HTTP \(code))"
+                self.completeOnMain {
+                    completion(nil, InterNetworkErrorCode.authFailed.error(message: msg))
+                }
+                return
+            }
+            self.completeOnMain { completion(sessions, nil) }
+        }
+    }
+
+    /// Revoke a specific session by its refresh-token row UUID.
+    ///
+    /// Calls `DELETE /auth/sessions/:id`. Returns an error if the session is
+    /// not found, already revoked, or belongs to a different user.
+    @objc(revokeSession:completion:)
+    public func revokeSession(
+        sessionId: String,
+        completion: @escaping (NSError?) -> Void
+    ) {
+        guard let serverURL = authServerBaseURL,
+              let accessToken = currentAccessToken else {
+            let err = InterNetworkErrorCode.authFailed.error(message: "Not authenticated")
+            completeOnMain { completion(err) }
+            return
+        }
+
+        // Percent-encode the UUID so it is URL-safe in the path segment.
+        let encodedId = sessionId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed)
+                     ?? sessionId
+
+        performAuthHTTPRequest(
+            url: "\(serverURL)/auth/sessions/\(encodedId)",
+            method: "DELETE",
+            body: nil,
+            bearerToken: accessToken,
+            retryCount: 0
+        ) { [weak self] data, httpResponse, error in
+            guard let self = self else { return }
+            if let error = error {
+                self.completeOnMain { completion(error) }
+                return
+            }
+            guard let httpResponse = httpResponse else {
+                self.completeOnMain {
+                    completion(InterNetworkErrorCode.authFailed.error(message: "No response"))
+                }
+                return
+            }
+            if httpResponse.statusCode == 200 {
+                self.completeOnMain { completion(nil) }
+            } else {
+                let msg = (data.flatMap { self.parseJSON($0) })?["error"] as? String
+                       ?? "Revoke failed (\(httpResponse.statusCode))"
+                self.completeOnMain { completion(InterNetworkErrorCode.authFailed.error(message: msg)) }
+            }
+        }
+    }
+
+    /// Permanently delete the authenticated account (GDPR right-to-erasure).
+    ///
+    /// Calls `DELETE /auth/account` with password confirmation. On success the
+    /// server anonymises all PII, cancels any active subscription, and revokes
+    /// all refresh tokens. Local auth state is cleared immediately.
+    ///
+    /// After calling this, the caller MUST clear their UI and show the login screen.
+    @objc(deleteAccount:completion:)
+    public func deleteAccount(
+        password: String,
+        completion: @escaping (NSError?) -> Void
+    ) {
+        guard let serverURL = authServerBaseURL,
+              let accessToken = currentAccessToken else {
+            let err = InterNetworkErrorCode.authFailed.error(message: "Not authenticated")
+            completeOnMain { completion(err) }
+            return
+        }
+
+        performAuthHTTPRequest(
+            url: "\(serverURL)/auth/account",
+            method: "DELETE",
+            body: ["password": password],
+            bearerToken: accessToken,
+            retryCount: 0
+        ) { [weak self] data, httpResponse, error in
+            guard let self = self else { return }
+            if let error = error {
+                self.completeOnMain { completion(error) }
+                return
+            }
+            guard let httpResponse = httpResponse else {
+                self.completeOnMain {
+                    completion(InterNetworkErrorCode.authFailed.error(message: "No response"))
+                }
+                return
+            }
+            if httpResponse.statusCode == 200 {
+                // Clear all local credentials — every token is now invalid server-side.
+                self.clearAuthState()
+                self.completeOnMain { completion(nil) }
+            } else {
+                let msg = (data.flatMap { self.parseJSON($0) })?["error"] as? String
+                       ?? "Account deletion failed (\(httpResponse.statusCode))"
+                self.completeOnMain { completion(InterNetworkErrorCode.authFailed.error(message: msg)) }
+            }
+        }
+    }
+
     // MARK: - Private: Network
 
     /// Perform a POST request with JSON body. Retries once on 5xx/timeout.

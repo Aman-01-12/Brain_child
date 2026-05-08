@@ -26,6 +26,7 @@
 #import "InterRecordingConsentPanel.h"
 #import "InterSchedulePanel.h"
 #import "InterTeamsPanel.h"
+#import "InterAccountPanel.h"
 
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #import <AuthenticationServices/AuthenticationServices.h>
@@ -35,7 +36,7 @@
 #import "inter-Swift.h"
 #endif
 
-@interface AppDelegate () <NSWindowDelegate, InterConnectionSetupPanelDelegate, InterLoginPanelDelegate, InterAuthSessionDelegate, InterParticipantOverlayDelegate, InterChatPanelDelegate, InterSpeakerQueuePanelDelegate, InterPollPanelDelegate, InterQAPanelDelegate, InterMediaWiringDelegate, InterModerationDelegate, InterLobbyPanelDelegate, InterRecordingCoordinatorDelegate, InterRecordingSignalDelegate, InterRecordingListPanelDelegate, InterRecordingConsentPanelDelegate, InterSchedulePanelDelegate, InterTeamsPanelDelegate, InterLobbyWaitingViewDelegate, ASWebAuthenticationPresentationContextProviding>
+@interface AppDelegate () <NSWindowDelegate, InterConnectionSetupPanelDelegate, InterLoginPanelDelegate, InterAuthSessionDelegate, InterParticipantOverlayDelegate, InterChatPanelDelegate, InterSpeakerQueuePanelDelegate, InterPollPanelDelegate, InterQAPanelDelegate, InterMediaWiringDelegate, InterModerationDelegate, InterLobbyPanelDelegate, InterRecordingCoordinatorDelegate, InterRecordingSignalDelegate, InterRecordingListPanelDelegate, InterRecordingConsentPanelDelegate, InterSchedulePanelDelegate, InterTeamsPanelDelegate, InterAccountPanelDelegate, InterLobbyWaitingViewDelegate, ASWebAuthenticationPresentationContextProviding>
 @property (nonatomic, strong) NSMutableArray<CapWindow *> *capWindows;
 @property (nonatomic, strong) SecureWindowController *secureController;
 @property (nonatomic, strong) NSWindow *setupWindow;
@@ -115,6 +116,10 @@
 // [Phase 11.4] Teams
 @property (nonatomic, strong, nullable) InterTeamsPanel *teamsPanel;
 @property (nonatomic, strong, nullable) NSWindow *teamsWindow;
+
+// [Phase 11.5] Account management
+@property (nonatomic, strong, nullable) InterAccountPanel *accountPanel;
+@property (nonatomic, strong, nullable) NSWindow *accountWindow;
 
 // Settings window — calendar connect/disconnect buttons (rebuilt each open)
 @property (nonatomic, strong, nullable) NSButton *settingsGoogleButton;
@@ -3614,7 +3619,7 @@ didRequestDeleteTeamId:(NSString *)teamId {
     }
 
     self.settingsWindow =
-        [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 420, 370)
+        [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 420, 410)
                                     styleMask:(NSWindowStyleMaskTitled |
                                                NSWindowStyleMaskClosable)
                                       backing:NSBackingStoreBuffered
@@ -3628,17 +3633,24 @@ didRequestDeleteTeamId:(NSString *)teamId {
 
     // ---- Section: Account -------------------------------------------------
     NSTextField *accountHeader = [NSTextField labelWithString:@"Account"];
-    accountHeader.frame = NSMakeRect(20, 310, 200, 20);
+    accountHeader.frame = NSMakeRect(20, 350, 200, 20);
     accountHeader.font  = [NSFont boldSystemFontOfSize:13];
     [cv addSubview:accountHeader];
 
     NSString *signedInEmail = self.roomController.tokenService.currentEmail ?: @"Not signed in";
     NSTextField *emailLabel = [NSTextField labelWithString:signedInEmail];
-    emailLabel.frame = NSMakeRect(20, 288, w - 40, 16);
+    emailLabel.frame = NSMakeRect(20, 328, w - 40, 16);
     emailLabel.font  = [NSFont monospacedSystemFontOfSize:11 weight:NSFontWeightRegular];
     emailLabel.textColor = [NSColor secondaryLabelColor];
     emailLabel.lineBreakMode = NSLineBreakByTruncatingMiddle;
     [cv addSubview:emailLabel];
+
+    NSButton *accountSettingsButton = [[NSButton alloc] initWithFrame:NSMakeRect(w - 160, 292, 140, 28)];
+    [accountSettingsButton setTitle:@"Account Settings\u2026"];
+    [accountSettingsButton setBezelStyle:NSBezelStyleRounded];
+    [accountSettingsButton setTarget:self];
+    [accountSettingsButton setAction:@selector(openAccountSettingsWindow)];
+    [cv addSubview:accountSettingsButton];
 
     NSBox *accountSep = [[NSBox alloc] initWithFrame:NSMakeRect(20, 280, w - 40, 1)];
     accountSep.boxType = NSBoxSeparator;
@@ -3838,6 +3850,129 @@ didRequestDeleteTeamId:(NSString *)teamId {
         [strongSelf.teamsPanel setTeams:teams ?: @[]];
         [strongSelf.teamsPanel setStatusText:@""];
     }];
+}
+
+// ---------------------------------------------------------------------------
+// MARK: - Account Settings Window
+// ---------------------------------------------------------------------------
+
+- (void)openAccountSettingsWindow {
+    if (!self.accountWindow) {
+        self.accountPanel = [[InterAccountPanel alloc] initWithFrame:NSMakeRect(0, 0, 460, 600)];
+        self.accountPanel.delegate = self;
+        self.accountPanel.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+
+        self.accountWindow = [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 460, 600)
+                                                          styleMask:(NSWindowStyleMaskTitled |
+                                                                     NSWindowStyleMaskClosable)
+                                                            backing:NSBackingStoreBuffered
+                                                              defer:NO];
+        [self.accountWindow setTitle:@"Account Settings"];
+        [self.accountWindow setSharingType:NSWindowSharingNone];
+        [self.accountWindow setReleasedWhenClosed:NO];
+        [self.accountWindow setContentView:self.accountPanel];
+        [self.accountWindow setDelegate:self];
+    }
+
+    // Refresh profile fields from the live session on every open.
+    InterTokenService *ts = self.roomController.tokenService;
+    [self.accountPanel setEmail:ts.currentEmail tier:ts.currentTier];
+
+    [self.accountWindow center];
+    [self.accountWindow makeKeyAndOrderFront:nil];
+    [NSApp activateIgnoringOtherApps:YES];
+
+    // Pre-load active sessions so the table is populated immediately.
+    [self accountPanelDidRequestLoadSessions:self.accountPanel
+                                  completion:^(NSArray<NSDictionary *> *sessions, NSError *error) {
+        if (error) {
+            [self.accountPanel showBannerError:error.localizedDescription];
+        } else {
+            [self.accountPanel setSessions:sessions];
+        }
+    }];
+}
+
+// ---------------------------------------------------------------------------
+// MARK: - InterAccountPanelDelegate
+// ---------------------------------------------------------------------------
+
+- (void)accountPanel:(InterAccountPanel *)panel
+  didRequestChangePassword:(NSString *)currentPassword
+             newPassword:(NSString *)newPassword
+              completion:(void (^)(NSError *_Nullable))completion {
+#pragma unused(panel)
+    InterTokenService *ts = self.roomController.tokenService;
+    if (!ts) {
+        if (completion) completion([NSError errorWithDomain:@"inter" code:-1
+                                                   userInfo:@{NSLocalizedDescriptionKey: @"Not connected."}]);
+        return;
+    }
+    [ts changePassword:currentPassword newPassword:newPassword completion:completion];
+}
+
+- (void)accountPanel:(InterAccountPanel *)panel
+   didRequestChangeEmail:(NSString *)password
+               newEmail:(NSString *)newEmail
+             completion:(void (^)(NSError *_Nullable))completion {
+#pragma unused(panel)
+    InterTokenService *ts = self.roomController.tokenService;
+    if (!ts) {
+        if (completion) completion([NSError errorWithDomain:@"inter" code:-1
+                                                   userInfo:@{NSLocalizedDescriptionKey: @"Not connected."}]);
+        return;
+    }
+    [ts changeEmail:password newEmail:newEmail completion:completion];
+}
+
+- (void)accountPanelDidRequestLoadSessions:(InterAccountPanel *)panel
+                                completion:(void (^)(NSArray<NSDictionary *> *_Nullable,
+                                                     NSError *_Nullable))completion {
+#pragma unused(panel)
+    InterTokenService *ts = self.roomController.tokenService;
+    if (!ts) {
+        if (completion) completion(@[], nil);
+        return;
+    }
+    [ts listSessionsWithCompletion:^(NSArray<NSDictionary *> *sessions, NSError *error) {
+        if (completion) completion(sessions, error);
+    }];
+}
+
+- (void)accountPanel:(InterAccountPanel *)panel
+ didRequestRevokeSession:(NSString *)sessionId
+             completion:(void (^)(NSError *_Nullable))completion {
+#pragma unused(panel)
+    InterTokenService *ts = self.roomController.tokenService;
+    if (!ts) {
+        if (completion) completion([NSError errorWithDomain:@"inter" code:-1
+                                                   userInfo:@{NSLocalizedDescriptionKey: @"Not connected."}]);
+        return;
+    }
+    [ts revokeSession:sessionId completion:completion];
+}
+
+- (void)accountPanel:(InterAccountPanel *)panel
+ didRequestDeleteAccount:(NSString *)password
+             completion:(void (^)(NSError *_Nullable))completion {
+#pragma unused(panel)
+    InterTokenService *ts = self.roomController.tokenService;
+    if (!ts) {
+        if (completion) completion([NSError errorWithDomain:@"inter" code:-1
+                                                   userInfo:@{NSLocalizedDescriptionKey: @"Not connected."}]);
+        return;
+    }
+    [ts deleteAccount:password completion:completion];
+}
+
+- (void)accountPanelDidDeleteAccount:(InterAccountPanel *)panel {
+#pragma unused(panel)
+    // Dismiss the account window.
+    [self.accountWindow orderOut:nil];
+    self.accountWindow = nil;
+    self.accountPanel  = nil;
+    // Navigate back to the login screen — same flow as manual sign-out.
+    [self handleLogout];
 }
 
 - (void)closeSettingsWindow {

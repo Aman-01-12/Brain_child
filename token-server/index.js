@@ -612,6 +612,7 @@ app.post('/auth/change-password', auth.requireAuth, async (req, res) => {
     return res.status(400).json({ error: 'Password must be 72 characters or fewer' });
   }
 
+  try {
   const userResult = await db.query(
     'SELECT id, password_hash FROM users WHERE id = $1 AND deleted_at IS NULL',
     [req.user.userId]
@@ -644,6 +645,11 @@ app.post('/auth/change-password', auth.requireAuth, async (req, res) => {
 
   auth.auditLog(user.id, 'change_password_success', req.ip);
   res.json({ message: 'Password changed. All other sessions have been revoked.' });
+  } catch (err) {
+    const status = err.status || 500;
+    if (status === 500) throw err;
+    res.status(status).json({ error: err.message });
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -745,19 +751,19 @@ app.delete('/auth/account', auth.requireAuth, async (req, res) => {
 // ---------------------------------------------------------------------------
 app.get('/auth/sessions', auth.requireAuth, async (req, res) => {
   const result = await db.query(
-    `SELECT id, family_id, client_id, created_at, last_used_at
+    `SELECT id, family_id, client_id, issued_at, last_used_at
      FROM refresh_tokens
      WHERE user_id = $1
        AND revoked_at IS NULL
        AND expires_at > NOW()
-     ORDER BY COALESCE(last_used_at, created_at) DESC`,
+     ORDER BY COALESCE(last_used_at, issued_at) DESC`,
     [req.user.userId]
   );
   res.json({
     sessions: result.rows.map(r => ({
       id: r.id,
       clientId: r.client_id,
-      createdAt: r.created_at,
+      createdAt: r.issued_at,
       lastUsedAt: r.last_used_at,
       isCurrent: r.family_id === req.user.tokenFamily || false,
     })),
@@ -4220,7 +4226,11 @@ setInterval(() => {
 // ---------------------------------------------------------------------------
 app.use((err, req, res, _next) => {
   const requestId = require('crypto').randomUUID();
+  const status = err.status || 500;
   console.error(`[error] requestId=${requestId} path=${req.path} err=${err.message}`);
+  if (status !== 500) {
+    return res.status(status).json({ error: err.message, requestId });
+  }
   res.status(500).json({
     error: 'An internal error occurred',
     requestId, // returned for support lookup — never the stack trace
