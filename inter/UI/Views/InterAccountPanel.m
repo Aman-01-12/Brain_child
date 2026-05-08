@@ -427,8 +427,8 @@ static const CGFloat kAPInnerW        = kAPWidth - kAPMargin * 2.0; // 420
         [self _showPwStatus:@"Please fill in all password fields." isError:YES];
         return;
     }
-    if (updatedPw.length < 8) {
-        [self _showPwStatus:@"New password must be at least 8 characters." isError:YES];
+    if (updatedPw.length < 8 || updatedPw.length > 72) {
+        [self _showPwStatus:@"New password must be between 8 and 72 characters." isError:YES];
         return;
     }
     if (![updatedPw isEqualToString:confirm]) {
@@ -564,19 +564,21 @@ static const CGFloat kAPInnerW        = kAPWidth - kAPMargin * 2.0; // 420
 
     NSWindow *parentWindow = self.window;
     if (parentWindow) {
+        __weak typeof(self) weakSelf = self;
         [alert beginSheetModalForWindow:parentWindow completionHandler:^(NSModalResponse response) {
+            __strong typeof(weakSelf) strongSelf = weakSelf;
+            if (!strongSelf) return;
             if (response != NSAlertFirstButtonReturn) return;
 
             NSString *password = pwField.stringValue;
             if (password.length == 0) {
-                [self showBannerError:@"Password is required to delete your account."];
+                [strongSelf showBannerError:@"Password is required to delete your account."];
                 return;
             }
 
-            [self.deleteAccountButton setEnabled:NO];
+            [strongSelf.deleteAccountButton setEnabled:NO];
 
-            __weak typeof(self) weakSelf = self;
-            [self.delegate accountPanel:self
+            [strongSelf.delegate accountPanel:strongSelf
                 didRequestDeleteAccount:password
                              completion:^(NSError *error) {
                 __strong typeof(weakSelf) strongSelf = weakSelf;
@@ -587,6 +589,10 @@ static const CGFloat kAPInnerW        = kAPWidth - kAPMargin * 2.0; // 420
                 } else {
                     if ([strongSelf.delegate respondsToSelector:@selector(accountPanelDidDeleteAccount:)]) {
                         [strongSelf.delegate accountPanelDidDeleteAccount:strongSelf];
+                    } else {
+                        // Fallback: delegate didn't handle teardown — dismiss the window
+                        // ourselves so the UI is never left in an inconsistent state.
+                        [strongSelf.window orderOut:nil];
                     }
                 }
             }];
@@ -615,6 +621,10 @@ static const CGFloat kAPInnerW        = kAPWidth - kAPMargin * 2.0; // 420
             } else {
                 if ([strongSelf.delegate respondsToSelector:@selector(accountPanelDidDeleteAccount:)]) {
                     [strongSelf.delegate accountPanelDidDeleteAccount:strongSelf];
+                } else {
+                    // Fallback: delegate didn't handle teardown — dismiss the window
+                    // ourselves so the UI is never left in an inconsistent state.
+                    [strongSelf.window orderOut:nil];
                 }
             }
         }];
@@ -778,18 +788,20 @@ static inline BOOL _safeBool(id value) {
     NSString *str = [value isKindOfClass:[NSString class]] ? (NSString *)value : nil;
     if (str.length == 0) return nil;
 
-    static NSISO8601DateFormatter *isoFmt = nil;
+    static NSISO8601DateFormatter *isoFmtWithFractionalSeconds = nil;
+    static NSISO8601DateFormatter *isoFmtWithoutFractionalSeconds = nil;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
-        isoFmt = [[NSISO8601DateFormatter alloc] init];
-        isoFmt.formatOptions = NSISO8601DateFormatWithInternetDateTime
-                             | NSISO8601DateFormatWithFractionalSeconds;
+        isoFmtWithFractionalSeconds = [[NSISO8601DateFormatter alloc] init];
+        isoFmtWithFractionalSeconds.formatOptions = NSISO8601DateFormatWithInternetDateTime
+                                                  | NSISO8601DateFormatWithFractionalSeconds;
+        isoFmtWithoutFractionalSeconds = [[NSISO8601DateFormatter alloc] init];
+        isoFmtWithoutFractionalSeconds.formatOptions = NSISO8601DateFormatWithInternetDateTime;
     });
 
-    NSDate *date = [isoFmt dateFromString:str];
+    NSDate *date = [isoFmtWithFractionalSeconds dateFromString:str];
     if (!date) {
-        isoFmt.formatOptions = NSISO8601DateFormatWithInternetDateTime;
-        date = [isoFmt dateFromString:str];
+        date = [isoFmtWithoutFractionalSeconds dateFromString:str];
     }
     if (!date) return nil;
 

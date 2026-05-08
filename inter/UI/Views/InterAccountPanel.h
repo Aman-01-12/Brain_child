@@ -63,6 +63,10 @@ NS_ASSUME_NONNULL_BEGIN
 /// Called after the server confirmed account deletion (after the completion
 /// above fires with nil). The delegate should dismiss the account window and
 /// show the login screen.
+///
+/// If this method is not implemented, InterAccountPanel will dismiss its own
+/// window as a safe fallback, preventing the UI from being left open after
+/// a successful deletion.
 - (void)accountPanelDidDeleteAccount:(InterAccountPanel *)panel;
 
 @end
