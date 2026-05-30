@@ -2078,6 +2078,17 @@ async function admitAllFromLobby(code, roomData) {
       break;
     }
 
+    // Skip banned identities — remove them from the lobby silently
+    try {
+      const isBannedMember = await redis.sismember(roomBannedKey(code), memberIdentity);
+      if (isBannedMember) {
+        await redis.zrem(roomLobbyKey(code), memberIdentity);
+        await redis.hdel(roomLobbyNamesKey(code), memberIdentity);
+        await redis.set(`room:${code}:lobby:${memberIdentity}:status`, 'denied', 'EX', 300);
+        continue;
+      }
+    } catch (_) { /* best-effort — allow admit on Redis error */ }
+
     try {
       const memberDisplayName = await redis.hget(roomLobbyNamesKey(code), memberIdentity) || memberIdentity;
       await addParticipant(code, memberIdentity);
@@ -2455,6 +2466,12 @@ app.post('/token/refresh', async (req, res) => {
     return res.status(404).json({ error: 'Invalid or expired room code' });
   }
 
+  // Ban check — a removed participant must not receive a fresh JWT
+  const isBannedRefresh = await redis.sismember(roomBannedKey(code), identity);
+  if (isBannedRefresh) {
+    return res.status(403).json({ error: 'You have been removed from this meeting.' });
+  }
+
   const isHost = roomData.hostIdentity === identity;
 
   try {
@@ -2710,11 +2727,16 @@ app.post('/room/remove', auth.requireAuth, async (req, res) => {
   }
 
   try {
+    // Write ban to Redis atomically before evicting from LiveKit, so a crash
+    // between eviction and ban-write cannot leave the user un-banned.
+    const pipeline = redis.pipeline();
+    pipeline.srem(roomParticipantsKey(code), targetIdentity);
+    pipeline.hdel(roomRolesKey(code), targetIdentity);
+    pipeline.sadd(roomBannedKey(code), targetIdentity);
+    pipeline.expire(roomBannedKey(code), ROOM_CODE_EXPIRY_SECONDS);
+    await pipeline.exec();
+
     await roomService.removeParticipant(roomData.roomName, targetIdentity);
-    await redis.srem(roomParticipantsKey(code), targetIdentity);
-    await redis.hdel(roomRolesKey(code), targetIdentity);
-    await redis.sadd(roomBannedKey(code), targetIdentity);
-    await redis.expire(roomBannedKey(code), ROOM_CODE_EXPIRY_SECONDS);
 
     console.log(`[audit] Remove+ban: code=${code} target=${targetIdentity} by=${callerIdentity}`);
     res.json({ success: true });
@@ -2980,6 +3002,12 @@ app.post('/room/admit', auth.requireAuth, async (req, res) => {
   // Remove from lobby
   await redis.zrem(roomLobbyKey(code), targetIdentity);
   await redis.hdel(roomLobbyNamesKey(code), targetIdentity);
+
+  // Ban check — refuse to admit a previously banned identity
+  const isBannedAdmit = await redis.sismember(roomBannedKey(code), targetIdentity);
+  if (isBannedAdmit) {
+    return res.status(403).json({ error: 'This participant has been removed from the meeting.' });
+  }
 
   // Add to participants
   await addParticipant(code, targetIdentity);
