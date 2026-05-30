@@ -186,6 +186,9 @@ typedef NS_ENUM(NSUInteger, InterRemoteVideoLayoutMode) {
 /// This is independent of isMicMuted (which reflects the actual track state).
 - (void)setHostMuted:(BOOL)hostMuted forParticipant:(NSString *)participantId;
 
+/// Update the co-host crown badge on a specific participant's tile.
+- (void)setIsCoHost:(BOOL)isCoHost forParticipant:(NSString *)identity;
+
 // MARK: — Per-participant moderation (host/co-host controls on tile hover)
 
 /// When YES, a three-dot (⋯) moderation menu button appears on remote participant tiles

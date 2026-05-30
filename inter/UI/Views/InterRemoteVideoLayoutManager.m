@@ -56,6 +56,9 @@ static NSString *const kInterPreferGridLayoutKey = @"InterPreferGridLayout";
 @property (nonatomic, assign) BOOL allPinSlotsUsed;
 /// Called when the host selects an action from the tile's moderation menu.
 @property (nonatomic, copy, nullable) void (^moderationMenuHandler)(NSString *tileKey, NSString *action);
+/// Co-host crown badge (👑 emoji in top-right corner), shown when isCoHost=YES.
+@property (nonatomic, strong) NSTextField *coHostBadge;
+@property (nonatomic, assign) BOOL isCoHost;
 @end
 
 @implementation InterRemoteVideoTileView
@@ -126,6 +129,16 @@ static NSString *const kInterPreferGridLayoutKey = @"InterPreferGridLayout";
     self.moderationMenuButton.hidden = YES;
     [self addSubview:self.moderationMenuButton];
 
+    self.coHostBadge = [NSTextField labelWithString:@"👑"];
+    self.coHostBadge.font = [NSFont systemFontOfSize:14];
+    self.coHostBadge.frame = NSMakeRect(0, 0, 22, 22);
+    [self.coHostBadge setWantsLayer:YES];
+    self.coHostBadge.layer.backgroundColor = [NSColor colorWithWhite:0.0 alpha:0.55].CGColor;
+    self.coHostBadge.layer.cornerRadius = 4.0;
+    self.coHostBadge.alignment = NSTextAlignmentCenter;
+    self.coHostBadge.hidden = YES;
+    [self addSubview:self.coHostBadge];
+
     return self;
 }
 
@@ -143,6 +156,12 @@ static NSString *const kInterPreferGridLayoutKey = @"InterPreferGridLayout";
     self.micMutedBadge.hidden = !isMicMuted;
 }
 
+- (void)setIsCoHost:(BOOL)isCoHost {
+    if (_isCoHost == isCoHost) return;
+    _isCoHost = isCoHost;
+    self.coHostBadge.hidden = !isCoHost;
+}
+
 - (void)layout {
     [super layout];
     NSRect b = self.bounds;
@@ -155,6 +174,8 @@ static NSString *const kInterPreferGridLayoutKey = @"InterPreferGridLayout";
     self.handRaiseBadge.frame = NSMakeRect(4, b.size.height - 28, 24, 24);
     // Mic-muted badge at bottom-right, just above the name label
     self.micMutedBadge.frame = NSMakeRect(b.size.width - 26, labelH + 2, 22, 22);
+    // Co-host crown badge at top-right corner
+    self.coHostBadge.frame = NSMakeRect(b.size.width - 26, b.size.height - 26, 22, 22);
     // Moderation menu button at top-right (symmetric with hand-raise badge)
     self.moderationMenuButton.frame = NSMakeRect(b.size.width - 26, b.size.height - 28, 22, 22);
 }
@@ -273,6 +294,24 @@ static NSString *const kInterPreferGridLayoutKey = @"InterPreferGridLayout";
     }
     [menu addItem:[NSMenuItem separatorItem]];
     addItem(@"Allow Sharing",  @"allowSharing");
+    [menu addItem:[NSMenuItem separatorItem]];
+    if (self.isCoHost) {
+        NSMenuItem *removeCoHostItem = [[NSMenuItem alloc] initWithTitle:@"Remove Co-Host"
+                                                                   action:@selector(moderationMenuItemClicked:)
+                                                            keyEquivalent:@""];
+        removeCoHostItem.target = self;
+        removeCoHostItem.enabled = YES;
+        removeCoHostItem.representedObject = @{@"tileKey": tileKey, @"action": @"removeCoHost"};
+        [menu addItem:removeCoHostItem];
+    } else {
+        NSMenuItem *makeCoHostItem = [[NSMenuItem alloc] initWithTitle:@"Make Co-Host"
+                                                                 action:@selector(moderationMenuItemClicked:)
+                                                          keyEquivalent:@""];
+        makeCoHostItem.target = self;
+        makeCoHostItem.enabled = YES;
+        makeCoHostItem.representedObject = @{@"tileKey": tileKey, @"action": @"makeCoHost"};
+        [menu addItem:makeCoHostItem];
+    }
     [menu addItem:[NSMenuItem separatorItem]];
 
     NSMenuItem *removeItem = [[NSMenuItem alloc] initWithTitle:@"Remove from Meeting"
@@ -781,6 +820,15 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
     if (tile) {
         tile.isHostMuted = hostMuted;
     }
+}
+
+- (void)setIsCoHost:(BOOL)isCoHost forParticipant:(NSString *)identity {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        InterRemoteVideoTileView *tile = self.tileViews[identity];
+        if (tile) {
+            tile.isCoHost = isCoHost;
+        }
+    });
 }
 
 - (void)setHostForcedSpotlightTileKeys:(NSArray<NSString *> * _Nullable)tileKeys animated:(BOOL)animated {
