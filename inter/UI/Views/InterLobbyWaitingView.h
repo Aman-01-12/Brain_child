@@ -24,6 +24,14 @@ NS_ASSUME_NONNULL_BEGIN
 /// Update the status message (e.g. "The host will let you in shortly").
 - (void)setStatusMessage:(NSString *)message;
 
+/// Transition to "joining" state — shown immediately when connecting to a room,
+/// before the server response arrives. Spinner runs, cancel button says "Cancel".
+- (void)showJoining;
+
+/// Transition from "joining" to "waiting room" state — called when the server
+/// reports the lobby is enabled and the participant must wait for admission.
+- (void)showWaiting;
+
 /// Transition to "denied" state — show denial message and stop spinner.
 - (void)showDenied;
 

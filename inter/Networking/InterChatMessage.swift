@@ -81,6 +81,28 @@ import Foundation
     case recordingResumed = 28
     /// Recording has been stopped. Participants should hide the REC indicator.
     case recordingStopped = 29
+
+    // Phase 9.x — Per-participant targeted mute/unmute notifications
+    /// Host has muted a specific participant's microphone (server-side).
+    /// Only the participant whose identity matches `targetIdentity` acts on this.
+    case requestMuteOne = 30
+
+    /// Host has fully lifted the per-participant mic mute.
+    /// The targeted participant unmutes locally and clears the host-mute restriction
+    /// so they can freely toggle their mic without the raise-hand prompt.
+    case requestUnmuteOne = 31
+
+    // Screen sharing permission signals
+    /// Participant requests permission to share their screen (broadcast to host).
+    case requestScreenShare = 32
+    /// Host approves a participant's screen share request (targeted to the requester).
+    case approveScreenShare = 33
+    /// Host denies a participant's screen share request (targeted to the requester).
+    case denyScreenShare = 34
+
+    /// Host is asking a specific participant to turn their camera back on.
+    /// Only the participant whose identity matches `targetIdentity` acts on this.
+    case askToUnmuteCamera = 35
 }
 
 // MARK: - Chat Message

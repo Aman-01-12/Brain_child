@@ -25,6 +25,7 @@ static const CGFloat InterQueuePadding = 8.0;
 @implementation InterSpeakerQueuePanel
 
 @synthesize showAllowActions = _showAllowActions;
+@synthesize hostMutedIdentities = _hostMutedIdentities;
 
 - (instancetype)initWithFrame:(NSRect)frameRect {
     self = [super initWithFrame:frameRect];
@@ -51,7 +52,15 @@ static const CGFloat InterQueuePadding = 8.0;
 - (void)setShowAllowActions:(BOOL)showAllowActions {
     if (_showAllowActions == showAllowActions) return;
     _showAllowActions = showAllowActions;
-    // Force full cell re-creation by clearing cached cells, then reload
+    [self.tableView reloadData];
+}
+
+- (NSSet<NSString *> *)hostMutedIdentities {
+    return _hostMutedIdentities ?: [NSSet set];
+}
+
+- (void)setHostMutedIdentities:(NSSet<NSString *> *)hostMutedIdentities {
+    _hostMutedIdentities = [hostMutedIdentities copy] ?: [NSSet set];
     [self.tableView reloadData];
 }
 
@@ -213,9 +222,14 @@ static const CGFloat InterQueuePadding = 8.0;
 - (NSView *)tableView:(NSTableView *)tableView viewForTableColumn:(NSTableColumn *)tableColumn row:(NSInteger)row {
 #pragma unused(tableColumn)
 
-    // Use different cell identifiers based on whether allow actions are shown,
-    // so cells don't get recycled into the wrong layout.
-    NSString *cellId = self.showAllowActions ? @"AllowEntryCell" : @"QueueEntryCell";
+    // Per-row: show Allow if the host muted everyone (showAllowActions) OR this
+    // specific participant was individually host-muted via the tile three-dot menu.
+    InterRaisedHandEntry *entry = self.queueEntries[row];
+    BOOL showAllow = self.showAllowActions || [self.hostMutedIdentities containsObject:entry.participantIdentity];
+
+    // Use distinct cell identifiers so Allow-layout cells are never recycled
+    // into Dismiss-only rows and vice versa.
+    NSString *cellId = showAllow ? @"AllowEntryCell" : @"QueueEntryCell";
 
     NSTableCellView *cell = [tableView makeViewWithIdentifier:cellId owner:nil];
     if (!cell) {
@@ -245,8 +259,8 @@ static const CGFloat InterQueuePadding = 8.0;
         nameLabel.lineBreakMode = NSLineBreakByTruncatingTail;
         [cell addSubview:nameLabel];
 
-        if (self.showAllowActions) {
-            // When host has muted all: show "Allow" (green) + "Dismiss"
+        if (showAllow) {
+            // Allow + Dismiss: participant is host-muted (mute-all or per-participant)
             nameLabel.frame = NSMakeRect(58, 12, 80, 18);
 
             NSButton *allowBtn = [[NSButton alloc] initWithFrame:NSMakeRect(InterQueuePanelWidth - 146, 8, 60, 24)];
@@ -282,8 +296,6 @@ static const CGFloat InterQueuePadding = 8.0;
         }
     }
 
-    InterRaisedHandEntry *entry = self.queueEntries[row];
-
     NSTextField *posLabel = [cell viewWithTag:200];
     NSTextField *nameLabel = [cell viewWithTag:202];
     NSButton *dismissBtn = [cell viewWithTag:203];
@@ -293,7 +305,7 @@ static const CGFloat InterQueuePadding = 8.0;
 
     // Store identity on the action buttons
     dismissBtn.cell.representedObject = entry.participantIdentity;
-    if (self.showAllowActions) {
+    if (showAllow) {
         NSButton *allowBtn = [cell viewWithTag:204];
         allowBtn.cell.representedObject = entry.participantIdentity;
     }

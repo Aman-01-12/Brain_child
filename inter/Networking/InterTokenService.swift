@@ -56,12 +56,43 @@ import CryptoKit
     @objc public let serverURL: String
     /// Room type: "call" or "interview". Determines the mode the joiner enters.
     @objc public let roomType: String
+    // MARK: - Meeting settings (host-configured, returned on join)
+    @objc public let meetingDisplayName: String
+    @objc public let muteOnJoin: Bool
+    @objc public let cameraOffOnJoin: Bool
+    @objc public let joinBeforeHost: Bool
+    @objc public let allowUnmuting: Bool
+    @objc public let chatPermissions: String
+    @objc public let sharingPermissions: String
+    @objc public let autoRecord: Bool
+    @objc public let autoTranscript: Bool
 
-    @objc public init(roomName: String, token: String, serverURL: String, roomType: String = "call") {
-        self.roomName = roomName
-        self.token = token
-        self.serverURL = serverURL
-        self.roomType = roomType
+    @objc public init(roomName: String,
+                      token: String,
+                      serverURL: String,
+                      roomType: String = "call",
+                      meetingDisplayName: String = "",
+                      muteOnJoin: Bool = false,
+                      cameraOffOnJoin: Bool = false,
+                      joinBeforeHost: Bool = false,
+                      allowUnmuting: Bool = true,
+                      chatPermissions: String = "everyone",
+                      sharingPermissions: String = "hostOnly",
+                      autoRecord: Bool = false,
+                      autoTranscript: Bool = false) {
+        self.roomName             = roomName
+        self.token                = token
+        self.serverURL            = serverURL
+        self.roomType             = roomType
+        self.meetingDisplayName   = meetingDisplayName
+        self.muteOnJoin           = muteOnJoin
+        self.cameraOffOnJoin      = cameraOffOnJoin
+        self.joinBeforeHost       = joinBeforeHost
+        self.allowUnmuting        = allowUnmuting
+        self.chatPermissions      = chatPermissions
+        self.sharingPermissions   = sharingPermissions
+        self.autoRecord           = autoRecord
+        self.autoTranscript       = autoTranscript
         super.init()
     }
 }
@@ -866,11 +897,13 @@ private struct TokenCacheEntry {
     ///   - identity: Unique participant identity.
     ///   - displayName: Human-readable name shown to remote participants.
     ///   - roomType: Room type string ("call" or "interview"). Defaults to "call".
+    ///   - settings: Optional meeting settings dict to store server-side (lobby, chat, etc.).
     ///   - completion: Called on the main queue with either a response or an error.
     @objc public func createRoom(serverURL: String,
                                  identity: String,
                                  displayName: String,
                                  roomType: String = "call",
+                                 settings: [String: Any]? = nil,
                                  completion: @escaping (InterCreateRoomResponse?, NSError?) -> Void) {
         var body: [String: Any] = [
             "identity": identity,
@@ -879,6 +912,10 @@ private struct TokenCacheEntry {
         // Only send roomType when non-default to stay backward-compatible with older servers
         if !roomType.isEmpty && roomType != "call" {
             body["roomType"] = roomType
+        }
+        // Merge meeting settings into the request body when provided
+        if let settings = settings {
+            for (k, v) in settings { body[k] = v }
         }
 
         interLogInfo(InterLog.networking, "Token: creating room (identity=%{private}@)", identity)
@@ -1015,11 +1052,31 @@ private struct TokenCacheEntry {
                     self?.cacheQueue.async { self?.leaveTokenStore[roomCode] = leaveToken }
                 }
 
+                // Parse meeting settings returned by the server (backward-compatible defaults)
+                let meetingDisplayName  = json["meetingDisplayName"] as? String ?? ""
+                let muteOnJoin          = json["muteOnJoin"] as? Bool ?? false
+                let cameraOffOnJoin     = json["cameraOffOnJoin"] as? Bool ?? false
+                let joinBeforeHost      = json["joinBeforeHost"] as? Bool ?? false
+                let allowUnmuting       = json["allowUnmuting"] as? Bool ?? true
+                let chatPermissions     = json["chatPermissions"] as? String ?? "everyone"
+                let sharingPermissions  = json["sharingPermissions"] as? String ?? "hostOnly"
+                let autoRecord          = json["autoRecord"] as? Bool ?? false
+                let autoTranscript      = json["autoTranscript"] as? Bool ?? false
+
                 let response = InterJoinRoomResponse(
                     roomName: roomName,
                     token: token,
                     serverURL: wsURL,
-                    roomType: responseRoomType
+                    roomType: responseRoomType,
+                    meetingDisplayName: meetingDisplayName,
+                    muteOnJoin: muteOnJoin,
+                    cameraOffOnJoin: cameraOffOnJoin,
+                    joinBeforeHost: joinBeforeHost,
+                    allowUnmuting: allowUnmuting,
+                    chatPermissions: chatPermissions,
+                    sharingPermissions: sharingPermissions,
+                    autoRecord: autoRecord,
+                    autoTranscript: autoTranscript
                 )
                 interLogInfo(InterLog.networking, "Token: room joined (code=***, type=%{public}@)", responseRoomType)
                 self?.completeOnMain { completion(response, nil) }
@@ -1424,7 +1481,10 @@ private struct TokenCacheEntry {
             ?? UserDefaults.standard.string(forKey: "InterDefaultTokenServerURL")
             ?? "http://localhost:3000"
 
-        let body: [String: Any] = ["code": code]
+        var body: [String: Any] = ["code": code]
+        if let hwUUID = getHardwareUUID() {
+            body["clientId"] = hwUUID
+        }
 
         interLogInfo(InterLog.networking, "Auth: exchanging OAuth handoff code")
 
@@ -2039,6 +2099,15 @@ private struct TokenCacheEntry {
                 return
             }
 
+            if httpResponse.statusCode == 503 {
+                let err = InterNetworkErrorCode.serverUnreachable.error(
+                    message: "The call server is currently unavailable. Please try again shortly."
+                )
+                interLogError(InterLog.networking, "Token: /meetings/:id/start — LiveKit unavailable (503)")
+                self.completeOnMain { completion(nil, err) }
+                return
+            }
+
             if httpResponse.statusCode == 403 || httpResponse.statusCode == 404 || httpResponse.statusCode == 410 {
                 let msg: String
                 if httpResponse.statusCode == 404 { msg = "Meeting not found" }
@@ -2167,7 +2236,7 @@ private struct TokenCacheEntry {
     ) {
         guard let serverURL = authServerBaseURL,
               let accessToken = currentAccessToken else {
-            completeOnMain { completion(nil, nil) }
+            completeOnMain { completion(nil, InterNetworkErrorCode.authFailed.error(message: "Not signed in")) }
             return
         }
 
@@ -2179,14 +2248,20 @@ private struct TokenCacheEntry {
             retryCount: 0
         ) { [weak self] data, httpResponse, error in
             guard let self = self else { return }
-            guard error == nil,
-                  let data = data,
-                  let json = self.parseJSON(data),
-                  let authUrl = json["authUrl"] as? String else {
+            if let error = error {
                 self.completeOnMain { completion(nil, error) }
                 return
             }
-            self.completeOnMain { completion(authUrl, nil) }
+            guard let data = data, let json = self.parseJSON(data) else {
+                self.completeOnMain { completion(nil, InterNetworkErrorCode.tokenFetchFailed.error(message: "No response from server")) }
+                return
+            }
+            if let authUrl = json["authUrl"] as? String {
+                self.completeOnMain { completion(authUrl, nil) }
+            } else {
+                let msg = json["error"] as? String ?? "Calendar connect unavailable (\(httpResponse?.statusCode ?? 0))"
+                self.completeOnMain { completion(nil, InterNetworkErrorCode.tokenFetchFailed.error(message: msg)) }
+            }
         }
     }
 
@@ -2866,6 +2941,16 @@ private struct TokenCacheEntry {
                 return
             }
 
+            // 503 — call server (LiveKit) is offline; don't retry, show friendly message
+            if statusCode == 503 {
+                let error = InterNetworkErrorCode.serverUnreachable.error(
+                    message: "The call server is currently unavailable. Please try again shortly."
+                )
+                interLogError(InterLog.networking, "Token: call server unavailable (503)")
+                completion(.failure(error))
+                return
+            }
+
             // Server errors (5xx) — retry once
             if self.shouldRetry(statusCode: statusCode, nsError: nil, retryCount: retryCount) {
                 interLogInfo(InterLog.networking, "Token: retrying after %{public}d", statusCode)
@@ -3047,7 +3132,8 @@ private struct TokenCacheEntry {
 
             // T9: Record success for circuit breaker on any valid HTTP response.
             // 4xx errors are client-side issues, not server failures.
-            if httpResponse.statusCode < 500 {
+            // 503 means a feature is not configured — server IS reachable, don't penalise.
+            if httpResponse.statusCode < 500 || httpResponse.statusCode == 503 {
                 self.circuitBreaker.recordSuccess()
             } else {
                 self.circuitBreaker.recordFailure()

@@ -26,9 +26,14 @@ NS_ASSUME_NONNULL_BEGIN
 
 @property (nonatomic, weak, nullable) id<InterSpeakerQueuePanelDelegate> delegate;
 
-/// When YES, each row shows an "Allow" button alongside "Dismiss".
+/// When YES, ALL rows show an "Allow" button alongside "Dismiss".
 /// Set to YES when the host has muted all participants.
 @property (nonatomic, assign) BOOL showAllowActions;
+
+/// Identities of participants who were individually host-muted (per-participant mute).
+/// Rows for these participants show an "Allow" button even when showAllowActions is NO.
+/// Synced by AppDelegate whenever a participant's host-mute state changes.
+@property (nonatomic, copy, null_resettable) NSSet<NSString *> *hostMutedIdentities;
 
 /// Update the queue entries. Reloads the table view.
 - (void)setEntries:(NSArray<InterRaisedHandEntry *> *)entries;

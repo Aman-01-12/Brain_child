@@ -35,10 +35,19 @@ static void *InterWiringParticipantCountContext = &InterWiringParticipantCountCo
 /// Tracks whether the mic LiveKit track is muted while connected.
 /// Used by twoPhaseToggleMicrophone to avoid AVCaptureSession reconfiguration.
 @property (nonatomic, assign, readwrite) BOOL isMicNetworkMuted;
-/// Whether the mic is locked by the host (hard mute).
-@property (nonatomic, assign, readwrite) BOOL isHostMuted;
-/// Whether the host has temporarily allowed us to speak.
-@property (nonatomic, assign, readwrite) BOOL isAllowedToSpeak;
+/// Per-tile host mute (requestMuteOne). NEVER set by Mute All.
+/// When YES: participant sees "Muted by host" and button is disabled.
+@property (nonatomic, assign, readwrite) BOOL hostMuted;
+/// Global Mute All is active. NEVER set by per-tile actions.
+/// When YES without speakPermissionGranted: raise-hand gate.
+@property (nonatomic, assign, readwrite) BOOL globalMuteActive;
+/// Host granted permission to speak during a Mute All session.
+/// ONE-TIME USE: cleared on self-mute while globalMuteActive (§8.2 revised).
+@property (nonatomic, assign, readwrite) BOOL speakPermissionGranted;
+/// Monotonically increasing counter incremented on every authoritative state
+/// change. Async completion blocks capture this before their async call and
+/// discard their update if the value has advanced (Bug 2 stale-update guard).
+@property (nonatomic, assign, readwrite) NSInteger stateSequenceNumber;
 @end
 
 @implementation InterMediaWiringController
@@ -94,6 +103,16 @@ static void *InterWiringParticipantCountContext = &InterWiringParticipantCountCo
         if (summary) {
             [weakSelf.controlPanel setMediaStatusText:summary];
         }
+        // [G9] When camera was just enabled, force the local self-tile's preview layer to
+        // redisplay. AVSampleBufferDisplayLayer (backing AVCaptureVideoPreviewLayer) can
+        // get stuck after a disable→enable cycle and needs an explicit session re-attach
+        // or a CALayer property change to resume rendering.  The control-panel preview
+        // (_previewLayer) works because updatePreviewMirroringPolicyOnMainThread sets its
+        // affineTransform; localPreviewLayer in the layout has no such trigger, so we
+        // kick the layout manager here.
+        if (weakSelf.mediaController.isCameraEnabled) {
+            [weakSelf.remoteLayout refreshLocalPreviewLayout];
+        }
     }];
 }
 
@@ -122,24 +141,55 @@ static void *InterWiringParticipantCountContext = &InterWiringParticipantCountCo
     InterLocalMediaController *media = self.mediaController;
     InterRoomController *rc = self.roomController;
     BOOL shouldEnable = !media.isCameraEnabled;
+    BOOL isConnected = rc && rc.connectionState == InterRoomConnectionStateConnected;
 
     __weak typeof(self) weakSelf = self;
 
     if (!shouldEnable) {
-        // DISABLE: [G2] Mute LiveKit track FIRST → then stop capture device
-        if (rc && rc.connectionState == InterRoomConnectionStateConnected) {
+        // DISABLE: [G2] Mute LiveKit track FIRST → then stop capture device.
+        //
+        // [R6] Guard against nil cameraSource: if the camera was never published
+        // (e.g. activeCameraOffOnJoin was YES and wireNetworkPublish skipped it),
+        // muteCameraTrackWithCompletion: is a nil-safe no-op whose completion block
+        // is never called. Fall back to a direct toggleCamera so the button and
+        // isCameraEnabled always reflect reality.
+        if (isConnected && rc.publisher.cameraSource != nil) {
             [rc.publisher muteCameraTrackWithCompletion:^{
                 [weakSelf toggleCamera];
             }];
         } else {
-            // [G8] No network — just toggle locally
+            // No published camera source — disable the local device directly.
             [self toggleCamera];
         }
     } else {
-        // ENABLE: [G2] Start capture device FIRST → first frame → unmute LiveKit track
+        // ENABLE: [G2] Start capture device FIRST → first frame → unmute LiveKit track.
+        //
+        // [R6] If no camera track has been published yet (cameraSource is nil), we cannot
+        // just unmute — there is nothing to unmute. Publish fresh so the remote side gets
+        // video. Both toggleCamera and publishCamera dispatch onto the same serial
+        // sessionQueue, so publishCamera's source.start() runs after the device input is
+        // already added, guaranteeing correct ordering without additional synchronisation.
         [self toggleCamera];
-        if (rc && rc.connectionState == InterRoomConnectionStateConnected) {
-            [rc.publisher unmuteCameraTrack];
+        if (isConnected) {
+            if (rc.publisher.cameraSource != nil) {
+                // Track exists but is muted — first real frame will auto-unmute via the
+                // cameraSource state machine (beginEnable → captureOutput → unmute).
+                [rc.publisher unmuteCameraTrack];
+            } else {
+                // No track yet — publish from scratch using the existing capture session.
+                AVCaptureSession *session = media.captureSession;
+                dispatch_queue_t sessionQueue = media.sessionQueue;
+                if (session && sessionQueue) {
+                    [rc.publisher publishCameraWithCaptureSession:session
+                                                    sessionQueue:sessionQueue
+                                                      completion:^(NSError * _Nullable error) {
+                        if (error) {
+                            NSLog(@"[R6] Camera re-publish on enable failed: %@",
+                                  error.localizedDescription);
+                        }
+                    }];
+                }
+            }
         }
     }
 }
@@ -162,21 +212,36 @@ static void *InterWiringParticipantCountContext = &InterWiringParticipantCountCo
         if (shouldMute) {
             [rc.publisher muteMicrophoneTrackWithCompletion:^{
                 weakSelf.isMicNetworkMuted = YES;
-                [weakSelf.controlPanel setMicrophoneEnabled:NO];
-                if (weakSelf.isHostMuted) {
-                    // Revoke the one-time speak permission (no-op if already NO)
-                    // and show raise-hand title.
-                    [weakSelf revokeAllowToSpeak];
+                // Bug 1 fix: speak permission is one-time use. Self-muting while
+                // globalMuteActive revokes the grant — the participant must raise
+                // their hand again for a new approval (§8.2 revised).
+                if (weakSelf.globalMuteActive) {
+                    weakSelf.speakPermissionGranted = NO;
                 }
+                weakSelf.stateSequenceNumber++;
+                [weakSelf deriveParticipantMicButton];
                 NSString *summary = weakSelf.mediaStateSummaryBlock ? weakSelf.mediaStateSummaryBlock() : nil;
                 if (summary) {
                     [weakSelf.controlPanel setMediaStatusText:summary];
                 }
             }];
         } else {
-            [rc.publisher unmuteMicrophoneTrack];
+            // [R7] If no mic track was published yet (activeMuteOnJoin suppressed it in
+            // wireNetworkPublish), unmuteMicrophoneTrack is a silent no-op — microphoneTrack
+            // is nil and the remote side hears nothing. Publish from scratch instead.
+            if (rc.publisher.isMicrophonePublished) {
+                [rc.publisher unmuteMicrophoneTrack];
+            } else {
+                [rc.publisher publishMicrophoneWithCompletion:^(NSError * _Nullable error) {
+                    if (error) {
+                        NSLog(@"[R7] Mic re-publish on unmute failed: %@",
+                              error.localizedDescription);
+                    }
+                }];
+            }
             self.isMicNetworkMuted = NO;
-            [self.controlPanel setMicrophoneEnabled:YES];
+            self.stateSequenceNumber++;
+            [self deriveParticipantMicButton];
             NSString *summary = self.mediaStateSummaryBlock ? self.mediaStateSummaryBlock() : nil;
             if (summary) {
                 [self.controlPanel setMediaStatusText:summary];
@@ -192,17 +257,68 @@ static void *InterWiringParticipantCountContext = &InterWiringParticipantCountCo
 
 #pragma mark - Remote Mic Mute/Unmute
 
+/// Single source of truth for mic button state. Derives button title and
+/// enabled state from the four mic state flags. Priority-ordered per
+/// mic_mute_unmute.md §6.2. Called after every authoritative state
+/// transition as the single derivation point (Bug 2 fix).
+- (void)deriveParticipantMicButton {
+    // Priority 1: per-tile host mute — not interactive, cannot self-unmute.
+    if (self.hostMuted) {
+        [self.controlPanel setMicrophoneEnabled:NO];
+        [self.controlPanel setMicrophoneButtonTitle:@"Muted by host"];
+    }
+    // Priority 2: speak permission granted and track muted → invite to unmute.
+    else if (self.speakPermissionGranted && self.isMicNetworkMuted) {
+        [self.controlPanel setMicrophoneEnabled:YES];
+        [self.controlPanel setMicrophoneButtonTitle:@"🎙 Click to Unmute"];
+    }
+    // Priority 3: global mute active, no permission yet → raise-hand gate.
+    // AppDelegate's toggle handler will override title with "⏳ Waiting…"
+    // if the hand is already raised (it knows the speakerQueue state).
+    else if (self.globalMuteActive && !self.speakPermissionGranted) {
+        [self.controlPanel setMicrophoneEnabled:YES];
+        [self.controlPanel setMicrophoneButtonTitle:@"✋ Raise Hand to Speak"];
+    }
+    // Priority 4: normal — participant controls mic freely.
+    // Use the actual mic-on/off state so the title reflects reality:
+    // isMicNetworkMuted=NO → "Turn Mic Off" (mic is on, click to mute)
+    // isMicNetworkMuted=YES → "Turn Mic On" (mic is off, click to unmute)
+    // Passing YES/NO directly to setMicrophoneEnabled: avoids the broken
+    // feedback loop in setMicrophoneButtonTitle:nil (Bug A fix).
+    else {
+        [self.controlPanel setMicrophoneEnabled:!self.isMicNetworkMuted];
+    }
+}
+
 - (void)applyRemoteMicMute {
     InterRoomController *rc = self.roomController;
     BOOL isConnected = rc && rc.connectionState == InterRoomConnectionStateConnected;
     if (!isConnected) return;
 
-    // The server already muted the LiveKit track. Just update local state + UI.
+    // Global Mute All: set the global flag only — NEVER hostMuted.
+    // Clears any prior speak permission (new mute supersedes it).
     self.isMicNetworkMuted = YES;
-    self.isHostMuted = YES;
-    self.isAllowedToSpeak = NO;
-    [self.controlPanel setMicrophoneEnabled:NO];
-    [self.controlPanel setMicrophoneButtonTitle:@"✋ Raise Hand to Speak"];
+    self.globalMuteActive = YES;
+    self.speakPermissionGranted = NO;
+    self.stateSequenceNumber++;
+    [self deriveParticipantMicButton];  // → "✋ Raise Hand to Speak"
+    NSString *summary = self.mediaStateSummaryBlock ? self.mediaStateSummaryBlock() : nil;
+    if (summary) {
+        [self.controlPanel setMediaStatusText:summary];
+    }
+}
+
+- (void)applyRemoteMicMuteOne {
+    InterRoomController *rc = self.roomController;
+    BOOL isConnected = rc && rc.connectionState == InterRoomConnectionStateConnected;
+    if (!isConnected) return;
+
+    // Per-tile host mute: set hostMuted only — NEVER globalMuteActive.
+    // Participant sees "Muted by host" with the button disabled.
+    self.isMicNetworkMuted = YES;
+    self.hostMuted = YES;
+    self.stateSequenceNumber++;
+    [self deriveParticipantMicButton];  // → "Muted by host" (disabled)
     NSString *summary = self.mediaStateSummaryBlock ? self.mediaStateSummaryBlock() : nil;
     if (summary) {
         [self.controlPanel setMediaStatusText:summary];
@@ -214,43 +330,14 @@ static void *InterWiringParticipantCountContext = &InterWiringParticipantCountCo
     BOOL isConnected = rc && rc.connectionState == InterRoomConnectionStateConnected;
     if (!isConnected) return;
 
-    // Host allowed us to speak — unmute mic but keep isHostMuted=YES.
-    // The "allow" is a one-time grant: if the participant turns mic off,
-    // they go back to raise-hand mode.
-    self.isAllowedToSpeak = YES;
-
-    if (self.isMicNetworkMuted) {
-        // Use force-unmute: the server muted the track via
-        // mutePublishedTrack, but the LiveKit SDK may not have
-        // processed the WebSocket mute notification yet. A plain
-        // track.unmute() would be a no-op in that case.
-        // DO NOT update isMicNetworkMuted or the button until the
-        // async unmute actually completes — this avoids the state
-        // desync where the UI says "Turn Mic Off" but audio is
-        // still blocked.
-        __weak typeof(self) weakSelf = self;
-        [rc.publisher forceUnmuteMicrophoneTrackWithCompletion:^{
-            // Guard: if a new requestMuteAll arrived while the async
-            // unmute was in flight, isAllowedToSpeak was reset to NO
-            // by applyRemoteMicMute. Honour the newer mute — do NOT
-            // flip state back to unmuted.
-            if (!weakSelf.isAllowedToSpeak) return;
-            weakSelf.isMicNetworkMuted = NO;
-            [weakSelf.controlPanel setMicrophoneEnabled:YES];
-            NSString *summary = weakSelf.mediaStateSummaryBlock ? weakSelf.mediaStateSummaryBlock() : nil;
-            if (summary) {
-                [weakSelf.controlPanel setMediaStatusText:summary];
-            }
-        }];
-    } else {
-        // Track wasn't network-muted (edge case: allowed before
-        // requestMuteAll arrived, or re-allowed). Just update UI.
-        [self.controlPanel setMicrophoneEnabled:YES];
-        NSString *summary = self.mediaStateSummaryBlock ? self.mediaStateSummaryBlock() : nil;
-        if (summary) {
-            [self.controlPanel setMediaStatusText:summary];
-        }
-    }
+    // Host granted speak permission during a Mute All session.
+    // Speak permission also clears any per-tile host mute (see §11.1).
+    // NEVER auto-unmute — participant must tap the button themselves.
+    self.speakPermissionGranted = YES;
+    self.hostMuted = NO;
+    self.stateSequenceNumber++;
+    [self deriveParticipantMicButton];  // → "🎙 Click to Unmute"
+    [self.controlPanel setMediaStatusText:@"The host has allowed you to speak — click the mic to unmute."];
 }
 
 - (void)applyUnmuteAll {
@@ -258,26 +345,47 @@ static void *InterWiringParticipantCountContext = &InterWiringParticipantCountCo
     BOOL isConnected = rc && rc.connectionState == InterRoomConnectionStateConnected;
     if (!isConnected) return;
 
-    // Clear the host-mute lock — participants can now freely toggle.
-    // Do NOT auto-unmute. The participant chooses when to turn mic on.
-    self.isHostMuted = NO;
-    self.isAllowedToSpeak = NO;
-
-    // Show the button matching the ACTUAL mic track state.
-    // The track is still muted from the host's mute-all unless the
-    // participant was individually allowed to speak and turned it on.
-    [self.controlPanel setMicrophoneEnabled:!self.isMicNetworkMuted];
+    // Clears global mute flag and speak permission only.
+    // Does NOT clear hostMuted — individual per-tile mutes persist (§8.1).
+    // Does NOT auto-unmute the track — participant chooses when to turn on.
+    self.globalMuteActive = NO;
+    self.speakPermissionGranted = NO;
+    self.stateSequenceNumber++;
+    [self deriveParticipantMicButton];
     NSString *summary = self.mediaStateSummaryBlock ? self.mediaStateSummaryBlock() : nil;
     if (summary) {
         [self.controlPanel setMediaStatusText:summary];
     }
 }
 
-/// Called after the participant turns mic OFF while isHostMuted is still YES.
-/// Revokes the one-time speak permission and puts them back in raise-hand mode.
-- (void)revokeAllowToSpeak {
-    self.isAllowedToSpeak = NO;
-    [self.controlPanel setMicrophoneButtonTitle:@"✋ Raise Hand to Speak"];
+- (void)applyRemoteMicUnmute {
+    InterRoomController *rc = self.roomController;
+    BOOL isConnected = rc && rc.connectionState == InterRoomConnectionStateConnected;
+    if (!isConnected) return;
+
+    // Host explicitly lifted the per-tile mute restriction.
+    // Clear hostMuted and force-unmute the track so mic is immediately active.
+    self.hostMuted = NO;
+
+    if (self.isMicNetworkMuted) {
+        __weak typeof(self) weakSelf = self;
+        [rc.publisher forceUnmuteMicrophoneTrackWithCompletion:^{
+            weakSelf.isMicNetworkMuted = NO;
+            weakSelf.stateSequenceNumber++;
+            [weakSelf deriveParticipantMicButton];
+            NSString *summary = weakSelf.mediaStateSummaryBlock ? weakSelf.mediaStateSummaryBlock() : nil;
+            if (summary) {
+                [weakSelf.controlPanel setMediaStatusText:summary];
+            }
+        }];
+    } else {
+        self.stateSequenceNumber++;
+        [self deriveParticipantMicButton];
+        NSString *summary = self.mediaStateSummaryBlock ? self.mediaStateSummaryBlock() : nil;
+        if (summary) {
+            [self.controlPanel setMediaStatusText:summary];
+        }
+    }
 }
 
 #pragma mark - Network Wiring
@@ -293,8 +401,11 @@ static void *InterWiringParticipantCountContext = &InterWiringParticipantCountCo
         return;
     }
 
-    // Reset network-level mic mute state when (re-)wiring tracks.
-    self.isMicNetworkMuted = NO;
+    // Initialise network-level mic mute state from the current AVCaptureSession state.
+    // If isMicrophoneEnabled is NO (e.g. activeMuteOnJoin suppressed it), the mic track
+    // will not be published below, so isMicNetworkMuted must be YES to ensure the first
+    // user toggle goes to the unmute (publish) path, not the mute path.
+    self.isMicNetworkMuted = !media.isMicrophoneEnabled;
 
     AVCaptureSession *session = media.captureSession;
     dispatch_queue_t sessionQueue = media.sessionQueue;

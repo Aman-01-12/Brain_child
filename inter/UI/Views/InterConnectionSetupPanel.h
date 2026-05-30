@@ -61,6 +61,10 @@ typedef NS_ENUM(NSUInteger, InterConnectionIndicatorState) {
 /// Set the room code field text programmatically.
 - (void)setRoomCodeText:(NSString *)code;
 
+/// Show or clear a "PRO" tier badge on the Host Interview button.
+/// Call from AppDelegate whenever the user's tier is known or changes.
+- (void)setHostInterviewButtonRequiresPro:(BOOL)requiresPro;
+
 @end
 
 NS_ASSUME_NONNULL_END

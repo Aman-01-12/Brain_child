@@ -32,6 +32,30 @@ static NSString *const kInterPreferGridLayoutKey = @"InterPreferGridLayout";
 /// [Phase 8.2.3] Hand-raise badge (✋ emoji in top-left corner).
 @property (nonatomic, strong) NSTextField *handRaiseBadge;
 @property (nonatomic, assign) BOOL handRaised;
+/// Mic-muted badge (🔇 emoji in bottom-right corner), shown when isMicMuted=YES.
+/// Updated by the setIsMicMuted: custom setter — driven by LiveKit track events.
+@property (nonatomic, strong) NSTextField *micMutedBadge;
+/// Three-dot moderation menu button shown at top-right on hover (host mode only).
+@property (nonatomic, strong) NSButton *moderationMenuButton;
+/// When YES, the moderation menu button is shown on hover.
+@property (nonatomic, assign) BOOL showsModerationMenu;
+/// Whether this participant's microphone is currently muted (updated by track events).
+/// Drives the visual mic indicator on the tile.
+@property (nonatomic, assign) BOOL isMicMuted;
+/// Whether the HOST has explicitly muted this participant (via tile action or Mute All).
+/// Drives the tile three-dot menu label ("Mute Mic" vs "Unmute Mic"),
+/// independent of the participant's self-mute state.
+@property (nonatomic, assign) BOOL isHostMuted;
+/// Whether this participant's camera is currently muted (updated by track events).
+@property (nonatomic, assign) BOOL isCameraMuted;
+/// When YES this tile is the current host-forced spotlight. The three-dot menu
+/// shows "Unpin for All" instead of "Pin for All".
+@property (nonatomic, assign) BOOL isPinnedByHost;
+/// When YES all 5 host-pin slots are taken and this tile is not pinned;
+/// the tile menu should show a disabled "Pin for All" item.
+@property (nonatomic, assign) BOOL allPinSlotsUsed;
+/// Called when the host selects an action from the tile's moderation menu.
+@property (nonatomic, copy, nullable) void (^moderationMenuHandler)(NSString *tileKey, NSString *action);
 @end
 
 @implementation InterRemoteVideoTileView
@@ -74,12 +98,49 @@ static NSString *const kInterPreferGridLayoutKey = @"InterPreferGridLayout";
     self.handRaiseBadge.hidden = YES;
     [self addSubview:self.handRaiseBadge];
 
+    // Mic-muted indicator — bottom-right corner, shown when the participant's
+    // microphone track is muted. Secondary indicator; does not affect host
+    // controls (the three-dot menu label uses isHostMuted exclusively).
+    self.micMutedBadge = [NSTextField labelWithString:@"🔇"];
+    self.micMutedBadge.font = [NSFont systemFontOfSize:14];
+    self.micMutedBadge.frame = NSMakeRect(0, 0, 22, 22);
+    [self.micMutedBadge setWantsLayer:YES];
+    self.micMutedBadge.layer.backgroundColor = [NSColor colorWithWhite:0.0 alpha:0.55].CGColor;
+    self.micMutedBadge.layer.cornerRadius = 4.0;
+    self.micMutedBadge.alignment = NSTextAlignmentCenter;
+    self.micMutedBadge.hidden = YES;
+    [self addSubview:self.micMutedBadge];
+
+    // Moderation three-dot button — top-right corner, visible on hover in host mode
+    self.moderationMenuButton = [[NSButton alloc] initWithFrame:NSMakeRect(0, 0, 22, 22)];
+    self.moderationMenuButton.title = @"···";
+    self.moderationMenuButton.font = [NSFont systemFontOfSize:11 weight:NSFontWeightBold];
+    self.moderationMenuButton.bezelStyle = NSBezelStyleRounded;
+    self.moderationMenuButton.bordered = NO;
+    [self.moderationMenuButton setWantsLayer:YES];
+    self.moderationMenuButton.layer.backgroundColor = [NSColor colorWithWhite:0.0 alpha:0.65].CGColor;
+    self.moderationMenuButton.layer.cornerRadius = 4.0;
+    self.moderationMenuButton.contentTintColor = [NSColor whiteColor];
+    [self.moderationMenuButton setTarget:self];
+    [self.moderationMenuButton setAction:@selector(showModerationMenu:)];
+    self.moderationMenuButton.hidden = YES;
+    [self addSubview:self.moderationMenuButton];
+
     return self;
 }
 
 - (void)setHandRaised:(BOOL)handRaised {
     _handRaised = handRaised;
     self.handRaiseBadge.hidden = !handRaised;
+}
+
+/// Custom setter: propagate mic-muted state to the visual badge immediately.
+/// Without this, isMicMuted is set but the badge never appears (no drawRect
+/// trigger for layer-backed views). This is the Bug 3 host-tile fix.
+- (void)setIsMicMuted:(BOOL)isMicMuted {
+    if (_isMicMuted == isMicMuted) return;
+    _isMicMuted = isMicMuted;
+    self.micMutedBadge.hidden = !isMicMuted;
 }
 
 - (void)layout {
@@ -92,6 +153,10 @@ static NSString *const kInterPreferGridLayoutKey = @"InterPreferGridLayout";
     self.nameLabel.frame = NSMakeRect(0, 0, b.size.width, labelH);
     // Hand raise badge at top-left
     self.handRaiseBadge.frame = NSMakeRect(4, b.size.height - 28, 24, 24);
+    // Mic-muted badge at bottom-right, just above the name label
+    self.micMutedBadge.frame = NSMakeRect(b.size.width - 26, labelH + 2, 22, 22);
+    // Moderation menu button at top-right (symmetric with hand-raise badge)
+    self.moderationMenuButton.frame = NSMakeRect(b.size.width - 26, b.size.height - 28, 22, 22);
 }
 
 - (void)updateTrackingAreas {
@@ -113,6 +178,9 @@ static NSString *const kInterPreferGridLayoutKey = @"InterPreferGridLayout";
         self.layer.borderColor = [NSColor colorWithWhite:1.0 alpha:0.5].CGColor;
         self.layer.borderWidth = 2.0;
     }
+    if (self.showsModerationMenu) {
+        self.moderationMenuButton.hidden = NO;
+    }
 }
 
 - (void)mouseExited:(NSEvent *)event {
@@ -121,6 +189,7 @@ static NSString *const kInterPreferGridLayoutKey = @"InterPreferGridLayout";
         self.layer.borderColor = nil;
         self.layer.borderWidth = 0.0;
     }
+    self.moderationMenuButton.hidden = YES;
 }
 
 - (void)setIsSpeaking:(BOOL)isSpeaking {
@@ -150,6 +219,89 @@ static NSString *const kInterPreferGridLayoutKey = @"InterPreferGridLayout";
 // Show pointer cursor on hover
 - (void)resetCursorRects {
     [self addCursorRect:self.bounds cursor:[NSCursor pointingHandCursor]];
+}
+
+// ---------------------------------------------------------------------------
+// Moderation menu
+// ---------------------------------------------------------------------------
+
+- (void)showModerationMenu:(NSButton *)sender {
+    NSString *tileKey = self.tileKey;
+
+    NSMenu *menu = [[NSMenu alloc] initWithTitle:@""];
+    menu.autoenablesItems = NO;
+
+    // Helper to create a menu item that carries (tileKey, action) payload
+    void (^addItem)(NSString *, NSString *) = ^(NSString *title, NSString *action) {
+        NSMenuItem *item = [[NSMenuItem alloc] initWithTitle:title
+                                                      action:@selector(moderationMenuItemClicked:)
+                                               keyEquivalent:@""];
+        item.target = self;
+        item.enabled = YES;
+        item.representedObject = @{@"tileKey": tileKey, @"action": action};
+        [menu addItem:item];
+    };
+
+    // Mic — label reflects HOST's mute intent, not participant's self-mute state.
+    // isMicMuted drives the visual mic indicator; isHostMuted drives the menu label
+    // so the host sees "Unmute Mic" only when THEY explicitly muted this participant.
+    if (self.isHostMuted) {
+        addItem(@"Unmute Mic", @"unmuteMic");
+    } else {
+        addItem(@"Mute Mic", @"muteMic");
+    }
+
+    // Camera — label and action toggle based on current mute state
+    if (self.isCameraMuted) {
+        addItem(@"Unmute Camera", @"unmuteCamera");
+    } else {
+        addItem(@"Mute Camera", @"muteCamera");
+    }
+    [menu addItem:[NSMenuItem separatorItem]];
+    // Pin/Unpin toggles.
+    if (self.isPinnedByHost) {
+        addItem(@"Unpin for All", @"unpinForAll");
+    } else if (self.allPinSlotsUsed) {
+        // All 5 host-pin slots are full — show a greyed-out label.
+        NSMenuItem *limitItem = [[NSMenuItem alloc] initWithTitle:@"Pin for All (max 5 reached)"
+                                                           action:nil
+                                                    keyEquivalent:@""];
+        limitItem.enabled = NO;
+        [menu addItem:limitItem];
+    } else {
+        addItem(@"Pin for All",   @"pinForAll");
+    }
+    [menu addItem:[NSMenuItem separatorItem]];
+    addItem(@"Allow Sharing",  @"allowSharing");
+    [menu addItem:[NSMenuItem separatorItem]];
+
+    NSMenuItem *removeItem = [[NSMenuItem alloc] initWithTitle:@"Remove from Meeting"
+                                                        action:@selector(moderationMenuItemClicked:)
+                                                 keyEquivalent:@""];
+    removeItem.target = self;
+    removeItem.enabled = YES;
+    removeItem.representedObject = @{@"tileKey": tileKey, @"action": @"remove"};
+    // Destructive visual hint — no standard NSMenuItem API for red text pre-macOS 14,
+    // so we use an attributed title with the system red color.
+    NSMutableDictionary *attrs = [NSMutableDictionary dictionary];
+    attrs[NSForegroundColorAttributeName] = [NSColor systemRedColor];
+    removeItem.attributedTitle = [[NSAttributedString alloc]
+                                  initWithString:@"Remove from Meeting"
+                                  attributes:attrs];
+    [menu addItem:removeItem];
+
+    // Pop up directly below the button (in the tile's coordinate space)
+    NSPoint origin = NSMakePoint(NSMinX(sender.frame), NSMinY(sender.frame));
+    [menu popUpMenuPositioningItem:nil atLocation:origin inView:self];
+}
+
+- (void)moderationMenuItemClicked:(NSMenuItem *)item {
+    NSDictionary<NSString *, NSString *> *info = item.representedObject;
+    NSString *tileKey = info[@"tileKey"];
+    NSString *action  = info[@"action"];
+    if (self.moderationMenuHandler && tileKey.length > 0 && action.length > 0) {
+        self.moderationMenuHandler(tileKey, action);
+    }
 }
 
 @end
@@ -183,8 +335,13 @@ static NSString *const kInterPreferGridLayoutKey = @"InterPreferGridLayout";
 /// Auto: screen share is spotlighted when present; otherwise first camera.
 @property (nonatomic, copy, nullable) NSString *spotlightedTileKey;
 
-// -- Filmstrip scrolling --
+/// Ordered list of tile keys locked by host-forced spotlight (max 5).
+/// When non-empty, click-to-spotlight is blocked for all participants.
+@property (nonatomic, strong, nonnull) NSMutableArray<NSString *> *hostForcedSpotlightTileKeys;
 
+/// Records whether grid mode was active at the moment the host first pinned a tile,
+/// so it can be restored when all pins are cleared.
+@property (nonatomic, assign) BOOL gridWasEnabledBeforePin;
 /// Clip view wrapping the filmstrip content to allow vertical scrolling.
 @property (nonatomic, strong) NSScrollView *filmstripScrollView;
 /// Content view inside scroll view that holds filmstrip tiles.
@@ -275,7 +432,8 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
     self.participantDisplayNames = [NSMutableDictionary dictionary];
     self.remoteCameraViews   = [NSMutableDictionary dictionary];
     self.cameraParticipantOrder = [NSMutableArray array];
-    self.tileViews           = [NSMutableDictionary dictionary];
+    self.tileViews                  = [NSMutableDictionary dictionary];
+    self.hostForcedSpotlightTileKeys = [NSMutableArray array];
 
     // Filmstrip scroll view (hidden until screen-share + cameras mode)
     self.filmstripScrollView = [[NSScrollView alloc] initWithFrame:NSZeroRect];
@@ -362,6 +520,29 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
     return self.remoteCameraViews.count;
 }
 
+#pragma mark - Host Mode (per-participant moderation menus)
+
+- (void)setIsHostMode:(BOOL)isHostMode {
+    _isHostMode = isHostMode;
+    __weak InterRemoteVideoLayoutManager *weakSelf = self;
+    // Update all existing remote tiles — screen share tile never gets the menu
+    for (NSString *key in self.tileViews) {
+        InterRemoteVideoTileView *tile = self.tileViews[key];
+        BOOL eligible = isHostMode && ![key isEqualToString:kScreenShareTileKey];
+        tile.showsModerationMenu = eligible;
+        if (eligible && !tile.moderationMenuHandler) {
+            tile.moderationMenuHandler = ^(NSString *tileKey, NSString *action) {
+                __strong InterRemoteVideoLayoutManager *s = weakSelf;
+                if (s && s.moderationActionHandler) {
+                    s.moderationActionHandler(tileKey, action);
+                }
+            };
+        } else if (!eligible) {
+            tile.moderationMenuHandler = nil;
+        }
+    }
+}
+
 #pragma mark - Grid Layout Toggle
 
 - (void)setGridLayoutEnabled:(BOOL)gridLayoutEnabled {
@@ -420,6 +601,25 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
     }
 
     // Re-layout so computeLayoutMode picks up the new effective camera count.
+    [self updateLayoutAnimated:NO];
+}
+
+- (void)refreshLocalPreviewLayout {
+    // Re-run the layout pass so arrangeCameraGridInRect: explicitly sets
+    // localPreviewLayer.frame, which triggers AVSampleBufferDisplayLayer
+    // to re-initialize its rendering pipeline after a camera disable/re-enable cycle.
+    // Without this, localPreviewLayer can remain blank even though the session has
+    // a live video input, because the backing display layer never receives a CALayer
+    // property change to wake it up (unlike the control-panel _previewLayer which
+    // gets an affineTransform update via updatePreviewMirroringPolicyOnMainThread).
+    if (!self.localPreviewLayer || !self.localCaptureSession) return;
+
+    // Resetting the session reference on the layer forces AVCaptureVideoPreviewLayer
+    // to re-attach its internal sample buffer connection, reliably clearing any
+    // stuck/paused state.
+    self.localPreviewLayer.session = self.localCaptureSession;
+
+    // Re-run layout so the tile is (re-)added to the hierarchy with correct geometry.
     [self updateLayoutAnimated:NO];
 }
 
@@ -567,6 +767,72 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
     }
 }
 
+- (void)setMicMuted:(BOOL)muted forParticipant:(NSString *)participantId {
+    if (!participantId || participantId.length == 0) return;
+    InterRemoteVideoTileView *tile = self.tileViews[participantId];
+    if (tile) {
+        tile.isMicMuted = muted;
+    }
+}
+
+- (void)setHostMuted:(BOOL)hostMuted forParticipant:(NSString *)participantId {
+    if (!participantId || participantId.length == 0) return;
+    InterRemoteVideoTileView *tile = self.tileViews[participantId];
+    if (tile) {
+        tile.isHostMuted = hostMuted;
+    }
+}
+
+- (void)setHostForcedSpotlightTileKeys:(NSArray<NSString *> * _Nullable)tileKeys animated:(BOOL)animated {
+    NSArray<NSString *> *incoming = tileKeys ?: @[];
+
+    // Clear isPinnedByHost and allPinSlotsUsed on all currently tracked tiles.
+    for (NSString *key in self.hostForcedSpotlightTileKeys) {
+        InterRemoteVideoTileView *tile = self.tileViews[key];
+        tile.isPinnedByHost = NO;
+    }
+    for (InterRemoteVideoTileView *tile in self.tileViews.allValues) {
+        tile.allPinSlotsUsed = NO;
+    }
+
+    BOOL wasEmpty = (self.hostForcedSpotlightTileKeys.count == 0);
+    [self.hostForcedSpotlightTileKeys setArray:incoming];
+
+    if (incoming.count > 0) {
+        // Transition from no-pin to first pin: save grid state and switch to stage.
+        if (wasEmpty && _gridLayoutEnabled) {
+            self.gridWasEnabledBeforePin = YES;
+            // Bypass the public setter (which writes to UserDefaults) — flip raw flags.
+            _gridLayoutEnabled = NO;
+            _preferStageLayoutForMultipleCameras = YES;
+            [self updateLayoutToggleButton];
+        }
+        // Mark all incoming tiles as pinned.
+        for (NSString *key in incoming) {
+            InterRemoteVideoTileView *tile = self.tileViews[key];
+            tile.isPinnedByHost = YES;
+        }
+        // When all 5 slots are full, tell non-pinned tiles so their menu can grey out.
+        if (incoming.count >= 5) {
+            for (InterRemoteVideoTileView *tile in self.tileViews.allValues) {
+                if (!tile.isPinnedByHost) tile.allPinSlotsUsed = YES;
+            }
+        }
+        // Point single-spotlight at first pinned tile (used by compact and single-pin paths).
+        [self updateManualSpotlightTileKey:incoming.firstObject];
+    } else {
+        // All pins cleared — restore the user's previous grid preference.
+        if (self.gridWasEnabledBeforePin) {
+            self.gridWasEnabledBeforePin = NO;
+            _gridLayoutEnabled = YES;
+            _preferStageLayoutForMultipleCameras = NO;
+            [self updateLayoutToggleButton];
+        }
+        [self updateManualSpotlightTileKey:nil];
+    }
+    [self updateLayoutAnimated:animated];
+}
+
 /// Wraps an InterRemoteVideoView in a tile (or returns existing tile).
 - (InterRemoteVideoTileView *)tileForKey:(NSString *)key videoView:(InterRemoteVideoView *)videoView {
     InterRemoteVideoTileView *tile = self.tileViews[key];
@@ -596,6 +862,18 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
         _activeSpeakerIdentity.length > 0 &&
         [key isEqualToString:_activeSpeakerIdentity]) {
         tile.isSpeaking = YES;
+    }
+
+    // Wire per-participant moderation menu for host/co-host
+    if (_isHostMode && ![key isEqualToString:kScreenShareTileKey]) {
+        tile.showsModerationMenu = YES;
+        __weak InterRemoteVideoLayoutManager *weakSelf = self;
+        tile.moderationMenuHandler = ^(NSString *tileKey, NSString *action) {
+            __strong InterRemoteVideoLayoutManager *s = weakSelf;
+            if (s && s.moderationActionHandler) {
+                s.moderationActionHandler(tileKey, action);
+            }
+        };
     }
 
     self.tileViews[key] = tile;
@@ -670,6 +948,21 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
         self.preAutoSpotlightKey = nil;
         [self updateManualSpotlightTileKey:nil];
     }
+
+    // If the departed participant was host-force-pinned, remove them from the
+    // pinned list and re-apply so the layout re-renders correctly.
+    // On the host side this also causes the host to re-broadcast the updated
+    // list via AppDelegate's response to the local delegate call.
+    if ([self.hostForcedSpotlightTileKeys containsObject:participantId]) {
+        NSMutableArray<NSString *> *pruned = [self.hostForcedSpotlightTileKeys mutableCopy];
+        [pruned removeObject:participantId];
+        [self setHostForcedSpotlightTileKeys:pruned animated:YES];
+        // Notify the host (AppDelegate) so it can re-broadcast the updated list
+        // to all remote clients via the moderation controller DataChannel.
+        if (self.hostForcedSpotlightChangedHandler) {
+            self.hostForcedSpotlightChangedHandler([pruned copy]);
+        }
+    }
 }
 
 #pragma mark - Frame Routing
@@ -712,6 +1005,9 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
     if (trackKind == InterTrackKindCamera) {
         InterRemoteVideoView *view = self.remoteCameraViews[participantId];
         [view clearFrame];
+        self.tileViews[participantId].isCameraMuted = YES;
+    } else if (trackKind == InterTrackKindMicrophone) {
+        self.tileViews[participantId].isMicMuted = YES;
     } else if (trackKind == InterTrackKindScreenShare) {
         if ([self.screenShareParticipantId isEqualToString:participantId]) {
             [self.remoteScreenShareView clearFrame];
@@ -720,7 +1016,12 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
 }
 
 - (void)handleRemoteTrackUnmuted:(NSUInteger)trackKind forParticipant:(NSString *)participantId {
-    // No-op: view exists, frames will flow again.
+    if (trackKind == InterTrackKindCamera) {
+        self.tileViews[participantId].isCameraMuted = NO;
+    } else if (trackKind == InterTrackKindMicrophone) {
+        self.tileViews[participantId].isMicMuted = NO;
+    }
+    // No other work needed: view exists, frames will flow again.
 }
 
 - (void)handleRemoteTrackEnded:(NSUInteger)trackKind forParticipant:(NSString *)participantId {
@@ -756,6 +1057,12 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
 
 /// Called by tile click or programmatic spotlight.
 - (void)handleTileClicked:(NSString *)tileKey {
+    // When the host has force-pinned tiles for all participants, block any
+    // click-to-spotlight so the forced pins cannot be overridden.
+    if (self.hostForcedSpotlightTileKeys.count > 0) {
+        return;
+    }
+
     if (!self.allowsManualSpotlightSelection) {
         return;
     }
@@ -986,7 +1293,164 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
     [self setTile:tile frame:NSMakeRect(0, 0, W, H) animated:animated];
 }
 
+/// Renders 2-5 host-pinned tiles in a sub-grid inside the stage area, with all
+/// other participants in the filmstrip.
+- (void)applyMultiPinStageLayoutAnimated:(BOOL)animated {
+    CGFloat W = self.bounds.size.width;
+    CGFloat H = self.bounds.size.height;
+
+    CGFloat filmstripW = W * kFilmstripWidthFraction;
+    filmstripW = MAX(filmstripW, kFilmstripMinWidth);
+    filmstripW = MIN(filmstripW, kFilmstripMaxWidth);
+    CGFloat stageW = W - filmstripW;
+
+    NSRect stageFrame = NSMakeRect(0, kFilmstripPadding,
+                                   stageW - kFilmstripPadding, H - 2 * kFilmstripPadding);
+
+    NSArray<NSString *> *pinnedKeys = self.hostForcedSpotlightTileKeys;
+    NSSet<NSString *> *pinnedSet = [NSSet setWithArray:pinnedKeys];
+
+    // Build filmstrip: every tile NOT in the pinned set.
+    NSMutableArray<NSString *> *filmstripKeys = [NSMutableArray array];
+    if (self.screenShareParticipantId && ![pinnedSet containsObject:kScreenShareTileKey]) {
+        [filmstripKeys addObject:kScreenShareTileKey];
+    }
+    for (NSString *pid in self.cameraParticipantOrder) {
+        if (![pinnedSet containsObject:pid]) [filmstripKeys addObject:pid];
+    }
+    if (self.localCaptureSession && ![pinnedSet containsObject:kLocalSelfTileKey]) {
+        [self setupLocalSelfTileIfNeeded];
+        if (self.localSelfTileView) [filmstripKeys addObject:kLocalSelfTileKey];
+    }
+
+    // --- Sub-grid of pinned tiles in the main stage ---
+    NSUInteger count = pinnedKeys.count;
+    NSUInteger cols, rows;
+    [self gridDimensionsForCount:count cols:&cols rows:&rows];
+
+    static const CGFloat kPinGap = 4.0;
+    CGFloat pinTileW = (stageFrame.size.width  - kPinGap * (cols + 1)) / cols;
+    CGFloat pinTileH = (stageFrame.size.height - kPinGap * (rows + 1)) / rows;
+
+    for (NSUInteger i = 0; i < count; i++) {
+        NSString *key = pinnedKeys[i];
+        NSUInteger col = i % cols;
+        NSUInteger row = i / cols;
+        CGFloat x = stageFrame.origin.x + kPinGap + col * (pinTileW + kPinGap);
+        CGFloat y = stageFrame.origin.y + stageFrame.size.height
+                    - kPinGap - (row + 1) * pinTileH - row * kPinGap;
+        NSRect tileFrame = NSMakeRect(x, y, pinTileW, pinTileH);
+
+        InterRemoteVideoView *videoView = self.remoteCameraViews[key];
+        if (!videoView) continue;
+        InterRemoteVideoTileView *tile = [self tileForKey:key videoView:videoView];
+        tile.nameLabel.hidden = NO;
+        tile.layer.cornerRadius = 8.0;
+        tile.isSpeaking = [key isEqualToString:self.activeSpeakerIdentity];
+
+        // Set the correct frame BEFORE adding to the hierarchy.
+        tile.frame = tileFrame;
+
+        // Also pre-size the videoView explicitly so the Metal drawable is updated
+        // to the correct dimensions before the display link fires. Without this,
+        // a tile that was previously in the filmstrip (small frame) keeps its
+        // filmstrip-sized metalLayer.frame / drawableSize until the deferred
+        // layout pass runs on the main thread — causing the Metal layer to appear
+        // as a tiny rectangle in the corner of the larger stage tile while the
+        // rest of the tile shows black.
+        videoView.frame = NSMakeRect(0, 0, pinTileW, pinTileH);
+
+        [self addSubview:tile positioned:NSWindowBelow relativeTo:self.filmstripScrollView];
+        tile.hidden = NO;
+        videoView.hidden = NO;
+
+        // Force a synchronous layout of the tile subtree so InterRemoteVideoView.layout()
+        // runs NOW (updating metalLayer.frame and metalLayer.drawableSize) before the
+        // CVDisplayLink fires on its background thread. This prevents the one-or-more-
+        // frame black-tile window that would otherwise occur while the layout is deferred.
+        [tile setNeedsLayout:YES];
+        [tile layoutSubtreeIfNeeded];
+
+        // If animated, fade the tile in rather than animating the frame.
+        // Frame animation from an old (filmstrip) coordinate causes the Metal
+        // drawable to resize mid-flight and can produce black frames.
+        if (animated) {
+            tile.alphaValue = 0.0;
+            [tile.animator setAlphaValue:1.0];
+        }
+
+        [self notifyDimensionsChange:CGSizeMake(1280, 720) forParticipant:key];
+    }
+
+    // --- Filmstrip ---
+    if (filmstripKeys.count == 0) {
+        self.filmstripScrollView.hidden = YES;
+        return;
+    }
+    self.filmstripScrollView.hidden = NO;
+    NSRect filmstripFrame = NSMakeRect(stageW, 0, filmstripW, H);
+    if (animated) { self.filmstripScrollView.animator.frame = filmstripFrame; }
+    else          { self.filmstripScrollView.frame = filmstripFrame; }
+
+    for (NSView *sub in [self.filmstripContentView.subviews copy]) [sub removeFromSuperview];
+
+    CGFloat tileW = filmstripW - 2 * kFilmstripPadding;
+    CGFloat tileH = tileW * 9.0 / 16.0;
+    NSUInteger itemCount = filmstripKeys.count;
+    CGFloat totalH = itemCount * tileH
+                     + (MAX(itemCount, 1) - 1) * kFilmstripTileGap
+                     + 2 * kFilmstripPadding;
+    totalH = MAX(totalH, H);
+    self.filmstripContentView.frame = NSMakeRect(0, 0, filmstripW, totalH);
+
+    for (NSUInteger i = 0; i < filmstripKeys.count; i++) {
+        NSString *key = filmstripKeys[i];
+        CGFloat y = totalH - kFilmstripPadding - (i + 1) * tileH - i * kFilmstripTileGap;
+        NSRect tileFrame = NSMakeRect(kFilmstripPadding, y, tileW, tileH);
+
+        if ([key isEqualToString:kLocalSelfTileKey]) {
+            NSView *selfTile = self.localSelfTileView;
+            if (!selfTile) continue;
+            selfTile.hidden = NO;
+            self.localPreviewLayer.frame = CGRectMake(0, 0, tileW, tileH);
+            CGFloat lblH = 20.0, lblPad = 6.0;
+            self.localSelfNameLabel.frame = NSMakeRect(lblPad, lblPad, MIN(60.0, tileW - 2 * lblPad), lblH);
+            [self.filmstripContentView addSubview:selfTile];
+            if (animated) { selfTile.animator.frame = tileFrame; }
+            else          { selfTile.frame = tileFrame; }
+            self.localPreviewLayer.frame = CGRectMake(0, 0, tileFrame.size.width, tileFrame.size.height);
+            continue;
+        }
+
+        InterRemoteVideoView *videoView = [key isEqualToString:kScreenShareTileKey]
+                                          ? self.remoteScreenShareView
+                                          : self.remoteCameraViews[key];
+        if (!videoView) continue;
+
+        InterRemoteVideoTileView *tile = [self tileForKey:key videoView:videoView];
+        tile.nameLabel.hidden = NO;
+        tile.layer.cornerRadius = 8.0;
+        tile.hidden = NO;
+        videoView.hidden = NO;
+        if (![key isEqualToString:kScreenShareTileKey]) {
+            tile.isSpeaking = [key isEqualToString:self.activeSpeakerIdentity];
+        }
+        [self.filmstripContentView addSubview:tile];
+        if (animated) { tile.animator.frame = tileFrame; }
+        else          { tile.frame = tileFrame; }
+        if (![key isEqualToString:kScreenShareTileKey]) {
+            [self notifyDimensionsChange:CGSizeMake(480, 270) forParticipant:key];
+        }
+    }
+}
+
 - (void)applyStageAndFilmstripLayoutAnimated:(BOOL)animated {
+    // 2+ pinned tiles need their own sub-grid stage rendering.
+    if (self.hostForcedSpotlightTileKeys.count > 1) {
+        [self applyMultiPinStageLayoutAnimated:animated];
+        return;
+    }
+
     CGFloat W = self.bounds.size.width;
     CGFloat H = self.bounds.size.height;
 

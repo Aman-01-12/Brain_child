@@ -591,7 +591,8 @@ import LiveKit
         case .disableChat, .enableChat, .askToUnmute, .meetingLocked, .meetingUnlocked,
              .suspended, .unsuspended, .forceSpotlight, .clearForceSpotlight,
              .participantRemoved, .roleChanged, .lobbyJoin, .requestUnmuteAll, .requestMuteAll,
-             .requestToSpeak, .allowToSpeak:
+             .requestToSpeak, .allowToSpeak, .requestMuteOne, .requestUnmuteOne,
+             .requestScreenShare, .approveScreenShare, .denyScreenShare:
             guard signal.senderIdentity != localIdentity else { return }
             moderationController?.handleControlSignal(signal)
 

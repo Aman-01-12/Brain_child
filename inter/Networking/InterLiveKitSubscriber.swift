@@ -339,21 +339,21 @@ extension InterLiveKitSubscriber: RoomDelegate {
     public nonisolated func room(
         _ room: Room,
         participant: Participant,
-        didUpdateIsMuted publication: TrackPublication
+        trackPublication publication: TrackPublication,
+        didUpdateIsMuted isMuted: Bool
     ) {
         // Only care about remote participants
         guard participant is RemoteParticipant else { return }
 
         let source = publication.source
-        let muted = publication.isMuted
         let participantId = participant.identity?.stringValue ?? "(unknown)"
 
         interLogInfo(InterLog.media, "Subscriber: track mute changed source=%d muted=%d participant=%{public}@",
-                     source.rawValue, muted ? 1 : 0, participantId)
+                     source.rawValue, isMuted ? 1 : 0, participantId)
 
         switch source {
         case .camera:
-            if muted {
+            if isMuted {
                 trackRenderer?.remoteTrackDidMute(.camera, forParticipant: participantId)
                 recordingFrameDelegate?.remoteTrackDidMute(.camera, forParticipant: participantId)
             } else {
@@ -361,13 +361,13 @@ extension InterLiveKitSubscriber: RoomDelegate {
                 recordingFrameDelegate?.remoteTrackDidUnmute(.camera, forParticipant: participantId)
             }
         case .microphone:
-            if muted {
+            if isMuted {
                 trackRenderer?.remoteTrackDidMute(.microphone, forParticipant: participantId)
             } else {
                 trackRenderer?.remoteTrackDidUnmute(.microphone, forParticipant: participantId)
             }
         case .screenShareVideo:
-            if muted {
+            if isMuted {
                 trackRenderer?.remoteTrackDidMute(.screenShare, forParticipant: participantId)
             } else {
                 trackRenderer?.remoteTrackDidUnmute(.screenShare, forParticipant: participantId)

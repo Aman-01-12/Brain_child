@@ -86,31 +86,56 @@ NS_ASSUME_NONNULL_BEGIN
 /// interrupt the camera preview.
 @property (nonatomic, readonly) BOOL isMicNetworkMuted;
 
-/// Apply a remote (server-side / host-initiated) mic mute. Updates local state
-/// and control panel UI to reflect that the mic has been muted externally.
+/// Global Mute All (requestMuteAll signal).
+/// Sets globalMuteActive=YES. NEVER sets hostMuted — Mute All is a global flag,
+/// not a per-participant one. Participant sees "✋ Raise Hand to Speak".
 - (void)applyRemoteMicMute;
 
-/// Host allowed this participant to speak. Unmutes the mic track but keeps
-/// isHostMuted=YES so if the participant turns mic off again they go back
-/// to "raise hand" mode.
+/// Per-tile host mute (requestMuteOne signal).
+/// Sets hostMuted=YES. NEVER sets globalMuteActive — this is an individual
+/// action independent of any global mute session. Participant sees "Muted by
+/// host" with the button disabled (no raise-hand gate).
+- (void)applyRemoteMicMuteOne;
+
+/// Host granted speak permission (allowToSpeak signal) — received during a Mute
+/// All session. Sets speakPermissionGranted=YES and clears hostMuted. Does NOT
+/// auto-unmute. Participant sees "🎙 Click to Unmute" and must tap themselves.
+/// Per mic_mute_unmute.md §11.2: never auto-unmute.
 - (void)applyAllowToSpeak;
 
-/// Host pressed "Unmute All". Clears isHostMuted so participants can freely
-/// toggle their mic. Does NOT auto-unmute — participants choose when to turn on.
+/// Global Unmute All (requestUnmuteAll signal).
+/// Clears globalMuteActive and speakPermissionGranted. Does NOT clear hostMuted
+/// (individual per-tile mutes persist after Unmute All, per §8.1). Does NOT
+/// auto-unmute the track — participants choose when to turn their mic on.
 - (void)applyUnmuteAll;
 
-/// Whether the mic is locked by the host (hard mute). When YES, the
-/// participant cannot unmute from the UI — they must raise hand to speak.
-@property (nonatomic, readonly) BOOL isHostMuted;
+/// Per-tile host unmute (requestUnmuteOne signal).
+/// Clears hostMuted and force-unmutes the LiveKit track so the mic is
+/// immediately active. Used only when no global Mute All is in effect.
+- (void)applyRemoteMicUnmute;
 
-/// Whether the host has temporarily allowed the participant to speak.
-/// Only meaningful when isHostMuted=YES. Cleared when participant turns
-/// mic off or when host unmutes all.
-@property (nonatomic, readonly) BOOL isAllowedToSpeak;
+/// Whether the host explicitly muted this participant via the tile menu
+/// (requestMuteOne). Set ONLY by applyRemoteMicMuteOne. Never set by Mute All.
+/// When YES, participant sees "Muted by host" and the button is disabled.
+@property (nonatomic, readonly) BOOL hostMuted;
 
-/// Revoke the one-time speak permission and put the mic button back to
-/// "raise hand" mode. Called when participant turns mic off while isHostMuted.
-- (void)revokeAllowToSpeak;
+/// Whether a global Mute All is currently active for this room.
+/// Set ONLY by applyRemoteMicMute. Cleared by applyUnmuteAll.
+/// When YES without speakPermissionGranted, participant sees raise-hand gate.
+@property (nonatomic, readonly) BOOL globalMuteActive;
+
+/// Whether the host has granted this participant permission to speak during a
+/// Mute All session. Set by applyAllowToSpeak. Cleared when globalMuteActive
+/// is lifted. ONE-TIME USE: cleared on self-mute while globalMuteActive
+/// so the participant must raise hand again (Bug 1 fix, §8.2 revised).
+@property (nonatomic, readonly) BOOL speakPermissionGranted;
+
+/// Monotonically increasing sequence number incremented on every authoritative
+/// state change (each apply* method call). Async completion blocks capture the
+/// sequence number before the async call and discard their update if the
+/// number has advanced (preventing stale async callbacks from overwriting
+/// fresher state — Bug 2 fix).
+@property (nonatomic, readonly) NSInteger stateSequenceNumber;
 
 // -- Simple Device Toggles -------------------------------------------------
 

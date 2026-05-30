@@ -90,6 +90,31 @@ static NSString *const InterDefaultDisplayNameKey    = @"InterDefaultDisplayName
     self.joinButton.enabled = enabled;
 }
 
+- (void)setHostInterviewButtonRequiresPro:(BOOL)requiresPro {
+    if (!requiresPro) {
+        // Clear any residual attributed title before restoring the plain title.
+        [self.hostInterviewButton setAttributedTitle:[[NSAttributedString alloc] initWithString:@""]];
+        [self.hostInterviewButton setTitle:@"Host Interview"];
+        [self.hostInterviewButton setAccessibilityLabel:@"Host Interview"];
+        return;
+    }
+    // Append an orange "PRO" badge via attributed title so free users
+    // know the feature exists but is gated — not just a missing button.
+    NSMutableAttributedString *title = [[NSMutableAttributedString alloc]
+        initWithString:@"Host Interview "
+            attributes:@{NSFontAttributeName: [NSFont systemFontOfSize:13]}];
+    NSDictionary *badgeAttrs = @{
+        NSFontAttributeName: [NSFont systemFontOfSize:10 weight:NSFontWeightBold],
+        NSForegroundColorAttributeName: [NSColor colorWithRed:1.0 green:0.58 blue:0.0 alpha:1.0],
+    };
+    [title appendAttributedString:[[NSAttributedString alloc]
+        initWithString:@"PRO" attributes:badgeAttrs]];
+    [self.hostInterviewButton setAttributedTitle:title];
+    // Give screen readers a plain-text label that includes the gating context,
+    // since the orange "PRO" badge is purely visual and not read by VoiceOver.
+    [self.hostInterviewButton setAccessibilityLabel:@"Host Interview — Pro plan required"];
+}
+
 - (void)setRoomCodeText:(NSString *)code {
     self.roomCodeField.stringValue = code ?: @"";
 }

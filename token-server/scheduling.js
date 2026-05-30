@@ -19,7 +19,7 @@ const crypto  = require('crypto');
 const db      = require('./db');
 const auth    = require('./auth');
 const redis   = require('./redis');
-const { AccessToken } = require('livekit-server-sdk');
+const { AccessToken, RoomServiceClient } = require('livekit-server-sdk');
 const { requireIdempotencyKey } = require('./idempotency');
 
 const router = express.Router();
@@ -30,12 +30,16 @@ const router = express.Router();
 const _LIVEKIT_API_KEY    = process.env.LIVEKIT_API_KEY    || 'devkey';
 const _LIVEKIT_API_SECRET = process.env.LIVEKIT_API_SECRET || 'secret';
 const _LIVEKIT_SERVER_URL = process.env.LIVEKIT_SERVER_URL || 'ws://localhost:7880';
+const _LIVEKIT_HTTP_URL   = process.env.LIVEKIT_HTTP_URL   || 'http://localhost:7880';
 const _TOKEN_TTL_SECONDS  = 6 * 60 * 60;   // 6 hours
 const _ROOM_CODE_EXPIRY   = 24 * 60 * 60;  // 24 hours
 
 const _rKey  = code => `room:${code}`;
 const _rPKey = code => `room:${code}:participants`;
 const _rRKey = code => `room:${code}:roles`;
+
+// Single shared client — avoids constructing a new instance per request.
+const _roomSvc = new RoomServiceClient(_LIVEKIT_HTTP_URL, _LIVEKIT_API_KEY, _LIVEKIT_API_SECRET);
 
 async function _createLiveKitToken(identity, displayName, roomName, isHost) {
   const lvToken = new AccessToken(_LIVEKIT_API_KEY, _LIVEKIT_API_SECRET, {
@@ -521,6 +525,19 @@ router.post('/:id/start', auth.requireAuth, async (req, res) => {
     const roomCode = meeting.room_code;
     const roomName = `inter-${roomCode}`;
     const roomType = meeting.room_type || 'call';
+
+    // Verify LiveKit is reachable before touching Redis or issuing a token.
+    // listRooms() makes a real HTTP call to the server; if it throws we know
+    // the server is offline and we should fail fast rather than handing the
+    // client a token that cannot be used.
+    try {
+      // Empty filter → list all rooms; this is a real HTTP round-trip to LiveKit
+      // regardless of whether roomName exists, so it reliably detects unreachability.
+      await _roomSvc.listRooms([]);
+    } catch (livekitErr) {
+      console.error(`[scheduling] LiveKit unreachable for meeting ${id}:`, livekitErr.message);
+      return res.status(503).json({ error: 'Call server is currently unavailable. Please try again shortly.' });
+    }
 
     // Register room in Redis if not already active (idempotent)
     const alreadyExists = await redis.exists(_rKey(roomCode));

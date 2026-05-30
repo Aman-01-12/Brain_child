@@ -59,7 +59,9 @@
 
 require('dotenv').config();
 
+const http = require('http');
 const express = require('express');
+const { Server: SocketIOServer } = require('socket.io');
 const { AccessToken, RoomServiceClient, TrackSource, EgressClient,
         EncodedFileOutput, EncodingOptionsPreset,
         WebhookReceiver } = require('livekit-server-sdk');
@@ -1569,8 +1571,11 @@ app.post('/auth/oauth/exchange', rateLimitAuth, async (req, res, next) => {
     }
     const user = userRes.rows[0];
 
-    // Issue fresh token pair
-    const clientId = `oauth_exchange_${Date.now()}`;
+    // Issue fresh token pair — prefer hardware UUID sent by client (eliminates device-binding mismatch on refresh)
+    const rawClientId = req.body.clientId;
+    const clientId = (rawClientId && typeof rawClientId === 'string' && rawClientId.length <= 128)
+      ? rawClientId
+      : `oauth_exchange_${Date.now()}`;
     const { rawToken: refreshToken, familyId } = await auth.issueRefreshToken(userId, clientId, client);
     const accessToken = auth.generateAccessToken(user, familyId);
 
@@ -2106,11 +2111,27 @@ async function admitAllFromLobby(code, roomData) {
 
 // ---------------------------------------------------------------------------
 // POST /room/create
-// Body: { identity, displayName, roomType? }
+// Body: { identity, displayName, roomType?, meetingDisplayName?, muteOnJoin?, cameraOffOnJoin?,
+//         joinBeforeHost?, allowUnmuting?, chatPermissions?, sharingPermissions?,
+//         autoRecord?, autoTranscript?, lobbyEnabled?, password? }
 // Returns: { roomCode, roomName, token, serverURL, roomType }
 // ---------------------------------------------------------------------------
 app.post('/room/create', requireIdempotencyKey, async (req, res) => {
-  const { identity, displayName, roomType: rawRoomType } = req.body;
+  const {
+    identity, displayName,
+    roomType: rawRoomType,
+    meetingDisplayName,
+    muteOnJoin,
+    cameraOffOnJoin,
+    joinBeforeHost,
+    allowUnmuting,
+    chatPermissions: rawChatPermissions,
+    sharingPermissions: rawSharingPermissions,
+    autoRecord,
+    autoTranscript,
+    lobbyEnabled,
+    password,
+  } = req.body;
 
   if (!identity || !displayName) {
     return res.status(400).json({ error: 'identity and displayName are required' });
@@ -2118,6 +2139,12 @@ app.post('/room/create', requireIdempotencyKey, async (req, res) => {
 
   // Normalize roomType — default to "call" for backward compatibility
   const roomType = (rawRoomType === 'interview') ? 'interview' : 'call';
+
+  // Validate enum fields
+  const VALID_CHAT_PERMS    = ['everyone', 'hostOnly', 'disabled'];
+  const VALID_SHARE_PERMS   = ['hostOnly', 'everyone', 'request'];
+  const chatPermissions     = VALID_CHAT_PERMS.includes(rawChatPermissions)     ? rawChatPermissions     : 'everyone';
+  const sharingPermissions  = VALID_SHARE_PERMS.includes(rawSharingPermissions) ? rawSharingPermissions  : 'hostOnly';
 
   if (!(await checkRateLimit(identity))) {
     return res.status(429).json({ error: 'Rate limit exceeded. Try again in 1 minute.' });
@@ -2133,10 +2160,29 @@ app.post('/room/create', requireIdempotencyKey, async (req, res) => {
 
   const roomName = `inter-${roomCode}`;
 
+  // Verify LiveKit is reachable before touching Redis or issuing a token.
+  // If the server is offline we fail fast here — no Redis state is written,
+  // no audit log fires, and the client gets a clear 503.
+  try {
+    await roomService.listRooms([roomName]);
+  } catch (livekitErr) {
+    console.error(`[room/create] LiveKit unreachable:`, livekitErr.message);
+    return res.status(503).json({ error: 'The call server is currently unavailable. Please try again shortly.' });
+  }
+
   // Store room data as a Redis Hash with 24h TTL
   // hostTier is snapshotted at creation so in-meeting tier checks use the
   // tier the host had when the room was created, not the current JWT tier.
   const hostTier = (req.user && req.user.tier) ? req.user.tier : 'free';
+
+  // Hash password server-side before storage (bcrypt is already available in auth.js
+  // but we use the same crypto helper for consistency)
+  let passwordHash = '';
+  if (password && typeof password === 'string' && password.length > 0) {
+    const bcrypt = require('bcrypt');
+    passwordHash = await bcrypt.hash(password, 10);
+  }
+
   const pipeline = redis.pipeline();
   pipeline.hset(roomKey(roomCode),
     'roomName', roomName,
@@ -2144,6 +2190,18 @@ app.post('/room/create', requireIdempotencyKey, async (req, res) => {
     'hostIdentity', identity,
     'roomType', roomType,
     'hostTier', hostTier,
+    // Meeting settings
+    'meetingDisplayName',  (meetingDisplayName && typeof meetingDisplayName === 'string') ? meetingDisplayName : '',
+    'muteOnJoin',          muteOnJoin         ? 'true' : 'false',
+    'cameraOffOnJoin',     cameraOffOnJoin    ? 'true' : 'false',
+    'joinBeforeHost',      joinBeforeHost     ? 'true' : 'false',
+    'allowUnmuting',       allowUnmuting === false ? 'false' : 'true',
+    'chatPermissions',     chatPermissions,
+    'sharingPermissions',  sharingPermissions,
+    'autoRecord',          autoRecord         ? 'true' : 'false',
+    'autoTranscript',      autoTranscript     ? 'true' : 'false',
+    'lobbyEnabled',        lobbyEnabled       ? 'true' : 'false',
+    'passwordHash',        passwordHash,
   );
   pipeline.expire(roomKey(roomCode), ROOM_CODE_EXPIRY_SECONDS);
   // Participants stored as a Redis Set (identity dedup is automatic)
@@ -2282,6 +2340,21 @@ app.post('/room/join', async (req, res) => {
   const alreadyIn = await isParticipant(code, identity);
   const participantCount = await getParticipantCount(code);
 
+  // Join Before Host enforcement: if disabled, non-host participants cannot join until
+  // the host is present in the participants set.
+  const joinBeforeHostEnabled = roomData.joinBeforeHost === 'true';
+  if (!joinBeforeHostEnabled && !alreadyIn) {
+    const hostIdentity = roomData.hostIdentity;
+    const hostPresent = hostIdentity ? await isParticipant(code, hostIdentity) : false;
+    if (!hostPresent) {
+      console.log(`[audit] Join-before-host blocked: code=${code} identity=${identity}`);
+      return res.status(403).json({
+        error: 'The host hasn\'t started the meeting yet.',
+        hostNotYetJoined: true,
+      });
+    }
+  }
+
   if (!alreadyIn && participantCount >= MAX_PARTICIPANTS_PER_ROOM) {
     console.log(`[audit] Room full: code=${code} rejected=${identity} (${participantCount}/${MAX_PARTICIPANTS_PER_ROOM})`);
     return res.status(403).json({
@@ -2333,6 +2406,16 @@ app.post('/room/join', async (req, res) => {
       maxParticipants: MAX_PARTICIPANTS_PER_ROOM,
       participantCount: newCount,
       leaveToken,
+      // Meeting settings — consumed by participants to apply host-configured behaviour
+      meetingDisplayName:  roomData.meetingDisplayName  || '',
+      muteOnJoin:          roomData.muteOnJoin          === 'true',
+      cameraOffOnJoin:     roomData.cameraOffOnJoin     === 'true',
+      joinBeforeHost:      roomData.joinBeforeHost      === 'true',
+      allowUnmuting:       roomData.allowUnmuting       !== 'false', // default true
+      chatPermissions:     roomData.chatPermissions     || 'everyone',
+      sharingPermissions:  roomData.sharingPermissions  || 'hostOnly',
+      autoRecord:          roomData.autoRecord          === 'true',
+      autoTranscript:      roomData.autoTranscript      === 'true',
     });
   } catch (err) {
     console.error(`[error] Token creation failed for ${identity}:`, err.message);
@@ -2574,6 +2657,12 @@ app.post('/room/mute-all', auth.requireAuth, async (req, res) => {
     }
 
     console.log(`[audit] Mute all: code=${code} muted=${mutedCount} skipped=${skippedCount} by=${callerIdentity}`);
+
+    // Persist global-mute state for Socket.IO mic-state checks (Bug 1 server fix)
+    await redis.set(globalMuteKey(code), '1', 'EX', 86400);
+    // Broadcast to all connected Socket.IO clients in the room
+    io.to(code).emit('room:global-mute-changed', { isAllMuted: true });
+
     res.json({ success: true, mutedCount });
   } catch (err) {
     console.error(`[error] Mute all failed:`, err.message);
@@ -3040,6 +3129,16 @@ app.get('/room/lobby-status/:code/:identity', async (req, res) => {
       serverURL: serverURL || LIVEKIT_SERVER_URL,
       roomName: roomData?.roomName,
       roomType: roomData?.roomType || 'call',
+      // Meeting settings — enforced by the client after admission
+      meetingDisplayName:  roomData?.meetingDisplayName  || '',
+      muteOnJoin:          roomData?.muteOnJoin          === 'true',
+      cameraOffOnJoin:     roomData?.cameraOffOnJoin     === 'true',
+      joinBeforeHost:      roomData?.joinBeforeHost      === 'true',
+      allowUnmuting:       roomData?.allowUnmuting       !== 'false',
+      chatPermissions:     roomData?.chatPermissions     || 'everyone',
+      sharingPermissions:  roomData?.sharingPermissions  || 'hostOnly',
+      autoRecord:          roomData?.autoRecord          === 'true',
+      autoTranscript:      roomData?.autoTranscript      === 'true',
     });
   }
 
@@ -4237,9 +4336,221 @@ app.use((err, req, res, _next) => {
   });
 });
 
-app.listen(PORT, () => {
+
+
+// ---------------------------------------------------------------------------
+// Startup cleanup — mark phantom 'active' meetings as 'failed'
+//
+// If the server was previously stopped while LiveKit was offline, DB rows for
+// meetings that never actually ran may have been written (status='active',
+// ended_at=NULL).  We detect them by checking whether their Redis room still
+// exists.  If Redis has no record (TTL expired or never written) we mark the
+// meeting 'failed'.  This runs once on every startup, is idempotent, and is
+// best-effort (a DB error only produces a warning).
+// ---------------------------------------------------------------------------
+async function markPhantomMeetingsFailed() {
+  // Schema changes (adding 'failed' to the status constraint) are handled
+  // exclusively by Migration 017. Doing DDL inline here causes exclusive table
+  // locks and schema races on multi-instance startup, so we rely on the
+  // migration having been run beforehand. If it hasn't, the UPDATE below will
+  // produce a check_violation (23514) which is caught per-row and logged.
+  try {
+    const result = await db.query(
+      `SELECT id, room_code FROM meetings
+       WHERE status = 'active' AND started_at < NOW() - INTERVAL '25 hours'`
+    );
+    if (result.rows.length === 0) return;
+
+    let marked = 0;
+    for (const row of result.rows) {
+      const exists = await redis.exists(roomKey(row.room_code));
+      if (!exists) {
+        await db.query(
+          `UPDATE meetings SET status = 'failed', ended_at = started_at WHERE id = $1`,
+          [row.id]
+        );
+        marked++;
+      }
+    }
+    if (marked > 0) {
+      console.log(`[startup] Marked ${marked} phantom meeting(s) as failed (LiveKit was offline at creation time)`);
+    }
+  } catch (err) {
+    console.warn('[startup] Could not clean up phantom meetings:', err.message);
+  }
+}
+
+// ============================================================================
+// Socket.IO — Real-time mic state coordination
+//
+// Tracks per-participant MicState objects in Redis keyed by:
+//   room:{CODE}:micstate:{identity}  (JSON, TTL 24h)
+//   room:{CODE}:global-mute          (0 or 1, TTL 24h)
+//
+// Events received from clients:
+//   client:join-room          { roomCode, identity } — join the socket room
+//   participant:self-mute     { roomCode, identity } — participant muted themselves
+//   participant:self-unmute   { roomCode, identity } — participant unmuted themselves
+//   participant:raise-hand    { roomCode, identity } — raise hand to speak
+//   participant:lower-hand    { roomCode, identity } — lower hand
+//
+// Events broadcast to the room:
+//   room:mic-state-update     { participantId, micState } — authoritative state update
+//   room:global-mute-changed  { isAllMuted }              — host toggled Mute All
+// ============================================================================
+
+const httpServer = http.createServer(app);
+const io = new SocketIOServer(httpServer, {
+  cors: {
+    // In production restrict this to your app's origin
+    origin: process.env.ALLOWED_ORIGINS ? process.env.ALLOWED_ORIGINS.split(',') : '*',
+    methods: ['GET', 'POST'],
+  },
+});
+
+// ---------------------------------------------------------------------------
+// Mic-state Redis key helpers
+// ---------------------------------------------------------------------------
+function micStateKey(code, identity) {
+  return `room:${code}:micstate:${identity}`;
+}
+function globalMuteKey(code) {
+  return `room:${code}:global-mute`;
+}
+function defaultMicState() {
+  return {
+    hostMuted: false,
+    globalMuteActive: false,
+    speakPermissionGranted: false,
+    selfMuted: false,
+    handRaised: false,
+    sequenceNumber: 0,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Socket.IO connection handler
+// ---------------------------------------------------------------------------
+io.on('connection', (socket) => {
+  // client:join-room — participant joins a socket room for live events
+  socket.on('client:join-room', async ({ roomCode, identity }) => {
+    if (!roomCode || !identity) return;
+    const code = String(roomCode).toUpperCase().replace(/[^A-Z0-9]/g, '');
+    if (!code) return;
+    socket.join(code);
+    // Send the participant their current mic state on reconnect
+    try {
+      const json = await redis.get(micStateKey(code, identity));
+      const micState = json ? JSON.parse(json) : defaultMicState();
+      socket.emit('room:mic-state-update', { participantId: identity, micState });
+    } catch (_) { /* best-effort */ }
+  });
+
+  // participant:self-mute — participant manually muted their mic
+  // Bug 1 fix: when globalMuteActive, revoking speakPermissionGranted here
+  // enforces one-time permission — they must raise hand again after re-muting.
+  socket.on('participant:self-mute', async ({ roomCode, identity }) => {
+    if (!roomCode || !identity) return;
+    const code = String(roomCode).toUpperCase().replace(/[^A-Z0-9]/g, '');
+    if (!code) return;
+
+    try {
+      const [stateJson, isGlobalMute] = await Promise.all([
+        redis.get(micStateKey(code, identity)),
+        redis.get(globalMuteKey(code)),
+      ]);
+      const micState = stateJson ? JSON.parse(stateJson) : defaultMicState();
+
+      micState.selfMuted = true;
+      micState.sequenceNumber++;
+
+      // One-time speak permission: self-muting during a global mute session
+      // revokes the grant so the participant must raise hand again.
+      if (isGlobalMute === '1') {
+        micState.speakPermissionGranted = false;
+        micState.handRaised = false;
+      }
+
+      await redis.set(micStateKey(code, identity), JSON.stringify(micState), 'EX', 86400);
+      io.to(code).emit('room:mic-state-update', { participantId: identity, micState });
+    } catch (err) {
+      console.error('[socket] participant:self-mute error:', err.message);
+    }
+  });
+
+  // participant:self-unmute — participant manually unmuted their mic
+  socket.on('participant:self-unmute', async ({ roomCode, identity }) => {
+    if (!roomCode || !identity) return;
+    const code = String(roomCode).toUpperCase().replace(/[^A-Z0-9]/g, '');
+    if (!code) return;
+
+    try {
+      const [stateJson, isGlobalMute] = await Promise.all([
+        redis.get(micStateKey(code, identity)),
+        redis.get(globalMuteKey(code)),
+      ]);
+      const micState = stateJson ? JSON.parse(stateJson) : defaultMicState();
+
+      // Block server-side if global mute is active and no speak permission
+      if (isGlobalMute === '1' && !micState.speakPermissionGranted) {
+        socket.emit('room:mic-state-update', { participantId: identity, micState });
+        return;
+      }
+
+      micState.selfMuted = false;
+      micState.sequenceNumber++;
+
+      await redis.set(micStateKey(code, identity), JSON.stringify(micState), 'EX', 86400);
+      io.to(code).emit('room:mic-state-update', { participantId: identity, micState });
+    } catch (err) {
+      console.error('[socket] participant:self-unmute error:', err.message);
+    }
+  });
+
+  // participant:raise-hand — participant raises hand to request speaking permission
+  socket.on('participant:raise-hand', async ({ roomCode, identity }) => {
+    if (!roomCode || !identity) return;
+    const code = String(roomCode).toUpperCase().replace(/[^A-Z0-9]/g, '');
+    if (!code) return;
+
+    try {
+      const stateJson = await redis.get(micStateKey(code, identity));
+      const micState = stateJson ? JSON.parse(stateJson) : defaultMicState();
+      micState.handRaised = true;
+      micState.sequenceNumber++;
+      await redis.set(micStateKey(code, identity), JSON.stringify(micState), 'EX', 86400);
+      io.to(code).emit('room:mic-state-update', { participantId: identity, micState });
+    } catch (err) {
+      console.error('[socket] participant:raise-hand error:', err.message);
+    }
+  });
+
+  // participant:lower-hand — participant lowers hand (or host lowered it)
+  socket.on('participant:lower-hand', async ({ roomCode, identity }) => {
+    if (!roomCode || !identity) return;
+    const code = String(roomCode).toUpperCase().replace(/[^A-Z0-9]/g, '');
+    if (!code) return;
+
+    try {
+      const stateJson = await redis.get(micStateKey(code, identity));
+      const micState = stateJson ? JSON.parse(stateJson) : defaultMicState();
+      micState.handRaised = false;
+      micState.sequenceNumber++;
+      await redis.set(micStateKey(code, identity), JSON.stringify(micState), 'EX', 86400);
+      io.to(code).emit('room:mic-state-update', { participantId: identity, micState });
+    } catch (err) {
+      console.error('[socket] participant:lower-hand error:', err.message);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Startup
+// ---------------------------------------------------------------------------
+httpServer.listen(PORT, () => {
   console.log(`[token-server] Running on http://localhost:${PORT}`);
   // NOTE: API key intentionally NOT logged — would persist in log aggregators
   console.log(`[token-server] Redis: ${process.env.REDIS_URL || 'redis://localhost:6379'}`);
   console.log(`[token-server] Endpoints: POST /room/create, /room/join, /token/refresh, /auth/register, /auth/login | GET /room/info/:code, /auth/me, /health`);
+  markPhantomMeetingsFailed();
 });

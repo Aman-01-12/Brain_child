@@ -118,6 +118,35 @@
 // MARK: - Public API
 // ---------------------------------------------------------------------------
 
+- (void)showJoining {
+    self.titleLabel.stringValue = @"Joining Meeting";
+    self.titleLabel.textColor   = [NSColor whiteColor];
+    self.statusLabel.stringValue = @"Connecting to the meeting\u2026";
+    self.positionLabel.hidden   = YES;
+    NSImage *img = [NSImage imageWithSystemSymbolName:@"video.fill"
+                               accessibilityDescription:@"Joining"];
+    if (img) self.iconView.image = img;
+    self.iconView.contentTintColor = [NSColor systemBlueColor];
+    [self.spinner startAnimation:nil];
+    self.spinner.hidden      = NO;
+    self.cancelButton.hidden = NO;
+    [self.cancelButton setTitle:@"Cancel"];
+}
+
+- (void)showWaiting {
+    self.titleLabel.stringValue  = @"Waiting Room";
+    self.titleLabel.textColor    = [NSColor whiteColor];
+    self.statusLabel.stringValue = @"Please wait, the host will let you in shortly.";
+    NSImage *img = [NSImage imageWithSystemSymbolName:@"person.badge.clock"
+                               accessibilityDescription:@"Waiting"];
+    if (img) self.iconView.image = img;
+    self.iconView.contentTintColor = [NSColor systemBlueColor];
+    [self.spinner startAnimation:nil];
+    self.spinner.hidden      = NO;
+    self.cancelButton.hidden = NO;
+    [self.cancelButton setTitle:@"Leave"];
+}
+
 - (void)setPosition:(NSInteger)position {
     if (position > 0) {
         self.positionLabel.hidden = NO;

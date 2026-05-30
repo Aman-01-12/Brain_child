@@ -161,6 +161,45 @@ enum InterMicrophoneNetworkAction {
     /// POST /meetings/:id/start instead of /room/create or /room/join.
     @objc public var scheduledMeetingId: String
 
+    // -----------------------------------------------------------------------
+    // MARK: - Meeting settings (host-configured, broadcast to all participants)
+    // -----------------------------------------------------------------------
+
+    /// Human-readable display name for the meeting (e.g. "Alice's Meeting").
+    /// Broadcast to participants via room metadata. Defaults to empty string.
+    @objc public var meetingDisplayName: String
+
+    /// Whether all participants start with their microphone muted. Default false.
+    @objc public var muteOnJoin: Bool
+
+    /// Whether all participants start with their camera off. Default false.
+    @objc public var cameraOffOnJoin: Bool
+
+    /// Whether participants can enter before the host arrives. Default false.
+    @objc public var joinBeforeHost: Bool
+
+    /// Whether participants can unmute themselves (true = yes, false = must raise hand). Default true.
+    @objc public var allowUnmuting: Bool
+
+    /// Chat permission level: "everyone" | "hostOnly" | "disabled". Default "everyone".
+    @objc public var chatPermissions: String
+
+    /// Screen sharing permission: "hostOnly" | "everyone" | "request". Default "hostOnly".
+    @objc public var sharingPermissions: String
+
+    /// Whether cloud recording auto-starts when the host joins (pro+ only). Default false.
+    @objc public var autoRecord: Bool
+
+    /// Whether AI transcription auto-starts when the host joins (pro+ only). Default false.
+    @objc public var autoTranscript: Bool
+
+    /// Whether the waiting room / lobby is enabled. Default false.
+    @objc public var lobbyEnabled: Bool
+
+    /// Optional meeting password sent to the server where it is bcrypt-hashed before storage.
+    /// Empty string means no password.
+    @objc public var meetingPassword: String
+
     @objc public init(serverURL: String,
                       tokenServerURL: String,
                       roomCode: String = "",
@@ -178,6 +217,17 @@ enum InterMicrophoneNetworkAction {
         self.roomType = roomType
         self.maxParticipants = maxParticipants
         self.scheduledMeetingId = ""
+        self.meetingDisplayName = ""
+        self.muteOnJoin = false
+        self.cameraOffOnJoin = false
+        self.joinBeforeHost = false
+        self.allowUnmuting = true
+        self.chatPermissions = "everyone"
+        self.sharingPermissions = "hostOnly"
+        self.autoRecord = false
+        self.autoTranscript = false
+        self.lobbyEnabled = false
+        self.meetingPassword = ""
         super.init()
     }
 
@@ -192,8 +242,36 @@ enum InterMicrophoneNetworkAction {
             roomType: roomType,
             maxParticipants: maxParticipants
         )
-        copy.scheduledMeetingId = scheduledMeetingId
+        copy.scheduledMeetingId   = scheduledMeetingId
+        copy.meetingDisplayName   = meetingDisplayName
+        copy.muteOnJoin           = muteOnJoin
+        copy.cameraOffOnJoin      = cameraOffOnJoin
+        copy.joinBeforeHost       = joinBeforeHost
+        copy.allowUnmuting        = allowUnmuting
+        copy.chatPermissions      = chatPermissions
+        copy.sharingPermissions   = sharingPermissions
+        copy.autoRecord           = autoRecord
+        copy.autoTranscript       = autoTranscript
+        copy.lobbyEnabled         = lobbyEnabled
+        copy.meetingPassword      = meetingPassword
         return copy
+    }
+
+    /// Returns the meeting settings as a dictionary suitable for the `createRoom` token-server body.
+    var meetingSettingsDict: [String: Any] {
+        return [
+            "meetingDisplayName": meetingDisplayName,
+            "muteOnJoin":         muteOnJoin,
+            "cameraOffOnJoin":    cameraOffOnJoin,
+            "joinBeforeHost":     joinBeforeHost,
+            "allowUnmuting":      allowUnmuting,
+            "chatPermissions":    chatPermissions,
+            "sharingPermissions": sharingPermissions,
+            "autoRecord":         autoRecord,
+            "autoTranscript":     autoTranscript,
+            "lobbyEnabled":       lobbyEnabled,
+            "password":           meetingPassword
+        ]
     }
 
     public override var description: String {

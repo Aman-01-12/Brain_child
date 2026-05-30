@@ -37,10 +37,15 @@ import LiveKit
     @objc func moderationController(_ controller: InterModerationController,
                                     chatDisabledStateChanged isDisabled: Bool)
 
-    /// A participant is asking us to unmute.
+    /// A participant is asking us to unmute our microphone.
     @objc func moderationController(_ controller: InterModerationController,
                                     receivedUnmuteRequest fromIdentity: String,
                                     displayName: String)
+
+    /// Host is asking us to turn our camera back on.
+    @objc optional func moderationController(_ controller: InterModerationController,
+                                             receivedCameraUnmuteRequest fromIdentity: String,
+                                             displayName: String)
 
     /// The meeting has been locked/unlocked.
     @objc func moderationController(_ controller: InterModerationController,
@@ -51,9 +56,10 @@ import LiveKit
                                     participantSuspendStateChanged identity: String,
                                     isSuspended: Bool)
 
-    /// Host is forcing a spotlight on a specific participant.
+    /// Host is forcing a spotlight on specific participants (1–5).
+    /// Replaces the previous single-identity callback.
     @objc func moderationController(_ controller: InterModerationController,
-                                    forceSpotlightOnParticipant identity: String)
+                                    forceSpotlightOnParticipants identities: [String])
 
     /// Host cleared the forced spotlight.
     @objc func moderationControllerDidClearForceSpotlight(_ controller: InterModerationController)
@@ -78,6 +84,14 @@ import LiveKit
     /// The participant should update local state and UI to reflect the muted mic.
     @objc optional func moderationControllerReceivedMuteAllRequest(_ controller: InterModerationController)
 
+    /// Host has muted this specific participant's microphone (server-side, targeted).
+    /// Only the participant whose identity was targeted receives this.
+    @objc optional func moderationControllerReceivedMuteOneRequest(_ controller: InterModerationController)
+
+    /// Host has fully lifted the per-participant mic mute on this participant.
+    /// The participant's client unmutes the track and clears the host-mute restriction.
+    @objc optional func moderationControllerReceivedUnmuteOneRequest(_ controller: InterModerationController)
+
     /// A participant is requesting permission to speak (after host mute-all).
     @objc optional func moderationController(_ controller: InterModerationController,
                                              receivedSpeakRequest fromIdentity: String,
@@ -85,6 +99,18 @@ import LiveKit
 
     /// Host has allowed us to unmute and speak.
     @objc optional func moderationControllerReceivedAllowToSpeak(_ controller: InterModerationController)
+
+    /// A participant is requesting permission to share their screen.
+    /// Only the host receives this; non-host participants ignore it.
+    @objc optional func moderationController(_ controller: InterModerationController,
+                                             receivedScreenShareRequest fromIdentity: String,
+                                             displayName: String)
+
+    /// Host has approved our screen share request. The client should now start sharing.
+    @objc optional func moderationControllerScreenShareRequestApproved(_ controller: InterModerationController)
+
+    /// Host has denied our screen share request.
+    @objc optional func moderationControllerScreenShareRequestDenied(_ controller: InterModerationController)
 }
 
 // MARK: - InterModerationController
@@ -111,8 +137,12 @@ import LiveKit
     /// Whether all participants are currently muted (host-side toggle state).
     @objc public private(set) dynamic var isAllMuted: Bool = false
 
-    /// The identity of the force-spotlighted participant (nil = no forced spotlight).
+    /// The identity of the force-spotlighted participant (first pinned, empty when none).
+    /// Kept for backward-compat; prefer forceSpotlightIdentities.
     @objc public private(set) dynamic var forceSpotlightIdentity: String = ""
+
+    /// Ordered list of host-pinned participant identities (up to 5).
+    @objc public private(set) dynamic var forceSpotlightIdentities: [String] = []
 
     /// Accumulated lobby waiting participants: array of {"identity": ..., "displayName": ...}.
     /// Populated by lobbyJoin signals, pruned by admit/deny/admitAll.
@@ -192,6 +222,7 @@ import LiveKit
         isLocalSuspended = false
         isAllMuted = false
         forceSpotlightIdentity = ""
+        forceSpotlightIdentities = []
         lobbyWaitingParticipants = []
     }
 
@@ -262,6 +293,12 @@ import LiveKit
             case .success:
                 interLogInfo(InterLog.room, "ModerationController: muted %{private}@ (%{public}@)",
                              identity, trackSource)
+                // Send a targeted DataChannel signal so the muted participant's
+                // own UI updates immediately (same as requestMuteAll for everyone,
+                // but scoped to this one participant via targetIdentity).
+                if trackSource == "microphone" {
+                    self.sendControlSignal(type: .requestMuteOne, targetIdentity: identity)
+                }
                 self.completeOnMain { completion(true, nil) }
             case .failure(let error):
                 self.completeOnMain { completion(false, error) }
@@ -314,6 +351,17 @@ import LiveKit
         completeOnMain {
             self.isAllMuted = false
             completion(true, 0, nil)
+        }
+    }
+
+    /// Sync `isAllMuted` when THIS client receives a global mute/unmute signal
+    /// sent by ANOTHER host (co-host scenario — Bug 3 fix).
+    /// The local DataChannel receive path calls this so the host's "Mute All"
+    /// toggle state reflects the room's true mute state even when a co-host
+    /// initiated the change.
+    @objc public func applyExternalGlobalMuteChanged(_ newValue: Bool) {
+        DispatchQueue.main.async { [weak self] in
+            self?.isAllMuted = newValue
         }
     }
 
@@ -379,6 +427,13 @@ import LiveKit
         interLogInfo(InterLog.room, "ModerationController: asked %{private}@ to unmute", identity)
     }
 
+    /// Ask a specific participant to turn their camera back on (DataChannel request).
+    @objc public func askToUnmuteCamera(identity: String) {
+        guard InterPermissionMatrix.role(localRole, hasPermission: .canAskToUnmute) else { return }
+        sendControlSignal(type: .askToUnmuteCamera, targetIdentity: identity)
+        interLogInfo(InterLog.room, "ModerationController: asked %{private}@ to unmute camera", identity)
+    }
+
     // MARK: - Request to Speak / Allow to Speak
 
     /// Send a request-to-speak signal from a participant to the host.
@@ -392,6 +447,38 @@ import LiveKit
         guard InterPermissionMatrix.role(localRole, hasPermission: .canMuteOthers) else { return }
         sendControlSignal(type: .allowToSpeak, targetIdentity: identity)
         interLogInfo(InterLog.room, "ModerationController: allowed %{private}@ to speak", identity)
+    }
+
+    /// Fully lift the per-participant mic mute for a specific participant.
+    /// Sends a targeted DataChannel signal; the participant's client force-unmutes
+    /// their track and clears the host-mute restriction so they can freely toggle
+    /// their mic without the raise-hand prompt afterward.
+    @objc public func unmuteParticipant(identity: String) {
+        guard InterPermissionMatrix.role(localRole, hasPermission: .canMuteOthers) else { return }
+        sendControlSignal(type: .requestUnmuteOne, targetIdentity: identity)
+        interLogInfo(InterLog.room, "ModerationController: sent requestUnmuteOne to %{private}@", identity)
+    }
+
+    // MARK: - Screen Share Permission Signals
+
+    /// Request permission to share screen. Broadcast to host when sharingPermissions == "request".
+    @objc public func requestScreenShare() {
+        sendControlSignal(type: .requestScreenShare)
+        interLogInfo(InterLog.room, "ModerationController: sent requestScreenShare")
+    }
+
+    /// Approve a participant's screen share request (host only).
+    @objc public func approveScreenShare(identity: String) {
+        guard InterPermissionMatrix.role(localRole, hasPermission: .canMuteOthers) else { return }
+        sendControlSignal(type: .approveScreenShare, targetIdentity: identity)
+        interLogInfo(InterLog.room, "ModerationController: approved screen share for %{private}@", identity)
+    }
+
+    /// Deny a participant's screen share request (host only).
+    @objc public func denyScreenShare(identity: String) {
+        guard InterPermissionMatrix.role(localRole, hasPermission: .canMuteOthers) else { return }
+        sendControlSignal(type: .denyScreenShare, targetIdentity: identity)
+        interLogInfo(InterLog.room, "ModerationController: denied screen share for %{private}@", identity)
     }
 
     // MARK: - Lock Meeting (9.2.6)
@@ -518,23 +605,76 @@ import LiveKit
 
     // MARK: - Force Spotlight (9.2.8)
 
-    /// Force-spotlight a participant for all viewers. DataChannel-based.
-    @objc public func forceSpotlight(identity: String) {
+    /// Add a participant to the host-pinned spotlight list (up to 5 simultaneously).
+    /// If the identity is already pinned, or 5 are already pinned, this is a no-op.
+    @objc public func addPinnedParticipant(identity: String) {
         guard InterPermissionMatrix.role(localRole, hasPermission: .canForceSpotlight) else { return }
-        sendControlSignal(type: .forceSpotlight, targetIdentity: identity)
+        var list = forceSpotlightIdentities
+        guard !list.contains(identity) else { return }   // already pinned — no-op
+        guard list.count < 5 else { return }             // cap at 5
+        list.append(identity)
+        let pinnedList = list.joined(separator: "|")
+        sendControlSignal(type: .forceSpotlight, extraData: ["pinnedList": pinnedList])
         completeOnMain {
-            self.forceSpotlightIdentity = identity
-            self.delegate?.moderationController(self, forceSpotlightOnParticipant: identity)
+            self.forceSpotlightIdentities = list
+            self.forceSpotlightIdentity = list.first ?? ""
+            self.delegate?.moderationController(self, forceSpotlightOnParticipants: list)
         }
     }
 
-    /// Clear forced spotlight. DataChannel-based.
+    /// Remove a participant from the host-pinned spotlight list.
+    /// If the identity is not pinned this is a no-op. If the list becomes empty,
+    /// fires `moderationControllerDidClearForceSpotlight` instead.
+    @objc public func removePinnedParticipant(identity: String) {
+        guard InterPermissionMatrix.role(localRole, hasPermission: .canForceSpotlight) else { return }
+        var list = forceSpotlightIdentities
+        guard let idx = list.firstIndex(of: identity) else { return }   // not pinned — no-op
+        list.remove(at: idx)
+        if list.isEmpty {
+            sendControlSignal(type: .clearForceSpotlight)
+            completeOnMain {
+                self.forceSpotlightIdentities = []
+                self.forceSpotlightIdentity = ""
+                self.delegate?.moderationControllerDidClearForceSpotlight(self)
+            }
+        } else {
+            let pinnedList = list.joined(separator: "|")
+            sendControlSignal(type: .forceSpotlight, extraData: ["pinnedList": pinnedList])
+            completeOnMain {
+                self.forceSpotlightIdentities = list
+                self.forceSpotlightIdentity = list.first ?? ""
+                self.delegate?.moderationController(self, forceSpotlightOnParticipants: list)
+            }
+        }
+    }
+
+    /// Clear all forced spotlights. DataChannel-based.
     @objc public func clearForceSpotlight() {
         guard InterPermissionMatrix.role(localRole, hasPermission: .canForceSpotlight) else { return }
         sendControlSignal(type: .clearForceSpotlight)
         completeOnMain {
+            self.forceSpotlightIdentities = []
             self.forceSpotlightIdentity = ""
             self.delegate?.moderationControllerDidClearForceSpotlight(self)
+        }
+    }
+
+    /// Broadcast an authoritative forced-spotlight list to all remote clients.
+    /// Use when the list has already been updated locally (e.g. a pinned participant
+    /// left the meeting) and only the DataChannel signal needs to be re-sent.
+    /// Requires host permission; no-op otherwise.
+    @objc public func broadcastForcedSpotlightList(_ identities: [String]) {
+        guard InterPermissionMatrix.role(localRole, hasPermission: .canForceSpotlight) else { return }
+        if identities.isEmpty {
+            clearForceSpotlight()
+        } else {
+            let pinnedList = identities.joined(separator: "|")
+            sendControlSignal(type: .forceSpotlight, extraData: ["pinnedList": pinnedList])
+            completeOnMain {
+                self.forceSpotlightIdentities = identities
+                self.forceSpotlightIdentity = identities.first ?? ""
+                // No delegate call here — the layout manager already updated locally.
+            }
         }
     }
 
@@ -849,6 +989,12 @@ import LiveKit
                                                displayName: signal.senderName)
             }
 
+        case .askToUnmuteCamera:
+            if targetIsLocal {
+                delegate?.moderationController?(self, receivedCameraUnmuteRequest: signal.senderIdentity,
+                                                displayName: signal.senderName)
+            }
+
         case .meetingLocked:
             isMeetingLocked = true
             delegate?.moderationController(self, meetingLockStateChanged: true)
@@ -878,12 +1024,26 @@ import LiveKit
             }
 
         case .forceSpotlight:
-            if let target = signal.targetIdentity {
-                forceSpotlightIdentity = target
-                delegate?.moderationController(self, forceSpotlightOnParticipant: target)
+            // Extract the full pinned list from extraData (new format).
+            // Fall back to targetIdentity for signals from older clients.
+            let pinnedList: [String]
+            if let raw = signal.extraData?["pinnedList"], !raw.isEmpty {
+                pinnedList = raw.split(separator: "|").map(String.init)
+            } else if let target = signal.targetIdentity, !target.isEmpty {
+                pinnedList = [target]
+            } else {
+                pinnedList = []
+            }
+            forceSpotlightIdentities = pinnedList
+            forceSpotlightIdentity = pinnedList.first ?? ""
+            if pinnedList.isEmpty {
+                delegate?.moderationControllerDidClearForceSpotlight(self)
+            } else {
+                delegate?.moderationController(self, forceSpotlightOnParticipants: pinnedList)
             }
 
         case .clearForceSpotlight:
+            forceSpotlightIdentities = []
             forceSpotlightIdentity = ""
             delegate?.moderationControllerDidClearForceSpotlight(self)
 
@@ -919,6 +1079,18 @@ import LiveKit
             interLogInfo(InterLog.room, "ModerationController: received requestMuteAll from %{public}@", signal.senderName)
             delegate?.moderationControllerReceivedMuteAllRequest?(self)
 
+        case .requestMuteOne:
+            if targetIsLocal {
+                interLogInfo(InterLog.room, "ModerationController: received requestMuteOne from %{public}@", signal.senderName)
+                delegate?.moderationControllerReceivedMuteOneRequest?(self)
+            }
+
+        case .requestUnmuteOne:
+            if targetIsLocal {
+                interLogInfo(InterLog.room, "ModerationController: received requestUnmuteOne from %{public}@", signal.senderName)
+                delegate?.moderationControllerReceivedUnmuteOneRequest?(self)
+            }
+
         case .requestToSpeak:
             interLogInfo(InterLog.room, "ModerationController: %{public}@ requests to speak", signal.senderName)
             delegate?.moderationController?(self, receivedSpeakRequest: signal.senderIdentity,
@@ -928,6 +1100,23 @@ import LiveKit
             if targetIsLocal {
                 interLogInfo(InterLog.room, "ModerationController: host allowed us to speak")
                 delegate?.moderationControllerReceivedAllowToSpeak?(self)
+            }
+
+        case .requestScreenShare:
+            interLogInfo(InterLog.room, "ModerationController: %{public}@ requests screen share", signal.senderName)
+            delegate?.moderationController?(self, receivedScreenShareRequest: signal.senderIdentity,
+                                            displayName: signal.senderName)
+
+        case .approveScreenShare:
+            if targetIsLocal {
+                interLogInfo(InterLog.room, "ModerationController: host approved our screen share")
+                delegate?.moderationControllerScreenShareRequestApproved?(self)
+            }
+
+        case .denyScreenShare:
+            if targetIsLocal {
+                interLogInfo(InterLog.room, "ModerationController: host denied our screen share")
+                delegate?.moderationControllerScreenShareRequestDenied?(self)
             }
 
         default:

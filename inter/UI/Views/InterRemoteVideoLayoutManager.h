@@ -178,14 +178,58 @@ typedef NS_ENUM(NSUInteger, InterRemoteVideoLayoutMode) {
 /// [Phase 8.2.3] Show or hide the raised-hand badge (✋) on a participant's tile.
 - (void)setHandRaised:(BOOL)raised forParticipant:(NSString *)participantId;
 
+/// Update the actual mic-muted state (track state) on a tile. Drives the visual mic indicator.
+- (void)setMicMuted:(BOOL)muted forParticipant:(NSString *)participantId;
+
+/// Update the HOST-MUTED state on a tile. Drives the three-dot menu label:
+/// YES → "Unmute Mic" (host explicitly muted), NO → "Mute Mic".
+/// This is independent of isMicMuted (which reflects the actual track state).
+- (void)setHostMuted:(BOOL)hostMuted forParticipant:(NSString *)participantId;
+
+// MARK: — Per-participant moderation (host/co-host controls on tile hover)
+
+/// When YES, a three-dot (⋯) moderation menu button appears on remote participant tiles
+/// when hovered. Set to YES while the local user has moderation permissions (host or co-host).
+/// Changing this property updates all existing tiles immediately.
+@property (nonatomic, assign) BOOL isHostMode;
+
+/// Invoked on the main queue when the local host selects a moderation action
+/// from a participant tile's three-dot hover menu.
+///
+/// @param participantIdentity  The LiveKit participant identity of the targeted tile.
+/// @param actionType           One of: @"muteMic", @"muteCamera", @"muteAll",
+///                             @"pinForAll", @"allowSharing", @"allowSpeaking", @"remove".
+@property (nonatomic, copy, nullable) void (^moderationActionHandler)(NSString *participantIdentity,
+                                                                       NSString *actionType);
+
+/// Invoked on the main queue whenever the host-forced spotlight list is internally
+/// mutated by the layout manager (e.g. a pinned participant left the meeting).
+/// In host mode, AppDelegate should call the moderation controller to re-broadcast
+/// the updated list to all remote clients. Passed array is the current pinned keys
+/// (empty = all pins cleared).
+@property (nonatomic, copy, nullable) void (^hostForcedSpotlightChangedHandler)(NSArray<NSString *> *currentPinnedKeys);
+
 /// Programmatically spotlight a specific feed.
 /// @param tileKey The tile key to spotlight. Screen share tile key is @"__screenshare__".
 ///                Camera tile keys are the participant identity string.
 - (void)spotlightTile:(NSString *)tileKey;
 
+/// Lock the spotlight to a specific tile for all participants (host-forced pin).
+/// Passing nil releases the lock and restores normal click-to-spotlight behavior.
+/// When locked, all click-to-spotlight interaction is suppressed — only the host
+/// can change the spotlight by calling this method again.
+/// Set the host-forced pinned participants (max 5). Pass nil or empty array to clear all pins.\n/// Automatically switches from grid to stage if grid was active when the first tile is pinned.
+- (void)setHostForcedSpotlightTileKeys:(NSArray<NSString *> * _Nullable)tileKeys animated:(BOOL)animated;
+
 /// Set the spotlight selection directly without toggle semantics.
 /// Passing nil returns the layout manager to automatic spotlight behavior.
 - (void)setManualSpotlightTileKey:(NSString * _Nullable)tileKey animated:(BOOL)animated;
+
+/// Re-run the current layout pass and force the local self-tile's preview layer to
+/// redisplay. Call this whenever the local camera transitions from off → on so that
+/// AVSampleBufferDisplayLayer (which backs AVCaptureVideoPreviewLayer) wakes up and
+/// begins rendering the new video frames.
+- (void)refreshLocalPreviewLayout;
 
 /// Tear down and remove all remote views. Call on mode exit.
 - (void)teardown;

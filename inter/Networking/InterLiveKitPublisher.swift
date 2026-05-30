@@ -47,7 +47,7 @@ import LiveKit
     // MARK: - Sources
 
     /// Camera video source. Non-nil while camera is published.
-    public private(set) var cameraSource: InterLiveKitCameraSource?
+    @objc public private(set) var cameraSource: InterLiveKitCameraSource?
 
     /// Audio bridge (mic). Non-nil while mic is published via surface share path.
     public private(set) var audioBridge: InterLiveKitAudioBridge?
@@ -55,6 +55,13 @@ import LiveKit
     /// Direct microphone track for normal calls (no bridge needed).
     /// LiveKit captures the mic natively when this track is published.
     public private(set) var microphoneTrack: LocalAudioTrack?
+
+    /// Whether a microphone track has been published (or is in the process of being published).
+    /// Used by ObjC callers to distinguish unmuting an existing muted track vs. publishing
+    /// from scratch when activeMuteOnJoin suppressed the initial wireNetworkPublish publish.
+    @objc public var isMicrophonePublished: Bool {
+        microphoneTrack != nil
+    }
 
     /// Screen share source. Created on demand via factory.
     public private(set) var screenShareSource: InterLiveKitScreenShareSource?
@@ -441,21 +448,22 @@ import LiveKit
     /// the WebSocket mute notification. In that case `track.isMuted` is
     /// still `false` and a plain `track.unmute()` is a no-op.
     ///
-    /// Strategy: if the SDK doesn't yet reflect the muted state, explicitly
-    /// mute first to synchronize, then unmute. The completion fires on the
-    /// main queue once the track is truly unmuted.
+    /// Strategy: unconditionally drive the track through mute→unmute to
+    /// guarantee a clean, ordered MuteTrackRequest(false) reaches the server.
+    /// Calling mute() first (regardless of current state) ensures isMuted=true
+    /// before unmute() runs, so unmute()'s guard always passes and only a
+    /// single MuteTrackRequest(false) is sent — eliminating the race where
+    /// two concurrent detached Tasks send conflicting muted:true / muted:false
+    /// signals in non-deterministic order.
+    /// Task.yield() at the start lets any pending SDK async notifications
+    /// (e.g. the server's mutePublishedTrack WebSocket signal) process first.
     @objc public func forceUnmuteMicrophoneTrack(completion: @escaping () -> Void) {
         if let bridge = audioBridge {
             bridge.beginEnable(completion: completion)
         } else if let track = microphoneTrack ?? microphonePublication?.track as? LocalAudioTrack {
             Task {
-                // If the SDK hasn't processed the server-side mute yet,
-                // track.isMuted is false and unmute() would silently
-                // return. Force the track into a muted state first.
-                if !track.isMuted {
-                    try? await track.mute()
-                    interLogInfo(InterLog.media, "Publisher: force-muted mic to sync with server state")
-                }
+                await Task.yield()
+                try? await track.mute()
                 try? await track.unmute()
                 interLogInfo(InterLog.media, "Publisher: mic track force-unmuted (isMuted=%d)", track.isMuted ? 1 : 0)
                 DispatchQueue.main.async { completion() }

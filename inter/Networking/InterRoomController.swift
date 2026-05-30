@@ -108,6 +108,44 @@ import LiveKit
         return configuration?.tokenServerURL ?? ""
     }
 
+    // MARK: - Active Meeting Settings (set after successful connect)
+
+    /// Human-readable meeting name broadcast to all participants.
+    @objc public private(set) dynamic var activeMeetingDisplayName: String = ""
+    /// Whether all participants start muted.
+    @objc public private(set) dynamic var activeMuteOnJoin: Bool = false
+    /// Whether all participants start with camera off.
+    @objc public private(set) dynamic var activeCameraOffOnJoin: Bool = false
+    /// Whether participants can join before the host.
+    @objc public private(set) dynamic var activeJoinBeforeHost: Bool = false
+    /// Whether participants can unmute themselves.
+    @objc public private(set) dynamic var activeAllowUnmuting: Bool = true
+    /// Chat permission level: "everyone" | "hostOnly" | "disabled".
+    @objc public private(set) dynamic var activeChatPermissions: String = "everyone"
+    /// Screen sharing permission: "hostOnly" | "everyone" | "request".
+    @objc public private(set) dynamic var activeSharingPermissions: String = "hostOnly"
+    /// Whether cloud recording should auto-start when the host joins.
+    @objc public private(set) dynamic var activeAutoRecord: Bool = false
+    /// Whether AI transcription should auto-start when the host joins.
+    @objc public private(set) dynamic var activeAutoTranscript: Bool = false
+
+    // MARK: - Meeting Settings Helpers
+
+    /// Apply meeting settings from a dictionary (used on the lobby-admitted path where
+    /// settings arrive in the polling response, not via `joinRoom`).
+    /// Callable from Objective-C. Must be called on the main thread.
+    @objc public func applyMeetingSettingsFromDict(_ dict: [AnyHashable: Any]) {
+        activeMeetingDisplayName = dict["meetingDisplayName"] as? String ?? ""
+        activeMuteOnJoin         = dict["muteOnJoin"]         as? Bool ?? false
+        activeCameraOffOnJoin    = dict["cameraOffOnJoin"]    as? Bool ?? false
+        activeJoinBeforeHost     = dict["joinBeforeHost"]     as? Bool ?? false
+        activeAllowUnmuting      = dict["allowUnmuting"]      as? Bool ?? true
+        activeChatPermissions    = dict["chatPermissions"]    as? String ?? "everyone"
+        activeSharingPermissions = dict["sharingPermissions"] as? String ?? "hostOnly"
+        activeAutoRecord         = dict["autoRecord"]         as? Bool ?? false
+        activeAutoTranscript     = dict["autoTranscript"]     as? Bool ?? false
+    }
+
     // MARK: - Private Properties
 
     /// The LiveKit Room instance. Created fresh for each connection.
@@ -207,8 +245,23 @@ import LiveKit
                 serverURL: configuration.tokenServerURL,
                 identity: configuration.participantIdentity,
                 displayName: configuration.participantName,
-                roomType: configuration.roomType.isEmpty ? "call" : configuration.roomType
+                roomType: configuration.roomType.isEmpty ? "call" : configuration.roomType,
+                settings: configuration.meetingSettingsDict
             ) { [weak self] response, error in
+                if let self = self, error == nil {
+                    // Apply host-configured settings immediately (from local config)
+                    DispatchQueue.main.async {
+                        self.activeMeetingDisplayName = configuration.meetingDisplayName
+                        self.activeMuteOnJoin         = configuration.muteOnJoin
+                        self.activeCameraOffOnJoin    = configuration.cameraOffOnJoin
+                        self.activeJoinBeforeHost     = configuration.joinBeforeHost
+                        self.activeAllowUnmuting      = configuration.allowUnmuting
+                        self.activeChatPermissions    = configuration.chatPermissions
+                        self.activeSharingPermissions = configuration.sharingPermissions
+                        self.activeAutoRecord         = configuration.autoRecord
+                        self.activeAutoTranscript     = configuration.autoTranscript
+                    }
+                }
                 self?.handleTokenResponse(
                     token: response?.token,
                     serverURL: response?.serverURL ?? configuration.serverURL,
@@ -225,6 +278,20 @@ import LiveKit
                 identity: configuration.participantIdentity,
                 displayName: configuration.participantName
             ) { [weak self] response, error in
+                if let self = self, let r = response, error == nil {
+                    // Apply server-returned meeting settings for participants
+                    DispatchQueue.main.async {
+                        self.activeMeetingDisplayName = r.meetingDisplayName
+                        self.activeMuteOnJoin         = r.muteOnJoin
+                        self.activeCameraOffOnJoin    = r.cameraOffOnJoin
+                        self.activeJoinBeforeHost     = r.joinBeforeHost
+                        self.activeAllowUnmuting      = r.allowUnmuting
+                        self.activeChatPermissions    = r.chatPermissions
+                        self.activeSharingPermissions = r.sharingPermissions
+                        self.activeAutoRecord         = r.autoRecord
+                        self.activeAutoTranscript     = r.autoTranscript
+                    }
+                }
                 self?.handleTokenResponse(
                     token: response?.token,
                     serverURL: response?.serverURL ?? configuration.serverURL,
