@@ -174,8 +174,8 @@ static NSString *const kInterPreferGridLayoutKey = @"InterPreferGridLayout";
     self.handRaiseBadge.frame = NSMakeRect(4, b.size.height - 28, 24, 24);
     // Mic-muted badge at bottom-right, just above the name label
     self.micMutedBadge.frame = NSMakeRect(b.size.width - 26, labelH + 2, 22, 22);
-    // Co-host crown badge at top-right corner
-    self.coHostBadge.frame = NSMakeRect(b.size.width - 26, b.size.height - 26, 22, 22);
+    // Co-host crown badge: top-right, below the moderation menu button
+    self.coHostBadge.frame = NSMakeRect(b.size.width - 26, b.size.height - 54, 22, 22);
     // Moderation menu button at top-right (symmetric with hand-raise badge)
     self.moderationMenuButton.frame = NSMakeRect(b.size.width - 26, b.size.height - 28, 22, 22);
 }
@@ -823,12 +823,11 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
 }
 
 - (void)setIsCoHost:(BOOL)isCoHost forParticipant:(NSString *)identity {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        InterRemoteVideoTileView *tile = self.tileViews[identity];
-        if (tile) {
-            tile.isCoHost = isCoHost;
-        }
-    });
+    if (!identity || identity.length == 0) return;
+    InterRemoteVideoTileView *tile = self.tileViews[identity];
+    if (tile) {
+        tile.isCoHost = isCoHost;
+    }
 }
 
 - (void)setHostForcedSpotlightTileKeys:(NSArray<NSString *> * _Nullable)tileKeys animated:(BOOL)animated {
