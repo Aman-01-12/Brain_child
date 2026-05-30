@@ -2294,6 +2294,15 @@ didRequestDeleteTeamId:(NSString *)teamId {
         [weakSelf toggleNormalRecordingListPanel];
     };
 
+    // Screen share permission mode toggle — host only
+    if (self.roomController.isHost) {
+        NSString *initialMode = self.roomController.activeSharingPermissions ?: @"hostOnly";
+        [self.normalControlPanel setScreenSharePermissionMode:initialMode];
+    }
+    self.normalControlPanel.screenShareModeChangedHandler = ^(NSString *mode) {
+        [weakSelf handleScreenShareModeChanged:mode];
+    };
+
     // [3.4.4] Network quality signal bars in the control panel
     self.normalNetworkStatusView = [[InterNetworkStatusView alloc] initWithFrame:NSMakeRect(0, 0, 40, 16)];
     [self.normalControlPanel.networkStatusContainerView addSubview:self.normalNetworkStatusView];
@@ -3125,6 +3134,94 @@ didRequestDeleteTeamId:(NSString *)teamId {
 }
 
 // MARK: InterMediaWiringDelegate (Phase 8 — participant list sync)
+
+- (void)mediaWiringControllerDidChangeConnectionState:(NSInteger)state {
+    InterRoomConnectionState cs = (InterRoomConnectionState)state;
+    if (cs != InterRoomConnectionStateConnected) return;
+    if (!self.roomController.isHost) return;
+
+    // T6: On (re)connect, fetch any pending screen share requests from Redis ZSET
+    [self fetchScreenShareQueueSnapshot];
+
+    // T7: Sync the screen share permission mode toggle to live value
+    NSString *mode = self.roomController.activeSharingPermissions ?: @"hostOnly";
+    [self.normalControlPanel setScreenSharePermissionMode:mode];
+}
+
+/// Fetch pending screen share requests from server on (re)connect.
+- (void)fetchScreenShareQueueSnapshot {
+    NSString *roomCode = self.roomController.roomCode;
+    NSString *identity = self.roomController.localParticipantIdentity;
+    NSString *serverURL = self.roomController.tokenServerURL;
+    if (!roomCode.length || !identity.length || !serverURL.length) return;
+
+    NSString *urlStr = [NSString stringWithFormat:@"%@/room/screenshare-queue?roomCode=%@&callerIdentity=%@",
+                        serverURL,
+                        [roomCode stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLQueryAllowedCharacterSet]],
+                        [identity stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLQueryAllowedCharacterSet]]];
+    NSURL *url = [NSURL URLWithString:urlStr];
+    if (!url) return;
+    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
+    req.HTTPMethod = @"GET";
+    NSString *token = self.roomController.tokenService.currentAccessToken;
+    if (token.length) {
+        [req setValue:[NSString stringWithFormat:@"Bearer %@", token] forHTTPHeaderField:@"Authorization"];
+    }
+
+    __weak typeof(self) weakSelf = self;
+    [[[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+        if (error || !data) return;
+        NSDictionary *json = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+        NSArray<NSDictionary *> *entries = json[@"entries"];
+        if (![entries isKindOfClass:[NSArray class]] || entries.count == 0) return;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            for (NSDictionary *entry in entries) {
+                NSString *entryIdentity = entry[@"identity"];
+                NSString *displayName = entry[@"displayName"] ?: entryIdentity;
+                if (entryIdentity.length) {
+                    [weakSelf.screenShareQueue addRequestWithIdentity:entryIdentity
+                                                         displayName:displayName];
+                }
+            }
+            if (weakSelf.screenShareQueue.entries.count > 0) {
+                [weakSelf.normalScreenShareQueuePanel setEntries:weakSelf.screenShareQueue.entries];
+                [weakSelf.normalScreenShareQueuePanel showPanel];
+            }
+        });
+    }] resume];
+}
+
+/// T7: Host changed screen share permission mid-meeting.
+- (void)handleScreenShareModeChanged:(NSString *)mode {
+    NSString *roomCode = self.roomController.roomCode;
+    NSString *callerIdentity = self.roomController.localParticipantIdentity;
+    NSString *serverURL = self.roomController.tokenServerURL;
+    if (!roomCode.length || !callerIdentity.length || !serverURL.length) return;
+
+    NSURL *url = [NSURL URLWithString:[NSString stringWithFormat:@"%@/room/screen-share-mode", serverURL]];
+    if (!url) return;
+    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
+    req.HTTPMethod = @"POST";
+    [req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
+    NSString *token = self.roomController.tokenService.currentAccessToken;
+    if (token.length) {
+        [req setValue:[NSString stringWithFormat:@"Bearer %@", token] forHTTPHeaderField:@"Authorization"];
+    }
+    NSDictionary *body = @{ @"roomCode": roomCode, @"callerIdentity": callerIdentity, @"mode": mode };
+    req.HTTPBody = [NSJSONSerialization dataWithJSONObject:body options:0 error:nil];
+    [[[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
+#pragma unused(d, r)
+        if (e) NSLog(@"[ScreenShare] mode change failed: %@", e.localizedDescription);
+    }] resume];
+    // Immediately update local state so share button reflects new policy
+    [self.roomController updateSharingPermissions:mode];
+    // If moving away from "request", clear queue
+    if ([mode isEqualToString:@"everyone"] || [mode isEqualToString:@"hostOnly"]) {
+        [self.screenShareQueue reset];
+        [self.normalScreenShareQueuePanel setEntries:@[]];
+        [self.normalScreenShareQueuePanel hidePanel];
+    }
+}
 
 - (void)mediaWiringControllerDidChangePresenceState:(NSInteger)state {
     [self refreshChatParticipantList];
@@ -4755,8 +4852,10 @@ didRequestDeleteTeamId:(NSString *)teamId {
         self.normalControlPanel.microphoneToggleHandler = nil;
         self.normalControlPanel.shareToggleHandler = nil;
         self.normalControlPanel.shareModeChangedHandler = nil;
+        self.normalControlPanel.screenShareModeChangedHandler = nil;
         self.normalControlPanel.audioInputSelectionChangedHandler = nil;
         self.normalControlPanel.shareSystemAudioChangedHandler = nil;
+        [self.normalControlPanel setScreenSharePermissionMode:nil];
     }
 
     [self.normalSurfaceShareController stopSharingFromSurfaceView:self.normalRenderView];

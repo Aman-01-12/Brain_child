@@ -24,6 +24,8 @@
 @property (nonatomic, assign) BOOL shareButtonActive;
 @property (nonatomic, assign) BOOL shareButtonStartPending;
 @property (nonatomic, assign) BOOL recordButtonActive;
+@property (nonatomic, strong) NSSegmentedControl *screenSharePermissionControl;
+@property (nonatomic, strong) NSTextField *screenSharePermissionLabel;
 @end
 
 @implementation InterLocalCallControlPanel
@@ -167,6 +169,28 @@
     [self.shareSystemAudioButton setTarget:self];
     [self.shareSystemAudioButton setAction:@selector(handleShareSystemAudioToggle:)];
     [self addSubview:self.shareSystemAudioButton];
+
+    // Screen share permission segmented control — host-only, hidden by default
+    self.screenSharePermissionLabel = [NSTextField labelWithString:@"Screen Share"];
+    self.screenSharePermissionLabel.frame = NSMakeRect(16, -62, 100, 16);
+    self.screenSharePermissionLabel.autoresizingMask = NSViewMaxXMargin | NSViewMaxYMargin;
+    self.screenSharePermissionLabel.font = [NSFont systemFontOfSize:11];
+    self.screenSharePermissionLabel.textColor = [NSColor colorWithWhite:0.85 alpha:1.0];
+    self.screenSharePermissionLabel.hidden = YES;
+    [self addSubview:self.screenSharePermissionLabel];
+
+    self.screenSharePermissionControl = [[NSSegmentedControl alloc] initWithFrame:NSMakeRect(16, -86, self.bounds.size.width - 32, 22)];
+    self.screenSharePermissionControl.autoresizingMask = NSViewWidthSizable | NSViewMaxYMargin;
+    self.screenSharePermissionControl.segmentCount = 3;
+    [self.screenSharePermissionControl setLabel:@"Everyone" forSegment:0];
+    [self.screenSharePermissionControl setLabel:@"Ask" forSegment:1];
+    [self.screenSharePermissionControl setLabel:@"Host Only" forSegment:2];
+    self.screenSharePermissionControl.trackingMode = NSSegmentSwitchTrackingSelectOne;
+    self.screenSharePermissionControl.selectedSegment = 1; // "Ask" default
+    [self.screenSharePermissionControl setTarget:self];
+    [self.screenSharePermissionControl setAction:@selector(handleScreenSharePermissionChange:)];
+    self.screenSharePermissionControl.hidden = YES;
+    [self addSubview:self.screenSharePermissionControl];
 
     self.cameraButton = [[NSButton alloc] initWithFrame:NSMakeRect(16, 118, self.bounds.size.width - 32, 30)];
     self.cameraButton.autoresizingMask = NSViewWidthSizable | NSViewMaxYMargin;
@@ -525,6 +549,35 @@
 
 - (void)setViewRecordingsButtonHidden:(BOOL)hidden {
     self.viewRecordingsButton.hidden = hidden;
+}
+
+// ---------------------------------------------------------------------------
+// MARK: - Screen Share Permission Control
+// ---------------------------------------------------------------------------
+
+- (void)handleScreenSharePermissionChange:(NSSegmentedControl *)sender {
+    NSArray<NSString *> *modes = @[@"everyone", @"request", @"hostOnly"];
+    NSInteger seg = sender.selectedSegment;
+    if (seg < 0 || seg >= (NSInteger)modes.count) return;
+    void (^handler)(NSString *) = self.screenShareModeChangedHandler;
+    if (handler) handler(modes[seg]);
+}
+
+- (void)setScreenSharePermissionMode:(nullable NSString *)mode {
+    if (!mode) {
+        self.screenSharePermissionControl.hidden = YES;
+        self.screenSharePermissionLabel.hidden = YES;
+        return;
+    }
+    self.screenSharePermissionControl.hidden = NO;
+    self.screenSharePermissionLabel.hidden = NO;
+    if ([mode isEqualToString:@"everyone"]) {
+        self.screenSharePermissionControl.selectedSegment = 0;
+    } else if ([mode isEqualToString:@"request"]) {
+        self.screenSharePermissionControl.selectedSegment = 1;
+    } else if ([mode isEqualToString:@"hostOnly"]) {
+        self.screenSharePermissionControl.selectedSegment = 2;
+    }
 }
 
 @end

@@ -146,6 +146,14 @@ import LiveKit
         activeAutoTranscript     = dict["autoTranscript"]     as? Bool ?? false
     }
 
+    /// Update the active screen sharing permissions mid-meeting.
+    /// Called when the host changes the mode via the control panel.
+    @objc public func updateSharingPermissions(_ mode: String) {
+        let valid = ["everyone", "request", "hostOnly"]
+        guard valid.contains(mode) else { return }
+        activeSharingPermissions = mode
+    }
+
     // MARK: - Private Properties
 
     /// The LiveKit Room instance. Created fresh for each connection.

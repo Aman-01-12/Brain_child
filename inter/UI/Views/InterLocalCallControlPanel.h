@@ -61,6 +61,15 @@ NS_ASSUME_NONNULL_BEGIN
 /// [Phase 10 R2] Show or hide the "View Recordings" button.
 - (void)setViewRecordingsButtonHidden:(BOOL)hidden;
 
+/// Called when the host changes the screen share permission segmented control.
+/// mode: @"everyone" | @"request" | @"hostOnly"
+@property (nonatomic, copy, nullable) void (^screenShareModeChangedHandler)(NSString *mode);
+
+/// Update the screen share permission segmented control.
+/// mode: @"everyone" | @"request" | @"hostOnly"
+/// Pass nil to hide the control (for non-host participants).
+- (void)setScreenSharePermissionMode:(nullable NSString *)mode;
+
 @end
 
 NS_ASSUME_NONNULL_END
