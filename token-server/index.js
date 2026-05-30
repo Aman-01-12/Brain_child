@@ -1998,6 +1998,7 @@ function roomNamesKey(code) { return `room:${code}:names`; }
 function roomLobbyKey(code) { return `room:${code}:lobby`; }
 function roomLobbyNamesKey(code) { return `room:${code}:lobby:names`; }
 function roomSuspendedKey(code) { return `room:${code}:suspended`; }
+function roomBannedKey(code) { return `room:${code}:banned`; }
 function roomLeaveTokenKey(code, identity) { return `room:${code}:leavetoken:${identity}`; }
 function roomFilesKey(code) { return `room:${code}:files`; }           // Hash: fileId → JSON metadata
 function roomFilesTotalSizeKey(code) { return `room:${code}:filesize`; } // String: cumulative bytes uploaded
