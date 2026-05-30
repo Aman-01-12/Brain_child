@@ -3599,6 +3599,28 @@ didRequestDeleteTeamId:(NSString *)teamId {
                                                       completion:^(BOOL success, NSError *error) {
             if (!success) NSLog(@"[Moderation] remove failed for %@: %@", participantIdentity, error.localizedDescription);
         }];
+
+    } else if ([actionType isEqualToString:@"makeCoHost"]) {
+        __weak typeof(self) weakSelf = self;
+        [self.moderationController promoteParticipantWithIdentity:participantIdentity
+                                                           toRole:InterParticipantRoleCoHost
+                                                       completion:^(BOOL success, NSError *error) {
+            if (!success) { NSLog(@"[Moderation] makeCoHost failed for %@: %@", participantIdentity, error.localizedDescription); return; }
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [weakSelf.normalRemoteLayout setIsCoHost:YES forParticipant:participantIdentity];
+            });
+        }];
+
+    } else if ([actionType isEqualToString:@"removeCoHost"]) {
+        __weak typeof(self) weakSelf = self;
+        [self.moderationController promoteParticipantWithIdentity:participantIdentity
+                                                           toRole:InterParticipantRoleParticipant
+                                                       completion:^(BOOL success, NSError *error) {
+            if (!success) { NSLog(@"[Moderation] removeCoHost failed for %@: %@", participantIdentity, error.localizedDescription); return; }
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [weakSelf.normalRemoteLayout setIsCoHost:NO forParticipant:participantIdentity];
+            });
+        }];
     }
 }
 
@@ -3928,7 +3950,6 @@ didRequestDeleteTeamId:(NSString *)teamId {
 }
 
 - (void)moderationController:(InterModerationController *)controller participantRoleChanged:(NSString *)identity newRole:(NSString *)newRole {
-#pragma unused(newRole)
     NSLog(@"[Phase 9] Role changed: %@ → %@", identity, newRole);
     // If the local user's role changed, refresh the tile host-mode flag so the
     // three-dot moderation menus appear (or disappear) immediately.
@@ -3939,6 +3960,9 @@ didRequestDeleteTeamId:(NSString *)teamId {
                             hasPermission:(InterPermission)InterPermissionCanMuteOthers];
         self.normalRemoteLayout.isHostMode = canModerate;
     }
+    // Sync the co-host crown badge on the remote tile
+    BOOL nowCoHost = [newRole isEqualToString:@"coHost"];
+    [self.normalRemoteLayout setIsCoHost:nowCoHost forParticipant:identity];
 }
 
 - (void)moderationController:(InterModerationController *)controller lobbyParticipantJoined:(NSString *)identity displayName:(NSString *)displayName {
