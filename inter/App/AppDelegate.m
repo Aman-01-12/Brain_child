@@ -3942,8 +3942,8 @@ didRequestDeleteTeamId:(NSString *)teamId {
 - (void)moderationControllerLocalParticipantWasRemoved:(InterModerationController *)controller {
 #pragma unused(controller)
     NSAlert *alert = [[NSAlert alloc] init];
-    alert.messageText = @"Removed";
-    alert.informativeText = @"You have been removed from the meeting by the host.";
+    alert.messageText = @"Removed from Meeting";
+    alert.informativeText = @"You have been removed from this meeting by the host. You may not rejoin.";
     [alert addButtonWithTitle:@"OK"];
     [alert runModal];
     [self requestExitCurrentMode];
