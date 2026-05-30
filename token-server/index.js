@@ -1999,6 +1999,8 @@ function roomLobbyKey(code) { return `room:${code}:lobby`; }
 function roomLobbyNamesKey(code) { return `room:${code}:lobby:names`; }
 function roomSuspendedKey(code) { return `room:${code}:suspended`; }
 function roomBannedKey(code) { return `room:${code}:banned`; }
+function roomScreenShareQueueKey(code) { return `room:${code}:screenshare-queue`; }
+function roomScreenShareQueueNamesKey(code) { return `room:${code}:screenshare-queue:names`; }
 function roomLeaveTokenKey(code, identity) { return `room:${code}:leavetoken:${identity}`; }
 function roomFilesKey(code) { return `room:${code}:files`; }           // Hash: fileId → JSON metadata
 function roomFilesTotalSizeKey(code) { return `room:${code}:filesize`; } // String: cumulative bytes uploaded
@@ -4057,6 +4059,136 @@ app.post('/webhooks/egress', express.raw({ type: 'application/webhook+json' }), 
 });
 
 // ---------------------------------------------------------------------------
+// GET /room/screenshare-queue — Returns pending screen share requests for a host.
+// Used by native app on reconnect (no Socket.IO client in native app).
+// Query params: roomCode, callerIdentity
+// ---------------------------------------------------------------------------
+app.get('/room/screenshare-queue', auth.requireAuth, async (req, res) => {
+  const { roomCode, callerIdentity } = req.query;
+  if (!roomCode || !callerIdentity) {
+    return res.status(400).json({ error: 'roomCode and callerIdentity are required' });
+  }
+  const code = String(roomCode).toUpperCase().replace(/[^A-Z0-9]/g, '');
+  const roomData = await getRoomData(code);
+  if (!roomData) return res.status(404).json({ error: 'Invalid or expired room code' });
+
+  const validation = await validateModerator(code, callerIdentity);
+  if (!validation.valid) return res.status(403).json({ error: validation.error });
+
+  try {
+    const queueEntries = await redis.zrangebyscore(
+      roomScreenShareQueueKey(code), '-inf', '+inf', 'WITHSCORES'
+    );
+    const entries = [];
+    for (let i = 0; i < queueEntries.length; i += 2) {
+      const entryIdentity = queueEntries[i];
+      const timestamp = parseFloat(queueEntries[i + 1]);
+      const displayName = await redis.hget(roomScreenShareQueueNamesKey(code), entryIdentity) || entryIdentity;
+      entries.push({ identity: entryIdentity, displayName, timestamp });
+    }
+    res.json({ entries });
+  } catch (err) {
+    console.error('[error] screenshare-queue fetch failed:', err.message);
+    res.status(500).json({ error: 'Failed to fetch screen share queue' });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// POST /room/request-screen-share — Participant requests permission to share.
+// Persists the request to Redis ZSET for reconnect resilience.
+// Body: { roomCode, requesterIdentity }
+// ---------------------------------------------------------------------------
+app.post('/room/request-screen-share', auth.requireAuth, async (req, res) => {
+  const { roomCode, requesterIdentity } = req.body;
+  if (!roomCode || !requesterIdentity) {
+    return res.status(400).json({ error: 'roomCode and requesterIdentity are required' });
+  }
+  const code = String(roomCode).toUpperCase().replace(/[^A-Z0-9]/g, '');
+  const roomData = await getRoomData(code);
+  if (!roomData) return res.status(404).json({ error: 'Invalid or expired room code' });
+
+  const isMember = await redis.sismember(roomParticipantsKey(code), requesterIdentity);
+  if (!isMember) return res.status(403).json({ error: 'Not a participant in this room' });
+
+  try {
+    const now = Date.now();
+    await redis.zadd(roomScreenShareQueueKey(code), 'NX', now, requesterIdentity);
+    await redis.expire(roomScreenShareQueueKey(code), ROOM_CODE_EXPIRY_SECONDS);
+
+    const displayName = await redis.hget(roomNamesKey(code), requesterIdentity);
+    if (displayName) {
+      await redis.hset(roomScreenShareQueueNamesKey(code), requesterIdentity, displayName);
+      await redis.expire(roomScreenShareQueueNamesKey(code), ROOM_CODE_EXPIRY_SECONDS);
+    }
+    res.json({ success: true });
+  } catch (err) {
+    console.error('[error] request-screen-share failed:', err.message);
+    res.status(500).json({ error: 'Failed to queue screen share request' });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// POST /room/resolve-screen-share-request — Host resolves a screen share request.
+// Body: { roomCode, callerIdentity, targetIdentity, resolution }
+// ---------------------------------------------------------------------------
+app.post('/room/resolve-screen-share-request', auth.requireAuth, async (req, res) => {
+  const { roomCode, callerIdentity, targetIdentity, resolution } = req.body;
+  if (!roomCode || !callerIdentity || !targetIdentity) {
+    return res.status(400).json({ error: 'roomCode, callerIdentity, and targetIdentity are required' });
+  }
+  const code = String(roomCode).toUpperCase().replace(/[^A-Z0-9]/g, '');
+  const roomData = await getRoomData(code);
+  if (!roomData) return res.status(404).json({ error: 'Invalid or expired room code' });
+
+  const validation = await validateModerator(code, callerIdentity);
+  if (!validation.valid) return res.status(403).json({ error: validation.error });
+
+  try {
+    await redis.zrem(roomScreenShareQueueKey(code), targetIdentity);
+    await redis.hdel(roomScreenShareQueueNamesKey(code), targetIdentity);
+    console.log(`[audit] Screen share resolved: code=${code} target=${targetIdentity} resolution=${resolution || 'unknown'} by=${callerIdentity}`);
+    res.json({ success: true });
+  } catch (err) {
+    console.error('[error] resolve-screen-share-request failed:', err.message);
+    res.status(500).json({ error: 'Failed to resolve screen share request' });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// POST /room/screen-share-mode — Host changes screen share permission mid-meeting.
+// Body: { roomCode, callerIdentity, mode }  mode: "everyone"|"request"|"hostOnly"
+// ---------------------------------------------------------------------------
+app.post('/room/screen-share-mode', auth.requireAuth, async (req, res) => {
+  const { roomCode, callerIdentity, mode } = req.body;
+  const VALID_MODES = ['everyone', 'request', 'hostOnly'];
+  if (!roomCode || !callerIdentity || !VALID_MODES.includes(mode)) {
+    return res.status(400).json({ error: 'roomCode, callerIdentity, and a valid mode are required' });
+  }
+  const code = String(roomCode).toUpperCase().replace(/[^A-Z0-9]/g, '');
+  const roomData = await getRoomData(code);
+  if (!roomData) return res.status(404).json({ error: 'Invalid or expired room code' });
+
+  const validation = await validateModerator(code, callerIdentity);
+  if (!validation.valid) return res.status(403).json({ error: validation.error });
+
+  try {
+    await redis.hset(roomKey(code), 'sharingPermissions', mode);
+
+    if (mode === 'everyone' || mode === 'hostOnly') {
+      await redis.del(roomScreenShareQueueKey(code));
+      await redis.del(roomScreenShareQueueNamesKey(code));
+    }
+
+    io.to(code).emit('room:screenshare-mode-changed', { mode });
+    console.log(`[audit] Screen share mode changed: code=${code} mode=${mode} by=${callerIdentity}`);
+    res.json({ success: true });
+  } catch (err) {
+    console.error('[error] screen-share-mode failed:', err.message);
+    res.status(500).json({ error: 'Failed to update screen share mode' });
+  }
+});
+
+// ---------------------------------------------------------------------------
 // Health check — includes Redis + PostgreSQL connection status
 // ---------------------------------------------------------------------------
 app.get('/health', async (req, res) => {
@@ -4494,6 +4626,26 @@ io.on('connection', (socket) => {
       const json = await redis.get(micStateKey(code, identity));
       const micState = json ? JSON.parse(json) : defaultMicState();
       socket.emit('room:mic-state-update', { participantId: identity, micState });
+    } catch (_) { /* best-effort */ }
+
+    // Send screen share queue snapshot to hosts on reconnect
+    try {
+      const callerRole = await getParticipantRole(code, identity);
+      if (callerRole === 'host' || callerRole === 'co-host') {
+        const queueEntries = await redis.zrangebyscore(
+          roomScreenShareQueueKey(code), '-inf', '+inf', 'WITHSCORES'
+        );
+        const entries = [];
+        for (let i = 0; i < queueEntries.length; i += 2) {
+          const entryIdentity = queueEntries[i];
+          const timestamp = parseFloat(queueEntries[i + 1]);
+          const displayName = await redis.hget(roomScreenShareQueueNamesKey(code), entryIdentity) || entryIdentity;
+          entries.push({ identity: entryIdentity, displayName, timestamp });
+        }
+        if (entries.length > 0) {
+          socket.emit('room:screenshare-queue-snapshot', { entries });
+        }
+      }
     } catch (_) { /* best-effort */ }
   });
 
