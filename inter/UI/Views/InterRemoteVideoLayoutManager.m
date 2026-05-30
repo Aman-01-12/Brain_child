@@ -59,6 +59,9 @@ static NSString *const kInterPreferGridLayoutKey = @"InterPreferGridLayout";
 /// Co-host crown badge (👑 emoji in top-right corner), shown when isCoHost=YES.
 @property (nonatomic, strong) NSTextField *coHostBadge;
 @property (nonatomic, assign) BOOL isCoHost;
+/// Host-camera-locked badge (🔒 emoji), shown when the host has locked this participant's camera.
+@property (nonatomic, strong) NSTextField *cameraLockedBadge;
+@property (nonatomic, assign) BOOL isHostCameraLocked;
 @end
 
 @implementation InterRemoteVideoTileView
@@ -139,6 +142,16 @@ static NSString *const kInterPreferGridLayoutKey = @"InterPreferGridLayout";
     self.coHostBadge.hidden = YES;
     [self addSubview:self.coHostBadge];
 
+    self.cameraLockedBadge = [NSTextField labelWithString:@"🔒"];
+    self.cameraLockedBadge.font = [NSFont systemFontOfSize:12];
+    self.cameraLockedBadge.frame = NSMakeRect(0, 0, 22, 22);
+    [self.cameraLockedBadge setWantsLayer:YES];
+    self.cameraLockedBadge.layer.backgroundColor = [NSColor colorWithWhite:0.0 alpha:0.55].CGColor;
+    self.cameraLockedBadge.layer.cornerRadius = 4.0;
+    self.cameraLockedBadge.alignment = NSTextAlignmentCenter;
+    self.cameraLockedBadge.hidden = YES;
+    [self addSubview:self.cameraLockedBadge];
+
     return self;
 }
 
@@ -162,6 +175,12 @@ static NSString *const kInterPreferGridLayoutKey = @"InterPreferGridLayout";
     self.coHostBadge.hidden = !isCoHost;
 }
 
+- (void)setIsHostCameraLocked:(BOOL)isHostCameraLocked {
+    if (_isHostCameraLocked == isHostCameraLocked) return;
+    _isHostCameraLocked = isHostCameraLocked;
+    self.cameraLockedBadge.hidden = !isHostCameraLocked;
+}
+
 - (void)layout {
     [super layout];
     NSRect b = self.bounds;
@@ -176,6 +195,8 @@ static NSString *const kInterPreferGridLayoutKey = @"InterPreferGridLayout";
     self.micMutedBadge.frame = NSMakeRect(b.size.width - 26, labelH + 2, 22, 22);
     // Co-host crown badge: top-right, below the moderation menu button
     self.coHostBadge.frame = NSMakeRect(b.size.width - 26, b.size.height - 54, 22, 22);
+    // Host-camera-locked badge: bottom-right, left of the mic-muted badge
+    self.cameraLockedBadge.frame = NSMakeRect(b.size.width - 52, labelH + 2, 22, 22);
     // Moderation menu button at top-right (symmetric with hand-raise badge)
     self.moderationMenuButton.frame = NSMakeRect(b.size.width - 26, b.size.height - 28, 22, 22);
 }
@@ -277,6 +298,12 @@ static NSString *const kInterPreferGridLayoutKey = @"InterPreferGridLayout";
         addItem(@"Unmute Camera", @"unmuteCamera");
     } else {
         addItem(@"Mute Camera", @"muteCamera");
+    }
+    // Camera lock — host-enforced camera off
+    if (self.isHostCameraLocked) {
+        addItem(@"Lift Camera Lock", @"liftCameraLock");
+    } else {
+        addItem(@"Lock Camera Off", @"lockCamera");
     }
     [menu addItem:[NSMenuItem separatorItem]];
     // Pin/Unpin toggles.
@@ -827,6 +854,14 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
     InterRemoteVideoTileView *tile = self.tileViews[identity];
     if (tile) {
         tile.isCoHost = isCoHost;
+    }
+}
+
+- (void)setIsHostCameraLocked:(BOOL)locked forParticipant:(NSString *)identity {
+    if (!identity || identity.length == 0) return;
+    InterRemoteVideoTileView *tile = self.tileViews[identity];
+    if (tile) {
+        tile.isHostCameraLocked = locked;
     }
 }
 

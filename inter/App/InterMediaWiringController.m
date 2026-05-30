@@ -388,6 +388,48 @@ static void *InterWiringParticipantCountContext = &InterWiringParticipantCountCo
     }
 }
 
+#pragma mark - Host Camera Lock
+
+- (void)deriveCameraButton {
+    if (self.isHostCameraLocked) {
+        [self.controlPanel setCameraButtonTitle:@"Camera Locked"];
+        [self.controlPanel setCameraEnabled:NO]; // keep title override
+    } else {
+        [self.controlPanel setCameraButtonTitle:nil]; // restore default
+        [self.controlPanel setCameraEnabled:self.mediaController.isCameraEnabled];
+    }
+}
+
+- (void)applyHostCameraMuteForParticipant {
+    self.isHostCameraLocked = YES;
+    InterLocalMediaController *media = self.mediaController;
+    if (!media) { [self deriveCameraButton]; return; }
+    __weak typeof(self) weakSelf = self;
+    if (media.isCameraEnabled) {
+        [media setCameraEnabled:NO completion:^(BOOL success) {
+#pragma unused(success)
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [weakSelf deriveCameraButton];
+            });
+        }];
+    } else {
+        [self deriveCameraButton];
+    }
+}
+
+- (void)applyHostCameraLiftForParticipant {
+    self.isHostCameraLocked = NO;
+    [self deriveCameraButton];
+}
+
+- (void)applyHostCameraMuteForAll {
+    [self applyHostCameraMuteForParticipant];
+}
+
+- (void)applyHostCameraLiftForAll {
+    [self applyHostCameraLiftForParticipant];
+}
+
 #pragma mark - Network Wiring
 
 - (void)wireNetworkPublish {

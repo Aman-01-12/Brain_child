@@ -145,6 +145,26 @@ NS_ASSUME_NONNULL_BEGIN
 /// Toggle microphone on/off (local device only, no G2 network coordination).
 - (void)toggleMicrophone;
 
+// -- Host Camera Lock ------------------------------------------------------
+
+/// Whether the host has locked this local participant's camera off.
+/// When YES the camera button title is replaced with "Camera Locked".
+@property (nonatomic, assign) BOOL isHostCameraLocked;
+
+/// Apply a host-initiated camera mute for this participant.
+/// Disables camera, sets isHostCameraLocked = YES.
+- (void)applyHostCameraMuteForParticipant;
+
+/// Apply a host-initiated camera lift for this participant (undo lock).
+/// Re-enables camera, sets isHostCameraLocked = NO.
+- (void)applyHostCameraLiftForParticipant;
+
+/// Apply a host-initiated camera mute for ALL participants.
+- (void)applyHostCameraMuteForAll;
+
+/// Lift the host camera lock for ALL participants.
+- (void)applyHostCameraLiftForAll;
+
 // -- Network Wiring --------------------------------------------------------
 
 /// Publish camera and microphone tracks to LiveKit if room is connected.

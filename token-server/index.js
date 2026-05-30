@@ -2001,6 +2001,7 @@ function roomSuspendedKey(code) { return `room:${code}:suspended`; }
 function roomBannedKey(code) { return `room:${code}:banned`; }
 function roomScreenShareQueueKey(code) { return `room:${code}:screenshare-queue`; }
 function roomScreenShareQueueNamesKey(code) { return `room:${code}:screenshare-queue:names`; }
+function roomCameraLockedKey(code) { return `room:${code}:camera-locked`; } // SET of locked identities
 function roomLeaveTokenKey(code, identity) { return `room:${code}:leavetoken:${identity}`; }
 function roomFilesKey(code) { return `room:${code}:files`; }           // Hash: fileId → JSON metadata
 function roomFilesTotalSizeKey(code) { return `room:${code}:filesize`; } // String: cumulative bytes uploaded
@@ -4189,6 +4190,132 @@ app.post('/room/screen-share-mode', auth.requireAuth, async (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// POST /room/camera-lock-one — Host locks a specific participant's camera off.
+// Body: { roomCode, callerIdentity, targetIdentity }
+// ---------------------------------------------------------------------------
+app.post('/room/camera-lock-one', auth.requireAuth, async (req, res) => {
+  const { roomCode, callerIdentity, targetIdentity } = req.body;
+  if (!roomCode || !callerIdentity || !targetIdentity) {
+    return res.status(400).json({ error: 'roomCode, callerIdentity, and targetIdentity are required' });
+  }
+  const code = String(roomCode).toUpperCase().replace(/[^A-Z0-9]/g, '');
+  const roomData = await getRoomData(code);
+  if (!roomData) return res.status(404).json({ error: 'Invalid or expired room code' });
+  const validation = await validateModerator(code, callerIdentity);
+  if (!validation.valid) return res.status(403).json({ error: validation.error });
+  try {
+    await redis.sadd(roomCameraLockedKey(code), targetIdentity);
+    await redis.expire(roomCameraLockedKey(code), ROOM_CODE_EXPIRY_SECONDS);
+    io.to(code).emit('room:camera-lock-changed', { identity: targetIdentity, locked: true });
+    console.log(`[audit] camera-lock-one: code=${code} target=${targetIdentity} by=${callerIdentity}`);
+    res.json({ success: true });
+  } catch (err) {
+    console.error('[error] camera-lock-one failed:', err.message);
+    res.status(500).json({ error: 'Failed to lock camera' });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// POST /room/camera-lock-all — Host locks ALL participants' cameras off.
+// Body: { roomCode, callerIdentity }
+// ---------------------------------------------------------------------------
+app.post('/room/camera-lock-all', auth.requireAuth, async (req, res) => {
+  const { roomCode, callerIdentity } = req.body;
+  if (!roomCode || !callerIdentity) {
+    return res.status(400).json({ error: 'roomCode and callerIdentity are required' });
+  }
+  const code = String(roomCode).toUpperCase().replace(/[^A-Z0-9]/g, '');
+  const roomData = await getRoomData(code);
+  if (!roomData) return res.status(404).json({ error: 'Invalid or expired room code' });
+  const validation = await validateModerator(code, callerIdentity);
+  if (!validation.valid) return res.status(403).json({ error: validation.error });
+  try {
+    const members = await redis.smembers(roomParticipantsKey(code));
+    if (members.length > 0) {
+      await redis.sadd(roomCameraLockedKey(code), ...members);
+      await redis.expire(roomCameraLockedKey(code), ROOM_CODE_EXPIRY_SECONDS);
+    }
+    io.to(code).emit('room:camera-lock-changed', { identity: null, locked: true, all: true });
+    console.log(`[audit] camera-lock-all: code=${code} by=${callerIdentity}`);
+    res.json({ success: true });
+  } catch (err) {
+    console.error('[error] camera-lock-all failed:', err.message);
+    res.status(500).json({ error: 'Failed to lock all cameras' });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// POST /room/camera-lift-one — Host lifts the camera lock for a specific participant.
+// Body: { roomCode, callerIdentity, targetIdentity }
+// ---------------------------------------------------------------------------
+app.post('/room/camera-lift-one', auth.requireAuth, async (req, res) => {
+  const { roomCode, callerIdentity, targetIdentity } = req.body;
+  if (!roomCode || !callerIdentity || !targetIdentity) {
+    return res.status(400).json({ error: 'roomCode, callerIdentity, and targetIdentity are required' });
+  }
+  const code = String(roomCode).toUpperCase().replace(/[^A-Z0-9]/g, '');
+  const roomData = await getRoomData(code);
+  if (!roomData) return res.status(404).json({ error: 'Invalid or expired room code' });
+  const validation = await validateModerator(code, callerIdentity);
+  if (!validation.valid) return res.status(403).json({ error: validation.error });
+  try {
+    await redis.srem(roomCameraLockedKey(code), targetIdentity);
+    io.to(code).emit('room:camera-lock-changed', { identity: targetIdentity, locked: false });
+    console.log(`[audit] camera-lift-one: code=${code} target=${targetIdentity} by=${callerIdentity}`);
+    res.json({ success: true });
+  } catch (err) {
+    console.error('[error] camera-lift-one failed:', err.message);
+    res.status(500).json({ error: 'Failed to lift camera lock' });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// POST /room/camera-lift-all — Host lifts camera lock for ALL participants.
+// Body: { roomCode, callerIdentity }
+// ---------------------------------------------------------------------------
+app.post('/room/camera-lift-all', auth.requireAuth, async (req, res) => {
+  const { roomCode, callerIdentity } = req.body;
+  if (!roomCode || !callerIdentity) {
+    return res.status(400).json({ error: 'roomCode and callerIdentity are required' });
+  }
+  const code = String(roomCode).toUpperCase().replace(/[^A-Z0-9]/g, '');
+  const roomData = await getRoomData(code);
+  if (!roomData) return res.status(404).json({ error: 'Invalid or expired room code' });
+  const validation = await validateModerator(code, callerIdentity);
+  if (!validation.valid) return res.status(403).json({ error: validation.error });
+  try {
+    await redis.del(roomCameraLockedKey(code));
+    io.to(code).emit('room:camera-lock-changed', { identity: null, locked: false, all: true });
+    console.log(`[audit] camera-lift-all: code=${code} by=${callerIdentity}`);
+    res.json({ success: true });
+  } catch (err) {
+    console.error('[error] camera-lift-all failed:', err.message);
+    res.status(500).json({ error: 'Failed to lift all camera locks' });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// GET /room/camera-locked — Returns locked camera identities for reconnect snapshot.
+// Query: { roomCode, callerIdentity }
+// ---------------------------------------------------------------------------
+app.get('/room/camera-locked', auth.requireAuth, async (req, res) => {
+  const { roomCode, callerIdentity } = req.query;
+  if (!roomCode || !callerIdentity) {
+    return res.status(400).json({ error: 'roomCode and callerIdentity are required' });
+  }
+  const code = String(roomCode).toUpperCase().replace(/[^A-Z0-9]/g, '');
+  const roomData = await getRoomData(code);
+  if (!roomData) return res.status(404).json({ error: 'Invalid or expired room code' });
+  try {
+    const locked = await redis.smembers(roomCameraLockedKey(code));
+    res.json({ locked });
+  } catch (err) {
+    console.error('[error] camera-locked fetch failed:', err.message);
+    res.status(500).json({ error: 'Failed to fetch camera lock state' });
+  }
+});
+
+// ---------------------------------------------------------------------------
 // Health check — includes Redis + PostgreSQL connection status
 // ---------------------------------------------------------------------------
 app.get('/health', async (req, res) => {
@@ -4646,6 +4773,14 @@ io.on('connection', (socket) => {
           socket.emit('room:screenshare-queue-snapshot', { entries });
         }
       }
+
+      // Camera lock snapshot — emit locked identities to the rejoining participant
+      try {
+        const lockedIdentities = await redis.smembers(roomCameraLockedKey(code));
+        if (lockedIdentities.length > 0) {
+          socket.emit('room:camera-state-snapshot', { locked: lockedIdentities });
+        }
+      } catch (_) { /* best-effort */ }
     } catch (_) { /* best-effort */ }
   });
 

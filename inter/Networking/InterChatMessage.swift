@@ -103,6 +103,18 @@ import Foundation
     /// Host is asking a specific participant to turn their camera back on.
     /// Only the participant whose identity matches `targetIdentity` acts on this.
     case askToUnmuteCamera = 35
+
+    /// Host forces a specific participant's camera off (targeted).
+    case requestMuteCameraOne = 36
+
+    /// Host forces ALL participants' cameras off.
+    case requestMuteCameraAll = 37
+
+    /// Host lifts the camera lock for a specific participant (targeted).
+    case liftCameraLockOne = 38
+
+    /// Host lifts the camera lock for ALL participants.
+    case liftCameraLockAll = 39
 }
 
 // MARK: - Chat Message

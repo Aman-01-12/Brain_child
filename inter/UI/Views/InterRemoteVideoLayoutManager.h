@@ -189,6 +189,11 @@ typedef NS_ENUM(NSUInteger, InterRemoteVideoLayoutMode) {
 /// Update the co-host crown badge on a specific participant's tile.
 - (void)setIsCoHost:(BOOL)isCoHost forParticipant:(NSString *)identity;
 
+/// Update the host-camera-locked badge on a specific participant's tile.
+/// When locked = YES, the tile shows a camera-lock indicator and the tile menu
+/// shows "Lift Camera Lock" instead of "Lock Camera Off".
+- (void)setIsHostCameraLocked:(BOOL)locked forParticipant:(NSString *)identity;
+
 // MARK: — Per-participant moderation (host/co-host controls on tile hover)
 
 /// When YES, a three-dot (⋯) moderation menu button appears on remote participant tiles

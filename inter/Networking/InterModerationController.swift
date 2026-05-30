@@ -111,6 +111,26 @@ import LiveKit
 
     /// Host has denied our screen share request.
     @objc optional func moderationControllerScreenShareRequestDenied(_ controller: InterModerationController)
+
+    /// Host ordered this local participant to turn their camera off.
+    @objc optional func moderationControllerReceivedCameraMuteOne(_ controller: InterModerationController)
+
+    /// Host ordered ALL participants to turn their cameras off.
+    @objc optional func moderationControllerReceivedCameraMuteAll(_ controller: InterModerationController)
+
+    /// Host lifted the camera lock for this local participant.
+    @objc optional func moderationControllerReceivedCameraLiftOne(_ controller: InterModerationController)
+
+    /// Host lifted the camera lock for ALL participants.
+    @objc optional func moderationControllerReceivedCameraLiftAll(_ controller: InterModerationController)
+
+    /// Host (self) should apply a per-participant camera mute to a specific remote tile.
+    @objc optional func moderationController(_ controller: InterModerationController,
+                                             shouldApplyCameraMuteForParticipant identity: String)
+
+    /// Host (self) should lift the camera lock for a specific remote tile.
+    @objc optional func moderationController(_ controller: InterModerationController,
+                                             shouldLiftCameraLockForParticipant identity: String)
 }
 
 // MARK: - InterModerationController
@@ -432,6 +452,36 @@ import LiveKit
         guard InterPermissionMatrix.role(localRole, hasPermission: .canAskToUnmute) else { return }
         sendControlSignal(type: .askToUnmuteCamera, targetIdentity: identity)
         interLogInfo(InterLog.room, "ModerationController: asked %{private}@ to unmute camera", identity)
+    }
+
+    // MARK: - Host Camera Mute / Lift
+
+    /// Host forces a specific participant's camera off.
+    @objc public func muteCameraOne(identity: String) {
+        guard InterPermissionMatrix.role(localRole, hasPermission: .canMuteOthers) else { return }
+        sendControlSignal(type: .requestMuteCameraOne, targetIdentity: identity)
+        interLogInfo(InterLog.room, "ModerationController: muteCameraOne → %{private}@", identity)
+    }
+
+    /// Host forces ALL participants' cameras off.
+    @objc public func muteCameraAll() {
+        guard InterPermissionMatrix.role(localRole, hasPermission: .canMuteOthers) else { return }
+        sendControlSignal(type: .requestMuteCameraAll)
+        interLogInfo(InterLog.room, "ModerationController: muteCameraAll broadcast")
+    }
+
+    /// Host lifts the camera lock for a specific participant.
+    @objc public func liftCameraLockOne(identity: String) {
+        guard InterPermissionMatrix.role(localRole, hasPermission: .canMuteOthers) else { return }
+        sendControlSignal(type: .liftCameraLockOne, targetIdentity: identity)
+        interLogInfo(InterLog.room, "ModerationController: liftCameraLockOne → %{private}@", identity)
+    }
+
+    /// Host lifts the camera lock for ALL participants.
+    @objc public func liftCameraLockAll() {
+        guard InterPermissionMatrix.role(localRole, hasPermission: .canMuteOthers) else { return }
+        sendControlSignal(type: .liftCameraLockAll)
+        interLogInfo(InterLog.room, "ModerationController: liftCameraLockAll broadcast")
     }
 
     // MARK: - Request to Speak / Allow to Speak
@@ -981,6 +1031,7 @@ import LiveKit
     /// Internal handler executed on the main queue.
     private func _handleControlSignal(_ signal: InterControlSignal) {
         let targetIsLocal = signal.targetIdentity == localIdentity
+        let senderIsLocal = signal.senderIdentity == localIdentity
 
         switch signal.type {
         case .disableChat:
@@ -1125,6 +1176,39 @@ import LiveKit
             if targetIsLocal {
                 interLogInfo(InterLog.room, "ModerationController: host denied our screen share")
                 delegate?.moderationControllerScreenShareRequestDenied?(self)
+            }
+
+        case .requestMuteCameraOne:
+            if targetIsLocal {
+                interLogInfo(InterLog.room, "ModerationController: received requestMuteCameraOne")
+                delegate?.moderationControllerReceivedCameraMuteOne?(self)
+            } else if senderIsLocal {
+                // Host sent it — notify delegate to update the remote tile badge
+                delegate?.moderationController?(self, shouldApplyCameraMuteForParticipant: signal.targetIdentity ?? "")
+            }
+
+        case .requestMuteCameraAll:
+            if senderIsLocal {
+                interLogInfo(InterLog.room, "ModerationController: broadcast requestMuteCameraAll")
+            } else {
+                interLogInfo(InterLog.room, "ModerationController: received requestMuteCameraAll from %{public}@", signal.senderName)
+                delegate?.moderationControllerReceivedCameraMuteAll?(self)
+            }
+
+        case .liftCameraLockOne:
+            if targetIsLocal {
+                interLogInfo(InterLog.room, "ModerationController: received liftCameraLockOne")
+                delegate?.moderationControllerReceivedCameraLiftOne?(self)
+            } else if senderIsLocal {
+                delegate?.moderationController?(self, shouldLiftCameraLockForParticipant: signal.targetIdentity ?? "")
+            }
+
+        case .liftCameraLockAll:
+            if senderIsLocal {
+                interLogInfo(InterLog.room, "ModerationController: broadcast liftCameraLockAll")
+            } else {
+                interLogInfo(InterLog.room, "ModerationController: received liftCameraLockAll from %{public}@", signal.senderName)
+                delegate?.moderationControllerReceivedCameraLiftAll?(self)
             }
 
         default:

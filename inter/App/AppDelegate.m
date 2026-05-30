@@ -3138,14 +3138,18 @@ didRequestDeleteTeamId:(NSString *)teamId {
 - (void)mediaWiringControllerDidChangeConnectionState:(NSInteger)state {
     InterRoomConnectionState cs = (InterRoomConnectionState)state;
     if (cs != InterRoomConnectionStateConnected) return;
-    if (!self.roomController.isHost) return;
 
     // T6: On (re)connect, fetch any pending screen share requests from Redis ZSET
     [self fetchScreenShareQueueSnapshot];
 
+    // T9: On (re)connect, restore camera-lock state from server
+    [self fetchCameraLockedSnapshot];
+
     // T7: Sync the screen share permission mode toggle to live value
-    NSString *mode = self.roomController.activeSharingPermissions ?: @"hostOnly";
-    [self.normalControlPanel setScreenSharePermissionMode:mode];
+    if (self.roomController.isHost) {
+        NSString *mode = self.roomController.activeSharingPermissions ?: @"hostOnly";
+        [self.normalControlPanel setScreenSharePermissionMode:mode];
+    }
 }
 
 /// Fetch pending screen share requests from server on (re)connect.
@@ -3188,6 +3192,72 @@ didRequestDeleteTeamId:(NSString *)teamId {
                 [weakSelf.normalScreenShareQueuePanel showPanel];
             }
         });
+    }] resume];
+}
+
+/// T9: Fetch camera-locked identities on (re)connect and apply local lock state.
+- (void)fetchCameraLockedSnapshot {
+    NSString *roomCode = self.roomController.roomCode;
+    NSString *identity = self.roomController.localParticipantIdentity;
+    NSString *serverURL = self.roomController.tokenServerURL;
+    if (!roomCode.length || !identity.length || !serverURL.length) return;
+
+    NSString *urlStr = [NSString stringWithFormat:@"%@/room/camera-locked?roomCode=%@&callerIdentity=%@",
+                        serverURL,
+                        [roomCode stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLQueryAllowedCharacterSet]],
+                        [identity stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLQueryAllowedCharacterSet]]];
+    NSURL *url = [NSURL URLWithString:urlStr];
+    if (!url) return;
+    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
+    req.HTTPMethod = @"GET";
+    NSString *token = self.roomController.tokenService.currentAccessToken;
+    if (token.length) {
+        [req setValue:[NSString stringWithFormat:@"Bearer %@", token] forHTTPHeaderField:@"Authorization"];
+    }
+
+    __weak typeof(self) weakSelf = self;
+    [[[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+        if (error || !data) return;
+        NSDictionary *json = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+        NSArray<NSString *> *locked = json[@"locked"];
+        if (![locked isKindOfClass:[NSArray class]] || locked.count == 0) return;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            NSString *localIdentity = weakSelf.roomController.localParticipantIdentity;
+            for (NSString *lockedIdentity in locked) {
+                if ([lockedIdentity isEqualToString:localIdentity]) {
+                    // Our own camera is locked — apply the lock locally
+                    [weakSelf.normalMediaWiring applyHostCameraMuteForParticipant];
+                } else {
+                    // A remote participant is locked — update their tile badge
+                    [weakSelf.normalRemoteLayout setIsHostCameraLocked:YES forParticipant:lockedIdentity];
+                }
+            }
+        });
+    }] resume];
+}
+
+/// Persist a per-participant camera lock/lift to Redis via REST (best-effort).
+- (void)persistCameraLock:(BOOL)lock identity:(NSString *)targetIdentity {
+    NSString *roomCode = self.roomController.roomCode;
+    NSString *callerIdentity = self.roomController.localParticipantIdentity;
+    NSString *serverURL = self.roomController.tokenServerURL;
+    if (!roomCode.length || !callerIdentity.length || !serverURL.length || !targetIdentity.length) return;
+
+    NSString *endpoint = lock ? @"/room/camera-lock-one" : @"/room/camera-lift-one";
+    NSURL *url = [NSURL URLWithString:[NSString stringWithFormat:@"%@%@", serverURL, endpoint]];
+    if (!url) return;
+    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
+    req.HTTPMethod = @"POST";
+    [req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
+    NSString *token = self.roomController.tokenService.currentAccessToken;
+    if (token.length) {
+        [req setValue:[NSString stringWithFormat:@"Bearer %@", token] forHTTPHeaderField:@"Authorization"];
+    }
+    NSDictionary *body = @{ @"roomCode": roomCode, @"callerIdentity": callerIdentity, @"targetIdentity": targetIdentity };
+    req.HTTPBody = [NSJSONSerialization dataWithJSONObject:body options:0 error:nil];
+    [[[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
+#pragma unused(d, r)
+        if (e) NSLog(@"[CameraLock] persistCameraLock failed: %@", e.localizedDescription);
     }] resume];
 }
 
@@ -3689,6 +3759,14 @@ didRequestDeleteTeamId:(NSString *)teamId {
         // No server-side camera unmute; ask the participant to turn their camera on
         [self.moderationController askToUnmuteCameraWithIdentity:participantIdentity];
 
+    } else if ([actionType isEqualToString:@"lockCamera"]) {
+        [self.moderationController muteCameraOneWithIdentity:participantIdentity];
+        [self persistCameraLock:YES identity:participantIdentity];
+
+    } else if ([actionType isEqualToString:@"liftCameraLock"]) {
+        [self.moderationController liftCameraLockOneWithIdentity:participantIdentity];
+        [self persistCameraLock:NO identity:participantIdentity];
+
     } else if ([actionType isEqualToString:@"pinForAll"]) {
         [self.moderationController addPinnedParticipantWithIdentity:participantIdentity];
 
@@ -4066,6 +4144,46 @@ didRequestDeleteTeamId:(NSString *)teamId {
     self.normalShareRequestPending = NO;
     [self.normalControlPanel setShareStartPending:NO];
     [self.normalControlPanel setShareStatusText:@"Screen share request denied by host."];
+}
+
+// MARK: - Camera Mute Delegate (Camera Mute feature)
+
+- (void)moderationControllerReceivedCameraMuteOne:(InterModerationController *)controller {
+#pragma unused(controller)
+    // Host locked OUR camera off.
+    [self.normalMediaWiring applyHostCameraMuteForParticipant];
+}
+
+- (void)moderationControllerReceivedCameraMuteAll:(InterModerationController *)controller {
+#pragma unused(controller)
+    // Host locked ALL cameras off — apply to our local camera.
+    [self.normalMediaWiring applyHostCameraMuteForAll];
+}
+
+- (void)moderationControllerReceivedCameraLiftOne:(InterModerationController *)controller {
+#pragma unused(controller)
+    // Host lifted the camera lock for US.
+    [self.normalMediaWiring applyHostCameraLiftForParticipant];
+}
+
+- (void)moderationControllerReceivedCameraLiftAll:(InterModerationController *)controller {
+#pragma unused(controller)
+    // Host lifted camera lock for everyone — apply to our local camera.
+    [self.normalMediaWiring applyHostCameraLiftForAll];
+}
+
+- (void)moderationController:(InterModerationController *)controller
+  shouldApplyCameraMuteForParticipant:(NSString *)identity {
+#pragma unused(controller)
+    // We are the host and we just sent the mute signal — update the remote tile badge.
+    [self.normalRemoteLayout setIsHostCameraLocked:YES forParticipant:identity];
+}
+
+- (void)moderationController:(InterModerationController *)controller
+  shouldLiftCameraLockForParticipant:(NSString *)identity {
+#pragma unused(controller)
+    // We are the host and we just sent the lift signal — update the remote tile badge.
+    [self.normalRemoteLayout setIsHostCameraLocked:NO forParticipant:identity];
 }
 
 - (void)moderationController:(InterModerationController *)controller meetingLockStateChanged:(BOOL)isLocked {

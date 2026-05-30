@@ -275,6 +275,16 @@
     }
 }
 
+- (void)setCameraButtonTitle:(nullable NSString *)title {
+    if (title) {
+        self.cameraButton.title = title;
+    } else {
+        // Reset to default based on current camera state
+        BOOL camOn = [self.cameraButton.title isEqualToString:@"Turn Camera Off"];
+        self.cameraButton.title = camOn ? @"Turn Camera Off" : @"Turn Camera On";
+    }
+}
+
 - (void)setSharingEnabled:(BOOL)enabled {
     if (self.shareButtonActive == enabled) {
         return;
