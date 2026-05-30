@@ -3961,8 +3961,11 @@ didRequestDeleteTeamId:(NSString *)teamId {
         self.normalRemoteLayout.isHostMode = canModerate;
     }
     // Sync the co-host crown badge on the remote tile
-    BOOL nowCoHost = [newRole isEqualToString:@"coHost"];
-    [self.normalRemoteLayout setIsCoHost:nowCoHost forParticipant:identity];
+    // Note: InterParticipantRole.coHost.stringValue is "co-host" (hyphenated)
+    BOOL nowCoHost = [newRole isEqualToString:@"co-host"];
+    if (self.normalRemoteLayout) {
+        [self.normalRemoteLayout setIsCoHost:nowCoHost forParticipant:identity];
+    }
 }
 
 - (void)moderationController:(InterModerationController *)controller lobbyParticipantJoined:(NSString *)identity displayName:(NSString *)displayName {
