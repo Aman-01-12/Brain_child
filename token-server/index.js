@@ -4448,6 +4448,18 @@ io.on('connection', (socket) => {
     if (!roomCode || !identity) return;
     const code = String(roomCode).toUpperCase().replace(/[^A-Z0-9]/g, '');
     if (!code) return;
+
+    // Ban check — prevent banned users from receiving room events even if
+    // they somehow acquired a valid LiveKit JWT (e.g. cached token).
+    try {
+      const isBanned = await redis.sismember(roomBannedKey(code), identity);
+      if (isBanned) {
+        socket.emit('join-rejected', { reason: 'banned_by_host' });
+        socket.disconnect(true);
+        return;
+      }
+    } catch (_) { /* best-effort — allow join on Redis error */ }
+
     socket.join(code);
     // Send the participant their current mic state on reconnect
     try {
