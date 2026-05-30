@@ -2705,8 +2705,10 @@ app.post('/room/remove', auth.requireAuth, async (req, res) => {
     await roomService.removeParticipant(roomData.roomName, targetIdentity);
     await redis.srem(roomParticipantsKey(code), targetIdentity);
     await redis.hdel(roomRolesKey(code), targetIdentity);
+    await redis.sadd(roomBannedKey(code), targetIdentity);
+    await redis.expire(roomBannedKey(code), ROOM_CODE_EXPIRY_SECONDS);
 
-    console.log(`[audit] Remove: code=${code} target=${targetIdentity} by=${callerIdentity}`);
+    console.log(`[audit] Remove+ban: code=${code} target=${targetIdentity} by=${callerIdentity}`);
     res.json({ success: true });
   } catch (err) {
     console.error(`[error] Remove failed:`, err.message);
