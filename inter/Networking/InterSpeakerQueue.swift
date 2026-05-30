@@ -122,3 +122,44 @@ import os.log
         return index + 1
     }
 }
+
+// MARK: - Screen Share Request Queue
+
+/// A single pending screen share request entry.
+@objc public class InterScreenShareEntry: NSObject {
+    @objc public let participantIdentity: String
+    @objc public let displayName: String
+    @objc public let timestamp: TimeInterval
+
+    @objc public init(participantIdentity: String,
+                      displayName: String,
+                      timestamp: TimeInterval = Date().timeIntervalSince1970) {
+        self.participantIdentity = participantIdentity
+        self.displayName = displayName
+        self.timestamp = timestamp
+        super.init()
+    }
+}
+
+/// FIFO queue of pending screen share requests. Mirrors InterSpeakerQueue.
+@objc public class InterScreenShareQueue: NSObject {
+    private var pendingRequests: [InterScreenShareEntry] = []
+
+    @objc public var entries: [InterScreenShareEntry] { pendingRequests }
+
+    /// Add a request. Idempotent — duplicate identity is ignored.
+    @objc public func addRequest(identity: String, displayName: String) {
+        guard !pendingRequests.contains(where: { $0.participantIdentity == identity }) else { return }
+        pendingRequests.append(InterScreenShareEntry(participantIdentity: identity, displayName: displayName))
+    }
+
+    @objc public func removeRequest(identity: String) {
+        pendingRequests.removeAll { $0.participantIdentity == identity }
+    }
+
+    @objc public func reset() { pendingRequests.removeAll() }
+
+    @objc public func hasPendingRequest(for identity: String) -> Bool {
+        pendingRequests.contains { $0.participantIdentity == identity }
+    }
+}
