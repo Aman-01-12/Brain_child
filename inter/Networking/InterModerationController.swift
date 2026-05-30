@@ -461,10 +461,18 @@ import LiveKit
 
     // MARK: - Screen Share Permission Signals
 
-    /// Request permission to share screen. Broadcast to host when sharingPermissions == "request".
+    /// Request permission to share screen. Persists the request to the server
+    /// (Redis ZSET) for reconnect resilience, then broadcasts the DataChannel signal.
     @objc public func requestScreenShare() {
-        sendControlSignal(type: .requestScreenShare)
-        interLogInfo(InterLog.room, "ModerationController: sent requestScreenShare")
+        let body: [String: Any] = [
+            "roomCode": roomCode,
+            "requesterIdentity": localIdentity,
+        ]
+        performPOST(endpoint: "/room/request-screen-share", body: body) { [weak self] _ in
+            // Best-effort persistence — always send DataChannel signal regardless of server result
+            self?.sendControlSignal(type: .requestScreenShare)
+            interLogInfo(InterLog.room, "ModerationController: sent requestScreenShare (persisted)")
+        }
     }
 
     /// Approve a participant's screen share request (host only).
