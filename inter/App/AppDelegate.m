@@ -17,6 +17,7 @@
 #import "InterNetworkStatusView.h"
 #import "InterChatPanel.h"
 #import "InterSpeakerQueuePanel.h"
+#import "InterScreenShareQueuePanel.h"
 #import "InterPollPanel.h"
 #import "InterQAPanel.h"
 #import "InterLobbyPanel.h"
@@ -38,7 +39,7 @@
 #import "inter-Swift.h"
 #endif
 
-@interface AppDelegate () <NSWindowDelegate, InterConnectionSetupPanelDelegate, InterLoginPanelDelegate, InterAuthSessionDelegate, InterParticipantOverlayDelegate, InterChatPanelDelegate, InterSpeakerQueuePanelDelegate, InterPollPanelDelegate, InterQAPanelDelegate, InterMediaWiringDelegate, InterModerationDelegate, InterLobbyPanelDelegate, InterRecordingCoordinatorDelegate, InterRecordingSignalDelegate, InterRecordingListPanelDelegate, InterRecordingConsentPanelDelegate, InterSchedulePanelDelegate, InterTeamsPanelDelegate, InterAccountPanelDelegate, InterLobbyWaitingViewDelegate, ASWebAuthenticationPresentationContextProviding, InterPreMeetingPanelDelegate>
+@interface AppDelegate () <NSWindowDelegate, InterConnectionSetupPanelDelegate, InterLoginPanelDelegate, InterAuthSessionDelegate, InterParticipantOverlayDelegate, InterChatPanelDelegate, InterSpeakerQueuePanelDelegate, InterScreenShareQueuePanelDelegate, InterPollPanelDelegate, InterQAPanelDelegate, InterMediaWiringDelegate, InterModerationDelegate, InterLobbyPanelDelegate, InterRecordingCoordinatorDelegate, InterRecordingSignalDelegate, InterRecordingListPanelDelegate, InterRecordingConsentPanelDelegate, InterSchedulePanelDelegate, InterTeamsPanelDelegate, InterAccountPanelDelegate, InterLobbyWaitingViewDelegate, ASWebAuthenticationPresentationContextProviding, InterPreMeetingPanelDelegate>
 @property (nonatomic, strong) NSMutableArray<CapWindow *> *capWindows;
 @property (nonatomic, strong) SecureWindowController *secureController;
 @property (nonatomic, strong) NSWindow *setupWindow;
@@ -61,6 +62,8 @@
 @property (nonatomic, strong, nullable) InterChatPanel *normalChatPanel;
 @property (nonatomic, strong, nullable) InterSpeakerQueue *speakerQueue;
 @property (nonatomic, strong, nullable) InterSpeakerQueuePanel *normalSpeakerQueuePanel;
+@property (nonatomic, strong, nullable) InterScreenShareQueuePanel *normalScreenShareQueuePanel;
+@property (nonatomic, strong, nullable) InterScreenShareQueue *screenShareQueue;
 @property (nonatomic, strong, nullable) NSButton *normalChatToggleButton;
 @property (nonatomic, strong, nullable) NSButton *normalHandRaiseButton;
 @property (nonatomic, strong, nullable) NSButton *normalQueueToggleButton;
@@ -235,6 +238,7 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
     // [Phase 8] Create chat controller and speaker queue
     self.chatController = [[InterChatController alloc] init];
     self.speakerQueue = [[InterSpeakerQueue alloc] init];
+    self.screenShareQueue = [[InterScreenShareQueue alloc] init];
     self.hostMutedParticipants = [NSMutableSet set];
 
     // [Phase 8.5] Create poll controller
@@ -585,6 +589,7 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
         }
     }
     [self.speakerQueue reset];
+    [self.screenShareQueue reset];
     [self.hostMutedParticipants removeAllObjects];
     if (self.normalSpeakerQueuePanel) {
         self.normalSpeakerQueuePanel.hostMutedIdentities = [NSSet set];
@@ -2032,6 +2037,13 @@ didRequestDeleteTeamId:(NSString *)teamId {
     self.normalSpeakerQueuePanel.autoresizingMask = NSViewMinXMargin | NSViewMaxYMargin;
     self.normalSpeakerQueuePanel.delegate = self;
     [view addSubview:self.normalSpeakerQueuePanel];
+
+    // Screen share request queue panel — positioned to left of speaker queue
+    CGFloat ssQueueX = queueX - 290.0;
+    self.normalScreenShareQueuePanel = [[InterScreenShareQueuePanel alloc] initWithFrame:NSMakeRect(ssQueueX, 90.0, 280.0, 280.0)];
+    self.normalScreenShareQueuePanel.autoresizingMask = NSViewMinXMargin | NSViewMaxYMargin;
+    self.normalScreenShareQueuePanel.delegate = self;
+    [view addSubview:self.normalScreenShareQueuePanel];
 
     // [Phase 8] Wire chat controller delegates
     self.chatController.chatDelegate = (id<InterChatControllerDelegate>)self;
@@ -3835,29 +3847,91 @@ didRequestDeleteTeamId:(NSString *)teamId {
   receivedScreenShareRequest:(NSString *)fromIdentity
                  displayName:(NSString *)displayName {
 #pragma unused(controller)
-    // Only the host handles incoming share requests.
     if (!self.roomController.isHost) return;
+    [self.screenShareQueue addRequestWithIdentity:fromIdentity displayName:displayName];
+    [self.normalScreenShareQueuePanel setEntries:self.screenShareQueue.entries];
+    [self.normalScreenShareQueuePanel showPanel];
+}
 
-    self.normalPendingShareRequestIdentity = fromIdentity;
+// MARK: - InterScreenShareQueuePanelDelegate
 
-    NSAlert *alert = [[NSAlert alloc] init];
-    alert.messageText = @"Screen Share Request";
-    alert.informativeText = [NSString stringWithFormat:
-        @"%@ is requesting to share their screen.", displayName];
-    [alert addButtonWithTitle:@"Allow"];
-    [alert addButtonWithTitle:@"Deny"];
+- (void)screenShareQueuePanel:(InterScreenShareQueuePanel *)panel
+        didApproveParticipant:(NSString *)identity {
+#pragma unused(panel)
+    [self.screenShareQueue removeRequestWithIdentity:identity];
+    [self.normalScreenShareQueuePanel setEntries:self.screenShareQueue.entries];
+    if (self.screenShareQueue.entries.count == 0) [self.normalScreenShareQueuePanel hidePanel];
+    [self.moderationController approveScreenShareWithIdentity:identity];
+    [self resolveScreenShareRequest:identity approved:YES];
+}
 
-    __weak typeof(self) weakSelf = self;
-    [alert beginSheetModalForWindow:self.normalCallWindow completionHandler:^(NSModalResponse response) {
-        NSString *identity = weakSelf.normalPendingShareRequestIdentity;
-        weakSelf.normalPendingShareRequestIdentity = nil;
-        if (!identity.length) return;
-        if (response == NSAlertFirstButtonReturn) {
-            [weakSelf.moderationController approveScreenShareWithIdentity:identity];
-        } else {
-            [weakSelf.moderationController denyScreenShareWithIdentity:identity];
-        }
-    }];
+- (void)screenShareQueuePanel:(InterScreenShareQueuePanel *)panel
+          didDenyParticipant:(NSString *)identity {
+#pragma unused(panel)
+    [self.screenShareQueue removeRequestWithIdentity:identity];
+    [self.normalScreenShareQueuePanel setEntries:self.screenShareQueue.entries];
+    if (self.screenShareQueue.entries.count == 0) [self.normalScreenShareQueuePanel hidePanel];
+    [self.moderationController denyScreenShareWithIdentity:identity];
+    [self resolveScreenShareRequest:identity approved:NO];
+}
+
+- (void)screenShareQueuePanelDidApproveAll:(InterScreenShareQueuePanel *)panel {
+#pragma unused(panel)
+    NSArray<InterScreenShareEntry *> *entries = [self.screenShareQueue.entries copy];
+    for (InterScreenShareEntry *entry in entries) {
+        [self.moderationController approveScreenShareWithIdentity:entry.participantIdentity];
+        [self resolveScreenShareRequest:entry.participantIdentity approved:YES];
+    }
+    [self.screenShareQueue reset];
+    [self.normalScreenShareQueuePanel setEntries:@[]];
+    [self.normalScreenShareQueuePanel hidePanel];
+}
+
+- (void)screenShareQueuePanelDidDenyAll:(InterScreenShareQueuePanel *)panel {
+#pragma unused(panel)
+    NSArray<InterScreenShareEntry *> *entries = [self.screenShareQueue.entries copy];
+    for (InterScreenShareEntry *entry in entries) {
+        [self.moderationController denyScreenShareWithIdentity:entry.participantIdentity];
+        [self resolveScreenShareRequest:entry.participantIdentity approved:NO];
+    }
+    [self.screenShareQueue reset];
+    [self.normalScreenShareQueuePanel setEntries:@[]];
+    [self.normalScreenShareQueuePanel hidePanel];
+}
+
+/// Best-effort server call to remove a resolved request from Redis ZSET.
+- (void)resolveScreenShareRequest:(NSString *)identity approved:(BOOL)approved {
+    NSString *roomCode = self.roomController.roomCode;
+    NSString *callerIdentity = self.roomController.localParticipantIdentity;
+    NSString *serverURL = self.roomController.tokenServerURL;
+    if (!roomCode.length || !callerIdentity.length || !serverURL.length) return;
+
+    NSURL *url = [NSURL URLWithString:[NSString stringWithFormat:@"%@/room/resolve-screen-share-request", serverURL]];
+    if (!url) return;
+    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
+    req.HTTPMethod = @"POST";
+    [req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
+    NSString *token = self.roomController.tokenService.currentAccessToken;
+    if (token.length) {
+        [req setValue:[NSString stringWithFormat:@"Bearer %@", token] forHTTPHeaderField:@"Authorization"];
+    }
+
+    NSDictionary *body = @{
+        @"roomCode": roomCode,
+        @"callerIdentity": callerIdentity,
+        @"targetIdentity": identity,
+        @"resolution": approved ? @"approved" : @"denied",
+    };
+    NSError *jsonError = nil;
+    req.HTTPBody = [NSJSONSerialization dataWithJSONObject:body options:0 error:&jsonError];
+    if (jsonError) {
+        NSLog(@"[ShareQueue] resolveScreenShareRequest JSON error: %@", jsonError.localizedDescription);
+        return;
+    }
+    [[[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
+#pragma unused(d, r)
+        if (e) NSLog(@"[ShareQueue] resolveScreenShareRequest failed: %@", e.localizedDescription);
+    }] resume];
 }
 
 - (void)moderationControllerScreenShareRequestApproved:(InterModerationController *)controller {
@@ -4696,6 +4770,9 @@ didRequestDeleteTeamId:(NSString *)teamId {
     // [Phase 8] Tear down chat and speaker queue UI
     [self.chatController detach];
     [self.speakerQueue reset];
+    [self.screenShareQueue reset];
+    [self.normalScreenShareQueuePanel setEntries:@[]];
+    [self.normalScreenShareQueuePanel hidePanel];
     [self.hostMutedParticipants removeAllObjects];
     self.chatController.chatDelegate = nil;
     self.chatController.controlDelegate = nil;
@@ -4708,6 +4785,10 @@ didRequestDeleteTeamId:(NSString *)teamId {
     if (self.normalSpeakerQueuePanel) {
         [self.normalSpeakerQueuePanel removeFromSuperview];
         self.normalSpeakerQueuePanel = nil;
+    }
+    if (self.normalScreenShareQueuePanel) {
+        [self.normalScreenShareQueuePanel removeFromSuperview];
+        self.normalScreenShareQueuePanel = nil;
     }
     self.normalChatToggleButton = nil;
     self.normalHandRaiseButton = nil;
