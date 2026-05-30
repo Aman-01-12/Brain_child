@@ -2295,6 +2295,14 @@ app.post('/room/join', async (req, res) => {
     return res.status(404).json({ error: 'Invalid or expired room code' });
   }
 
+  // Ban check — must run before any other validation so banned users cannot
+  // bypass via lobby, password, or any other mechanism.
+  const isBanned = await redis.sismember(roomBannedKey(code), identity);
+  if (isBanned) {
+    console.log(`[audit] Join blocked (banned): code=${code} identity=${identity}`);
+    return res.status(403).json({ error: 'You have been removed from this meeting.' });
+  }
+
   // Phase 9.2.6 — Check if meeting is locked
   const isLocked = await redis.exists(roomLockedKey(code));
   if (isLocked) {
