@@ -115,6 +115,11 @@ import Foundation
 
     /// Host lifts the camera lock for ALL participants.
     case liftCameraLockAll = 39
+
+    /// Host changed the screen-share permission mode mid-meeting.
+    /// Payload carries `mode` ("everyone" | "request" | "hostOnly") in the body field.
+    /// Broadcast to all — native co-hosts use this to sync their segmented control.
+    case screenshareModeChanged = 40
 }
 
 // MARK: - Chat Message

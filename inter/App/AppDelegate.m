@@ -3175,6 +3175,8 @@ didRequestDeleteTeamId:(NSString *)teamId {
     __weak typeof(self) weakSelf = self;
     [[[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
         if (error || !data) return;
+        NSHTTPURLResponse *http = (NSHTTPURLResponse *)response;
+        if (http.statusCode < 200 || http.statusCode > 299) return;
         NSDictionary *json = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
         NSArray<NSDictionary *> *entries = json[@"entries"];
         if (![entries isKindOfClass:[NSArray class]] || entries.count == 0) return;
@@ -3182,9 +3184,11 @@ didRequestDeleteTeamId:(NSString *)teamId {
             for (NSDictionary *entry in entries) {
                 NSString *entryIdentity = entry[@"identity"];
                 NSString *displayName = entry[@"displayName"] ?: entryIdentity;
+                NSTimeInterval timestamp = [entry[@"timestamp"] doubleValue];
                 if (entryIdentity.length) {
                     [weakSelf.screenShareQueue addRequestWithIdentity:entryIdentity
-                                                         displayName:displayName];
+                                                         displayName:displayName
+                                                           timestamp:timestamp];
                 }
             }
             if (weakSelf.screenShareQueue.entries.count > 0) {
@@ -3218,15 +3222,22 @@ didRequestDeleteTeamId:(NSString *)teamId {
     __weak typeof(self) weakSelf = self;
     [[[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
         if (error || !data) return;
+        NSHTTPURLResponse *http = (NSHTTPURLResponse *)response;
+        if (http.statusCode < 200 || http.statusCode > 299) return;
         NSDictionary *json = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
         NSArray<NSString *> *locked = json[@"locked"];
+        BOOL globalLock = [json[@"globalLock"] boolValue];
         if (![locked isKindOfClass:[NSArray class]] || locked.count == 0) return;
         dispatch_async(dispatch_get_main_queue(), ^{
             NSString *localIdentity = weakSelf.roomController.localParticipantIdentity;
             for (NSString *lockedIdentity in locked) {
                 if ([lockedIdentity isEqualToString:localIdentity]) {
-                    // Our own camera is locked — apply the lock locally
-                    [weakSelf.normalMediaWiring applyHostCameraMuteForParticipant];
+                    // Use global flag variant if the server said it's a global lock
+                    if (globalLock) {
+                        [weakSelf.normalMediaWiring applyHostCameraMuteForAll];
+                    } else {
+                        [weakSelf.normalMediaWiring applyHostCameraMuteForParticipant];
+                    }
                 } else {
                     // A remote participant is locked — update their tile badge
                     [weakSelf.normalRemoteLayout setIsHostCameraLocked:YES forParticipant:lockedIdentity];
@@ -3236,17 +3247,22 @@ didRequestDeleteTeamId:(NSString *)teamId {
     }] resume];
 }
 
-/// Persist a per-participant camera lock/lift to Redis via REST (best-effort).
-- (void)persistCameraLock:(BOOL)lock identity:(NSString *)targetIdentity {
+/// Persist a per-participant camera lock/lift to Redis via REST, then call completion(success).
+/// Pass a non-nil completion block to chain the DataChannel signal after successful persistence.
+- (void)persistCameraLock:(BOOL)lock identity:(NSString *)targetIdentity completion:(void (^)(BOOL success))completion {
     NSString *roomCode = self.roomController.roomCode;
     NSString *callerIdentity = self.roomController.localParticipantIdentity;
     NSString *serverURL = self.roomController.tokenServerURL;
-    if (!roomCode.length || !callerIdentity.length || !serverURL.length || !targetIdentity.length) return;
+    if (!roomCode.length || !callerIdentity.length || !serverURL.length || !targetIdentity.length) {
+        if (completion) completion(NO);
+        return;
+    }
 
     NSString *endpoint = lock ? @"/room/camera-lock-one" : @"/room/camera-lift-one";
     NSURL *url = [NSURL URLWithString:[NSString stringWithFormat:@"%@%@", serverURL, endpoint]];
-    if (!url) return;
+    if (!url) { if (completion) completion(NO); return; }
     NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
+    req.timeoutInterval = 10.0;
     req.HTTPMethod = @"POST";
     [req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
     NSString *token = self.roomController.tokenService.currentAccessToken;
@@ -3256,8 +3272,10 @@ didRequestDeleteTeamId:(NSString *)teamId {
     NSDictionary *body = @{ @"roomCode": roomCode, @"callerIdentity": callerIdentity, @"targetIdentity": targetIdentity };
     req.HTTPBody = [NSJSONSerialization dataWithJSONObject:body options:0 error:nil];
     [[[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
-#pragma unused(d, r)
-        if (e) NSLog(@"[CameraLock] persistCameraLock failed: %@", e.localizedDescription);
+        NSHTTPURLResponse *http = (NSHTTPURLResponse *)r;
+        BOOL ok = !e && (http.statusCode >= 200 && http.statusCode <= 299);
+        if (!ok) NSLog(@"[CameraLock] persistCameraLock failed: %@", e.localizedDescription ?: @"non-2xx");
+        if (completion) completion(ok);
     }] resume];
 }
 
@@ -3270,7 +3288,7 @@ didRequestDeleteTeamId:(NSString *)teamId {
 
     NSURL *url = [NSURL URLWithString:[NSString stringWithFormat:@"%@/room/screen-share-mode", serverURL]];
     if (!url) return;
-    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
+    NSMutableURLRequest *req = [[NSMutableURLRequest alloc] initWithURL:url cachePolicy:NSURLRequestUseProtocolCachePolicy timeoutInterval:10.0];
     req.HTTPMethod = @"POST";
     [req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
     NSString *token = self.roomController.tokenService.currentAccessToken;
@@ -3283,6 +3301,9 @@ didRequestDeleteTeamId:(NSString *)teamId {
 #pragma unused(d, r)
         if (e) NSLog(@"[ScreenShare] mode change failed: %@", e.localizedDescription);
     }] resume];
+    // Broadcast a DataChannel signal so native co-hosts (who have no Socket.IO client)
+    // also receive the mode change and sync their segmented control.
+    [self.moderationController broadcastScreenShareMode:mode];
     // Immediately update local state so share button reflects new policy
     [self.roomController updateSharingPermissions:mode];
     // If moving away from "request", clear queue
@@ -3760,12 +3781,27 @@ didRequestDeleteTeamId:(NSString *)teamId {
         [self.moderationController askToUnmuteCameraWithIdentity:participantIdentity];
 
     } else if ([actionType isEqualToString:@"lockCamera"]) {
-        [self.moderationController muteCameraOneWithIdentity:participantIdentity];
-        [self persistCameraLock:YES identity:participantIdentity];
+        // Persist to Redis FIRST so state is durable, then send DataChannel signal.
+        __weak typeof(self) weakSelf = self;
+        NSString *captured = participantIdentity;
+        [self persistCameraLock:YES identity:captured completion:^(BOOL success) {
+            if (success) {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    [weakSelf.moderationController muteCameraOneWithIdentity:captured];
+                });
+            }
+        }];
 
     } else if ([actionType isEqualToString:@"liftCameraLock"]) {
-        [self.moderationController liftCameraLockOneWithIdentity:participantIdentity];
-        [self persistCameraLock:NO identity:participantIdentity];
+        __weak typeof(self) weakSelf = self;
+        NSString *captured = participantIdentity;
+        [self persistCameraLock:NO identity:captured completion:^(BOOL success) {
+            if (success) {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    [weakSelf.moderationController liftCameraLockOneWithIdentity:captured];
+                });
+            }
+        }];
 
     } else if ([actionType isEqualToString:@"pinForAll"]) {
         [self.moderationController addPinnedParticipantWithIdentity:participantIdentity];
@@ -3788,25 +3824,19 @@ didRequestDeleteTeamId:(NSString *)teamId {
         }];
 
     } else if ([actionType isEqualToString:@"makeCoHost"]) {
-        __weak typeof(self) weakSelf = self;
         [self.moderationController promoteParticipantWithIdentity:participantIdentity
                                                            toRole:InterParticipantRoleCoHost
                                                        completion:^(BOOL success, NSError *error) {
-            if (!success) { NSLog(@"[Moderation] makeCoHost failed for %@: %@", participantIdentity, error.localizedDescription); return; }
-            dispatch_async(dispatch_get_main_queue(), ^{
-                [weakSelf.normalRemoteLayout setIsCoHost:YES forParticipant:participantIdentity];
-            });
+            if (!success) { NSLog(@"[Moderation] makeCoHost failed for %@: %@", participantIdentity, error.localizedDescription); }
+            // Badge update is handled by moderationController:participantRoleChanged: via DataChannel echo.
         }];
 
     } else if ([actionType isEqualToString:@"removeCoHost"]) {
-        __weak typeof(self) weakSelf = self;
         [self.moderationController promoteParticipantWithIdentity:participantIdentity
                                                            toRole:InterParticipantRoleParticipant
                                                        completion:^(BOOL success, NSError *error) {
-            if (!success) { NSLog(@"[Moderation] removeCoHost failed for %@: %@", participantIdentity, error.localizedDescription); return; }
-            dispatch_async(dispatch_get_main_queue(), ^{
-                [weakSelf.normalRemoteLayout setIsCoHost:NO forParticipant:participantIdentity];
-            });
+            if (!success) { NSLog(@"[Moderation] removeCoHost failed for %@: %@", participantIdentity, error.localizedDescription); }
+            // Badge update is handled by moderationController:participantRoleChanged: via DataChannel echo.
         }];
     }
 }
@@ -4023,7 +4053,7 @@ didRequestDeleteTeamId:(NSString *)teamId {
                  displayName:(NSString *)displayName {
 #pragma unused(controller)
     if (!self.roomController.isHost) return;
-    [self.screenShareQueue addRequestWithIdentity:fromIdentity displayName:displayName];
+    [self.screenShareQueue addRequestWithIdentity:fromIdentity displayName:displayName timestamp:[NSDate date].timeIntervalSince1970];
     [self.normalScreenShareQueuePanel setEntries:self.screenShareQueue.entries];
     [self.normalScreenShareQueuePanel showPanel];
 }
@@ -4186,6 +4216,20 @@ didRequestDeleteTeamId:(NSString *)teamId {
     [self.normalRemoteLayout setIsHostCameraLocked:NO forParticipant:identity];
 }
 
+- (void)moderationController:(InterModerationController *)controller
+  receivedScreenShareModeChange:(NSString *)mode {
+#pragma unused(controller)
+    // A co-host or participant received a mode change broadcast — sync local state and UI.
+    [self.roomController updateSharingPermissions:mode];
+    [self.normalControlPanel setScreenSharePermissionMode:mode];
+    // If moving away from "request", clear the pending queue locally
+    if ([mode isEqualToString:@"everyone"] || [mode isEqualToString:@"hostOnly"]) {
+        [self.screenShareQueue reset];
+        [self.normalScreenShareQueuePanel setEntries:@[]];
+        [self.normalScreenShareQueuePanel hidePanel];
+    }
+}
+
 - (void)moderationController:(InterModerationController *)controller meetingLockStateChanged:(BOOL)isLocked {
 #pragma unused(controller)
     NSLog(@"[Phase 9] Meeting %@", isLocked ? @"locked" : @"unlocked");
@@ -4248,6 +4292,14 @@ didRequestDeleteTeamId:(NSString *)teamId {
                             role:controller.localRole
                             hasPermission:(InterPermission)InterPermissionCanMuteOthers];
         self.normalRemoteLayout.isHostMode = canModerate;
+
+        // If promoted to co-host mid-meeting, show the screen-share permission control.
+        // Hosts already have it from setupNormalControlPanel; now co-hosts need it too.
+        BOOL nowCoHostOrHost = [newRole isEqualToString:@"co-host"] || [newRole isEqualToString:@"host"];
+        if (nowCoHostOrHost && self.normalControlPanel) {
+            NSString *activeMode = self.roomController.activeSharingPermissions ?: @"everyone";
+            [self.normalControlPanel setScreenSharePermissionMode:activeMode];
+        }
     }
     // Sync the co-host crown badge on the remote tile
     // Note: InterParticipantRole.coHost.stringValue is "co-host" (hyphenated)

@@ -147,22 +147,28 @@ NS_ASSUME_NONNULL_BEGIN
 
 // -- Host Camera Lock ------------------------------------------------------
 
-/// Whether the host has locked this local participant's camera off.
-/// When YES the camera button title is replaced with "Camera Locked".
+/// Whether the host has individually locked this local participant's camera off.
+/// Cleared only by applyHostCameraLiftForParticipant.
 @property (nonatomic, assign) BOOL isHostCameraLocked;
 
-/// Apply a host-initiated camera mute for this participant.
+/// Whether the host has globally locked ALL cameras in the room.
+/// Cleared only by applyHostCameraLiftForAll.
+@property (nonatomic, assign) BOOL globalCameraLockActive;
+
+/// Apply a host-initiated camera mute for this participant (per-participant lock).
 /// Disables camera, sets isHostCameraLocked = YES.
 - (void)applyHostCameraMuteForParticipant;
 
-/// Apply a host-initiated camera lift for this participant (undo lock).
-/// Re-enables camera, sets isHostCameraLocked = NO.
+/// Lift the per-participant camera lock for this participant.
+/// Clears isHostCameraLocked = NO. Does NOT clear globalCameraLockActive.
 - (void)applyHostCameraLiftForParticipant;
 
-/// Apply a host-initiated camera mute for ALL participants.
+/// Apply a global camera mute for ALL participants (sets globalCameraLockActive = YES).
+/// Physically disables camera on the local participant.
 - (void)applyHostCameraMuteForAll;
 
-/// Lift the host camera lock for ALL participants.
+/// Lift the global camera lock (clears globalCameraLockActive = NO).
+/// Does NOT clear per-participant isHostCameraLocked.
 - (void)applyHostCameraLiftForAll;
 
 // -- Network Wiring --------------------------------------------------------

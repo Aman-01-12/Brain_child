@@ -147,17 +147,30 @@ import os.log
 
     @objc public var entries: [InterScreenShareEntry] { pendingRequests }
 
+    /// KVO-observable count of pending requests. Mirrors the InterSpeakerQueue pattern.
+    @objc public private(set) dynamic var count: Int = 0
+
     /// Add a request. Idempotent — duplicate identity is ignored.
-    @objc public func addRequest(identity: String, displayName: String) {
+    /// Pass the server-side timestamp (ZSET score) when rebuilding from a snapshot
+    /// so queue ordering is preserved across reconnects.
+    @objc public func addRequest(identity: String, displayName: String,
+                                 timestamp: TimeInterval = Date().timeIntervalSince1970) {
         guard !pendingRequests.contains(where: { $0.participantIdentity == identity }) else { return }
-        pendingRequests.append(InterScreenShareEntry(participantIdentity: identity, displayName: displayName))
+        pendingRequests.append(InterScreenShareEntry(participantIdentity: identity,
+                                                     displayName: displayName,
+                                                     timestamp: timestamp))
+        count = pendingRequests.count
     }
 
     @objc public func removeRequest(identity: String) {
         pendingRequests.removeAll { $0.participantIdentity == identity }
+        count = pendingRequests.count
     }
 
-    @objc public func reset() { pendingRequests.removeAll() }
+    @objc public func reset() {
+        pendingRequests.removeAll()
+        count = 0
+    }
 
     @objc public func hasPendingRequest(for identity: String) -> Bool {
         pendingRequests.contains { $0.participantIdentity == identity }

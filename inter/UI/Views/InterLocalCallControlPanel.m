@@ -258,6 +258,7 @@
 
 - (void)setCameraEnabled:(BOOL)enabled {
     self.cameraButton.title = enabled ? @"Turn Camera Off" : @"Turn Camera On";
+    self.cameraButton.enabled = enabled;
 }
 
 - (void)setMicrophoneEnabled:(BOOL)enabled {

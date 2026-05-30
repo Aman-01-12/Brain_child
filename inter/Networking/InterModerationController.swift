@@ -131,6 +131,11 @@ import LiveKit
     /// Host (self) should lift the camera lock for a specific remote tile.
     @objc optional func moderationController(_ controller: InterModerationController,
                                              shouldLiftCameraLockForParticipant identity: String)
+
+    /// Host changed the screen-share permission mode mid-meeting.
+    /// All participants (including native co-hosts) receive this to sync their UI.
+    @objc optional func moderationController(_ controller: InterModerationController,
+                                             receivedScreenShareModeChange mode: String)
 }
 
 // MARK: - InterModerationController
@@ -482,6 +487,14 @@ import LiveKit
         guard InterPermissionMatrix.role(localRole, hasPermission: .canMuteOthers) else { return }
         sendControlSignal(type: .liftCameraLockAll)
         interLogInfo(InterLog.room, "ModerationController: liftCameraLockAll broadcast")
+    }
+
+    /// Host broadcasts a screen-share permission mode change to all native clients.
+    /// The `mode` payload is encoded in the signal's `extraData["mode"]` field.
+    @objc public func broadcastScreenShareMode(_ mode: String) {
+        guard InterPermissionMatrix.role(localRole, hasPermission: .canMuteOthers) else { return }
+        sendControlSignal(type: .screenshareModeChanged, extraData: ["mode": mode])
+        interLogInfo(InterLog.room, "ModerationController: broadcastScreenShareMode=%{public}@", mode)
     }
 
     // MARK: - Request to Speak / Allow to Speak
@@ -1209,6 +1222,13 @@ import LiveKit
             } else {
                 interLogInfo(InterLog.room, "ModerationController: received liftCameraLockAll from %{public}@", signal.senderName)
                 delegate?.moderationControllerReceivedCameraLiftAll?(self)
+            }
+
+        case .screenshareModeChanged:
+            // Non-sender participants (including co-hosts) sync their UI to the new mode.
+            if !senderIsLocal, let mode = signal.extraData?["mode"] {
+                interLogInfo(InterLog.room, "ModerationController: received screenshareModeChanged mode=%{public}@", mode)
+                delegate?.moderationController?(self, receivedScreenShareModeChange: mode)
             }
 
         default:

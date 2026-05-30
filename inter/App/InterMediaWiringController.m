@@ -138,6 +138,8 @@ static void *InterWiringParticipantCountContext = &InterWiringParticipantCountCo
 #pragma mark - G2 Two-Phase Toggles
 
 - (void)twoPhaseToggleCamera {
+    // Safety net: if camera is locked by host (per-participant or global), ignore.
+    if (self.isHostCameraLocked || self.globalCameraLockActive) { return; }
     InterLocalMediaController *media = self.mediaController;
     InterRoomController *rc = self.roomController;
     BOOL shouldEnable = !media.isCameraEnabled;
@@ -391,9 +393,11 @@ static void *InterWiringParticipantCountContext = &InterWiringParticipantCountCo
 #pragma mark - Host Camera Lock
 
 - (void)deriveCameraButton {
-    if (self.isHostCameraLocked) {
+    if (self.isHostCameraLocked || self.globalCameraLockActive) {
+        // Disable first so the button is non-interactive, then set title last
+        // so "Camera Locked" wins over setCameraEnabled:'s default string.
+        [self.controlPanel setCameraEnabled:NO];
         [self.controlPanel setCameraButtonTitle:@"Camera Locked"];
-        [self.controlPanel setCameraEnabled:NO]; // keep title override
     } else {
         [self.controlPanel setCameraButtonTitle:nil]; // restore default
         [self.controlPanel setCameraEnabled:self.mediaController.isCameraEnabled];
@@ -423,11 +427,28 @@ static void *InterWiringParticipantCountContext = &InterWiringParticipantCountCo
 }
 
 - (void)applyHostCameraMuteForAll {
-    [self applyHostCameraMuteForParticipant];
+    // Use the global flag — independent of the per-participant flag so that
+    // liftCameraLockAll does NOT accidentally clear individual per-participant locks.
+    self.globalCameraLockActive = YES;
+    InterLocalMediaController *media = self.mediaController;
+    if (!media) { [self deriveCameraButton]; return; }
+    __weak typeof(self) weakSelf = self;
+    if (media.isCameraEnabled) {
+        [media setCameraEnabled:NO completion:^(BOOL success) {
+#pragma unused(success)
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [weakSelf deriveCameraButton];
+            });
+        }];
+    } else {
+        [self deriveCameraButton];
+    }
 }
 
 - (void)applyHostCameraLiftForAll {
-    [self applyHostCameraLiftForParticipant];
+    // Clear ONLY the global flag — per-participant isHostCameraLocked is untouched.
+    self.globalCameraLockActive = NO;
+    [self deriveCameraButton];
 }
 
 #pragma mark - Network Wiring

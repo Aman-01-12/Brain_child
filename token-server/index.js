@@ -2002,6 +2002,7 @@ function roomBannedKey(code) { return `room:${code}:banned`; }
 function roomScreenShareQueueKey(code) { return `room:${code}:screenshare-queue`; }
 function roomScreenShareQueueNamesKey(code) { return `room:${code}:screenshare-queue:names`; }
 function roomCameraLockedKey(code) { return `room:${code}:camera-locked`; } // SET of locked identities
+function roomUserBindingKey(code) { return `room:${code}:user-binding`; }    // Hash: identity → userId
 function roomLeaveTokenKey(code, identity) { return `room:${code}:leavetoken:${identity}`; }
 function roomFilesKey(code) { return `room:${code}:files`; }           // Hash: fileId → JSON metadata
 function roomFilesTotalSizeKey(code) { return `room:${code}:filesize`; } // String: cumulative bytes uploaded
@@ -2033,7 +2034,17 @@ async function getParticipantRole(code, identity) {
 }
 
 /// Validate that the caller has moderator privileges. Returns { valid, role, error }.
-async function validateModerator(code, callerIdentity) {
+/// When userId is provided, also cross-checks that callerIdentity is bound to that user,
+/// preventing authenticated participants from impersonating the host via body-supplied identity.
+async function validateModerator(code, callerIdentity, userId = null) {
+  if (userId != null) {
+    const boundUser = await redis.hget(roomUserBindingKey(code), callerIdentity);
+    // If a binding exists and it doesn't match, reject immediately.
+    if (boundUser !== null && String(boundUser) !== String(userId)) {
+      console.warn(`[SECURITY] validateModerator identity mismatch: code=${code} claimed=${callerIdentity} userId=${userId} boundTo=${boundUser}`);
+      return { valid: false, role: null, error: 'Identity mismatch: caller does not match authenticated user.' };
+    }
+  }
   const role = await getParticipantRole(code, callerIdentity);
   if (!isModeratorRole(role)) {
     return { valid: false, role, error: 'Insufficient permissions. Moderator role required.' };
@@ -2238,6 +2249,13 @@ app.post('/room/create', requireIdempotencyKey, async (req, res) => {
     await redis.hset(roomRolesKey(roomCode), identity, hostRole);
     await redis.expire(roomRolesKey(roomCode), ROOM_CODE_EXPIRY_SECONDS);
 
+    // Bind authenticated userId → identity so validateModerator can cross-check
+    // that callerIdentity in request bodies matches the authenticated user.
+    if (req.user?.userId != null) {
+      await redis.hset(roomUserBindingKey(roomCode), identity, String(req.user.userId));
+      await redis.expire(roomUserBindingKey(roomCode), ROOM_CODE_EXPIRY_SECONDS);
+    }
+
     // Issue a single-use leave token so only the legitimate participant can call /room/leave
     const leaveToken = crypto.randomBytes(32).toString('hex');
     await redis.set(roomLeaveTokenKey(roomCode, identity), leaveToken, 'EX', ROOM_CODE_EXPIRY_SECONDS);
@@ -2399,6 +2417,12 @@ app.post('/room/join', async (req, res) => {
 
     // Store participant role in Redis for server-side validation (Phase 9)
     await redis.hset(roomRolesKey(code), identity, joinerRole === 'interviewee' ? 'participant' : joinerRole);
+
+    // Bind authenticated userId → identity so validateModerator can cross-check
+    if (req.user?.userId != null) {
+      await redis.hset(roomUserBindingKey(code), identity, String(req.user.userId));
+      await redis.expire(roomUserBindingKey(code), ROOM_CODE_EXPIRY_SECONDS);
+    }
 
     // Issue a single-use leave token so only the legitimate participant can call /room/leave
     const leaveToken = crypto.randomBytes(32).toString('hex');
@@ -2603,7 +2627,7 @@ app.post('/room/mute', auth.requireAuth, async (req, res) => {
   const roomData = await getRoomData(code);
   if (!roomData) return res.status(404).json({ error: 'Invalid or expired room code' });
 
-  const validation = await validateModerator(code, callerIdentity);
+  const validation = await validateModerator(code, callerIdentity, req.user?.userId);
   if (!validation.valid) return res.status(403).json({ error: validation.error });
 
   // Cannot mute someone of equal or higher role
@@ -2653,7 +2677,7 @@ app.post('/room/mute-all', auth.requireAuth, async (req, res) => {
   const roomData = await getRoomData(code);
   if (!roomData) return res.status(404).json({ error: 'Invalid or expired room code' });
 
-  const validation = await validateModerator(code, callerIdentity);
+  const validation = await validateModerator(code, callerIdentity, req.user?.userId);
   if (!validation.valid) return res.status(403).json({ error: validation.error });
 
   try {
@@ -2719,7 +2743,7 @@ app.post('/room/remove', auth.requireAuth, async (req, res) => {
   const roomData = await getRoomData(code);
   if (!roomData) return res.status(404).json({ error: 'Invalid or expired room code' });
 
-  const validation = await validateModerator(code, callerIdentity);
+  const validation = await validateModerator(code, callerIdentity, req.user?.userId);
   if (!validation.valid) return res.status(403).json({ error: validation.error });
 
   // Cannot remove someone of equal or higher role
@@ -2819,7 +2843,7 @@ app.post('/room/lock', auth.requireAuth, async (req, res) => {
   const roomData = await getRoomData(code);
   if (!roomData) return res.status(404).json({ error: 'Invalid or expired room code' });
 
-  const validation = await validateModerator(code, callerIdentity);
+  const validation = await validateModerator(code, callerIdentity, req.user?.userId);
   if (!validation.valid) return res.status(403).json({ error: validation.error });
 
   await redis.set(roomLockedKey(code), '1');
@@ -2845,7 +2869,7 @@ app.post('/room/unlock', auth.requireAuth, async (req, res) => {
   const roomData = await getRoomData(code);
   if (!roomData) return res.status(404).json({ error: 'Invalid or expired room code' });
 
-  const validation = await validateModerator(code, callerIdentity);
+  const validation = await validateModerator(code, callerIdentity, req.user?.userId);
   if (!validation.valid) return res.status(403).json({ error: validation.error });
 
   await redis.del(roomLockedKey(code));
@@ -2870,7 +2894,7 @@ app.post('/room/suspend', auth.requireAuth, async (req, res) => {
   const roomData = await getRoomData(code);
   if (!roomData) return res.status(404).json({ error: 'Invalid or expired room code' });
 
-  const validation = await validateModerator(code, callerIdentity);
+  const validation = await validateModerator(code, callerIdentity, req.user?.userId);
   if (!validation.valid) return res.status(403).json({ error: validation.error });
 
   // Cannot suspend someone of equal or higher role
@@ -2921,7 +2945,7 @@ app.post('/room/unsuspend', auth.requireAuth, async (req, res) => {
   const roomData = await getRoomData(code);
   if (!roomData) return res.status(404).json({ error: 'Invalid or expired room code' });
 
-  const validation = await validateModerator(code, callerIdentity);
+  const validation = await validateModerator(code, callerIdentity, req.user?.userId);
   if (!validation.valid) return res.status(403).json({ error: validation.error });
 
   await redis.srem(roomSuspendedKey(code), targetIdentity);
@@ -2946,7 +2970,7 @@ app.post('/room/lobby/enable', auth.requireAuth, async (req, res) => {
   const roomData = await getRoomData(code);
   if (!roomData) return res.status(404).json({ error: 'Invalid or expired room code' });
 
-  const validation = await validateModerator(code, callerIdentity);
+  const validation = await validateModerator(code, callerIdentity, req.user?.userId);
   if (!validation.valid) return res.status(403).json({ error: validation.error });
 
   await redis.hset(roomKey(code), 'lobbyEnabled', 'true');
@@ -2971,7 +2995,7 @@ app.post('/room/lobby/disable', auth.requireAuth, async (req, res) => {
   const roomData = await getRoomData(code);
   if (!roomData) return res.status(404).json({ error: 'Invalid or expired room code' });
 
-  const validation = await validateModerator(code, callerIdentity);
+  const validation = await validateModerator(code, callerIdentity, req.user?.userId);
   if (!validation.valid) return res.status(403).json({ error: validation.error });
 
   await redis.hdel(roomKey(code), 'lobbyEnabled');
@@ -2999,7 +3023,7 @@ app.post('/room/admit', auth.requireAuth, async (req, res) => {
   const roomData = await getRoomData(code);
   if (!roomData) return res.status(404).json({ error: 'Invalid or expired room code' });
 
-  const validation = await validateModerator(code, callerIdentity);
+  const validation = await validateModerator(code, callerIdentity, req.user?.userId);
   if (!validation.valid) return res.status(403).json({ error: validation.error });
 
   // Remove from lobby
@@ -3048,7 +3072,7 @@ app.post('/room/admit-all', auth.requireAuth, async (req, res) => {
   const roomData = await getRoomData(code);
   if (!roomData) return res.status(404).json({ error: 'Invalid or expired room code' });
 
-  const validation = await validateModerator(code, callerIdentity);
+  const validation = await validateModerator(code, callerIdentity, req.user?.userId);
   if (!validation.valid) return res.status(403).json({ error: validation.error });
 
   const admittedCount = await admitAllFromLobby(code, roomData);
@@ -3073,7 +3097,7 @@ app.post('/room/deny', auth.requireAuth, async (req, res) => {
   const roomData = await getRoomData(code);
   if (!roomData) return res.status(404).json({ error: 'Invalid or expired room code' });
 
-  const validation = await validateModerator(code, callerIdentity);
+  const validation = await validateModerator(code, callerIdentity, req.user?.userId);
   if (!validation.valid) return res.status(403).json({ error: validation.error });
 
   // Remove from lobby
@@ -3104,13 +3128,13 @@ app.get('/room/lobby/list/:code', auth.requireAuth, async (req, res) => {
   const roomData = await getRoomData(code);
   if (!roomData) return res.status(404).json({ error: 'Invalid or expired room code' });
 
-  const validation = await validateModerator(code, callerIdentity);
+  const validation = await validateModerator(code, callerIdentity, req.user?.userId);
   if (!validation.valid) return res.status(403).json({ error: validation.error });
 
   try {
     // Get all lobby members with their scores (join timestamps)
-    const membersWithScores = await redis.zrangebyscore(
-      roomLobbyKey(code), '-inf', '+inf', 'WITHSCORES'
+    const membersWithScores = await redis.zrange(
+      roomLobbyKey(code), '-inf', '+inf', 'BYSCORE', 'WITHSCORES'
     );
     const names = await redis.hgetall(roomLobbyNamesKey(code)) || {};
 
@@ -3223,7 +3247,7 @@ app.post('/room/password', auth.requireAuth, async (req, res) => {
   const roomData = await getRoomData(code);
   if (!roomData) return res.status(404).json({ error: 'Invalid or expired room code' });
 
-  const validation = await validateModerator(code, callerIdentity);
+  const validation = await validateModerator(code, callerIdentity, req.user?.userId);
   if (!validation.valid) return res.status(403).json({ error: validation.error });
 
   if (password === null || password === undefined || password === '') {
@@ -3325,7 +3349,7 @@ app.post('/room/record/start', auth.requireAuth, async (req, res) => {
   }
 
   // Validate caller is a moderator (host/co-host)
-  const validation = await validateModerator(code, callerIdentity);
+  const validation = await validateModerator(code, callerIdentity, req.user?.userId);
   if (!validation.valid) return res.status(403).json({ error: validation.error });
 
   // Validate estimated duration
@@ -3534,7 +3558,7 @@ app.post('/room/record/stop', auth.requireAuth, async (req, res) => {
   if (!roomData) return res.status(404).json({ error: 'Invalid or expired room code' });
 
   // Validate caller is a moderator
-  const validation = await validateModerator(code, callerIdentity);
+  const validation = await validateModerator(code, callerIdentity, req.user?.userId);
   if (!validation.valid) return res.status(403).json({ error: validation.error });
 
   // Verify the egress belongs to this room
@@ -4073,12 +4097,12 @@ app.get('/room/screenshare-queue', auth.requireAuth, async (req, res) => {
   const roomData = await getRoomData(code);
   if (!roomData) return res.status(404).json({ error: 'Invalid or expired room code' });
 
-  const validation = await validateModerator(code, callerIdentity);
+  const validation = await validateModerator(code, callerIdentity, req.user?.userId);
   if (!validation.valid) return res.status(403).json({ error: validation.error });
 
   try {
-    const queueEntries = await redis.zrangebyscore(
-      roomScreenShareQueueKey(code), '-inf', '+inf', 'WITHSCORES'
+    const queueEntries = await redis.zrange(
+      roomScreenShareQueueKey(code), '-inf', '+inf', 'BYSCORE', 'WITHSCORES'
     );
     const entries = [];
     for (let i = 0; i < queueEntries.length; i += 2) {
@@ -4141,7 +4165,7 @@ app.post('/room/resolve-screen-share-request', auth.requireAuth, async (req, res
   const roomData = await getRoomData(code);
   if (!roomData) return res.status(404).json({ error: 'Invalid or expired room code' });
 
-  const validation = await validateModerator(code, callerIdentity);
+  const validation = await validateModerator(code, callerIdentity, req.user?.userId);
   if (!validation.valid) return res.status(403).json({ error: validation.error });
 
   try {
@@ -4169,7 +4193,7 @@ app.post('/room/screen-share-mode', auth.requireAuth, async (req, res) => {
   const roomData = await getRoomData(code);
   if (!roomData) return res.status(404).json({ error: 'Invalid or expired room code' });
 
-  const validation = await validateModerator(code, callerIdentity);
+  const validation = await validateModerator(code, callerIdentity, req.user?.userId);
   if (!validation.valid) return res.status(403).json({ error: validation.error });
 
   try {
@@ -4201,7 +4225,7 @@ app.post('/room/camera-lock-one', auth.requireAuth, async (req, res) => {
   const code = String(roomCode).toUpperCase().replace(/[^A-Z0-9]/g, '');
   const roomData = await getRoomData(code);
   if (!roomData) return res.status(404).json({ error: 'Invalid or expired room code' });
-  const validation = await validateModerator(code, callerIdentity);
+  const validation = await validateModerator(code, callerIdentity, req.user?.userId);
   if (!validation.valid) return res.status(403).json({ error: validation.error });
   try {
     await redis.sadd(roomCameraLockedKey(code), targetIdentity);
@@ -4227,7 +4251,7 @@ app.post('/room/camera-lock-all', auth.requireAuth, async (req, res) => {
   const code = String(roomCode).toUpperCase().replace(/[^A-Z0-9]/g, '');
   const roomData = await getRoomData(code);
   if (!roomData) return res.status(404).json({ error: 'Invalid or expired room code' });
-  const validation = await validateModerator(code, callerIdentity);
+  const validation = await validateModerator(code, callerIdentity, req.user?.userId);
   if (!validation.valid) return res.status(403).json({ error: validation.error });
   try {
     const members = await redis.smembers(roomParticipantsKey(code));
@@ -4235,6 +4259,8 @@ app.post('/room/camera-lock-all', auth.requireAuth, async (req, res) => {
       await redis.sadd(roomCameraLockedKey(code), ...members);
       await redis.expire(roomCameraLockedKey(code), ROOM_CODE_EXPIRY_SECONDS);
     }
+    // Set global lock flag so late joiners are also locked when they join
+    await redis.hset(roomKey(code), 'globalCameraLock', 'true');
     io.to(code).emit('room:camera-lock-changed', { identity: null, locked: true, all: true });
     console.log(`[audit] camera-lock-all: code=${code} by=${callerIdentity}`);
     res.json({ success: true });
@@ -4256,7 +4282,7 @@ app.post('/room/camera-lift-one', auth.requireAuth, async (req, res) => {
   const code = String(roomCode).toUpperCase().replace(/[^A-Z0-9]/g, '');
   const roomData = await getRoomData(code);
   if (!roomData) return res.status(404).json({ error: 'Invalid or expired room code' });
-  const validation = await validateModerator(code, callerIdentity);
+  const validation = await validateModerator(code, callerIdentity, req.user?.userId);
   if (!validation.valid) return res.status(403).json({ error: validation.error });
   try {
     await redis.srem(roomCameraLockedKey(code), targetIdentity);
@@ -4281,10 +4307,12 @@ app.post('/room/camera-lift-all', auth.requireAuth, async (req, res) => {
   const code = String(roomCode).toUpperCase().replace(/[^A-Z0-9]/g, '');
   const roomData = await getRoomData(code);
   if (!roomData) return res.status(404).json({ error: 'Invalid or expired room code' });
-  const validation = await validateModerator(code, callerIdentity);
+  const validation = await validateModerator(code, callerIdentity, req.user?.userId);
   if (!validation.valid) return res.status(403).json({ error: validation.error });
   try {
     await redis.del(roomCameraLockedKey(code));
+    // Clear global lock flag so future joiners are NOT auto-locked
+    await redis.hdel(roomKey(code), 'globalCameraLock');
     io.to(code).emit('room:camera-lock-changed', { identity: null, locked: false, all: true });
     console.log(`[audit] camera-lift-all: code=${code} by=${callerIdentity}`);
     res.json({ success: true });
@@ -4308,7 +4336,15 @@ app.get('/room/camera-locked', auth.requireAuth, async (req, res) => {
   if (!roomData) return res.status(404).json({ error: 'Invalid or expired room code' });
   try {
     const locked = await redis.smembers(roomCameraLockedKey(code));
-    res.json({ locked });
+    // Moderators receive the full set; participants receive only their own lock state
+    // to avoid leaking which peers are locked.
+    const callerRole = await getParticipantRole(code, callerIdentity);
+    if (isModeratorRole(callerRole)) {
+      res.json({ locked });
+    } else {
+      const selfLocked = locked.includes(callerIdentity);
+      res.json({ locked: selfLocked ? [callerIdentity] : [] });
+    }
   } catch (err) {
     console.error('[error] camera-locked fetch failed:', err.message);
     res.status(500).json({ error: 'Failed to fetch camera lock state' });
@@ -4759,8 +4795,8 @@ io.on('connection', (socket) => {
     try {
       const callerRole = await getParticipantRole(code, identity);
       if (callerRole === 'host' || callerRole === 'co-host') {
-        const queueEntries = await redis.zrangebyscore(
-          roomScreenShareQueueKey(code), '-inf', '+inf', 'WITHSCORES'
+        const queueEntries = await redis.zrange(
+          roomScreenShareQueueKey(code), '-inf', '+inf', 'BYSCORE', 'WITHSCORES'
         );
         const entries = [];
         for (let i = 0; i < queueEntries.length; i += 2) {
@@ -4774,11 +4810,23 @@ io.on('connection', (socket) => {
         }
       }
 
-      // Camera lock snapshot — emit locked identities to the rejoining participant
+      // Camera lock snapshot — emit locked identities to the rejoining participant.
+      // If globalCameraLock is set, also add the joining participant themselves.
       try {
-        const lockedIdentities = await redis.smembers(roomCameraLockedKey(code));
-        if (lockedIdentities.length > 0) {
-          socket.emit('room:camera-state-snapshot', { locked: lockedIdentities });
+        const [lockedIdentities, roomData] = await Promise.all([
+          redis.smembers(roomCameraLockedKey(code)),
+          getRoomData(code),
+        ]);
+        const isGlobalLock = roomData?.globalCameraLock === 'true';
+        const finalLocked = isGlobalLock
+          ? Array.from(new Set([...lockedIdentities, identity]))
+          : lockedIdentities;
+        if (isGlobalLock) {
+          // Add late joiner to the locked set so the REST snapshot is consistent
+          await redis.sadd(roomCameraLockedKey(code), identity).catch(() => {});
+        }
+        if (finalLocked.length > 0) {
+          socket.emit('room:camera-state-snapshot', { locked: finalLocked, globalLock: isGlobalLock });
         }
       } catch (_) { /* best-effort */ }
     } catch (_) { /* best-effort */ }
