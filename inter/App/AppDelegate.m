@@ -3178,6 +3178,8 @@ didRequestDeleteTeamId:(NSString *)teamId {
 
     // T9: On (re)connect, restore camera-lock state from server
     [self fetchCameraLockedSnapshot];
+    // T9b: On (re)connect, restore mic-lock state from server
+    [self fetchMicLockedSnapshot];
 
     // T7: Sync the screen share permission mode toggle to live value
     if (self.roomController.isHost) {
@@ -3298,6 +3300,53 @@ didRequestDeleteTeamId:(NSString *)teamId {
                     [weakSelf.normalRemoteLayout setIsHostCameraLocked:YES forParticipant:lockedIdentity];
                 }
             }
+        });
+    }] resume];
+}
+
+/// T9b: Fetch mic-locked identities on (re)connect and apply local host-muted state.
+- (void)fetchMicLockedSnapshot {
+    NSString *roomCode = self.roomController.roomCode;
+    NSString *identity = self.roomController.localParticipantIdentity;
+    NSString *serverURL = self.roomController.tokenServerURL;
+    if (!roomCode.length || !identity.length || !serverURL.length) return;
+
+    NSString *urlStr = [NSString stringWithFormat:@"%@/room/mic-locked?roomCode=%@&callerIdentity=%@",
+                        serverURL,
+                        [roomCode stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLQueryAllowedCharacterSet]],
+                        [identity stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLQueryAllowedCharacterSet]]];
+    NSURL *url = [NSURL URLWithString:urlStr];
+    if (!url) return;
+    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
+    req.HTTPMethod = @"GET";
+    NSString *token = self.roomController.tokenService.currentAccessToken;
+    if (token.length) {
+        [req setValue:[NSString stringWithFormat:@"Bearer %@", token] forHTTPHeaderField:@"Authorization"];
+    }
+
+    __weak typeof(self) weakSelf = self;
+    [[[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+        if (error || !data) return;
+        NSHTTPURLResponse *http = (NSHTTPURLResponse *)response;
+        if (http.statusCode < 200 || http.statusCode > 299) return;
+        NSDictionary *json = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+        NSArray<NSString *> *locked = json[@"locked"];
+        if (![locked isKindOfClass:[NSArray class]]) return;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (!weakSelf) return;
+            NSString *localIdentity = weakSelf.roomController.localParticipantIdentity;
+            for (NSString *lockedIdentity in locked) {
+                if (![lockedIdentity isKindOfClass:[NSString class]] || !lockedIdentity.length) continue;
+                if ([lockedIdentity isEqualToString:localIdentity]) {
+                    // We are mic-locked — apply host-muted state locally.
+                    [weakSelf.normalMediaWiring applyRemoteMicMuteOne];
+                } else {
+                    // A remote participant is mic-locked — update their tile badge.
+                    [weakSelf.normalRemoteLayout setHostMuted:YES forParticipant:lockedIdentity];
+                    [weakSelf.hostMutedParticipants addObject:lockedIdentity];
+                }
+            }
+            weakSelf.normalSpeakerQueuePanel.hostMutedIdentities = [weakSelf.hostMutedParticipants copy];
         });
     }] resume];
 }
