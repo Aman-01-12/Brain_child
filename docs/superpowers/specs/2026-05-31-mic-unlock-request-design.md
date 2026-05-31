@@ -135,7 +135,7 @@ At top: clear all 3 new flags before setting `hostMuted=YES`.
 At top: clear all 3 new flags before setting `globalMuteActive=YES`.
 
 ### Updated `applyUnmuteAll`
-Clears `globalMuteActive`, `speakPermissionGranted` (existing). Does NOT clear `hostMuted` (§8.1 rule, unchanged). Does NOT clear the 3 new flags if `hostMuted` is still YES (tile mute persists).
+Clears `globalMuteActive`, `speakPermissionGranted` (existing). Does NOT clear `hostMuted` (§8.1 rule, unchanged). Does NOT clear the 3 new flags — `deriveMicButton` is called, and because `hostMuted` may still be YES, the `restricted` branch remains active. If neither `hostMuted` nor `globalMuteActive` is true after clearing, `deriveMicButton` will clear the flags itself in the `else` branch.
 
 ### Updated `applyRemoteMicUnmute`
 Clears `hostMuted` + all 3 new flags.
@@ -338,7 +338,22 @@ self.normalSpeakerQueuePanel.hostMutedIdentities = [self.hostMutedParticipants c
 
 ---
 
-## 11. Out of Scope
+## 11. Paranoid Review — Approved Mitigations
+
+These findings were identified during pre-implementation threat analysis and must be implemented alongside the feature code.
+
+| # | Severity | Finding | Mitigation |
+|---|---|---|---|
+| F1 | High | Any participant (even unmuted) can send `requestMicUnlock` — floods host queue | In `receivedMicUnlockRequest:displayName:`, discard if sender not in `hostMutedParticipants` AND `isAllMuted` is false |
+| F6 | Medium | `approveMicUnlock` DataChannel signal lost → participant stuck in "Request Sent…" forever | 30-second `NSTimer` started in `applyMicUnlockRequestPending`; cancelled on approval or reset; fires → `pending=NO`, "Ask to Unmute" |
+| F7 | Medium | `SADD` + `EXPIRE` for `mic-locked` not atomic — crash between them leaves immortal key | Use Redis pipeline: `await redis.multi().sadd(key, identity).expire(key, 86400).exec()` |
+| F10 | High | `InterMicUnlockQueue` grows unboundedly — spamming participant can fill host queue | `addRequest` deduplicates by identity — silently drops request if entry for that identity already exists |
+| F16 | High | `approveMicUnlock` applies to participant after restriction already lifted — stale grant | In `applyMicUnlockApproved`: `if (!self.hostMuted && !self.globalMuteActive) { return; }` — moot approval discarded |
+| F17 | Medium | `/room/mute` — `SADD` fails after LiveKit mute succeeds → identity not in Redis SET | Wrap `SADD` in `try/catch`; log warning but don't fail HTTP response — LiveKit state is authoritative, Redis is best-effort restore |
+
+---
+
+## 12. Out of Scope
 
 - Mute All per-tile override (§8.1 rule) — already implemented, not changed
 - Global camera lock — not touched
