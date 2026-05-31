@@ -120,6 +120,23 @@ import Foundation
     /// Payload carries `mode` ("everyone" | "request" | "hostOnly") in the body field.
     /// Broadcast to all — native co-hosts use this to sync their segmented control.
     case screenshareModeChanged = 40
+
+    /// Participant requests that the host unlock their camera.
+    /// Sent by the locked participant; received and handled by the host.
+    case requestCameraUnlock = 41
+
+    /// Host approves a participant's camera unlock request.
+    /// The lock remains in Redis — participant may turn camera on once;
+    /// turning it back off reverts to the "Ask to Unlock" state.
+    case approveCameraUnlock = 42
+
+    /// Sent by the mic-locked participant to request a temporary unmute.
+    /// Received and enqueued by the host.
+    case requestMicUnlock    = 43
+
+    /// Host approves a participant's mic unlock request.
+    /// Participant may unmute once; muting again reverts to "Ask to Unmute".
+    case approveMicUnlock    = 44
 }
 
 // MARK: - Chat Message
