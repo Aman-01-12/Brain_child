@@ -160,8 +160,43 @@ NS_ASSUME_NONNULL_BEGIN
 - (void)applyHostCameraMuteForParticipant;
 
 /// Lift the per-participant camera lock for this participant.
-/// Clears isHostCameraLocked = NO. Does NOT clear globalCameraLockActive.
+/// Clears isHostCameraLocked, cameraUnlockApproved, cameraUnlockRequestPending.
 - (void)applyHostCameraLiftForParticipant;
+
+/// Host approved this participant's camera unlock request.
+/// Sets cameraUnlockApproved = YES, clears cameraUnlockRequestPending.
+/// The Redis lock remains — participant may now turn camera on once.
+- (void)applyHostCameraApprovalForParticipant;
+
+/// Mark that a camera unlock request has been sent (participant side).
+/// Sets cameraUnlockRequestPending = YES, shows "Request Sent…" button.
+- (void)applyHostCameraUnlockRequestPending;
+
+/// Reset the camera unlock flow state (approved + pending) without touching the
+/// lock flags or camera enable state. Call on reconnect so a stale pending request
+/// does not persist into the new session.
+- (void)resetCameraUnlockFlowState;
+
+/// Whether a camera unlock request has been sent and is pending host approval.
+@property (nonatomic, assign, readonly) BOOL cameraUnlockRequestPending;
+
+/// Whether the host has approved the latest camera unlock request.
+@property (nonatomic, assign, readonly) BOOL cameraUnlockApproved;
+
+/// YES after participant taps "Ask to Unmute". Button shows "Request Sent…" (disabled).
+@property (nonatomic, assign, readonly) BOOL micUnlockRequestPending;
+
+/// YES after host approves the mic unlock request. Normal toggle re-enabled.
+@property (nonatomic, assign, readonly) BOOL micUnlockApproved;
+
+/// Sets micUnlockRequestPending=YES and starts the 30-second approval timeout (F6 mitigation).
+- (void)applyMicUnlockRequestPending;
+
+/// Sets micUnlockApproved=YES, clears pending. No-op if restriction already lifted (F16 mitigation).
+- (void)applyMicUnlockApproved;
+
+/// Clears all three mic unlock flow flags. Call on reconnect.
+- (void)resetMicUnlockFlowState;
 
 /// Apply a global camera mute for ALL participants (sets globalCameraLockActive = YES).
 /// Physically disables camera on the local participant.

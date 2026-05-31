@@ -48,6 +48,25 @@ static void *InterWiringParticipantCountContext = &InterWiringParticipantCountCo
 /// change. Async completion blocks capture this before their async call and
 /// discard their update if the value has advanced (Bug 2 stale-update guard).
 @property (nonatomic, assign, readwrite) NSInteger stateSequenceNumber;
+/// Records whether the camera was active at the moment applyHostCameraMuteForParticipant
+/// ran. Used by applyHostCameraLiftForParticipant to restore camera only when the host
+/// lock was the reason it went off, not a pre-existing user choice to be camera-off.
+@property (nonatomic, assign) BOOL cameraWasEnabledBeforeHostLock;
+/// Set when the participant has sent a camera unlock request and is waiting for approval.
+/// Shows "Request Sent…" on the camera button (non-interactive).
+@property (nonatomic, assign, readwrite) BOOL cameraUnlockRequestPending;
+/// Set when the host has approved the participant's unlock request.
+/// The Redis lock remains — participant may turn camera on once;
+/// turning it back off reverts to the "Ask to Unlock" state.
+@property (nonatomic, assign, readwrite) BOOL cameraUnlockApproved;
+/// Guards the revoke-on-camera-off branch in deriveCameraButton.
+/// Set to YES only after the camera actually turns on during an approved window,
+/// so the revoke does not fire the moment approval arrives with camera still off.
+@property (nonatomic, assign) BOOL cameraWasEnabledWhileApproved;
+@property (nonatomic, assign, readwrite) BOOL micUnlockRequestPending;
+@property (nonatomic, assign, readwrite) BOOL micUnlockApproved;
+@property (nonatomic, assign) BOOL micWasUnmutedWhileApproved;
+@property (nonatomic, strong, nullable) NSTimer *micUnlockRequestTimer;
 @end
 
 @implementation InterMediaWiringController
@@ -138,12 +157,20 @@ static void *InterWiringParticipantCountContext = &InterWiringParticipantCountCo
 #pragma mark - G2 Two-Phase Toggles
 
 - (void)twoPhaseToggleCamera {
-    // Safety net: if camera is locked by host (per-participant or global), ignore.
-    if (self.isHostCameraLocked || self.globalCameraLockActive) { return; }
+    // Safety net: if camera is locked by host (per-participant or global) AND the
+    // participant has not been individually approved via the unlock-request flow, ignore.
+    if ((self.isHostCameraLocked || self.globalCameraLockActive) && !self.cameraUnlockApproved) { return; }
     InterLocalMediaController *media = self.mediaController;
     InterRoomController *rc = self.roomController;
     BOOL shouldEnable = !media.isCameraEnabled;
     BOOL isConnected = rc && rc.connectionState == InterRoomConnectionStateConnected;
+
+    // Track that the camera was turned on during an approved-unlock window so
+    // deriveCameraButton's revoke branch can distinguish "still off at approval
+    // time" from "participant voluntarily turned it back off".
+    if (shouldEnable && self.cameraUnlockApproved) {
+        self.cameraWasEnabledWhileApproved = YES;
+    }
 
     __weak typeof(self) weakSelf = self;
 
@@ -208,6 +235,16 @@ static void *InterWiringParticipantCountContext = &InterWiringParticipantCountCo
         // shared session's audio inputs calls beginConfiguration /
         // commitConfiguration, which momentarily interrupts ALL session
         // outputs including the camera video preview.
+        // Guard: cannot freely toggle while restricted unless the host approved it.
+        // AppDelegate's mic button handler drives the request-flow path.
+        if ((self.hostMuted || self.globalMuteActive) && !self.micUnlockApproved) {
+            return;
+        }
+        // Track that participant used their approved unmute (for revoke detection).
+        if (self.micUnlockApproved && !self.isMicNetworkMuted) {
+            // User is currently mic-on while approved — about to mute themselves.
+            self.micWasUnmutedWhileApproved = YES;
+        }
         BOOL shouldMute = !self.isMicNetworkMuted;
         __weak typeof(self) weakSelf = self;
 
@@ -263,36 +300,92 @@ static void *InterWiringParticipantCountContext = &InterWiringParticipantCountCo
 /// enabled state from the four mic state flags. Priority-ordered per
 /// mic_mute_unmute.md §6.2. Called after every authoritative state
 /// transition as the single derivation point (Bug 2 fix).
+/// Single source of truth for mic button state.
+/// Priority: restricted → approval path → normal toggle.
 - (void)deriveParticipantMicButton {
-    // Priority 1: per-tile host mute — not interactive, cannot self-unmute.
-    if (self.hostMuted) {
-        [self.controlPanel setMicrophoneEnabled:NO];
-        [self.controlPanel setMicrophoneButtonTitle:@"Muted by host"];
-    }
-    // Priority 2: speak permission granted and track muted → invite to unmute.
-    else if (self.speakPermissionGranted && self.isMicNetworkMuted) {
-        [self.controlPanel setMicrophoneEnabled:YES];
-        [self.controlPanel setMicrophoneButtonTitle:@"🎙 Click to Unmute"];
-    }
-    // Priority 3: global mute active, no permission yet → raise-hand gate.
-    // AppDelegate's toggle handler will override title with "⏳ Waiting…"
-    // if the hand is already raised (it knows the speakerQueue state).
-    else if (self.globalMuteActive && !self.speakPermissionGranted) {
-        [self.controlPanel setMicrophoneEnabled:YES];
-        [self.controlPanel setMicrophoneButtonTitle:@"✋ Raise Hand to Speak"];
-    }
-    // Priority 4: normal — participant controls mic freely.
-    // Use the actual mic-on/off state so the title reflects reality:
-    // isMicNetworkMuted=NO → "Turn Mic Off" (mic is on, click to mute)
-    // isMicNetworkMuted=YES → "Turn Mic On" (mic is off, click to unmute)
-    // Passing YES/NO directly to setMicrophoneEnabled: avoids the broken
-    // feedback loop in setMicrophoneButtonTitle:nil (Bug A fix).
-    else {
+    BOOL restricted = self.hostMuted || self.globalMuteActive;
+
+    if (restricted) {
+        if (self.micUnlockApproved) {
+            // Host approved — detect revoke: participant unmuted then muted again.
+            if (self.micWasUnmutedWhileApproved && self.isMicNetworkMuted) {
+                self.micUnlockApproved = NO;
+                self.micWasUnmutedWhileApproved = NO;
+                [self.controlPanel setMicrophoneEnabled:YES];
+                [self.controlPanel setMicrophoneButtonTitle:@"Ask to Unmute"];
+            } else {
+                // Approved — normal toggle available.
+                [self.controlPanel setMicrophoneEnabled:YES];
+                NSString *title = self.isMicNetworkMuted ? @"Turn Mic On" : @"Turn Mic Off";
+                [self.controlPanel setMicrophoneButtonTitle:title];
+            }
+        } else if (self.micUnlockRequestPending) {
+            // F6: timer running — show pending state.
+            [self.controlPanel setMicrophoneEnabled:NO];
+            [self.controlPanel setMicrophoneButtonTitle:@"Request Sent…"];
+        } else {
+            [self.controlPanel setMicrophoneEnabled:YES];
+            [self.controlPanel setMicrophoneButtonTitle:@"Ask to Unmute"];
+        }
+    } else {
+        // Restriction lifted — clear all unlock-flow state.
+        self.micUnlockApproved = NO;
+        self.micUnlockRequestPending = NO;
+        self.micWasUnmutedWhileApproved = NO;
+        [self invalidateMicUnlockRequestTimer];
         [self.controlPanel setMicrophoneEnabled:!self.isMicNetworkMuted];
+        [self.controlPanel setMicrophoneButtonTitle:nil];
     }
 }
 
+/// F6 mitigation: cancel the pending-approval safety-net timer.
+- (void)invalidateMicUnlockRequestTimer {
+    [self.micUnlockRequestTimer invalidate];
+    self.micUnlockRequestTimer = nil;
+}
+
+- (void)applyMicUnlockRequestPending {
+    self.micUnlockRequestPending = YES;
+    [self deriveParticipantMicButton];
+    // F6: start 30-second safety-net timer.
+    [self invalidateMicUnlockRequestTimer];
+    __weak typeof(self) weakSelf = self;
+    self.micUnlockRequestTimer = [NSTimer scheduledTimerWithTimeInterval:30.0
+                                                                  repeats:NO
+                                                                    block:^(NSTimer *t) {
+        __strong typeof(weakSelf) self = weakSelf;
+        if (!self) return;
+        if (self.micUnlockRequestPending) {
+            self.micUnlockRequestPending = NO;
+            [self deriveParticipantMicButton];
+        }
+    }];
+}
+
+- (void)applyMicUnlockApproved {
+    // F16 mitigation: if restriction was already lifted, approval is moot.
+    if (!self.hostMuted && !self.globalMuteActive) { return; }
+    self.micUnlockApproved = YES;
+    self.micUnlockRequestPending = NO;
+    self.micWasUnmutedWhileApproved = NO;
+    [self invalidateMicUnlockRequestTimer];
+    [self deriveParticipantMicButton];
+}
+
+- (void)resetMicUnlockFlowState {
+    self.micUnlockApproved = NO;
+    self.micUnlockRequestPending = NO;
+    self.micWasUnmutedWhileApproved = NO;
+    [self invalidateMicUnlockRequestTimer];
+    [self deriveParticipantMicButton];
+}
+
 - (void)applyRemoteMicMute {
+    // Clear any pending unlock flow — Mute All supersedes any pending request.
+    self.micUnlockApproved = NO;
+    self.micUnlockRequestPending = NO;
+    self.micWasUnmutedWhileApproved = NO;
+    [self invalidateMicUnlockRequestTimer];
     InterRoomController *rc = self.roomController;
     BOOL isConnected = rc && rc.connectionState == InterRoomConnectionStateConnected;
     if (!isConnected) return;
@@ -311,6 +404,11 @@ static void *InterWiringParticipantCountContext = &InterWiringParticipantCountCo
 }
 
 - (void)applyRemoteMicMuteOne {
+    // Clear any pending unlock flow — new mute supersedes it.
+    self.micUnlockApproved = NO;
+    self.micUnlockRequestPending = NO;
+    self.micWasUnmutedWhileApproved = NO;
+    [self invalidateMicUnlockRequestTimer];
     InterRoomController *rc = self.roomController;
     BOOL isConnected = rc && rc.connectionState == InterRoomConnectionStateConnected;
     if (!isConnected) return;
@@ -328,18 +426,10 @@ static void *InterWiringParticipantCountContext = &InterWiringParticipantCountCo
 }
 
 - (void)applyAllowToSpeak {
-    InterRoomController *rc = self.roomController;
-    BOOL isConnected = rc && rc.connectionState == InterRoomConnectionStateConnected;
-    if (!isConnected) return;
-
-    // Host granted speak permission during a Mute All session.
-    // Speak permission also clears any per-tile host mute (see §11.1).
-    // NEVER auto-unmute — participant must tap the button themselves.
-    self.speakPermissionGranted = YES;
-    self.hostMuted = NO;
-    self.stateSequenceNumber++;
-    [self deriveParticipantMicButton];  // → "🎙 Click to Unmute"
-    [self.controlPanel setMediaStatusText:@"The host has allowed you to speak — click the mic to unmute."];
+    // Raise-hand approval: lower the visual hand indicator only.
+    // Mic unlock is now handled exclusively by the approveMicUnlock DataChannel
+    // signal path. This method no longer touches mic state.
+    NSLog(@"[MediaWiring] allowToSpeak received — hand lowered (mic state unchanged)");
 }
 
 - (void)applyUnmuteAll {
@@ -361,6 +451,10 @@ static void *InterWiringParticipantCountContext = &InterWiringParticipantCountCo
 }
 
 - (void)applyRemoteMicUnmute {
+    self.micUnlockApproved = NO;
+    self.micUnlockRequestPending = NO;
+    self.micWasUnmutedWhileApproved = NO;
+    [self invalidateMicUnlockRequestTimer];
     InterRoomController *rc = self.roomController;
     BOOL isConnected = rc && rc.connectionState == InterRoomConnectionStateConnected;
     if (!isConnected) return;
@@ -394,20 +488,60 @@ static void *InterWiringParticipantCountContext = &InterWiringParticipantCountCo
 
 - (void)deriveCameraButton {
     if (self.isHostCameraLocked || self.globalCameraLockActive) {
-        // Disable first so the button is non-interactive, then set title last
-        // so "Camera Locked" wins over setCameraEnabled:'s default string.
-        [self.controlPanel setCameraEnabled:NO];
-        [self.controlPanel setCameraButtonTitle:@"Camera Locked"];
+        if (self.cameraUnlockApproved) {
+            // Host approved — only revoke if the camera was previously turned on
+            // during this approved window and has now gone back off. We must NOT
+            // revoke at the moment approval arrives while the camera is still off
+            // (it was locked off — participant hasn't tapped yet).
+            if (self.cameraWasEnabledWhileApproved && !self.mediaController.isCameraEnabled) {
+                // Camera was on, participant voluntarily turned it off → revoke.
+                self.cameraUnlockApproved = NO;
+                self.cameraWasEnabledWhileApproved = NO;
+                // cameraWasEnabledBeforeHostLock is now stale — clear it so that
+                // an eventual explicit host lift doesn't auto-restore.
+                self.cameraWasEnabledBeforeHostLock = NO;
+                [self.controlPanel setCameraEnabled:NO];
+                [self.controlPanel setCameraButtonTitle:@"Ask to Unlock Camera"];
+                [self.controlPanel setCameraInteractive:YES];
+            } else {
+                // Approved and camera is not yet on (or is on) — reflect the actual
+                // camera state so the button title is correct in both cases.
+                [self.controlPanel setCameraInteractive:YES];
+                [self.controlPanel setCameraButtonTitle:nil]; // default: "Turn Camera On" / "Turn Camera Off"
+                [self.controlPanel setCameraEnabled:self.mediaController.isCameraEnabled];
+            }
+        } else if (self.cameraUnlockRequestPending) {
+            // Request in flight — disable the button.
+            [self.controlPanel setCameraEnabled:NO];
+            [self.controlPanel setCameraButtonTitle:@"Request Sent…"];
+            [self.controlPanel setCameraInteractive:NO];
+        } else {
+            // Locked, no pending request — show "Ask to Unlock Camera" (interactive).
+            [self.controlPanel setCameraEnabled:NO];
+            [self.controlPanel setCameraButtonTitle:@"Ask to Unlock Camera"];
+            [self.controlPanel setCameraInteractive:YES];
+        }
     } else {
-        [self.controlPanel setCameraButtonTitle:nil]; // restore default
+        // Lock fully lifted — clear any residual unlock-flow state.
+        self.cameraUnlockApproved = NO;
+        self.cameraUnlockRequestPending = NO;
+        [self.controlPanel setCameraInteractive:YES];
+        [self.controlPanel setCameraButtonTitle:nil]; // restore default title
         [self.controlPanel setCameraEnabled:self.mediaController.isCameraEnabled];
     }
 }
 
 - (void)applyHostCameraMuteForParticipant {
     self.isHostCameraLocked = YES;
+    // Clear any prior unlock-request flow state so a re-lock forces the
+    // participant back through "Ask to Unlock Camera".
+    self.cameraUnlockApproved = NO;
+    self.cameraUnlockRequestPending = NO;
+    self.cameraWasEnabledWhileApproved = NO;
     InterLocalMediaController *media = self.mediaController;
     if (!media) { [self deriveCameraButton]; return; }
+    // Capture before setCameraEnabled:NO changes it so the lift can restore accurately.
+    self.cameraWasEnabledBeforeHostLock = media.isCameraEnabled;
     __weak typeof(self) weakSelf = self;
     if (media.isCameraEnabled) {
         [media setCameraEnabled:NO completion:^(BOOL success) {
@@ -423,6 +557,48 @@ static void *InterWiringParticipantCountContext = &InterWiringParticipantCountCo
 
 - (void)applyHostCameraLiftForParticipant {
     self.isHostCameraLocked = NO;
+    self.cameraUnlockApproved = NO;
+    self.cameraUnlockRequestPending = NO;
+    self.cameraWasEnabledWhileApproved = NO;
+    InterLocalMediaController *media = self.mediaController;
+    if (media && self.cameraWasEnabledBeforeHostLock) {
+        // The host lock was the reason the camera went off — restore it.
+        self.cameraWasEnabledBeforeHostLock = NO;
+        __weak typeof(self) weakSelf = self;
+        [media setCameraEnabled:YES completion:^(BOOL success) {
+#pragma unused(success)
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [weakSelf deriveCameraButton];
+            });
+        }];
+    } else {
+        // Camera was already off before the lock; don't second-guess the user.
+        self.cameraWasEnabledBeforeHostLock = NO;
+        [self deriveCameraButton];
+    }
+}
+
+/// Host approved this participant's camera unlock request.
+/// The Redis lock stays — participant may now turn camera on once.
+- (void)applyHostCameraApprovalForParticipant {
+    self.cameraUnlockApproved = YES;
+    self.cameraUnlockRequestPending = NO;
+    self.cameraWasEnabledWhileApproved = NO; // camera hasn't been turned on yet in this window
+    [self deriveCameraButton];
+}
+
+/// Participant has sent a camera unlock request — update button to "Request Sent…".
+- (void)applyHostCameraUnlockRequestPending {
+    self.cameraUnlockRequestPending = YES;
+    [self deriveCameraButton];
+}
+
+/// Reset the unlock-request flow state without touching lock flags or camera enable state.
+/// Called on reconnect to clear any stale pending/approved unlock state from the prior session.
+- (void)resetCameraUnlockFlowState {
+    self.cameraUnlockApproved = NO;
+    self.cameraUnlockRequestPending = NO;
+    self.cameraWasEnabledWhileApproved = NO;
     [self deriveCameraButton];
 }
 
