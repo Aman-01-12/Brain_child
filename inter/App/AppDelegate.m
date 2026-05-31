@@ -18,6 +18,8 @@
 #import "InterChatPanel.h"
 #import "InterSpeakerQueuePanel.h"
 #import "InterScreenShareQueuePanel.h"
+#import "InterCameraUnlockQueuePanel.h"
+#import "InterMicUnlockQueuePanel.h"
 #import "InterPollPanel.h"
 #import "InterQAPanel.h"
 #import "InterLobbyPanel.h"
@@ -39,7 +41,7 @@
 #import "inter-Swift.h"
 #endif
 
-@interface AppDelegate () <NSWindowDelegate, InterConnectionSetupPanelDelegate, InterLoginPanelDelegate, InterAuthSessionDelegate, InterParticipantOverlayDelegate, InterChatPanelDelegate, InterSpeakerQueuePanelDelegate, InterScreenShareQueuePanelDelegate, InterPollPanelDelegate, InterQAPanelDelegate, InterMediaWiringDelegate, InterModerationDelegate, InterLobbyPanelDelegate, InterRecordingCoordinatorDelegate, InterRecordingSignalDelegate, InterRecordingListPanelDelegate, InterRecordingConsentPanelDelegate, InterSchedulePanelDelegate, InterTeamsPanelDelegate, InterAccountPanelDelegate, InterLobbyWaitingViewDelegate, ASWebAuthenticationPresentationContextProviding, InterPreMeetingPanelDelegate>
+@interface AppDelegate () <NSWindowDelegate, InterConnectionSetupPanelDelegate, InterLoginPanelDelegate, InterAuthSessionDelegate, InterParticipantOverlayDelegate, InterChatPanelDelegate, InterSpeakerQueuePanelDelegate, InterScreenShareQueuePanelDelegate, InterCameraUnlockQueuePanelDelegate, InterMicUnlockQueuePanelDelegate, InterPollPanelDelegate, InterQAPanelDelegate, InterMediaWiringDelegate, InterModerationDelegate, InterLobbyPanelDelegate, InterRecordingCoordinatorDelegate, InterRecordingSignalDelegate, InterRecordingListPanelDelegate, InterRecordingConsentPanelDelegate, InterSchedulePanelDelegate, InterTeamsPanelDelegate, InterAccountPanelDelegate, InterLobbyWaitingViewDelegate, ASWebAuthenticationPresentationContextProviding, InterPreMeetingPanelDelegate>
 @property (nonatomic, strong) NSMutableArray<CapWindow *> *capWindows;
 @property (nonatomic, strong) SecureWindowController *secureController;
 @property (nonatomic, strong) NSWindow *setupWindow;
@@ -64,6 +66,10 @@
 @property (nonatomic, strong, nullable) InterSpeakerQueuePanel *normalSpeakerQueuePanel;
 @property (nonatomic, strong, nullable) InterScreenShareQueuePanel *normalScreenShareQueuePanel;
 @property (nonatomic, strong, nullable) InterScreenShareQueue *screenShareQueue;
+@property (nonatomic, strong, nullable) InterCameraUnlockQueuePanel *normalCameraUnlockQueuePanel;
+@property (nonatomic, strong, nullable) InterCameraUnlockQueue *cameraUnlockQueue;
+@property (nonatomic, strong, nullable) InterMicUnlockQueuePanel *normalMicUnlockQueuePanel;
+@property (nonatomic, strong, nonnull) InterMicUnlockQueue *micUnlockQueue;
 @property (nonatomic, strong, nullable) NSButton *normalChatToggleButton;
 @property (nonatomic, strong, nullable) NSButton *normalHandRaiseButton;
 @property (nonatomic, strong, nullable) NSButton *normalQueueToggleButton;
@@ -239,6 +245,8 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
     self.chatController = [[InterChatController alloc] init];
     self.speakerQueue = [[InterSpeakerQueue alloc] init];
     self.screenShareQueue = [[InterScreenShareQueue alloc] init];
+    self.cameraUnlockQueue = [[InterCameraUnlockQueue alloc] init];
+    self.micUnlockQueue = [[InterMicUnlockQueue alloc] init];
     self.hostMutedParticipants = [NSMutableSet set];
 
     // [Phase 8.5] Create poll controller
@@ -590,6 +598,12 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
     }
     [self.speakerQueue reset];
     [self.screenShareQueue reset];
+    [self.cameraUnlockQueue reset];
+    [self.micUnlockQueue reset];
+    [self.normalMediaWiring resetMicUnlockFlowState];
+    // Reconnect clears the camera unlock flow: any in-flight request is lost,
+    // so the participant must re-request if still locked after rejoining.
+    [self.normalMediaWiring resetCameraUnlockFlowState];
     [self.hostMutedParticipants removeAllObjects];
     if (self.normalSpeakerQueuePanel) {
         self.normalSpeakerQueuePanel.hostMutedIdentities = [NSSet set];
@@ -2045,6 +2059,20 @@ didRequestDeleteTeamId:(NSString *)teamId {
     self.normalScreenShareQueuePanel.delegate = self;
     [view addSubview:self.normalScreenShareQueuePanel];
 
+    // Camera unlock request queue panel — positioned to left of screen share queue
+    CGFloat cuQueueX = ssQueueX - 290.0;
+    self.normalCameraUnlockQueuePanel = [[InterCameraUnlockQueuePanel alloc] initWithFrame:NSMakeRect(cuQueueX, 90.0, 280.0, 280.0)];
+    self.normalCameraUnlockQueuePanel.autoresizingMask = NSViewMinXMargin | NSViewMaxYMargin;
+    self.normalCameraUnlockQueuePanel.delegate = self;
+    [view addSubview:self.normalCameraUnlockQueuePanel];
+
+    // Mic unlock request queue panel — positioned to left of camera unlock queue
+    CGFloat muQueueX = cuQueueX - 292.0;
+    self.normalMicUnlockQueuePanel = [[InterMicUnlockQueuePanel alloc] initWithFrame:NSMakeRect(muQueueX, 90.0, 280.0, 280.0)];
+    self.normalMicUnlockQueuePanel.autoresizingMask = NSViewMinXMargin | NSViewMaxYMargin;
+    self.normalMicUnlockQueuePanel.delegate = self;
+    [view addSubview:self.normalMicUnlockQueuePanel];
+
     // [Phase 8] Wire chat controller delegates
     self.chatController.chatDelegate = (id<InterChatControllerDelegate>)self;
     self.chatController.controlDelegate = (id<InterControlSignalDelegate>)self;
@@ -2230,8 +2258,22 @@ didRequestDeleteTeamId:(NSString *)teamId {
 
     __weak typeof(self) weakSelf = self;
     self.normalControlPanel.cameraToggleHandler = ^{
-        // [2.5.6] [G2] Two-phase camera toggle via shared wiring controller
-        [weakSelf.normalMediaWiring twoPhaseToggleCamera];
+        InterMediaWiringController *wiring = weakSelf.normalMediaWiring;
+        // If locked (per-participant or global), intercept and route to unlock-request flow.
+        if (wiring.isHostCameraLocked || wiring.globalCameraLockActive) {
+            if (wiring.cameraUnlockApproved) {
+                // Host approved — allow normal toggle (camera on/off).
+                [wiring twoPhaseToggleCamera];
+            } else if (!wiring.cameraUnlockRequestPending) {
+                // "Ask to Unlock Camera" was tapped — send request and show "Request Sent…".
+                [wiring applyHostCameraUnlockRequestPending];
+                [weakSelf.moderationController requestCameraUnlock];
+            }
+            // If pending — button is disabled; tap should not reach here.
+            return;
+        }
+        // [2.5.6] [G2] Normal two-phase camera toggle via shared wiring controller.
+        [wiring twoPhaseToggleCamera];
     };
     self.normalControlPanel.microphoneToggleHandler = ^{
         // [R3] If the host has disabled unmuting and this participant is muted
@@ -2243,29 +2285,20 @@ didRequestDeleteTeamId:(NSString *)teamId {
             return;
         }
 
-        // If global mute is active and participant has no speak permission → raise/lower hand.
-        // (The button is enabled in this state so the participant can raise hand.)
-        if (weakSelf.normalMediaWiring.globalMuteActive && !weakSelf.normalMediaWiring.speakPermissionGranted) {
-            [weakSelf toggleNormalHandRaise];
-            // Update mic button title based on current hand state
-            NSString *localId = weakSelf.roomController.localParticipantIdentity;
-            if (localId.length > 0 && [weakSelf.speakerQueue isHandRaisedFor:localId]) {
-                [weakSelf.normalControlPanel setMicrophoneButtonTitle:@"⏳ Waiting..."];
-            } else {
-                [weakSelf.normalControlPanel setMicrophoneButtonTitle:@"✋ Raise Hand to Speak"];
+        // Restricted path: route through "Ask to Unmute" flow.
+        if (weakSelf.normalMediaWiring.hostMuted || weakSelf.normalMediaWiring.globalMuteActive) {
+            if (weakSelf.normalMediaWiring.micUnlockApproved) {
+                // Approved — twoPhaseToggle's internal guard allows this.
+                [weakSelf.normalMediaWiring twoPhaseToggleMicrophone];
+            } else if (!weakSelf.normalMediaWiring.micUnlockRequestPending) {
+                [weakSelf.normalMediaWiring applyMicUnlockRequestPending];
+                [weakSelf.moderationController requestMicUnlock];
             }
-            return;
-        }
-
-        // Per-tile host mute: button is disabled so this path should not be
-        // reached. Guard defensively to prevent accidental self-unmute.
-        if (weakSelf.normalMediaWiring.hostMuted) {
+            // If pending — button is disabled, tap should not reach here.
             return;
         }
 
         // Normal path: self-toggle (mute ↔ unmute).
-        // speakPermissionGranted is preserved across self-mute (§8.2) so the
-        // participant can re-unmute without re-raising hand.
         [weakSelf.normalMediaWiring twoPhaseToggleMicrophone];
     };
     self.normalControlPanel.shareToggleHandler = ^{
@@ -2298,10 +2331,11 @@ didRequestDeleteTeamId:(NSString *)teamId {
     if (self.roomController.isHost) {
         NSString *initialMode = self.roomController.activeSharingPermissions ?: @"hostOnly";
         [self.normalControlPanel setScreenSharePermissionMode:initialMode];
+        __weak typeof(self) weakSelf = self;
+        self.normalControlPanel.screenShareModeChangedHandler = ^(NSString *mode) {
+            [weakSelf handleScreenShareModeChanged:mode];
+        };
     }
-    self.normalControlPanel.screenShareModeChangedHandler = ^(NSString *mode) {
-        [weakSelf handleScreenShareModeChanged:mode];
-    };
 
     // [3.4.4] Network quality signal bars in the control panel
     self.normalNetworkStatusView = [[InterNetworkStatusView alloc] initWithFrame:NSMakeRect(0, 0, 40, 16)];
@@ -3177,10 +3211,21 @@ didRequestDeleteTeamId:(NSString *)teamId {
         if (error || !data) return;
         NSHTTPURLResponse *http = (NSHTTPURLResponse *)response;
         if (http.statusCode < 200 || http.statusCode > 299) return;
-        NSDictionary *json = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+        NSError *parseError = nil;
+        NSDictionary *json = [NSJSONSerialization JSONObjectWithData:data options:0 error:&parseError];
+        if (parseError || ![json isKindOfClass:[NSDictionary class]]) return;
         NSArray<NSDictionary *> *entries = json[@"entries"];
-        if (![entries isKindOfClass:[NSArray class]] || entries.count == 0) return;
+        if (![entries isKindOfClass:[NSArray class]]) return;
         dispatch_async(dispatch_get_main_queue(), ^{
+            if (!weakSelf) return;
+            // Always reset local queue first so stale requests from a previous
+            // session are not left behind when the server returns an empty list.
+            [weakSelf.screenShareQueue reset];
+            if (entries.count == 0) {
+                [weakSelf.normalScreenShareQueuePanel setEntries:@[]];
+                [weakSelf.normalScreenShareQueuePanel hidePanel];
+                return;
+            }
             for (NSDictionary *entry in entries) {
                 NSString *entryIdentity = entry[@"identity"];
                 NSString *displayName = entry[@"displayName"] ?: entryIdentity;
@@ -3191,10 +3236,8 @@ didRequestDeleteTeamId:(NSString *)teamId {
                                                            timestamp:timestamp];
                 }
             }
-            if (weakSelf.screenShareQueue.entries.count > 0) {
-                [weakSelf.normalScreenShareQueuePanel setEntries:weakSelf.screenShareQueue.entries];
-                [weakSelf.normalScreenShareQueuePanel showPanel];
-            }
+            [weakSelf.normalScreenShareQueuePanel setEntries:weakSelf.screenShareQueue.entries];
+            [weakSelf.normalScreenShareQueuePanel showPanel];
         });
     }] resume];
 }
@@ -3226,20 +3269,32 @@ didRequestDeleteTeamId:(NSString *)teamId {
         if (http.statusCode < 200 || http.statusCode > 299) return;
         NSDictionary *json = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
         NSArray<NSString *> *locked = json[@"locked"];
+        if (![locked isKindOfClass:[NSArray class]]) return;
         BOOL globalLock = [json[@"globalLock"] boolValue];
-        if (![locked isKindOfClass:[NSArray class]] || locked.count == 0) return;
         dispatch_async(dispatch_get_main_queue(), ^{
+            if (!weakSelf) return;
             NSString *localIdentity = weakSelf.roomController.localParticipantIdentity;
+
+            // Clear all existing camera-lock state before applying the fresh
+            // snapshot. Without this, stale locks survive when participants
+            // are unlocked between reconnects and locked.count == 0 would have
+            // returned early, leaving stale badges and disabled camera buttons.
+            [weakSelf.normalMediaWiring applyHostCameraLiftForParticipant];
+            [weakSelf.normalMediaWiring applyHostCameraLiftForAll];
+            [weakSelf.normalRemoteLayout clearAllHostCameraLocks];
+
+            // Apply each lock from the snapshot.
             for (NSString *lockedIdentity in locked) {
+                if (![lockedIdentity isKindOfClass:[NSString class]] || !lockedIdentity.length) continue;
                 if ([lockedIdentity isEqualToString:localIdentity]) {
-                    // Use global flag variant if the server said it's a global lock
+                    // Use global flag variant if the server said it's a global lock.
                     if (globalLock) {
                         [weakSelf.normalMediaWiring applyHostCameraMuteForAll];
                     } else {
                         [weakSelf.normalMediaWiring applyHostCameraMuteForParticipant];
                     }
                 } else {
-                    // A remote participant is locked — update their tile badge
+                    // A remote participant is locked — update their tile badge.
                     [weakSelf.normalRemoteLayout setIsHostCameraLocked:YES forParticipant:lockedIdentity];
                 }
             }
@@ -3297,21 +3352,38 @@ didRequestDeleteTeamId:(NSString *)teamId {
     }
     NSDictionary *body = @{ @"roomCode": roomCode, @"callerIdentity": callerIdentity, @"mode": mode };
     req.HTTPBody = [NSJSONSerialization dataWithJSONObject:body options:0 error:nil];
+
+    // Capture previous mode for revert on failure.
+    NSString *previousMode = self.roomController.activeSharingPermissions ?: @"hostOnly";
+
+    // Disable the control while the request is in flight so the host cannot
+    // fire a second change before the server has confirmed the first.
+    [self.normalControlPanel setScreenSharePermissionEnabled:NO];
+
+    __weak typeof(self) weakSelf = self;
     [[[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
-#pragma unused(d, r)
-        if (e) NSLog(@"[ScreenShare] mode change failed: %@", e.localizedDescription);
+        NSHTTPURLResponse *http = (NSHTTPURLResponse *)r;
+        BOOL success = !e && (http.statusCode >= 200 && http.statusCode < 300);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [weakSelf.normalControlPanel setScreenSharePermissionEnabled:YES];
+            if (!success) {
+                // Server rejected the change — revert the segmented control.
+                NSLog(@"[ScreenShare] mode change failed: %@",
+                      e ? e.localizedDescription : [NSString stringWithFormat:@"HTTP %ld", (long)http.statusCode]);
+                [weakSelf.normalControlPanel setScreenSharePermissionMode:previousMode];
+                return;
+            }
+            // Server confirmed — apply local state and broadcast to co-hosts.
+            [weakSelf.moderationController broadcastScreenShareMode:mode];
+            [weakSelf.roomController updateSharingPermissions:mode];
+            // Moving away from "request" mode: clear the pending share queue.
+            if ([mode isEqualToString:@"everyone"] || [mode isEqualToString:@"hostOnly"]) {
+                [weakSelf.screenShareQueue reset];
+                [weakSelf.normalScreenShareQueuePanel setEntries:@[]];
+                [weakSelf.normalScreenShareQueuePanel hidePanel];
+            }
+        });
     }] resume];
-    // Broadcast a DataChannel signal so native co-hosts (who have no Socket.IO client)
-    // also receive the mode change and sync their segmented control.
-    [self.moderationController broadcastScreenShareMode:mode];
-    // Immediately update local state so share button reflects new policy
-    [self.roomController updateSharingPermissions:mode];
-    // If moving away from "request", clear queue
-    if ([mode isEqualToString:@"everyone"] || [mode isEqualToString:@"hostOnly"]) {
-        [self.screenShareQueue reset];
-        [self.normalScreenShareQueuePanel setEntries:@[]];
-        [self.normalScreenShareQueuePanel hidePanel];
-    }
 }
 
 - (void)mediaWiringControllerDidChangePresenceState:(NSInteger)state {
@@ -3769,25 +3841,25 @@ didRequestDeleteTeamId:(NSString *)teamId {
             self.normalSpeakerQueuePanel.hostMutedIdentities = [self.hostMutedParticipants copy];
         }
 
-    } else if ([actionType isEqualToString:@"muteCamera"]) {
-        [self.moderationController muteParticipantWithIdentity:participantIdentity
-                                                   trackSource:@"camera"
-                                                    completion:^(BOOL success, NSError *error) {
-            if (!success) NSLog(@"[Moderation] muteCamera failed for %@: %@", participantIdentity, error.localizedDescription);
-        }];
-
-    } else if ([actionType isEqualToString:@"unmuteCamera"]) {
-        // No server-side camera unmute; ask the participant to turn their camera on
-        [self.moderationController askToUnmuteCameraWithIdentity:participantIdentity];
-
     } else if ([actionType isEqualToString:@"lockCamera"]) {
-        // Persist to Redis FIRST so state is durable, then send DataChannel signal.
+        // "Mute Camera" — persist lock to Redis FIRST for durability, then send DataChannel signal.
+        // Participant will see "Ask to Unlock Camera" instead of a hard-disabled button.
         __weak typeof(self) weakSelf = self;
         NSString *captured = participantIdentity;
         [self persistCameraLock:YES identity:captured completion:^(BOOL success) {
             if (success) {
                 dispatch_async(dispatch_get_main_queue(), ^{
                     [weakSelf.moderationController muteCameraOneWithIdentity:captured];
+                    // Update the tile badge immediately — the DataChannel signal is
+                    // filtered on own-send, so we must update the host tile directly.
+                    [weakSelf.normalRemoteLayout setIsHostCameraLocked:YES forParticipant:captured];
+                    // Remove any pending unlock request for this participant
+                    // since the lock is being freshly applied.
+                    [weakSelf.cameraUnlockQueue removeRequestWithIdentity:captured];
+                    [weakSelf.normalCameraUnlockQueuePanel setEntries:weakSelf.cameraUnlockQueue.entries];
+                    if (weakSelf.cameraUnlockQueue.count == 0) {
+                        [weakSelf.normalCameraUnlockQueuePanel hidePanel];
+                    }
                 });
             }
         }];
@@ -3799,6 +3871,14 @@ didRequestDeleteTeamId:(NSString *)teamId {
             if (success) {
                 dispatch_async(dispatch_get_main_queue(), ^{
                     [weakSelf.moderationController liftCameraLockOneWithIdentity:captured];
+                    // Update the tile badge immediately — same reason as lockCamera.
+                    [weakSelf.normalRemoteLayout setIsHostCameraLocked:NO forParticipant:captured];
+                    // Remove any pending unlock request for this participant.
+                    [weakSelf.cameraUnlockQueue removeRequestWithIdentity:captured];
+                    [weakSelf.normalCameraUnlockQueuePanel setEntries:weakSelf.cameraUnlockQueue.entries];
+                    if (weakSelf.cameraUnlockQueue.count == 0) {
+                        [weakSelf.normalCameraUnlockQueuePanel hidePanel];
+                    }
                 });
             }
         }];
@@ -4139,6 +4219,91 @@ didRequestDeleteTeamId:(NSString *)teamId {
     }] resume];
 }
 
+// MARK: - InterCameraUnlockQueuePanelDelegate
+
+- (void)cameraUnlockQueuePanel:(InterCameraUnlockQueuePanel *)panel
+         didApproveParticipant:(NSString *)identity {
+#pragma unused(panel)
+    [self.cameraUnlockQueue removeRequestWithIdentity:identity];
+    [self.normalCameraUnlockQueuePanel setEntries:self.cameraUnlockQueue.entries];
+    if (self.cameraUnlockQueue.count == 0) [self.normalCameraUnlockQueuePanel hidePanel];
+    [self.moderationController approveCameraUnlockWithIdentity:identity];
+}
+
+- (void)cameraUnlockQueuePanel:(InterCameraUnlockQueuePanel *)panel
+           didDenyParticipant:(NSString *)identity {
+#pragma unused(panel)
+    // Denying just removes from the queue — participant stays locked and can ask again.
+    [self.cameraUnlockQueue removeRequestWithIdentity:identity];
+    [self.normalCameraUnlockQueuePanel setEntries:self.cameraUnlockQueue.entries];
+    if (self.cameraUnlockQueue.count == 0) [self.normalCameraUnlockQueuePanel hidePanel];
+}
+
+- (void)cameraUnlockQueuePanelDidApproveAll:(InterCameraUnlockQueuePanel *)panel {
+#pragma unused(panel)
+    NSArray<InterCameraUnlockEntry *> *entries = [self.cameraUnlockQueue.entries copy];
+    for (InterCameraUnlockEntry *entry in entries) {
+        [self.moderationController approveCameraUnlockWithIdentity:entry.participantIdentity];
+    }
+    [self.cameraUnlockQueue reset];
+    [self.normalCameraUnlockQueuePanel setEntries:@[]];
+    [self.normalCameraUnlockQueuePanel hidePanel];
+}
+
+- (void)cameraUnlockQueuePanelDidDenyAll:(InterCameraUnlockQueuePanel *)panel {
+#pragma unused(panel)
+    [self.cameraUnlockQueue reset];
+    [self.normalCameraUnlockQueuePanel setEntries:@[]];
+    [self.normalCameraUnlockQueuePanel hidePanel];
+}
+
+// MARK: - InterMicUnlockQueuePanelDelegate
+
+- (void)micUnlockQueuePanel:(InterMicUnlockQueuePanel *)panel
+    didApproveParticipant:(NSString *)identity {
+#pragma unused(panel)
+    // Send approval signal to participant.
+    [self.moderationController approveMicUnlockWithIdentity:identity];
+    // Update tile badge — host's own DataChannel signal is not echoed back.
+    [self.normalRemoteLayout setHostMuted:NO forParticipant:identity];
+    [self.hostMutedParticipants removeObject:identity];
+    self.normalSpeakerQueuePanel.hostMutedIdentities = [self.hostMutedParticipants copy];
+    // Remove from queue.
+    [self.micUnlockQueue removeRequestWithIdentity:identity];
+    [self.normalMicUnlockQueuePanel setEntries:self.micUnlockQueue.entries];
+    if (self.micUnlockQueue.count == 0) [self.normalMicUnlockQueuePanel hidePanel];
+}
+
+- (void)micUnlockQueuePanel:(InterMicUnlockQueuePanel *)panel
+       didDenyParticipant:(NSString *)identity {
+#pragma unused(panel)
+    // Denying just removes from queue — participant stays locked and can ask again.
+    [self.micUnlockQueue removeRequestWithIdentity:identity];
+    [self.normalMicUnlockQueuePanel setEntries:self.micUnlockQueue.entries];
+    if (self.micUnlockQueue.count == 0) [self.normalMicUnlockQueuePanel hidePanel];
+}
+
+- (void)micUnlockQueuePanelDidApproveAll:(InterMicUnlockQueuePanel *)panel {
+#pragma unused(panel)
+    NSArray<InterMicUnlockEntry *> *entries = [self.micUnlockQueue.entries copy];
+    for (InterMicUnlockEntry *entry in entries) {
+        [self.moderationController approveMicUnlockWithIdentity:entry.participantIdentity];
+        [self.normalRemoteLayout setHostMuted:NO forParticipant:entry.participantIdentity];
+        [self.hostMutedParticipants removeObject:entry.participantIdentity];
+    }
+    self.normalSpeakerQueuePanel.hostMutedIdentities = [self.hostMutedParticipants copy];
+    [self.micUnlockQueue reset];
+    [self.normalMicUnlockQueuePanel setEntries:@[]];
+    [self.normalMicUnlockQueuePanel hidePanel];
+}
+
+- (void)micUnlockQueuePanelDidDenyAll:(InterMicUnlockQueuePanel *)panel {
+#pragma unused(panel)
+    [self.micUnlockQueue reset];
+    [self.normalMicUnlockQueuePanel setEntries:@[]];
+    [self.normalMicUnlockQueuePanel hidePanel];
+}
+
 - (void)moderationControllerScreenShareRequestApproved:(InterModerationController *)controller {
 #pragma unused(controller)
     self.normalShareRequestPending = NO;
@@ -4214,6 +4379,52 @@ didRequestDeleteTeamId:(NSString *)teamId {
 #pragma unused(controller)
     // We are the host and we just sent the lift signal — update the remote tile badge.
     [self.normalRemoteLayout setIsHostCameraLocked:NO forParticipant:identity];
+}
+
+// MARK: Camera Unlock Request Flow
+
+- (void)moderationController:(InterModerationController *)controller
+  receivedCameraUnlockRequest:(NSString *)fromIdentity
+                  displayName:(NSString *)displayName {
+#pragma unused(controller)
+    // Only the host should see and act on camera unlock requests.
+    if (!self.roomController.isHost) return;
+    // A locked participant is requesting camera unlock — show in the panel.
+    [self.cameraUnlockQueue addRequestWithIdentity:fromIdentity displayName:displayName];
+    [self.normalCameraUnlockQueuePanel setEntries:self.cameraUnlockQueue.entries];
+    [self.normalCameraUnlockQueuePanel showPanel];
+}
+
+- (void)moderationController:(InterModerationController *)controller
+  receivedMicUnlockRequest:(NSString *)fromIdentity
+               displayName:(NSString *)displayName {
+#pragma unused(controller)
+    // Only the host should handle mic unlock requests.
+    if (!self.roomController.isHost) return;
+    // F1 mitigation: discard if the sender is not actually mic-restricted.
+    if (!self.moderationController.isAllMuted &&
+        ![self.hostMutedParticipants containsObject:fromIdentity]) {
+        NSLog(@"[MicUnlock] discarded requestMicUnlock from non-restricted participant %@", fromIdentity);
+        return;
+    }
+    [self.micUnlockQueue addRequestWithIdentity:fromIdentity displayName:displayName];
+    [self.normalMicUnlockQueuePanel setEntries:self.micUnlockQueue.entries];
+    [self.normalMicUnlockQueuePanel showPanel];
+}
+
+- (void)moderationControllerCameraUnlockApproved:(InterModerationController *)controller {
+#pragma unused(controller)
+    // Host approved our camera unlock request — allow one camera toggle.
+    [self.normalMediaWiring applyHostCameraApprovalForParticipant];
+    // Show a brief status message to let the participant know they can turn camera on.
+    [self.normalControlPanel setMediaStatusText:@"Camera unlocked — you can turn it on now"];
+}
+
+- (void)moderationControllerMicUnlockApproved:(InterModerationController *)controller {
+#pragma unused(controller)
+    // Host approved our mic unlock request — allow one mic toggle.
+    [self.normalMediaWiring applyMicUnlockApproved];
+    [self.normalControlPanel setMediaStatusText:@"Mic unlocked — you can unmute now"];
 }
 
 - (void)moderationController:(InterModerationController *)controller
@@ -5058,6 +5269,14 @@ didRequestDeleteTeamId:(NSString *)teamId {
     if (self.normalScreenShareQueuePanel) {
         [self.normalScreenShareQueuePanel removeFromSuperview];
         self.normalScreenShareQueuePanel = nil;
+    }
+    if (self.normalCameraUnlockQueuePanel) {
+        [self.normalCameraUnlockQueuePanel removeFromSuperview];
+        self.normalCameraUnlockQueuePanel = nil;
+    }
+    if (self.normalMicUnlockQueuePanel) {
+        [self.normalMicUnlockQueuePanel removeFromSuperview];
+        self.normalMicUnlockQueuePanel = nil;
     }
     self.normalChatToggleButton = nil;
     self.normalHandRaiseButton = nil;
