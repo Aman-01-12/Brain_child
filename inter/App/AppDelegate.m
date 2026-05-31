@@ -2872,15 +2872,12 @@ didRequestDeleteTeamId:(NSString *)teamId {
     [self.normalSpeakerQueuePanel setEntries:self.speakerQueue.entries];
     [self.normalRemoteLayout setHandRaised:NO forParticipant:identity];
 
-    // If the dismissed identity is our own (host lowered our hand), reset the local button
+    // If the dismissed identity is our own (host lowered our hand), reset the
+    // raise-hand button. Mic button state is managed exclusively by
+    // deriveParticipantMicButton — do NOT override it here.
     NSString *localIdentity = self.roomController.localParticipantIdentity;
     if ([identity isEqualToString:localIdentity]) {
         [self.normalHandRaiseButton setTitle:@"✋ Raise"];
-        // If global mute is still active and participant has no speak permission,
-        // reset mic button to raise-hand state (host lowered hand, not granted).
-        if (self.normalMediaWiring.globalMuteActive && !self.normalMediaWiring.speakPermissionGranted) {
-            [self.normalControlPanel setMicrophoneButtonTitle:@"✋ Raise Hand to Speak"];
-        }
     }
 }
 
@@ -3031,8 +3028,10 @@ didRequestDeleteTeamId:(NSString *)teamId {
 
 - (void)speakerQueuePanel:(InterSpeakerQueuePanel *)panel didAllowParticipant:(NSString *)identity {
 #pragma unused(panel)
-    // Send allowToSpeak signal so the participant can unmute
-    [self.moderationController allowToSpeakWithIdentity:identity];
+    // Grant a mic unlock slot via the new approval flow (replaces legacy
+    // allowToSpeak which is now a no-op). Participant's applyMicUnlockApproved
+    // takes the global-mute path: they see normal toggle buttons for one slot.
+    [self.moderationController approveMicUnlockWithIdentity:identity];
 
     // Lower the hand via network + remove from queue
     [self.chatController lowerHandForParticipant:identity];
@@ -3872,18 +3871,17 @@ didRequestDeleteTeamId:(NSString *)teamId {
 
     } else if ([actionType isEqualToString:@"unmuteMic"]) {
         if (self.moderationController.isAllMuted) {
-            // Mute All is active — sending requestUnmuteOne would force the mic on
-            // and bypass the raise-hand permission gate entirely. Use allowToSpeak
-            // instead: the participant is notified they may unmute (same as the
-            // raise-hand approval flow). Their mic is NOT force-enabled here;
-            // applyAllowToSpeak on their client handles it.
-            [self.moderationController allowToSpeakWithIdentity:participantIdentity];
-            // Clear any pending raise-hand from this participant
+            // Mute All is active — grant this participant a mic unlock slot via
+            // the new approval flow. approveMicUnlock sends the signal; on the
+            // participant side applyMicUnlockApproved takes the global-mute path
+            // (one-time slot with revoke detection). Lower their raised hand if
+            // one is pending.
+            [self.moderationController approveMicUnlockWithIdentity:participantIdentity];
             [self.chatController lowerHandForParticipant:participantIdentity];
             [self.speakerQueue removeHandFor:participantIdentity];
             [self.normalSpeakerQueuePanel setEntries:self.speakerQueue.entries];
             [self.normalRemoteLayout setHandRaised:NO forParticipant:participantIdentity];
-            // Participant is now allowed to speak — flip tile menu to "Mute Mic"
+            // Flip tile to "Mute Mic" so host can silence them if needed.
             [self.normalRemoteLayout setHostMuted:NO forParticipant:participantIdentity];
         } else {
             // No Mute All active — directly unmute; participant's mic turns on immediately
