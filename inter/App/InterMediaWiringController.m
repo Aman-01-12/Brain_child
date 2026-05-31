@@ -310,6 +310,7 @@ static void *InterWiringParticipantCountContext = &InterWiringParticipantCountCo
             // Host approved — detect revoke: participant unmuted then muted again.
             if (self.micWasUnmutedWhileApproved && self.isMicNetworkMuted) {
                 self.micUnlockApproved = NO;
+                self.micUnlockRequestPending = NO;
                 self.micWasUnmutedWhileApproved = NO;
                 [self.controlPanel setMicrophoneEnabled:YES];
                 [self.controlPanel setMicrophoneButtonTitle:@"Ask to Unmute"];
