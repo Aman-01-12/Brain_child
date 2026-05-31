@@ -176,3 +176,111 @@ import os.log
         pendingRequests.contains { $0.participantIdentity == identity }
     }
 }
+
+// MARK: - Camera Unlock Request Queue
+
+/// A single pending camera unlock request entry.
+@objc public class InterCameraUnlockEntry: NSObject {
+    @objc public let participantIdentity: String
+    @objc public let displayName: String
+    @objc public let timestamp: TimeInterval
+
+    @objc public init(participantIdentity: String,
+                      displayName: String,
+                      timestamp: TimeInterval = Date().timeIntervalSince1970) {
+        self.participantIdentity = participantIdentity
+        self.displayName = displayName
+        self.timestamp = timestamp
+        super.init()
+    }
+}
+
+/// FIFO queue of pending camera unlock requests. Mirrors InterScreenShareQueue.
+@objc public class InterCameraUnlockQueue: NSObject {
+    private var pendingRequests: [InterCameraUnlockEntry] = []
+
+    @objc public var entries: [InterCameraUnlockEntry] { pendingRequests }
+
+    @objc public private(set) dynamic var count: Int = 0
+
+    /// Add a request. Idempotent — duplicate identity refreshes the timestamp.
+    @objc public func addRequest(identity: String, displayName: String) {
+        // Remove existing entry so the refreshed request appears at the bottom.
+        pendingRequests.removeAll { $0.participantIdentity == identity }
+        pendingRequests.append(InterCameraUnlockEntry(participantIdentity: identity,
+                                                      displayName: displayName))
+        count = pendingRequests.count
+    }
+
+    @objc public func removeRequest(identity: String) {
+        pendingRequests.removeAll { $0.participantIdentity == identity }
+        count = pendingRequests.count
+    }
+
+    @objc public func reset() {
+        pendingRequests.removeAll()
+        count = 0
+    }
+
+    @objc public func hasPendingRequest(for identity: String) -> Bool {
+        pendingRequests.contains { $0.participantIdentity == identity }
+    }
+}
+
+// MARK: - Mic Unlock Request Queue
+
+/// A single pending mic-unlock request from a participant.
+@objc public class InterMicUnlockEntry: NSObject {
+    @objc public let participantIdentity: String
+    @objc public let displayName: String
+    @objc public let timestamp: TimeInterval
+
+    @objc public init(participantIdentity: String,
+                      displayName: String,
+                      timestamp: TimeInterval = Date().timeIntervalSince1970) {
+        self.participantIdentity = participantIdentity
+        self.displayName = displayName
+        self.timestamp = timestamp
+        super.init()
+    }
+}
+
+/// FIFO queue of pending mic unlock requests. Mirrors InterCameraUnlockQueue.
+///
+/// F10 mitigation: `addRequest` deduplicates by identity — a participant can
+/// only have one entry in the queue at a time. Duplicate requests are silently
+/// dropped (not refreshed) to prevent queue flooding.
+@objc public class InterMicUnlockQueue: NSObject {
+    private var pendingRequests: [InterMicUnlockEntry] = []
+
+    @objc public var entries: [InterMicUnlockEntry] { pendingRequests }
+
+    /// KVO-observable count of pending requests.
+    @objc public private(set) dynamic var count: Int = 0
+
+    /// Add a request. Idempotent — duplicate identity is silently dropped.
+    /// (Unlike camera unlock queue which refreshes; mic queue does NOT refresh
+    /// to prevent queue flooding — F10 mitigation.)
+    @objc public func addRequest(identity: String, displayName: String) {
+        guard !pendingRequests.contains(where: { $0.participantIdentity == identity }) else {
+            return  // F10: silently drop
+        }
+        pendingRequests.append(InterMicUnlockEntry(participantIdentity: identity,
+                                                    displayName: displayName))
+        count = pendingRequests.count
+    }
+
+    @objc public func removeRequest(identity: String) {
+        pendingRequests.removeAll { $0.participantIdentity == identity }
+        count = pendingRequests.count
+    }
+
+    @objc public func reset() {
+        pendingRequests.removeAll()
+        count = 0
+    }
+
+    @objc public func hasPendingRequest(for identity: String) -> Bool {
+        pendingRequests.contains { $0.participantIdentity == identity }
+    }
+}

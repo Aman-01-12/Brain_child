@@ -84,4 +84,45 @@ final class InterCameraWiringTests: XCTestCase {
         controller.liftCameraLockOne(identity: "frank")
         controller.liftCameraLockAll()
     }
+
+    // MARK: - InterMicUnlockQueue
+
+    func testMicUnlockQueue_addDeduplicates() {
+        let queue = InterMicUnlockQueue()
+        queue.addRequest(identity: "alice", displayName: "Alice")
+        queue.addRequest(identity: "alice", displayName: "Alice")
+        XCTAssertEqual(queue.count, 1, "Duplicate identity must not create two entries (F10 mitigation)")
+    }
+
+    func testMicUnlockQueue_addDoesNotRefreshOnDuplicate() {
+        let queue = InterMicUnlockQueue()
+        queue.addRequest(identity: "alice", displayName: "Alice")
+        let first = queue.entries[0].timestamp
+        Thread.sleep(forTimeInterval: 0.01)
+        queue.addRequest(identity: "alice", displayName: "Alice")
+        XCTAssertEqual(queue.entries[0].timestamp, first, "Duplicate must not refresh timestamp")
+    }
+
+    func testMicUnlockQueue_remove() {
+        let queue = InterMicUnlockQueue()
+        queue.addRequest(identity: "alice", displayName: "Alice")
+        queue.removeRequest(identity: "alice")
+        XCTAssertEqual(queue.count, 0)
+    }
+
+    func testMicUnlockQueue_reset() {
+        let queue = InterMicUnlockQueue()
+        queue.addRequest(identity: "alice", displayName: "Alice")
+        queue.addRequest(identity: "bob",   displayName: "Bob")
+        queue.reset()
+        XCTAssertEqual(queue.count, 0)
+        XCTAssertTrue(queue.entries.isEmpty)
+    }
+
+    func testMicUnlockQueue_hasPendingRequest() {
+        let queue = InterMicUnlockQueue()
+        queue.addRequest(identity: "alice", displayName: "Alice")
+        XCTAssertTrue(queue.hasPendingRequest(for: "alice"))
+        XCTAssertFalse(queue.hasPendingRequest(for: "bob"))
+    }
 }
