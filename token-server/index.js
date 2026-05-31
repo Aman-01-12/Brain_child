@@ -2002,6 +2002,7 @@ function roomBannedKey(code) { return `room:${code}:banned`; }
 function roomScreenShareQueueKey(code) { return `room:${code}:screenshare-queue`; }
 function roomScreenShareQueueNamesKey(code) { return `room:${code}:screenshare-queue:names`; }
 function roomCameraLockedKey(code) { return `room:${code}:camera-locked`; } // SET of locked identities
+function roomMicLockedKey(code) { return `room:${code}:mic-locked`; }       // SET of mic-locked identities
 function roomUserBindingKey(code) { return `room:${code}:user-binding`; }    // Hash: identity → userId
 function roomLeaveTokenKey(code, identity) { return `room:${code}:leavetoken:${identity}`; }
 function roomFilesKey(code) { return `room:${code}:files`; }           // Hash: fileId → JSON metadata
@@ -2651,6 +2652,11 @@ app.post('/room/mute', auth.requireAuth, async (req, res) => {
 
     if (targetTrack) {
       await roomService.mutePublishedTrack(roomData.roomName, targetIdentity, targetTrack.sid, true);
+    }
+
+    // F7/F17 mitigation: atomic sadd+expire for mic-locked persistence.
+    if (trackSource === 'microphone') {
+      await redis.multi().sadd(roomMicLockedKey(code), targetIdentity).expire(roomMicLockedKey(code), ROOM_CODE_EXPIRY_SECONDS).exec();
     }
 
     console.log(`[audit] Mute: code=${code} target=${targetIdentity} track=${trackSource} by=${callerIdentity}`);
@@ -4227,6 +4233,11 @@ app.post('/room/camera-lock-one', auth.requireAuth, async (req, res) => {
   if (!roomData) return res.status(404).json({ error: 'Invalid or expired room code' });
   const validation = await validateModerator(code, callerIdentity, req.user?.userId);
   if (!validation.valid) return res.status(403).json({ error: validation.error });
+  // Prevent locking participants of equal or higher privilege.
+  const targetRole = await getParticipantRole(code, targetIdentity);
+  if (roleLevel(targetRole) >= roleLevel(validation.role)) {
+    return res.status(403).json({ error: 'Cannot target a participant of equal or higher role' });
+  }
   try {
     await redis.sadd(roomCameraLockedKey(code), targetIdentity);
     await redis.expire(roomCameraLockedKey(code), ROOM_CODE_EXPIRY_SECONDS);
@@ -4255,14 +4266,24 @@ app.post('/room/camera-lock-all', auth.requireAuth, async (req, res) => {
   if (!validation.valid) return res.status(403).json({ error: validation.error });
   try {
     const members = await redis.smembers(roomParticipantsKey(code));
-    if (members.length > 0) {
-      await redis.sadd(roomCameraLockedKey(code), ...members);
-      await redis.expire(roomCameraLockedKey(code), ROOM_CODE_EXPIRY_SECONDS);
+    const callerRole = validation.role;
+    const tolock = [];
+    for (const member of members) {
+      // Never lock the caller or anyone with equal/higher privileges.
+      if (member === callerIdentity) continue;
+      const targetRole = await getParticipantRole(code, member);
+      if (roleLevel(targetRole) >= roleLevel(callerRole)) continue;
+      tolock.push(member);
     }
-    // Set global lock flag so late joiners are also locked when they join
+    if (tolock.length > 0) {
+      await redis.sadd(roomCameraLockedKey(code), ...tolock);
+    }
+    // Always set/refresh expiry and global flag regardless of tolock count.
+    await redis.expire(roomCameraLockedKey(code), ROOM_CODE_EXPIRY_SECONDS);
+    // Set global lock flag so late joiners are also locked when they join.
     await redis.hset(roomKey(code), 'globalCameraLock', 'true');
     io.to(code).emit('room:camera-lock-changed', { identity: null, locked: true, all: true });
-    console.log(`[audit] camera-lock-all: code=${code} by=${callerIdentity}`);
+    console.log(`[audit] camera-lock-all: code=${code} locked=${tolock.length} by=${callerIdentity}`);
     res.json({ success: true });
   } catch (err) {
     console.error('[error] camera-lock-all failed:', err.message);
@@ -4348,6 +4369,58 @@ app.get('/room/camera-locked', auth.requireAuth, async (req, res) => {
   } catch (err) {
     console.error('[error] camera-locked fetch failed:', err.message);
     res.status(500).json({ error: 'Failed to fetch camera lock state' });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// POST /room/mic-lift-one — Host lifts the mic lock for a specific participant.
+// Body: { roomCode, callerIdentity, targetIdentity }
+// ---------------------------------------------------------------------------
+app.post('/room/mic-lift-one', auth.requireAuth, async (req, res) => {
+  const { roomCode, callerIdentity, targetIdentity } = req.body;
+  if (!roomCode || !callerIdentity || !targetIdentity) {
+    return res.status(400).json({ error: 'roomCode, callerIdentity, and targetIdentity are required' });
+  }
+  const code = String(roomCode).toUpperCase().replace(/[^A-Z0-9]/g, '');
+  const roomData = await getRoomData(code);
+  if (!roomData) return res.status(404).json({ error: 'Invalid or expired room code' });
+  const validation = await validateModerator(code, callerIdentity, req.user?.userId);
+  if (!validation.valid) return res.status(403).json({ error: validation.error });
+  try {
+    await redis.srem(roomMicLockedKey(code), targetIdentity);
+    console.log(`[audit] mic-lift-one: code=${code} target=${targetIdentity} by=${callerIdentity}`);
+    res.json({ success: true });
+  } catch (err) {
+    console.error('[error] mic-lift-one failed:', err.message);
+    res.status(500).json({ error: 'Failed to lift mic lock' });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// GET /room/mic-locked — Returns mic-locked identities for reconnect snapshot.
+// Query: { roomCode, callerIdentity }
+// ---------------------------------------------------------------------------
+app.get('/room/mic-locked', auth.requireAuth, async (req, res) => {
+  const { roomCode, callerIdentity } = req.query;
+  if (!roomCode || !callerIdentity) {
+    return res.status(400).json({ error: 'roomCode and callerIdentity are required' });
+  }
+  const code = String(roomCode).toUpperCase().replace(/[^A-Z0-9]/g, '');
+  const roomData = await getRoomData(code);
+  if (!roomData) return res.status(404).json({ error: 'Invalid or expired room code' });
+  try {
+    const locked = await redis.smembers(roomMicLockedKey(code));
+    // Moderators receive the full set; participants receive only their own lock state.
+    const callerRole = await getParticipantRole(code, callerIdentity);
+    if (isModeratorRole(callerRole)) {
+      res.json({ locked });
+    } else {
+      const selfLocked = locked.includes(callerIdentity);
+      res.json({ locked: selfLocked ? [callerIdentity] : [] });
+    }
+  } catch (err) {
+    console.error('[error] mic-locked fetch failed:', err.message);
+    res.status(500).json({ error: 'Failed to fetch mic lock state' });
   }
 });
 
