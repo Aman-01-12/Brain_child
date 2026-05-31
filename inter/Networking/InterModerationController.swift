@@ -132,6 +132,26 @@ import LiveKit
     @objc optional func moderationController(_ controller: InterModerationController,
                                              shouldLiftCameraLockForParticipant identity: String)
 
+    /// A locked participant is requesting the host to unlock their camera.
+    /// Only the host receives this; non-host participants ignore it.
+    @objc optional func moderationController(_ controller: InterModerationController,
+                                             receivedCameraUnlockRequest fromIdentity: String,
+                                             displayName: String)
+
+    /// Host has approved our camera unlock request. The lock remains active —
+    /// the participant may toggle their camera on once; turning it back off
+    /// reverts to the "Ask to Unlock" state until the host lifts the lock from the tile.
+    @objc optional func moderationControllerCameraUnlockApproved(_ controller: InterModerationController)
+
+    /// A mic-locked participant is requesting the host to grant a temporary unmute.
+    /// Only the host receives this; non-host participants ignore it.
+    @objc optional func moderationController(_ controller: InterModerationController,
+                                             receivedMicUnlockRequest fromIdentity: String,
+                                             displayName: String)
+
+    /// Host has approved our mic unlock request — participant may unmute once.
+    @objc optional func moderationControllerMicUnlockApproved(_ controller: InterModerationController)
+
     /// Host changed the screen-share permission mode mid-meeting.
     /// All participants (including native co-hosts) receive this to sync their UI.
     @objc optional func moderationController(_ controller: InterModerationController,
@@ -487,6 +507,35 @@ import LiveKit
         guard InterPermissionMatrix.role(localRole, hasPermission: .canMuteOthers) else { return }
         sendControlSignal(type: .liftCameraLockAll)
         interLogInfo(InterLog.room, "ModerationController: liftCameraLockAll broadcast")
+    }
+
+    /// Locked participant sends a camera unlock request to the host.
+    /// No permission guard — any participant can send this.
+    @objc public func requestCameraUnlock() {
+        sendControlSignal(type: .requestCameraUnlock)
+        interLogInfo(InterLog.room, "ModerationController: requestCameraUnlock sent")
+    }
+
+    /// Host approves a specific participant's camera unlock request.
+    /// The Redis lock is NOT removed — participant may turn camera on once.
+    @objc public func approveCameraUnlock(identity: String) {
+        guard InterPermissionMatrix.role(localRole, hasPermission: .canMuteOthers) else { return }
+        sendControlSignal(type: .approveCameraUnlock, targetIdentity: identity)
+        interLogInfo(InterLog.room, "ModerationController: approveCameraUnlock → %{private}@", identity)
+    }
+
+    /// Participant requests host to grant a temporary mic unmute.
+    @objc public func requestMicUnlock() {
+        sendControlSignal(type: .requestMicUnlock)
+        interLogInfo(InterLog.room, "ModerationController: requestMicUnlock sent")
+    }
+
+    /// Host approves a specific participant's mic unlock request.
+    /// Participant may unmute once; muting again requires a new request.
+    @objc public func approveMicUnlock(identity: String) {
+        guard InterPermissionMatrix.role(localRole, hasPermission: .canMuteOthers) else { return }
+        sendControlSignal(type: .approveMicUnlock, targetIdentity: identity)
+        interLogInfo(InterLog.room, "ModerationController: approveMicUnlock → %{private}@", identity)
     }
 
     /// Host broadcasts a screen-share permission mode change to all native clients.
@@ -1126,8 +1175,8 @@ import LiveKit
 
         case .roleChanged:
             if let target = signal.targetIdentity, let newRole = signal.extraData?["newRole"] {
+                let role = InterParticipantRole.from(string: newRole)
                 if target == localIdentity {
-                    let role = InterParticipantRole.from(string: newRole)
                     localRole = role
                 }
                 delegate?.moderationController(self, participantRoleChanged: target, newRole: newRole)
@@ -1196,8 +1245,11 @@ import LiveKit
                 interLogInfo(InterLog.room, "ModerationController: received requestMuteCameraOne")
                 delegate?.moderationControllerReceivedCameraMuteOne?(self)
             } else if senderIsLocal {
-                // Host sent it — notify delegate to update the remote tile badge
-                delegate?.moderationController?(self, shouldApplyCameraMuteForParticipant: signal.targetIdentity ?? "")
+                // Host sent it — notify delegate to update the remote tile badge.
+                // Guard non-empty: an empty identity would corrupt tile state.
+                if let target = signal.targetIdentity, !target.isEmpty {
+                    delegate?.moderationController?(self, shouldApplyCameraMuteForParticipant: target)
+                }
             }
 
         case .requestMuteCameraAll:
@@ -1213,7 +1265,9 @@ import LiveKit
                 interLogInfo(InterLog.room, "ModerationController: received liftCameraLockOne")
                 delegate?.moderationControllerReceivedCameraLiftOne?(self)
             } else if senderIsLocal {
-                delegate?.moderationController?(self, shouldLiftCameraLockForParticipant: signal.targetIdentity ?? "")
+                if let target = signal.targetIdentity, !target.isEmpty {
+                    delegate?.moderationController?(self, shouldLiftCameraLockForParticipant: target)
+                }
             }
 
         case .liftCameraLockAll:
@@ -1229,6 +1283,64 @@ import LiveKit
             if !senderIsLocal, let mode = signal.extraData?["mode"] {
                 interLogInfo(InterLog.room, "ModerationController: received screenshareModeChanged mode=%{public}@", mode)
                 delegate?.moderationController?(self, receivedScreenShareModeChange: mode)
+            }
+
+        case .requestCameraUnlock:
+            // A locked participant is asking the host to unlock their camera.
+            // Only the host handles this; participants ignore requests from others.
+            if !senderIsLocal {
+                let senderIdentity = signal.senderIdentity ?? ""
+                let senderName = signal.senderName ?? senderIdentity
+                interLogInfo(InterLog.room, "ModerationController: received requestCameraUnlock from %{private}@", senderName)
+                delegate?.moderationController?(self, receivedCameraUnlockRequest: senderIdentity, displayName: senderName)
+            }
+
+        case .approveCameraUnlock:
+            // Host approved our camera unlock request — apply only if the signal
+            // targets us AND the sender holds a privileged role (canMuteOthers).
+            // Role is read from the sender's live LiveKit participant metadata so
+            // it is correct from the moment they join — no bootstrap race.
+            // This is defense-in-depth: the proper fix is server-authoritative
+            // delivery (see TODO: route approveCameraUnlock via server).
+            if targetIsLocal {
+                let senderIdentity = signal.senderIdentity ?? ""
+                let senderRole = roomController?.role(forParticipantIdentity: senderIdentity) ?? .participant
+                guard InterPermissionMatrix.role(senderRole, hasPermission: .canMuteOthers) else {
+                    interLogInfo(InterLog.room,
+                        "ModerationController: discarded approveCameraUnlock from unprivileged sender %{private}@",
+                        senderIdentity)
+                    break
+                }
+                interLogInfo(InterLog.room, "ModerationController: camera unlock approved by host")
+                delegate?.moderationControllerCameraUnlockApproved?(self)
+            }
+
+        case .requestMicUnlock:
+            // A mic-locked participant is asking the host for a temporary unmute.
+            // Only the host handles this; other participants ignore it.
+            if !senderIsLocal {
+                let senderIdentity = signal.senderIdentity ?? ""
+                let senderName = signal.senderName ?? senderIdentity
+                interLogInfo(InterLog.room,
+                    "ModerationController: received requestMicUnlock from %{private}@", senderName)
+                delegate?.moderationController?(self,
+                                               receivedMicUnlockRequest: senderIdentity,
+                                               displayName: senderName)
+            }
+
+        case .approveMicUnlock:
+            // Host approved our mic unlock — apply only if targeted at us and sender is privileged.
+            if targetIsLocal {
+                let senderIdentity = signal.senderIdentity ?? ""
+                let senderRole = roomController?.role(forParticipantIdentity: senderIdentity) ?? .participant
+                guard InterPermissionMatrix.role(senderRole, hasPermission: .canMuteOthers) else {
+                    interLogInfo(InterLog.room,
+                        "ModerationController: discarded approveMicUnlock from unprivileged sender %{private}@",
+                        senderIdentity)
+                    break
+                }
+                interLogInfo(InterLog.room, "ModerationController: mic unlock approved by host")
+                delegate?.moderationControllerMicUnlockApproved?(self)
             }
 
         default:
