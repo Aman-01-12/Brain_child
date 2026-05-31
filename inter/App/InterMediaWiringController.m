@@ -366,6 +366,24 @@ static void *InterWiringParticipantCountContext = &InterWiringParticipantCountCo
 - (void)applyMicUnlockApproved {
     // F16 mitigation: if restriction was already lifted, approval is moot.
     if (!self.hostMuted && !self.globalMuteActive) { return; }
+
+    if (self.hostMuted && !self.globalMuteActive) {
+        // Per-tile mute approval: lift the host restriction entirely so the
+        // participant can freely toggle their mic (no "one-time slot" semantics).
+        // Revoke detection must NOT apply here — once approved, they own their
+        // mic toggle until the host explicitly mutes them again.
+        self.hostMuted = NO;
+        self.micUnlockApproved = NO;
+        self.micUnlockRequestPending = NO;
+        self.micWasUnmutedWhileApproved = NO;
+        [self invalidateMicUnlockRequestTimer];
+        [self deriveParticipantMicButton];
+        return;
+    }
+
+    // Global mute-all path: one-time approval slot — revoke detection in
+    // deriveParticipantMicButton will reset to "Ask to Unmute" if they
+    // self-mute after using the slot.
     self.micUnlockApproved = YES;
     self.micUnlockRequestPending = NO;
     self.micWasUnmutedWhileApproved = NO;
