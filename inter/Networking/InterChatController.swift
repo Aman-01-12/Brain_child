@@ -592,7 +592,11 @@ import LiveKit
              .suspended, .unsuspended, .forceSpotlight, .clearForceSpotlight,
              .participantRemoved, .roleChanged, .lobbyJoin, .requestUnmuteAll, .requestMuteAll,
              .requestToSpeak, .allowToSpeak, .requestMuteOne, .requestUnmuteOne,
-             .requestScreenShare, .approveScreenShare, .denyScreenShare:
+             .requestScreenShare, .approveScreenShare, .denyScreenShare,
+             .askToUnmuteCamera, .requestMuteCameraOne, .requestMuteCameraAll,
+             .liftCameraLockOne, .liftCameraLockAll, .screenshareModeChanged,
+             .requestCameraUnlock, .approveCameraUnlock,
+             .requestMicUnlock, .approveMicUnlock:
             guard signal.senderIdentity != localIdentity else { return }
             moderationController?.handleControlSignal(signal)
 
