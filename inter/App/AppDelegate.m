@@ -4331,10 +4331,17 @@ didRequestDeleteTeamId:(NSString *)teamId {
 #pragma unused(panel)
     // Send approval signal to participant.
     [self.moderationController approveMicUnlockWithIdentity:identity];
-    // Update tile badge — host's own DataChannel signal is not echoed back.
-    [self.normalRemoteLayout setHostMuted:NO forParticipant:identity];
-    [self.hostMutedParticipants removeObject:identity];
-    self.normalSpeakerQueuePanel.hostMutedIdentities = [self.hostMutedParticipants copy];
+    // Only lift tile badge and hostMutedParticipants when mute-all is NOT active.
+    // When isAllMuted=YES the approval is a one-time slot (participant wiring takes
+    // the global-mute path): the per-tile restriction remains after the slot is
+    // used and revoke fires. Removing the identity here would cause the F1 filter
+    // to silently discard the participant's next request once mute-all is lifted,
+    // because F1 discards when !isAllMuted && !inHostMutedParticipants.
+    if (!self.moderationController.isAllMuted) {
+        [self.normalRemoteLayout setHostMuted:NO forParticipant:identity];
+        [self.hostMutedParticipants removeObject:identity];
+        self.normalSpeakerQueuePanel.hostMutedIdentities = [self.hostMutedParticipants copy];
+    }
     // Remove from queue.
     [self.micUnlockQueue removeRequestWithIdentity:identity];
     [self.normalMicUnlockQueuePanel setEntries:self.micUnlockQueue.entries];
@@ -4352,13 +4359,20 @@ didRequestDeleteTeamId:(NSString *)teamId {
 
 - (void)micUnlockQueuePanelDidApproveAll:(InterMicUnlockQueuePanel *)panel {
 #pragma unused(panel)
+    BOOL muteAllActive = self.moderationController.isAllMuted;
     NSArray<InterMicUnlockEntry *> *entries = [self.micUnlockQueue.entries copy];
     for (InterMicUnlockEntry *entry in entries) {
         [self.moderationController approveMicUnlockWithIdentity:entry.participantIdentity];
-        [self.normalRemoteLayout setHostMuted:NO forParticipant:entry.participantIdentity];
-        [self.hostMutedParticipants removeObject:entry.participantIdentity];
+        // Same guard as single-approve: only lift per-tile state when mute-all
+        // is not active, to avoid corrupting the F1 filter state.
+        if (!muteAllActive) {
+            [self.normalRemoteLayout setHostMuted:NO forParticipant:entry.participantIdentity];
+            [self.hostMutedParticipants removeObject:entry.participantIdentity];
+        }
     }
-    self.normalSpeakerQueuePanel.hostMutedIdentities = [self.hostMutedParticipants copy];
+    if (!muteAllActive) {
+        self.normalSpeakerQueuePanel.hostMutedIdentities = [self.hostMutedParticipants copy];
+    }
     [self.micUnlockQueue reset];
     [self.normalMicUnlockQueuePanel setEntries:@[]];
     [self.normalMicUnlockQueuePanel hidePanel];
