@@ -3863,6 +3863,11 @@ didRequestDeleteTeamId:(NSString *)teamId {
             [weakSelf.normalRemoteLayout setHostMuted:YES forParticipant:participantIdentity];
             [weakSelf.hostMutedParticipants addObject:participantIdentity];
             weakSelf.normalSpeakerQueuePanel.hostMutedIdentities = [weakSelf.hostMutedParticipants copy];
+            // Remove any pending mic unlock request from this participant — it is
+            // now stale since they are being re-muted.
+            [weakSelf.micUnlockQueue removeRequestWithIdentity:participantIdentity];
+            [weakSelf.normalMicUnlockQueuePanel setEntries:weakSelf.micUnlockQueue.entries];
+            if (weakSelf.micUnlockQueue.count == 0) [weakSelf.normalMicUnlockQueuePanel hidePanel];
         }];
 
     } else if ([actionType isEqualToString:@"unmuteMic"]) {
@@ -4125,6 +4130,10 @@ didRequestDeleteTeamId:(NSString *)teamId {
 #pragma unused(controller)
     NSLog(@"[Phase 9] Host muted all — updating local mic state");
     [self.normalMediaWiring applyRemoteMicMute];
+    // Cancel any pending mic unlock requests — they are invalidated by the new mute.
+    [self.micUnlockQueue reset];
+    [self.normalMicUnlockQueuePanel setEntries:@[]];
+    [self.normalMicUnlockQueuePanel hidePanel];
     // Bug 3 fix: if we are a host who received this from a co-host, sync
     // the Mute All toggle state and mark all remote tiles as host-muted so
     // the three-dot menu shows "Unmute Mic" for all participants.
