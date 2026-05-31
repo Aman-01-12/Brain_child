@@ -4282,10 +4282,17 @@ didRequestDeleteTeamId:(NSString *)teamId {
 - (void)cameraUnlockQueuePanel:(InterCameraUnlockQueuePanel *)panel
          didApproveParticipant:(NSString *)identity {
 #pragma unused(panel)
+    // Send the full lift signal (not just one-time approval) so participant
+    // can toggle freely — mirrors per-tile mic unlock approval semantics.
+    [self.moderationController liftCameraLockOneWithIdentity:identity];
+    // Update host's own tile badge immediately (DataChannel is not echoed).
+    [self.normalRemoteLayout setIsHostCameraLocked:NO forParticipant:identity];
+    // Remove from Redis asynchronously (best-effort; ignore failure).
+    [self persistCameraLock:NO identity:identity completion:nil];
+    // Remove from queue.
     [self.cameraUnlockQueue removeRequestWithIdentity:identity];
     [self.normalCameraUnlockQueuePanel setEntries:self.cameraUnlockQueue.entries];
     if (self.cameraUnlockQueue.count == 0) [self.normalCameraUnlockQueuePanel hidePanel];
-    [self.moderationController approveCameraUnlockWithIdentity:identity];
 }
 
 - (void)cameraUnlockQueuePanel:(InterCameraUnlockQueuePanel *)panel
@@ -4301,7 +4308,9 @@ didRequestDeleteTeamId:(NSString *)teamId {
 #pragma unused(panel)
     NSArray<InterCameraUnlockEntry *> *entries = [self.cameraUnlockQueue.entries copy];
     for (InterCameraUnlockEntry *entry in entries) {
-        [self.moderationController approveCameraUnlockWithIdentity:entry.participantIdentity];
+        [self.moderationController liftCameraLockOneWithIdentity:entry.participantIdentity];
+        [self.normalRemoteLayout setIsHostCameraLocked:NO forParticipant:entry.participantIdentity];
+        [self persistCameraLock:NO identity:entry.participantIdentity completion:nil];
     }
     [self.cameraUnlockQueue reset];
     [self.normalCameraUnlockQueuePanel setEntries:@[]];

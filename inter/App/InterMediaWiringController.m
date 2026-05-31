@@ -598,11 +598,14 @@ static void *InterWiringParticipantCountContext = &InterWiringParticipantCountCo
 }
 
 /// Host approved this participant's camera unlock request.
-/// The Redis lock stays — participant may now turn camera on once.
+/// For per-tile lock: lifts isHostCameraLocked entirely so the participant
+/// can toggle freely (mirrors mic unlock per-tile approval semantics).
 - (void)applyHostCameraApprovalForParticipant {
-    self.cameraUnlockApproved = YES;
+    self.isHostCameraLocked = NO;
+    self.cameraUnlockApproved = NO;
     self.cameraUnlockRequestPending = NO;
-    self.cameraWasEnabledWhileApproved = NO; // camera hasn't been turned on yet in this window
+    self.cameraWasEnabledWhileApproved = NO;
+    self.cameraWasEnabledBeforeHostLock = NO;
     [self deriveCameraButton];
 }
 
