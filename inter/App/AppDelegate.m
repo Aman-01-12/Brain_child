@@ -3941,14 +3941,6 @@ didRequestDeleteTeamId:(NSString *)teamId {
     } else if ([actionType isEqualToString:@"unpinForAll"]) {
         [self.moderationController removePinnedParticipantWithIdentity:participantIdentity];
 
-    } else if ([actionType isEqualToString:@"allowSharing"]) {
-        // Promote to presenter so the participant gains screen-share permission
-        [self.moderationController promoteParticipantWithIdentity:participantIdentity
-                                                           toRole:InterParticipantRolePresenter
-                                                       completion:^(BOOL success, NSError *error) {
-            if (!success) NSLog(@"[Moderation] allowSharing failed for %@: %@", participantIdentity, error.localizedDescription);
-        }];
-
     } else if ([actionType isEqualToString:@"remove"]) {
         [self.moderationController removeParticipantWithIdentity:participantIdentity
                                                       completion:^(BOOL success, NSError *error) {

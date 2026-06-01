@@ -194,6 +194,11 @@ typedef NS_ENUM(NSUInteger, InterRemoteVideoLayoutMode) {
 /// shows "Lift Camera Lock" instead of "Lock Camera Off".
 - (void)setIsHostCameraLocked:(BOOL)locked forParticipant:(NSString *)identity;
 
+/// Clear the host-camera-locked badge on every currently tracked remote tile.
+/// Called before applying a fresh snapshot from the server so stale locks
+/// do not persist across reconnects or when the locked set shrinks.
+- (void)clearAllHostCameraLocks;
+
 // MARK: — Per-participant moderation (host/co-host controls on tile hover)
 
 /// When YES, a three-dot (⋯) moderation menu button appears on remote participant tiles
@@ -206,7 +211,7 @@ typedef NS_ENUM(NSUInteger, InterRemoteVideoLayoutMode) {
 ///
 /// @param participantIdentity  The LiveKit participant identity of the targeted tile.
 /// @param actionType           One of: @"muteMic", @"muteCamera", @"muteAll",
-///                             @"pinForAll", @"allowSharing", @"allowSpeaking", @"remove".
+///                             @"pinForAll", @"allowSpeaking", @"remove".
 @property (nonatomic, copy, nullable) void (^moderationActionHandler)(NSString *participantIdentity,
                                                                        NSString *actionType);
 

@@ -293,17 +293,11 @@ static NSString *const kInterPreferGridLayoutKey = @"InterPreferGridLayout";
         addItem(@"Mute Mic", @"muteMic");
     }
 
-    // Camera — label and action toggle based on current mute state
-    if (self.isCameraMuted) {
-        addItem(@"Unmute Camera", @"unmuteCamera");
-    } else {
-        addItem(@"Mute Camera", @"muteCamera");
-    }
-    // Camera lock — host-enforced camera off
+    // Camera lock — unified "Mute Camera" (locks camera) / "Lift Camera Lock"
     if (self.isHostCameraLocked) {
-        addItem(@"Lift Camera Lock", @"liftCameraLock");
+        addItem(@"Unmute Camera", @"liftCameraLock");
     } else {
-        addItem(@"Lock Camera Off", @"lockCamera");
+        addItem(@"Mute Camera", @"lockCamera");
     }
     [menu addItem:[NSMenuItem separatorItem]];
     // Pin/Unpin toggles.
@@ -319,8 +313,6 @@ static NSString *const kInterPreferGridLayoutKey = @"InterPreferGridLayout";
     } else {
         addItem(@"Pin for All",   @"pinForAll");
     }
-    [menu addItem:[NSMenuItem separatorItem]];
-    addItem(@"Allow Sharing",  @"allowSharing");
     [menu addItem:[NSMenuItem separatorItem]];
     if (self.isCoHost) {
         NSMenuItem *removeCoHostItem = [[NSMenuItem alloc] initWithTitle:@"Remove Co-Host"
@@ -394,6 +386,14 @@ static NSString *const kInterPreferGridLayoutKey = @"InterPreferGridLayout";
 
 /// Per-tile wrapper views, keyed by tile key (participantId or kScreenShareTileKey).
 @property (nonatomic, strong) NSMutableDictionary<NSString *, InterRemoteVideoTileView *> *tileViews;
+
+/// Persisted co-host flag per participant identity. Outlives individual tile views so
+/// that the crown badge is correctly restored when a tile is torn down and recreated.
+@property (nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *coHostStates;
+
+/// Persisted host-camera-locked flag per participant identity. Same rationale as
+/// coHostStates — survives layout mode changes that recreate tile views.
+@property (nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *hostCameraLockStates;
 
 // -- Spotlight --
 
@@ -500,6 +500,8 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
     self.cameraParticipantOrder = [NSMutableArray array];
     self.tileViews                  = [NSMutableDictionary dictionary];
     self.hostForcedSpotlightTileKeys = [NSMutableArray array];
+    self.coHostStates               = [NSMutableDictionary dictionary];
+    self.hostCameraLockStates       = [NSMutableDictionary dictionary];
 
     // Filmstrip scroll view (hidden until screen-share + cameras mode)
     self.filmstripScrollView = [[NSScrollView alloc] initWithFrame:NSZeroRect];
@@ -851,6 +853,8 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
 
 - (void)setIsCoHost:(BOOL)isCoHost forParticipant:(NSString *)identity {
     if (!identity || identity.length == 0) return;
+    // Persist so the flag survives tile teardown/recreation.
+    self.coHostStates[identity] = @(isCoHost);
     InterRemoteVideoTileView *tile = self.tileViews[identity];
     if (tile) {
         tile.isCoHost = isCoHost;
@@ -859,9 +863,18 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
 
 - (void)setIsHostCameraLocked:(BOOL)locked forParticipant:(NSString *)identity {
     if (!identity || identity.length == 0) return;
+    // Persist so the flag survives tile teardown/recreation.
+    self.hostCameraLockStates[identity] = @(locked);
     InterRemoteVideoTileView *tile = self.tileViews[identity];
     if (tile) {
         tile.isHostCameraLocked = locked;
+    }
+}
+
+- (void)clearAllHostCameraLocks {
+    [self.hostCameraLockStates removeAllObjects];
+    for (InterRemoteVideoTileView *tile in self.tileViews.allValues) {
+        tile.isHostCameraLocked = NO;
     }
 }
 
@@ -956,6 +969,14 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
                 s.moderationActionHandler(tileKey, action);
             }
         };
+    }
+
+    // Restore persisted moderation flags so badges survive tile teardown/recreation.
+    if (![key isEqualToString:kScreenShareTileKey]) {
+        NSNumber *coHost = self.coHostStates[key];
+        if (coHost) tile.isCoHost = coHost.boolValue;
+        NSNumber *cameraLocked = self.hostCameraLockStates[key];
+        if (cameraLocked) tile.isHostCameraLocked = cameraLocked.boolValue;
     }
 
     self.tileViews[key] = tile;
