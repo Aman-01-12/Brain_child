@@ -172,14 +172,14 @@
 
     // Screen share permission segmented control — host-only, hidden by default
     self.screenSharePermissionLabel = [NSTextField labelWithString:@"Screen Share"];
-    self.screenSharePermissionLabel.frame = NSMakeRect(16, -62, 100, 16);
+    self.screenSharePermissionLabel.frame = NSMakeRect(16, 124, 100, 16);
     self.screenSharePermissionLabel.autoresizingMask = NSViewMaxXMargin | NSViewMaxYMargin;
     self.screenSharePermissionLabel.font = [NSFont systemFontOfSize:11];
     self.screenSharePermissionLabel.textColor = [NSColor colorWithWhite:0.85 alpha:1.0];
     self.screenSharePermissionLabel.hidden = YES;
     [self addSubview:self.screenSharePermissionLabel];
 
-    self.screenSharePermissionControl = [[NSSegmentedControl alloc] initWithFrame:NSMakeRect(16, -86, self.bounds.size.width - 32, 22)];
+    self.screenSharePermissionControl = [[NSSegmentedControl alloc] initWithFrame:NSMakeRect(16, 98, self.bounds.size.width - 32, 22)];
     self.screenSharePermissionControl.autoresizingMask = NSViewWidthSizable | NSViewMaxYMargin;
     self.screenSharePermissionControl.segmentCount = 3;
     [self.screenSharePermissionControl setLabel:@"Everyone" forSegment:0];
@@ -258,7 +258,20 @@
 
 - (void)setCameraEnabled:(BOOL)enabled {
     self.cameraButton.title = enabled ? @"Turn Camera Off" : @"Turn Camera On";
-    self.cameraButton.enabled = enabled;
+    // Button interactivity is intentionally NOT gated on camera state here.
+    // The camera button must remain enabled (clickable) whether the camera is
+    // on or off — the user must always be able to toggle it.
+    // The ONLY case where the button should be non-interactive is when the host
+    // has locked the camera, which is handled exclusively by deriveCameraButton
+    // in InterMediaWiringController via setCameraButtonTitle: + setCameraEnabled:NO
+    // in that locked branch. Disabling here was the root cause of both:
+    //   - Bug 1: "cameraOffOnJoin = YES → cannot turn camera on after joining"
+    //   - Bug 2: "camera turned off manually → cannot turn camera on again"
+    self.cameraButton.enabled = YES;
+}
+
+- (void)setCameraInteractive:(BOOL)interactive {
+    self.cameraButton.enabled = interactive;
 }
 
 - (void)setMicrophoneEnabled:(BOOL)enabled {
@@ -589,6 +602,10 @@
     } else if ([mode isEqualToString:@"hostOnly"]) {
         self.screenSharePermissionControl.selectedSegment = 2;
     }
+}
+
+- (void)setScreenSharePermissionEnabled:(BOOL)enabled {
+    self.screenSharePermissionControl.enabled = enabled;
 }
 
 @end

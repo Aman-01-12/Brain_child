@@ -813,6 +813,16 @@ import LiveKit
             ]
         }
     }
+
+    /// Returns the role of a remote participant by reading their LiveKit metadata.
+    /// Falls back to `.participant` if the identity is not found or has no role metadata.
+    @objc public func role(forParticipantIdentity identity: String) -> InterParticipantRole {
+        guard let room = room else { return .participant }
+        let participant = room.remoteParticipants.values.first {
+            $0.identity?.stringValue == identity
+        }
+        return InterParticipantMetadata.parseRole(from: participant?.metadata)
+    }
 }
 
 // MARK: - RoomDelegate

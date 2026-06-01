@@ -29,7 +29,16 @@ NS_ASSUME_NONNULL_BEGIN
 @property (nonatomic, strong, readonly) NSView *networkStatusContainerView;
 
 - (void)setPanelTitleText:(NSString *)title;
+/// Update the camera button title to reflect whether the camera is on or off.
+/// This does NOT change button interactivity — use setCameraInteractive: for that.
 - (void)setCameraEnabled:(BOOL)enabled;
+
+/// Set whether the camera button accepts user clicks.
+/// Pass NO only when the host has locked the camera for this participant.
+/// This is separate from setCameraEnabled: so that a toggled-off camera
+/// (enabled=NO) remains interactive (the user can click to re-enable it).
+- (void)setCameraInteractive:(BOOL)interactive;
+
 - (void)setMicrophoneEnabled:(BOOL)enabled;
 
 /// Set a custom microphone button title. Pass nil to restore the default
@@ -74,6 +83,10 @@ NS_ASSUME_NONNULL_BEGIN
 /// mode: @"everyone" | @"request" | @"hostOnly"
 /// Pass nil to hide the control (for non-host participants).
 - (void)setScreenSharePermissionMode:(nullable NSString *)mode;
+
+/// Enable or disable the screen share permission segmented control.
+/// Call NO before an in-flight server request, YES when the request completes.
+- (void)setScreenSharePermissionEnabled:(BOOL)enabled;
 
 @end
 

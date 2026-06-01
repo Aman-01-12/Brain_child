@@ -482,3 +482,173 @@ When the host pinned participants 105 and 106, every client received the full pi
 
 **Build: SUCCEEDED ✅**
 
+---
+
+## [31 May 2026] — Mic Unlock Request Flow (Tasks 1–11)
+
+### Overview
+Replaced the legacy "Raise Hand to Speak" mic-unlock mechanism with a unified **"Ask to Unmute"** request-approval flow. Under mute-all, participants tap "Ask to Unmute" → host sees a queue panel → approves/denies. Per-tile host mutes use the same queue but approval fully lifts the per-tile restriction (no one-time slot). Raise-hand stays as an intent signal only, decoupled from mic state.
+
+### Signal Layer
+
+**`inter/Networking/InterChatMessage.swift`**
+- Added case `.requestMicUnlock = 43` — participant → host: "I'd like to unmute"
+- Added case `.approveMicUnlock = 44` — host → participant: "you may unmute"
+
+**`inter/Networking/InterChatController.swift`** — Phase 9 routing
+- `requestMicUnlock` and `approveMicUnlock` cases handled in the moderator/participant routing branches
+- Both signals routed to `InterModerationController` delegate callbacks
+
+**`inter/Networking/InterModerationController.swift`**
+- `requestMicUnlockWithIdentity:` — sends `.requestMicUnlock` DataChannel signal with sender identity
+- `approveMicUnlockWithIdentity:` — sends `.approveMicUnlock` DataChannel signal targeting specific participant
+- Delegate methods: `moderationControllerReceivedMicUnlockRequest:fromIdentity:displayName:` and `moderationControllerReceivedMicUnlockApproval:`
+
+### Data Model
+
+**`inter/Networking/InterMicUnlockQueue.swift`** — NEW
+- `InterMicUnlockEntry`: `participantIdentity`, `displayName`, `timestamp`
+- `InterMicUnlockQueue`: ordered array, `addRequest(identity:displayName:)` (silent duplicate drop — F10 mitigation), `removeRequestWithIdentity:`, `reset()`, `count`, `entries`
+
+### Participant State Machine
+
+**`inter/App/InterMediaWiringController.m`** — rewritten `deriveParticipantMicButton` + new flags
+- New flags: `micUnlockRequestPending`, `micUnlockApproved`, `micWasUnmutedWhileApproved`, `micUnlockRequestTimer`
+- `deriveParticipantMicButton` — 4-priority chain:
+  1. `restricted + approved + revoke detected` → "Ask to Unmute" (reset)
+  2. `restricted + approved` → normal toggle ("Turn Mic On/Off")
+  3. `restricted + pending` → "Request Sent…" (disabled)
+  4. `restricted` → "Ask to Unmute" (enabled)
+  5. `not restricted` → clear all flags, `setMicrophoneButtonTitle:nil`
+- `applyMicUnlockRequestPending` — sets pending flag, starts 30-second safety-net timer (F6 mitigation)
+- `applyMicUnlockApproved` — **split into two paths**:
+  - `hostMuted && !globalMuteActive` (per-tile): clears `hostMuted=NO` entirely — participant toggles freely, no one-time slot
+  - Global mute-all path: sets `micUnlockApproved=YES` — one-time slot with revoke-on-self-mute detection
+  - F16 guard: moot approval (restriction already lifted) is a no-op
+- `resetMicUnlockFlowState` — clears all flags + timer
+- `applyRemoteMicMute` / `applyRemoteMicMuteOne` — both clear all pending unlock state on new mute
+- `applyAllowToSpeak` — now a no-op (mic unlock fully handled by new approval flow)
+
+### Host Queue Panel UI
+
+**`inter/UI/Views/InterMicUnlockQueuePanel.h/.m`** — NEW
+- `InterMicUnlockEntry`-backed `NSTableView` with participant name + "Approve" and "Dismiss" per-row buttons
+- "Approve All" and "Dismiss All" header buttons
+- `InterMicUnlockQueuePanelDelegate` protocol
+- Floating dark panel matching existing moderation panels
+
+### AppDelegate Wiring
+
+**`inter/App/AppDelegate.m`**
+- Mic button handler: restricted path routes through request flow; approved path calls `twoPhaseToggleMicrophone`; [R3] guard blocks "unmute" when host has disabled it and mic is network-muted
+- F1 filter in `receivedMicUnlockRequest:`: discards requests from participants who are neither globally muted (`isAllMuted`) nor in `hostMutedParticipants` — prevents queue spam from unrestricted participants
+- `moderationControllerReceivedMicUnlockApproval:` → `[normalMediaWiring applyMicUnlockApproved]`
+- `moderationControllerReceivedMuteOneRequest:` → `applyRemoteMicMuteOne` (cancel queue on new mute — Task 10)
+- Full `InterMicUnlockQueuePanelDelegate` implementation: approve single, deny single, approve all, deny all
+
+### Token Server — Redis Persistence
+
+**`token-server/index.js`**
+- `roomMicLockedKey(roomCode)` helper → `room:{code}:mic-locked`
+- `POST /room/mute`: atomic `redis.multi().sadd().expire().exec()` adds identity to locked set (F7 mitigation — atomic with TTL)
+- `POST /room/mic-lift-one`: `SREM` removes identity from locked set
+- `GET /room/mic-locked`: returns locked identities (full set for moderators, self-only for participants)
+- Try/catch on all Redis ops (F17 mitigation)
+
+### Snapshot Restore
+
+**`inter/App/AppDelegate.m` — `fetchMicLockedSnapshot`**
+- On call join: `GET /room/mic-locked` → applies `applyRemoteMicMuteOne` for self if in set, sets `setHostMuted:YES` badge for remote participants
+- Populates `hostMutedParticipants` from snapshot for correct F1 filter state on rejoin
+
+### Paranoid Mitigations Verified
+| ID | Mitigation | Location |
+|----|-----------|----------|
+| F1 | Discard requests from non-restricted senders | `AppDelegate.m receivedMicUnlockRequest:` |
+| F6 | 30-second safety-net timer clears pending state | `applyMicUnlockRequestPending` |
+| F7 | Atomic `SADD + EXPIRE` in single Redis transaction | `token-server/index.js POST /room/mute` |
+| F10 | Silent duplicate drop in `addRequest:` | `InterMicUnlockQueue.swift` |
+| F16 | Moot approval guard in `applyMicUnlockApproved` | `InterMediaWiringController.m` |
+| F17 | Try/catch on all Redis mic-lock ops | `token-server/index.js` |
+
+**Commits**: `8081347`, `e1f5172`, `a9a1654`, `981fb1b`, `82238c0`, `28528fa`, `baa8360`, `c7855e2`, `3fefd40`, `de64627`, `1da4c9b`
+**Build: SUCCEEDED ✅**
+
+---
+
+## [31 May 2026] — Bug Fix: Per-Tile Mic Unlock Approval Shows "Ask to Unmute" After Self-Mute
+
+### Problem
+After the host approved a per-tile mic unlock request, when the participant self-muted, the button reverted to "Ask to Unmute" instead of staying as a normal toggle — as if their approval had been revoked.
+
+### Root Cause
+`applyMicUnlockApproved` set `micUnlockApproved=YES` while leaving `hostMuted=YES`. When the participant self-muted after using the slot, the revoke-detection branch in `deriveParticipantMicButton` (`micWasUnmutedWhileApproved && isMicNetworkMuted`) fired and reset to "Ask to Unmute" — even though the approval should have permanently lifted the per-tile restriction.
+
+### Fix (`inter/App/InterMediaWiringController.m`)
+Split `applyMicUnlockApproved` into two paths:
+- **Per-tile path** (`hostMuted=YES && globalMuteActive=NO`): clears `hostMuted=NO`, resets all unlock flags — participant is permanently unrestricted; revoke detection cannot fire
+- **Global mute-all path** (`globalMuteActive=YES`): retains one-time slot semantics with revoke detection
+
+**Commit**: `092cb21` | **Build: SUCCEEDED ✅**
+
+---
+
+## [31 May 2026] — Bug Fix: Per-Tile Camera Unlock Approval — Stale Badge + Revoke
+
+### Problem
+After the host approved a per-tile camera unlock request, the participant's tile still showed the "camera locked" badge on the host side, and the participant saw the "Ask to Unlock Camera" button reappear after turning their camera off — same one-time-slot semantics applied incorrectly to per-tile camera mutes.
+
+### Root Cause
+1. `applyHostCameraApprovalForParticipant` left `isHostCameraLocked=YES` (wrong — per-tile approval should lift the lock entirely)
+2. `cameraUnlockQueuePanel:didApproveParticipant:` sent `approveCameraUnlock` signal (wrong) instead of `liftCameraLockOneWithIdentity:`, never called `setIsHostCameraLocked:NO` on the host tile, and never removed from Redis
+
+### Fix
+- `applyHostCameraApprovalForParticipant` (`InterMediaWiringController.m`): now clears `isHostCameraLocked=NO` and resets all camera unlock flags — mirrors the per-tile mic fix
+- `cameraUnlockQueuePanel:didApproveParticipant:` (`AppDelegate.m`): now calls `liftCameraLockOneWithIdentity:` + `setIsHostCameraLocked:NO` tile update + `persistCameraLock:NO` Redis removal
+- `cameraUnlockQueuePanelDidApproveAll:` (`AppDelegate.m`): same pattern applied to batch approval
+
+**Commit**: `064001e` | **Build: SUCCEEDED ✅**
+
+---
+
+## [31 May 2026] — Bug Fix: Race Condition — Mute-All + Per-Tile + Approval Corrupts F1 Filter
+
+### Problem (exact scenario)
+1. Host enables mute-all → participant sees "Ask to Unmute"
+2. Host per-tile mutes the same participant (`hostMuted=YES`, `globalMuteActive=YES`)
+3. Participant sends request → host approves (global mute-all path: one-time slot)
+4. Participant uses slot then self-mutes → revoke fires → "Ask to Unmute"
+5. Host lifts mute-all (`globalMuteActive=NO`) — `hostMuted=YES` remains
+6. Participant taps "Ask to Unmute" → sends request → **host never sees it**
+7. Button stuck on "Ask to Unmute" with no request sent
+
+### Root Cause
+`micUnlockQueuePanel:didApproveParticipant:` unconditionally called `[hostMutedParticipants removeObject:identity]`. When `isAllMuted=YES` the approval is a one-time slot — the per-tile restriction (`hostMuted=YES`) survives. Removing from `hostMutedParticipants` poisoned the F1 filter: after mute-all lifted, F1's check (`!isAllMuted && !inHostMutedParticipants`) became `true` and silently dropped every subsequent request.
+
+### Fix (`inter/App/AppDelegate.m`)
+Gated the `hostMutedParticipants` removal and tile-badge clear on `!isAllMuted`:
+- When `isAllMuted=YES` at approve time: send the signal, keep `hostMutedParticipants` intact, keep tile badge — one-time slot granted, per-tile restriction survives
+- When `isAllMuted=NO` at approve time: previous behaviour, full per-tile state cleared
+- Same guard added to `micUnlockQueuePanelDidApproveAll:` (`muteAllActive` captured once before the loop for consistent batch treatment)
+
+**Commit**: `1ccb3d1` | **Build: SUCCEEDED ✅**
+
+---
+
+## [1 June 2026] — Bug Fix: Stale "Raise Hand to Speak" Traces
+
+### Problem
+When mute-all was active and the host clicked "Unmute Mic" from a participant's per-tile context menu, the participant's UI showed "✋ Raise Hand to Speak" instead of the correct "Ask to Unmute" or unlock slot button.
+
+### Root Cause (three related issues)
+1. **`chatController:participantDidLowerHand:`** — stale Phase 8 block directly set `"✋ Raise Hand to Speak"` on the mic button whenever `globalMuteActive=YES && !speakPermissionGranted`. This fired because the tile "Unmute Mic" path (and the speaker-queue "Allow" path) both sent `lowerHandForParticipant:` as a side-effect.
+2. **Tile "Unmute Mic" during mute-all** — called `allowToSpeakWithIdentity:` which was neutered to a no-op in Phase 9. Its only live effect was emitting the `lowerHand` DataChannel signal, which triggered the stale override above.
+3. **Speaker queue "Allow" button** — same `allowToSpeakWithIdentity:` no-op + `lowerHand` trigger.
+
+### Fix (`inter/App/AppDelegate.m`)
+- `chatController:participantDidLowerHand:` — removed the mic button override entirely. The raise-hand button title is still reset; mic button state is managed exclusively by `deriveParticipantMicButton`
+- Tile "Unmute Mic" during mute-all — replaced `allowToSpeakWithIdentity:` with `approveMicUnlockWithIdentity:`: sends the proper Phase 9 approval signal; participant's `applyMicUnlockApproved` takes the global-mute path (one-time slot)
+- Speaker queue "Allow" — same replacement: raise-hand approval now grants a mic unlock slot through the new flow
+
+**Commit**: `f6ed039` | **Build: SUCCEEDED ✅**
+
