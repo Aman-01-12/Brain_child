@@ -96,6 +96,22 @@ static void *InterWiringParticipantCountContext = &InterWiringParticipantCountCo
         if (currentCount > 0) {
             [remoteLayout setRemoteParticipantCount:(NSUInteger)currentCount];
         }
+
+        // Seed the local entry in the roster so the snapshot includes the local
+        // self-tile from the moment the layout is wired.
+        InterRoomController *rc = self.roomController;
+        if (rc) {
+            NSString *localId = rc.localParticipantIdentity;
+            NSString *localName = rc.localParticipantName;
+            BOOL camOn = self.mediaController.isCameraEnabled;
+            BOOL micMuted = !self.mediaController.isMicrophoneEnabled;
+            if (localId.length > 0) {
+                [rc.subscriber.roster setLocalWithIdentity:localId
+                                               displayName:localName
+                                                  cameraOn:camOn
+                                                 micMuted:micMuted];
+            }
+        }
     }
 }
 
@@ -132,6 +148,9 @@ static void *InterWiringParticipantCountContext = &InterWiringParticipantCountCo
         if (weakSelf.mediaController.isCameraEnabled) {
             [weakSelf.remoteLayout refreshLocalPreviewLayout];
         }
+        // Push local camera state to roster so snapshot reflects it.
+        BOOL cameraOn = weakSelf.mediaController.isCameraEnabled;
+        [weakSelf.roomController.subscriber.roster setLocalCameraOn:cameraOn];
     }];
 }
 
@@ -151,6 +170,9 @@ static void *InterWiringParticipantCountContext = &InterWiringParticipantCountCo
         if (summary) {
             [weakSelf.controlPanel setMediaStatusText:summary];
         }
+        // Push local mic state to roster so snapshot reflects it.
+        BOOL micMuted = !weakSelf.mediaController.isMicrophoneEnabled;
+        [weakSelf.roomController.subscriber.roster setLocalMicMuted:micMuted];
     }];
 }
 
@@ -559,16 +581,31 @@ static void *InterWiringParticipantCountContext = &InterWiringParticipantCountCo
     self.cameraWasEnabledWhileApproved = NO;
     InterLocalMediaController *media = self.mediaController;
     if (!media) { [self deriveCameraButton]; return; }
-    // Capture before setCameraEnabled:NO changes it so the lift can restore accurately.
+    // Capture before disabling so the lift can restore accurately.
     self.cameraWasEnabledBeforeHostLock = media.isCameraEnabled;
     __weak typeof(self) weakSelf = self;
     if (media.isCameraEnabled) {
-        [media setCameraEnabled:NO completion:^(BOOL success) {
+        InterRoomController *rc = self.roomController;
+        BOOL isConnected = rc && rc.connectionState == InterRoomConnectionStateConnected;
+        if (isConnected && rc.publisher.cameraSource != nil) {
+            // G2: mute LiveKit track first (keeps cameraState in sync), then stop device.
+            // Without the G2 step, cameraState stays .active while isCameraEnabled = NO,
+            // causing the next user toggle (enable path) to call beginEnable() from
+            // .active — an invalid transition that silently drops the unmute.
+            [rc.publisher muteCameraTrackWithCompletion:^{
+                [weakSelf toggleCamera];
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    [weakSelf deriveCameraButton];
+                });
+            }];
+        } else {
+            [media setCameraEnabled:NO completion:^(BOOL success) {
 #pragma unused(success)
-            dispatch_async(dispatch_get_main_queue(), ^{
-                [weakSelf deriveCameraButton];
-            });
-        }];
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    [weakSelf deriveCameraButton];
+                });
+            }];
+        }
     } else {
         [self deriveCameraButton];
     }
@@ -584,12 +621,24 @@ static void *InterWiringParticipantCountContext = &InterWiringParticipantCountCo
         // The host lock was the reason the camera went off — restore it.
         self.cameraWasEnabledBeforeHostLock = NO;
         __weak typeof(self) weakSelf = self;
-        [media setCameraEnabled:YES completion:^(BOOL success) {
-#pragma unused(success)
+        InterRoomController *rc = self.roomController;
+        BOOL isConnected = rc && rc.connectionState == InterRoomConnectionStateConnected;
+        if (isConnected && rc.publisher.cameraSource != nil) {
+            // G2 enable: start capture device first, then let first frame auto-unmute the track.
+            // This mirrors twoPhaseToggleCamera's enable path and keeps cameraState in sync.
+            [self toggleCamera];           // async: starts device on sessionQueue
+            [rc.publisher unmuteCameraTrack]; // beginEnable() — first real frame will unmute
             dispatch_async(dispatch_get_main_queue(), ^{
                 [weakSelf deriveCameraButton];
             });
-        }];
+        } else {
+            [media setCameraEnabled:YES completion:^(BOOL success) {
+#pragma unused(success)
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    [weakSelf deriveCameraButton];
+                });
+            }];
+        }
     } else {
         // Camera was already off before the lock; don't second-guess the user.
         self.cameraWasEnabledBeforeHostLock = NO;
@@ -927,6 +976,11 @@ static void *InterWiringParticipantCountContext = &InterWiringParticipantCountCo
     InterRemoteVideoLayoutManager *layout = self.remoteLayout;
     if (layout) {
         [layout setActiveSpeakerIdentity:speakerIdentity];
+    }
+    // Also feed the roster so isSpeaking is reflected in snapshot-driven tiles.
+    InterRoomController *rc = self.roomController;
+    if (rc) {
+        [rc.subscriber.roster setActiveSpeaker:speakerIdentity ?: @""];
     }
 }
 
