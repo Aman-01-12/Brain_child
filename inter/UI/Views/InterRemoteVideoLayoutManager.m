@@ -22,7 +22,7 @@ static NSString *const kInterPreferGridLayoutKey = @"InterPreferGridLayout";
 //   • Click-to-spotlight via target/action
 // ---------------------------------------------------------------------------
 @interface InterRemoteVideoTileView : NSView
-@property (nonatomic, strong) InterRemoteVideoView *videoView;
+@property (nonatomic, strong) NSView *videoView;
 @property (nonatomic, strong) NSTextField *nameLabel;
 @property (nonatomic, copy) NSString *tileKey;
 @property (nonatomic, weak) id spotlightTarget;
@@ -85,7 +85,7 @@ static NSString *const kInterPreferGridLayoutKey = @"InterPreferGridLayout";
 
 @implementation InterRemoteVideoTileView
 
-- (instancetype)initWithVideoView:(InterRemoteVideoView *)videoView
+- (instancetype)initWithVideoView:(NSView *)videoView
                           tileKey:(NSString *)tileKey
                       displayName:(NSString *)displayName {
     self = [super initWithFrame:NSZeroRect];
@@ -466,7 +466,7 @@ static NSString *const kInterPreferGridLayoutKey = @"InterPreferGridLayout";
 /// Per-participant display names, keyed by participant identity string.
 @property (nonatomic, strong) NSMutableDictionary<NSString *, NSString *> *participantDisplayNames;
 /// Per-participant remote camera views, keyed by participant identity string.
-@property (nonatomic, strong) NSMutableDictionary<NSString *, InterRemoteVideoView *> *remoteCameraViews;
+@property (nonatomic, strong) NSMutableDictionary<NSString *, InterRemoteSampleBufferView *> *remoteCameraViews;
 /// Insertion-order list of participant IDs so grid layout is deterministic.
 @property (nonatomic, strong) NSMutableArray<NSString *> *cameraParticipantOrder;
 /// Single screen share view (at most one active at a time).
@@ -543,6 +543,7 @@ static NSString *const kInterPreferGridLayoutKey = @"InterPreferGridLayout";
 @property (nonatomic, strong) NSMutableSet<NSString *> *visibleParticipantIds;
 
 /// Tile recycling pool — reusable InterRemoteVideoView instances. [Phase 7.3.3]
+/// Kept for screen-share view recycling; camera tiles now use InterRemoteSampleBufferView.
 @property (nonatomic, strong) NSMutableArray<InterRemoteVideoView *> *recycledVideoViews;
 
 /// Set of participant IDs for which a first-frame dispatch has already been queued
@@ -1084,7 +1085,7 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
 }
 
 /// Wraps an InterRemoteVideoView in a tile (or returns existing tile).
-- (InterRemoteVideoTileView *)tileForKey:(NSString *)key videoView:(InterRemoteVideoView *)videoView {
+- (InterRemoteVideoTileView *)tileForKey:(NSString *)key videoView:(NSView *)videoView {
     InterRemoteVideoTileView *tile = self.tileViews[key];
     if (tile) {
         // Ensure the video view is still the correct one
@@ -1155,18 +1156,11 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
 
 #pragma mark - View Factory (low-level)
 
-- (InterRemoteVideoView *)cameraViewForParticipant:(NSString *)participantId {
-    InterRemoteVideoView *view = self.remoteCameraViews[participantId];
+- (InterRemoteSampleBufferView *)cameraViewForParticipant:(NSString *)participantId {
+    InterRemoteSampleBufferView *view = self.remoteCameraViews[participantId];
     if (!view) {
-        // Phase 7.3.3: Try recycling pool before creating new
-        if (self.recycledVideoViews.count > 0) {
-            view = self.recycledVideoViews.lastObject;
-            [self.recycledVideoViews removeLastObject];
-            view.hidden = YES;
-        } else {
-            view = [[InterRemoteVideoView alloc] initWithFrame:self.bounds];
-            view.hidden = YES;
-        }
+        view = [[InterRemoteSampleBufferView alloc] initWithFrame:self.bounds];
+        view.hidden = YES;
         view.isMirrored = YES;  // Mirror camera feeds for natural appearance
         self.remoteCameraViews[participantId] = view;
         [self.cameraParticipantOrder addObject:participantId];
@@ -1202,7 +1196,7 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
     }
 
     // Ensure the tile exists and reflects the avatar placeholder + correct name.
-    InterRemoteVideoView *view = self.remoteCameraViews[participantId];
+    InterRemoteSampleBufferView *view = self.remoteCameraViews[participantId];
     if (view) {
         InterRemoteVideoTileView *tile = [self tileForKey:participantId videoView:view];
         [tile updateAvatarInitialFromDisplayName:[self displayNameForTileKey:participantId]];
@@ -1303,18 +1297,11 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
     [self.pendingFirstFrameIdentifiers removeObject:participantId];
     os_unfair_lock_unlock(&_pendingFirstFrameLock);
 
-    InterRemoteVideoView *view = self.remoteCameraViews[participantId];
+    InterRemoteSampleBufferView *view = self.remoteCameraViews[participantId];
     if (view) {
-        // Phase 7.3.3: Recycle view instead of destroying it (up to 10 pooled).
-        // Beyond 10, shut down rendering to cap memory usage.
         [self removeTileForKey:participantId];
-        [view clearFrame];
-        if (self.recycledVideoViews.count < 10) {
-            [view removeFromSuperview];
-            [self.recycledVideoViews addObject:view];
-        } else {
-            [view shutdownRenderingSynchronously];
-        }
+        [view shutdownRendering];
+        [view removeFromSuperview];
         [self.remoteCameraViews removeObjectForKey:participantId];
         [self.cameraParticipantOrder removeObject:participantId];
         [self.participantDisplayNames removeObjectForKey:participantId];
@@ -1355,7 +1342,7 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
 #pragma mark - Frame Routing
 
 - (void)handleRemoteCameraFrame:(CVPixelBufferRef)pixelBuffer fromParticipant:(NSString *)participantId {
-    InterRemoteVideoView *view = self.remoteCameraViews[participantId];
+    InterRemoteSampleBufferView *view = self.remoteCameraViews[participantId];
     if (view) {
         [view updateFrame:pixelBuffer];
         // First frame after the camera turns on (or after a presence-created tile):
@@ -1398,7 +1385,7 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
         [self.pendingFirstFrameIdentifiers removeObject:participantId];
         os_unfair_lock_unlock(&self->_pendingFirstFrameLock);
 
-        InterRemoteVideoView *v = [self cameraViewForParticipant:participantId];
+        InterRemoteSampleBufferView *v = [self cameraViewForParticipant:participantId];
         [v updateFrame:pixelBuffer];
         CVPixelBufferRelease(pixelBuffer);
 
@@ -1407,13 +1394,6 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
         self.tileViews[participantId].cameraOff = NO;
 
         // Use non-animated layout for the first appearance.
-        // tile.animator.frame bypasses setFrame:, so layout() on the
-        // InterRemoteVideoView is deferred 300 ms, leaving
-        // metalLayer.drawableSize at CGSizeZero and producing a blank
-        // screen until the animation completes. A direct setFrame: call
-        // (animated:NO) triggers layout() immediately, ensuring
-        // metalLayer.drawableSize is correct on the very next display-link
-        // tick and the video appears without any blank period.
         [self updateLayoutAnimated:NO];
 
         // Re-attach the local self-view preview layer's session connection.
@@ -1448,8 +1428,8 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
 
 - (void)handleRemoteTrackMuted:(NSUInteger)trackKind forParticipant:(NSString *)participantId {
     if (trackKind == InterTrackKindCamera) {
-        InterRemoteVideoView *view = self.remoteCameraViews[participantId];
-        [view clearFrame];
+        InterRemoteSampleBufferView *view = self.remoteCameraViews[participantId];
+        [view shutdownRendering];  // clear last frame; no CVDisplayLink to stop
         self.tileViews[participantId].isCameraMuted = YES;
         // Camera turned off — show the avatar placeholder (tile stays; presence owns removal).
         self.cameraOffStates[participantId] = @YES;
@@ -1480,8 +1460,8 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
         // their camera off / unpublished — NOT that they left. Show the avatar
         // placeholder and keep the tile. Tile removal happens only on participant
         // disconnect (removeRemoteParticipant:).
-        InterRemoteVideoView *view = self.remoteCameraViews[participantId];
-        [view clearFrame];
+        InterRemoteSampleBufferView *view = self.remoteCameraViews[participantId];
+        [view shutdownRendering];  // clear last frame
         self.cameraOffStates[participantId] = @YES;
         self.tileViews[participantId].cameraOff = YES;
     } else if (trackKind == InterTrackKindScreenShare) {
@@ -1671,7 +1651,7 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
             // remote participant present but camera off).
             NSString *pid = self.cameraParticipantOrder.firstObject;
             if (pid) {
-                InterRemoteVideoView *camView = self.remoteCameraViews[pid];
+                InterRemoteSampleBufferView *camView = self.remoteCameraViews[pid];
                 if (!camView) break;
 
                 camView.aspectFill = NO;
@@ -1831,7 +1811,7 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
                     - kPinGap - (row + 1) * pinTileH - row * kPinGap;
         NSRect tileFrame = NSMakeRect(x, y, pinTileW, pinTileH);
 
-        InterRemoteVideoView *videoView = self.remoteCameraViews[key];
+        InterRemoteSampleBufferView *videoView = self.remoteCameraViews[key];
         if (!videoView) continue;
         InterRemoteVideoTileView *tile = [self tileForKey:key videoView:videoView];
         tile.nameLabel.hidden = NO;
@@ -2318,7 +2298,7 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
         }
 
         // --- Remote camera tile ---
-        InterRemoteVideoView *view = self.remoteCameraViews[pid];
+        InterRemoteSampleBufferView *view = self.remoteCameraViews[pid];
         if (!view) continue;
 
         view.aspectFill = NO; // aspect-fit: downscale 2x keeps compression artifacts invisible
