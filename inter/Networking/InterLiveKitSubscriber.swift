@@ -55,8 +55,23 @@ import LiveKit
     /// A remote participant's display name was discovered or updated.
     @objc optional func remoteParticipantDidUpdateDisplayName(_ displayName: String, forParticipant participantId: String)
 
+    /// A remote participant joined the room. Fired on participant connect — BEFORE any
+    /// video frame arrives — so the UI can create a tile immediately (with an avatar
+    /// placeholder) following the standard video-call presence model.
+    @objc optional func remoteParticipantDidJoin(_ participantId: String, displayName: String)
+
+    /// A remote participant left the room. Fired on participant disconnect. The UI should
+    /// remove the participant's tile entirely (presence-driven removal — independent of
+    /// whether a track-end event fired for their camera).
+    @objc optional func remoteParticipantDidLeave(_ participantId: String)
+
     /// The active/dominant speaker changed. Identity is empty string when no remote speaker is active.
     @objc optional func activeSpeakerDidChange(_ participantId: String)
+
+    /// The full participant roster changed. Carries the complete ordered set of
+    /// presence entries (local first, then remote join order). The receiver reconciles
+    /// its tiles to match — this is the single source of truth for tile lifecycle/state.
+    @objc optional func applyParticipantSnapshot(_ entries: [InterParticipantSnapshotEntry])
 }
 
 // MARK: - InterLiveKitSubscriber
@@ -93,6 +108,12 @@ import LiveKit
     /// Per-participant screen share video tracks keyed by participant identity.
     private var screenShareTracks: [String: RemoteVideoTrack] = [:]
 
+    /// Identities of remote participants who currently have an active screen share track.
+    /// Main-thread only — all mutations happen on the main thread via LiveKit callbacks.
+    @objc public var activeScreenShareIdentities: [String] {
+        return Array(screenShareTracks.keys)
+    }
+
     /// Weak reference to the room for delegate management.
     private weak var room: Room?
 
@@ -103,6 +124,23 @@ import LiveKit
         self.room = room
         room.add(delegate: self)
         interLogInfo(InterLog.media, "Subscriber: attached to room")
+
+        // Seed presence tiles for participants who are ALREADY in the room at the moment
+        // we attach (e.g. a participant joining a room where the host is already present).
+        // LiveKit only fires participantDidConnect for participants who join AFTER us, so
+        // without this seeding a participant who is already present with their camera off
+        // would never get a tile until they toggled their camera.
+        let existing = room.remoteParticipants.values.compactMap { p -> (String, String)? in
+            guard let id = p.identity?.stringValue, !id.isEmpty else { return nil }
+            return (id, p.name ?? id)
+        }
+        if !existing.isEmpty {
+            DispatchQueue.main.async {
+                for (id, name) in existing {
+                    self.trackRenderer?.remoteParticipantDidJoin?(id, displayName: name)
+                }
+            }
+        }
     }
 
     // MARK: - Phase 7.2.2: Track Visibility Binding
@@ -223,6 +261,35 @@ import LiveKit
 // MARK: - RoomDelegate
 
 extension InterLiveKitSubscriber: RoomDelegate {
+
+    /// A remote participant connected. Presence-driven: forward immediately so the UI
+    /// can create a placeholder tile before any media arrives (standard video-call model).
+    public nonisolated func room(_ room: Room, participantDidConnect participant: RemoteParticipant) {
+        let pid = participant.identity?.stringValue ?? ""
+        guard !pid.isEmpty else { return }
+        let name = participant.name ?? pid
+        interLogInfo(InterLog.media, "Subscriber: participant connected %{public}@", pid)
+        DispatchQueue.main.async {
+            self.trackRenderer?.remoteParticipantDidJoin?(pid, displayName: name)
+        }
+    }
+
+    /// A remote participant disconnected. Presence-driven: forward so the UI removes the
+    /// participant's tile entirely, independent of any track-end events.
+    public nonisolated func room(_ room: Room, participantDidDisconnect participant: RemoteParticipant) {
+        let pid = participant.identity?.stringValue ?? ""
+        guard !pid.isEmpty else { return }
+        interLogInfo(InterLog.media, "Subscriber: participant disconnected %{public}@", pid)
+        // Tear down any renderers/tracks we still hold for this participant so a
+        // re-join with the same identity starts from a clean slate. cleanUpTrack is a
+        // no-op when nothing is held, and runs on the main thread to match the other
+        // dictionary access points reached from delegate callbacks.
+        DispatchQueue.main.async {
+            self.cleanUpTrack(source: .camera, participantId: pid)
+            self.cleanUpTrack(source: .screenShareVideo, participantId: pid)
+            self.trackRenderer?.remoteParticipantDidLeave?(pid)
+        }
+    }
 
     /// A remote participant's track was subscribed (we can now receive media).
     public nonisolated func room(
