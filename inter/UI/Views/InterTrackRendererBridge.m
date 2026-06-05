@@ -99,4 +99,31 @@
     });
 }
 
+- (void)remoteParticipantDidJoin:(NSString *)participantId displayName:(NSString *)displayName {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        InterRemoteVideoLayoutManager *mgr = self.layoutManager;
+        if (mgr) {
+            [mgr addRemoteParticipant:participantId displayName:displayName];
+        }
+    });
+}
+
+- (void)remoteParticipantDidLeave:(NSString *)participantId {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        InterRemoteVideoLayoutManager *mgr = self.layoutManager;
+        if (mgr) {
+            [mgr removeRemoteParticipant:participantId];
+        }
+    });
+}
+
+- (void)applyParticipantSnapshot:(NSArray<InterParticipantSnapshotEntry *> *)entries {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        InterRemoteVideoLayoutManager *mgr = self.layoutManager;
+        if (mgr) {
+            [mgr applyParticipantSnapshot:entries];
+        }
+    });
+}
+
 @end

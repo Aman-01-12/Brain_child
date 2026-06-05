@@ -5,6 +5,7 @@ NS_ASSUME_NONNULL_BEGIN
 
 @class InterParticipantOverlayView;
 @class InterRemoteVideoLayoutManager;
+@class InterParticipantSnapshotEntry;
 
 /// Delegate protocol for layout manager to request track visibility/quality changes. [Phase 7]
 /// Implemented by the media wiring controller to relay to InterLiveKitSubscriber.
@@ -153,8 +154,15 @@ typedef NS_ENUM(NSUInteger, InterRemoteVideoLayoutMode) {
 
 /// Call when a remote camera frame arrives from a participant.
 - (void)handleRemoteCameraFrame:(CVPixelBufferRef)pixelBuffer fromParticipant:(NSString *)participantId;
-
-/// Call when a remote screen share frame arrives from a participant.
+/// Presence-driven: call when a remote participant joins the room. Creates a tile
+/// immediately with an avatar placeholder (shown until their first camera frame arrives).
+/// This follows the standard video-call model where every participant gets a tile on join,
+/// independent of whether their camera is on.
+- (void)addRemoteParticipant:(NSString *)participantId displayName:(NSString *)displayName;
+/// Presence-driven: call when a remote participant leaves the room. Removes their tile
+/// entirely. This is the authoritative tile-removal path (track-end only toggles the
+/// avatar placeholder; it never removes the tile).
+- (void)removeRemoteParticipant:(NSString *)participantId;/// Call when a remote screen share frame arrives from a participant.
 - (void)handleRemoteScreenShareFrame:(CVPixelBufferRef)pixelBuffer fromParticipant:(NSString *)participantId;
 
 /// Call when a remote track mutes.
@@ -165,6 +173,11 @@ typedef NS_ENUM(NSUInteger, InterRemoteVideoLayoutMode) {
 
 /// Call when a remote track ends completely.
 - (void)handleRemoteTrackEnded:(NSUInteger)trackKind forParticipant:(NSString *)participantId;
+
+/// Reconcile all tiles to match the authoritative roster snapshot. This is the ONLY
+/// entry point that adds/removes/updates tiles. Local entry (isLocal) uses the local
+/// preview layer; remote entries use AVSampleBufferDisplayLayer tiles.
+- (void)applyParticipantSnapshot:(NSArray<InterParticipantSnapshotEntry *> *)entries;
 
 /// Register a human-readable display name for a participant identity.
 /// Once registered, tiles for this participant show the display name
@@ -189,6 +202,10 @@ typedef NS_ENUM(NSUInteger, InterRemoteVideoLayoutMode) {
 /// Update the co-host crown badge on a specific participant's tile.
 - (void)setIsCoHost:(BOOL)isCoHost forParticipant:(NSString *)identity;
 
+/// Mark a tile as belonging to the meeting host. When YES the tile's moderation
+/// menu shows only pin/unpin — co-hosts cannot mute, remove, or promote the host.
+- (void)setIsHostParticipant:(BOOL)isHost forParticipant:(NSString *)identity;
+
 /// Update the host-camera-locked badge on a specific participant's tile.
 /// When locked = YES, the tile shows a camera-lock indicator and the tile menu
 /// shows "Lift Camera Lock" instead of "Lock Camera Off".
@@ -206,12 +223,20 @@ typedef NS_ENUM(NSUInteger, InterRemoteVideoLayoutMode) {
 /// Changing this property updates all existing tiles immediately.
 @property (nonatomic, assign) BOOL isHostMode;
 
+/// When YES, the local user is the meeting host and the tile moderation menu includes
+/// Make Co-Host / Remove Co-Host options. Set to NO for co-hosts — role assignment
+/// is a host-only action and co-hosts must not see or trigger it.
+/// Propagated to all existing and newly created tiles automatically.
+@property (nonatomic, assign) BOOL localUserCanAssignCoHost;
+
 /// Invoked on the main queue when the local host selects a moderation action
 /// from a participant tile's three-dot hover menu.
 ///
 /// @param participantIdentity  The LiveKit participant identity of the targeted tile.
 /// @param actionType           One of: @"muteMic", @"muteCamera", @"muteAll",
-///                             @"pinForAll", @"allowSpeaking", @"remove".
+///                             @"unmuteMic", @"lockCamera", @"liftCameraLock",
+///                             @"pinForAll", @"unpinForAll", @"makeCoHost",
+///                             @"removeCoHost", @"rename", @"remove".
 @property (nonatomic, copy, nullable) void (^moderationActionHandler)(NSString *participantIdentity,
                                                                        NSString *actionType);
 

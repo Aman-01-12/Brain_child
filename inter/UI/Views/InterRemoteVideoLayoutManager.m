@@ -1,6 +1,7 @@
 #import "InterRemoteVideoLayoutManager.h"
 #import "InterParticipantOverlayView.h"
 #import <AVFoundation/AVFoundation.h>
+#import <os/lock.h>
 
 #if __has_include("inter-Swift.h")
 #import "inter-Swift.h"
@@ -62,6 +63,24 @@ static NSString *const kInterPreferGridLayoutKey = @"InterPreferGridLayout";
 /// Host-camera-locked badge (🔒 emoji), shown when the host has locked this participant's camera.
 @property (nonatomic, strong) NSTextField *cameraLockedBadge;
 @property (nonatomic, assign) BOOL isHostCameraLocked;
+/// When YES, this tile belongs to the meeting host. The moderation menu shows only pin/unpin.
+@property (nonatomic, assign) BOOL isHostParticipant;
+/// When YES, the local user is the meeting host and may assign or revoke co-host status.
+/// When NO (local user is a co-host), the Make/Remove Co-Host menu items are hidden.
+@property (nonatomic, assign) BOOL localUserCanAssignCoHost;
+/// Avatar placeholder shown when the participant's camera is off (no video).
+/// A circular badge with the participant's initial, centered in the tile.
+@property (nonatomic, strong) NSView *avatarPlaceholder;
+/// The initial-letter label inside the avatar placeholder circle.
+@property (nonatomic, strong) NSTextField *avatarInitial;
+/// When YES, the avatar placeholder is shown and the video view is hidden
+/// (participant present but camera off). Driven by presence + track/frame events.
+@property (nonatomic, assign) BOOL cameraOff;
+
+/// Update the avatar's initial letter when the display name becomes known.
+- (void)updateAvatarInitialFromDisplayName:(NSString *)displayName;
+/// Compute the single-character avatar initial for a display name.
++ (NSString *)initialForDisplayName:(NSString *)displayName;
 @end
 
 @implementation InterRemoteVideoTileView
@@ -81,6 +100,25 @@ static NSString *const kInterPreferGridLayoutKey = @"InterPreferGridLayout";
     self.videoView = videoView;
     videoView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
     [self addSubview:videoView];
+
+    // Avatar placeholder — shown when the participant's camera is off. Sits above
+    // the video view but below the name label / badges. A circular grey badge with
+    // the participant's initial, centred in the tile (standard video-call style).
+    NSView *avatar = [[NSView alloc] initWithFrame:NSZeroRect];
+    avatar.wantsLayer = YES;
+    avatar.layer.backgroundColor = [NSColor colorWithWhite:0.22 alpha:1.0].CGColor;
+    avatar.hidden = YES;
+    [self addSubview:avatar];
+    self.avatarPlaceholder = avatar;
+
+    NSTextField *initial = [NSTextField labelWithString:[[self class] initialForDisplayName:displayName]];
+    initial.font = [NSFont systemFontOfSize:32 weight:NSFontWeightSemibold];
+    initial.textColor = [NSColor whiteColor];
+    initial.alignment = NSTextAlignmentCenter;
+    initial.backgroundColor = [NSColor clearColor];
+    initial.drawsBackground = NO;
+    [avatar addSubview:initial];
+    self.avatarInitial = initial;
 
     // Name label pinned to bottom
     self.nameLabel = [NSTextField labelWithString:displayName];
@@ -181,11 +219,43 @@ static NSString *const kInterPreferGridLayoutKey = @"InterPreferGridLayout";
     self.cameraLockedBadge.hidden = !isHostCameraLocked;
 }
 
+/// Show/hide the avatar placeholder. When YES, the video view is hidden and the
+/// circular initial badge is shown (participant present but camera off).
+- (void)setCameraOff:(BOOL)cameraOff {
+    _cameraOff = cameraOff;
+    self.avatarPlaceholder.hidden = !cameraOff;
+    self.videoView.hidden = cameraOff;
+}
+
+/// Update the avatar's initial letter when the display name becomes known.
+- (void)updateAvatarInitialFromDisplayName:(NSString *)displayName {
+    self.avatarInitial.stringValue = [[self class] initialForDisplayName:displayName];
+}
+
+/// Compute the single-character avatar initial for a display name.
++ (NSString *)initialForDisplayName:(NSString *)displayName {
+    NSString *trimmed = [displayName stringByTrimmingCharactersInSet:
+                         [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (trimmed.length == 0) return @"?";
+    return [[trimmed substringToIndex:1] uppercaseString];
+}
+
 - (void)layout {
     [super layout];
     NSRect b = self.bounds;
     // Video fills entire tile
     self.videoView.frame = b;
+    // Avatar placeholder: centred circle sized to ~35% of the smaller dimension.
+    CGFloat avatarD = MIN(b.size.width, b.size.height) * 0.35;
+    avatarD = MAX(40.0, MIN(avatarD, 120.0));
+    self.avatarPlaceholder.frame = NSMakeRect((b.size.width - avatarD) / 2.0,
+                                              (b.size.height - avatarD) / 2.0,
+                                              avatarD, avatarD);
+    self.avatarPlaceholder.layer.cornerRadius = avatarD / 2.0;
+    // Centre the initial label vertically within the circle.
+    CGFloat initialH = avatarD * 0.5;
+    self.avatarInitial.font = [NSFont systemFontOfSize:avatarD * 0.4 weight:NSFontWeightSemibold];
+    self.avatarInitial.frame = NSMakeRect(0, (avatarD - initialH) / 2.0, avatarD, initialH);
     // Name label at bottom, 22px tall
     CGFloat labelH = 22.0;
     self.nameLabel.frame = NSMakeRect(0, 0, b.size.width, labelH);
@@ -284,6 +354,26 @@ static NSString *const kInterPreferGridLayoutKey = @"InterPreferGridLayout";
         [menu addItem:item];
     };
 
+    // When the tile belongs to the meeting host, co-hosts can only pin/unpin.
+    // All other moderation actions (mute, camera, remove, role changes) are not
+    // shown to avoid confusing no-op items in the menu.
+    if (self.isHostParticipant) {
+        if (self.isPinnedByHost) {
+            addItem(@"Unpin for All", @"unpinForAll");
+        } else if (self.allPinSlotsUsed) {
+            NSMenuItem *limitItem = [[NSMenuItem alloc] initWithTitle:@"Pin for All (max 5 reached)"
+                                                               action:nil
+                                                        keyEquivalent:@""];
+            limitItem.enabled = NO;
+            [menu addItem:limitItem];
+        } else {
+            addItem(@"Pin for All", @"pinForAll");
+        }
+        NSPoint hostOrigin = NSMakePoint(NSMinX(sender.frame), NSMinY(sender.frame));
+        [menu popUpMenuPositioningItem:nil atLocation:hostOrigin inView:self];
+        return;
+    }
+
     // Mic — label reflects HOST's mute intent, not participant's self-mute state.
     // isMicMuted drives the visual mic indicator; isHostMuted drives the menu label
     // so the host sees "Unmute Mic" only when THEY explicitly muted this participant.
@@ -314,23 +404,27 @@ static NSString *const kInterPreferGridLayoutKey = @"InterPreferGridLayout";
         addItem(@"Pin for All",   @"pinForAll");
     }
     [menu addItem:[NSMenuItem separatorItem]];
-    if (self.isCoHost) {
-        NSMenuItem *removeCoHostItem = [[NSMenuItem alloc] initWithTitle:@"Remove Co-Host"
-                                                                   action:@selector(moderationMenuItemClicked:)
-                                                            keyEquivalent:@""];
-        removeCoHostItem.target = self;
-        removeCoHostItem.enabled = YES;
-        removeCoHostItem.representedObject = @{@"tileKey": tileKey, @"action": @"removeCoHost"};
-        [menu addItem:removeCoHostItem];
-    } else {
-        NSMenuItem *makeCoHostItem = [[NSMenuItem alloc] initWithTitle:@"Make Co-Host"
-                                                                 action:@selector(moderationMenuItemClicked:)
-                                                          keyEquivalent:@""];
-        makeCoHostItem.target = self;
-        makeCoHostItem.enabled = YES;
-        makeCoHostItem.representedObject = @{@"tileKey": tileKey, @"action": @"makeCoHost"};
-        [menu addItem:makeCoHostItem];
+    // Role assignment is host-only — co-hosts do not see Make/Remove Co-Host.
+    if (self.localUserCanAssignCoHost) {
+        if (self.isCoHost) {
+            NSMenuItem *removeCoHostItem = [[NSMenuItem alloc] initWithTitle:@"Remove Co-Host"
+                                                                       action:@selector(moderationMenuItemClicked:)
+                                                                keyEquivalent:@""];
+            removeCoHostItem.target = self;
+            removeCoHostItem.enabled = YES;
+            removeCoHostItem.representedObject = @{@"tileKey": tileKey, @"action": @"removeCoHost"};
+            [menu addItem:removeCoHostItem];
+        } else {
+            NSMenuItem *makeCoHostItem = [[NSMenuItem alloc] initWithTitle:@"Make Co-Host"
+                                                                     action:@selector(moderationMenuItemClicked:)
+                                                              keyEquivalent:@""];
+            makeCoHostItem.target = self;
+            makeCoHostItem.enabled = YES;
+            makeCoHostItem.representedObject = @{@"tileKey": tileKey, @"action": @"makeCoHost"};
+            [menu addItem:makeCoHostItem];
+        }
     }
+    addItem(@"Rename…", @"rename");
     [menu addItem:[NSMenuItem separatorItem]];
 
     NSMenuItem *removeItem = [[NSMenuItem alloc] initWithTitle:@"Remove from Meeting"
@@ -395,6 +489,16 @@ static NSString *const kInterPreferGridLayoutKey = @"InterPreferGridLayout";
 /// coHostStates — survives layout mode changes that recreate tile views.
 @property (nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *hostCameraLockStates;
 
+/// Persisted host-participant flag per participant identity. When YES for a given identity,
+/// that tile's moderation menu shows only pin/unpin (co-hosts cannot moderate the host).
+@property (nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *hostParticipantStates;
+
+/// Persisted camera-off flag per participant identity. YES means the avatar placeholder
+/// is shown (participant present but no video). Survives tile teardown/recreation so the
+/// placeholder state is correct after layout-mode changes. Set by presence (join) and
+/// track/frame events; cleared when the first camera frame arrives.
+@property (nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *cameraOffStates;
+
 // -- Spotlight --
 
 /// Tile key currently shown on the main stage (nil = auto).
@@ -441,6 +545,13 @@ static NSString *const kInterPreferGridLayoutKey = @"InterPreferGridLayout";
 /// Tile recycling pool — reusable InterRemoteVideoView instances. [Phase 7.3.3]
 @property (nonatomic, strong) NSMutableArray<InterRemoteVideoView *> *recycledVideoViews;
 
+/// Set of participant IDs for which a first-frame dispatch has already been queued
+/// but not yet processed on the main thread. Prevents duplicate dispatches that would
+/// otherwise cause repeated animated layout thrash (freeze + blank screen) when many
+/// frames arrive from the background thread before the main thread creates the view.
+/// Protected by _pendingFirstFrameLock.
+@property (nonatomic, strong) NSMutableSet<NSString *> *pendingFirstFrameIdentifiers;
+
 /// Spotlight key prior to auto-speaker-spotlight, for restoring after speaker stops. [Phase 7.4.2]
 @property (nonatomic, copy, nullable) NSString *preAutoSpotlightKey;
 
@@ -469,6 +580,10 @@ static NSString *const kInterPreferGridLayoutKey = @"InterPreferGridLayout";
 /// Floating toggle button (top-right) for switching between Grid and Stage views.
 @property (nonatomic, strong, nullable) NSButton *layoutToggleButton;
 
+/// When YES, the local self-view tile shows the live preview; when NO, shows the
+/// avatar placeholder. Driven by the roster snapshot from the local camera state.
+@property (nonatomic, assign) BOOL localSelfCameraOn;
+
 @end
 
 // ---------------------------------------------------------------------------
@@ -484,7 +599,12 @@ static const NSUInteger kDefaultMaxTilesPerPage = 25;  // Phase 7: 5×5 grid max
 static const CGFloat kPageIndicatorHeight    = 30.0;
 static const CGFloat kPageIndicatorPadding   = 8.0;
 
-@implementation InterRemoteVideoLayoutManager
+@implementation InterRemoteVideoLayoutManager {
+    /// os_unfair_lock protecting pendingFirstFrameIdentifiers for lock-free
+    /// first-frame dispatch deduplication. Must be declared as a raw ivar
+    /// because os_unfair_lock is a value type, not an ObjC object.
+    os_unfair_lock _pendingFirstFrameLock;
+}
 
 #pragma mark - Lifecycle
 
@@ -502,6 +622,8 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
     self.hostForcedSpotlightTileKeys = [NSMutableArray array];
     self.coHostStates               = [NSMutableDictionary dictionary];
     self.hostCameraLockStates       = [NSMutableDictionary dictionary];
+    self.hostParticipantStates      = [NSMutableDictionary dictionary];
+    self.cameraOffStates            = [NSMutableDictionary dictionary];
 
     // Filmstrip scroll view (hidden until screen-share + cameras mode)
     self.filmstripScrollView = [[NSScrollView alloc] initWithFrame:NSZeroRect];
@@ -539,6 +661,8 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
     self.currentGridPage = 0;
     self.visibleParticipantIds = [NSMutableSet set];
     self.recycledVideoViews = [NSMutableArray array];
+    self.pendingFirstFrameIdentifiers = [NSMutableSet set];
+    _pendingFirstFrameLock = OS_UNFAIR_LOCK_INIT;
 
     self.pageIndicatorBar = [[NSView alloc] initWithFrame:NSZeroRect];
     self.pageIndicatorBar.wantsLayer = YES;
@@ -611,6 +735,13 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
     }
 }
 
+- (void)setLocalUserCanAssignCoHost:(BOOL)canAssign {
+    _localUserCanAssignCoHost = canAssign;
+    for (NSString *key in self.tileViews) {
+        self.tileViews[key].localUserCanAssignCoHost = canAssign;
+    }
+}
+
 #pragma mark - Grid Layout Toggle
 
 - (void)setGridLayoutEnabled:(BOOL)gridLayoutEnabled {
@@ -665,6 +796,13 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
         AVCaptureVideoPreviewLayer *preview = [AVCaptureVideoPreviewLayer layerWithSession:localCaptureSession];
         preview.videoGravity = AVLayerVideoGravityResizeAspect;
         preview.frame = CGRectMake(0, 0, 1, 1);  // sized during tile placement
+        // Mirror to match remote tiles (which render with isMirrored = YES). Applied here
+        // where the connection is freshly available, and again in setupLocalSelfTileIfNeeded
+        // as a safety net in case the connection was not ready at creation time.
+        if (preview.connection) {
+            preview.connection.automaticallyAdjustsVideoMirroring = NO;
+            preview.connection.videoMirrored = YES;
+        }
         self.localPreviewLayer = preview;
     }
 
@@ -772,7 +910,13 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
 
     // Preview layer was already created eagerly in setLocalCaptureSession:.
     // Just attach it to the tile's backing layer.
+    // Mirror the local self-view to MATCH the remote tiles, which render camera
+    // feeds with isMirrored = YES. Keeping both mirrored means the host sees their
+    // own tile and every remote tile with the same handedness (no odd "one tile is
+    // flipped" inconsistency).
     AVCaptureVideoPreviewLayer *preview = self.localPreviewLayer;
+    preview.connection.automaticallyAdjustsVideoMirroring = NO;
+    preview.connection.videoMirrored = YES;
     preview.autoresizingMask = kCALayerWidthSizable | kCALayerHeightSizable;
     [tile.layer addSublayer:preview];
 
@@ -823,6 +967,7 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
     InterRemoteVideoTileView *tile = self.tileViews[participantId];
     if (tile) {
         tile.nameLabel.stringValue = [self displayNameForTileKey:participantId];
+        [tile updateAvatarInitialFromDisplayName:[self displayNameForTileKey:participantId]];
     }
 }
 
@@ -858,6 +1003,16 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
     InterRemoteVideoTileView *tile = self.tileViews[identity];
     if (tile) {
         tile.isCoHost = isCoHost;
+    }
+}
+
+- (void)setIsHostParticipant:(BOOL)isHost forParticipant:(NSString *)identity {
+    if (!identity || identity.length == 0) return;
+    // Persist so the flag survives tile teardown/recreation.
+    self.hostParticipantStates[identity] = @(isHost);
+    InterRemoteVideoTileView *tile = self.tileViews[identity];
+    if (tile) {
+        tile.isHostParticipant = isHost;
     }
 }
 
@@ -977,6 +1132,12 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
         if (coHost) tile.isCoHost = coHost.boolValue;
         NSNumber *cameraLocked = self.hostCameraLockStates[key];
         if (cameraLocked) tile.isHostCameraLocked = cameraLocked.boolValue;
+        NSNumber *isHost = self.hostParticipantStates[key];
+        if (isHost) tile.isHostParticipant = isHost.boolValue;
+        tile.localUserCanAssignCoHost = _localUserCanAssignCoHost;
+        // Restore camera-off (avatar placeholder) state so it survives tile recreation.
+        NSNumber *camOff = self.cameraOffStates[key];
+        tile.cameraOff = camOff ? camOff.boolValue : NO;
     }
 
     self.tileViews[key] = tile;
@@ -1021,7 +1182,127 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
     return self.remoteScreenShareView;
 }
 
+#pragma mark - Presence-Driven Tiles
+
+- (void)addRemoteParticipant:(NSString *)participantId displayName:(NSString *)displayName {
+    if (participantId.length == 0) return;
+
+    if (displayName.length > 0) {
+        self.participantDisplayNames[participantId] = displayName;
+    }
+
+    // Create the camera view + register the participant immediately so a tile exists
+    // even before any video frame arrives. The tile shows the avatar placeholder until
+    // the first frame flips cameraOff → NO.
+    BOOL isNew = (self.remoteCameraViews[participantId] == nil);
+    if (isNew) {
+        // Default to camera-off (avatar placeholder) until a frame proves otherwise.
+        self.cameraOffStates[participantId] = @YES;
+        (void)[self cameraViewForParticipant:participantId];
+    }
+
+    // Ensure the tile exists and reflects the avatar placeholder + correct name.
+    InterRemoteVideoView *view = self.remoteCameraViews[participantId];
+    if (view) {
+        InterRemoteVideoTileView *tile = [self tileForKey:participantId videoView:view];
+        [tile updateAvatarInitialFromDisplayName:[self displayNameForTileKey:participantId]];
+        if (isNew) {
+            tile.cameraOff = YES;
+        }
+    }
+
+    [self updateLayoutAnimated:NO];
+}
+
+- (void)removeRemoteParticipant:(NSString *)participantId {
+    if (participantId.length == 0) return;
+    [self.cameraOffStates removeObjectForKey:participantId];
+    [self removeCameraViewForParticipant:participantId];
+    [self updateLayoutAnimated:NO];
+}
+
+#pragma mark - Presence-Driven Reconciler (snapshot-based)
+
+/// Create a tile for the given identity if it doesn't exist yet. The tile starts with
+/// the avatar placeholder shown (cameraOff = YES). The reconciler sets the final state.
+- (void)ensureTileForParticipant:(NSString *)identity displayName:(NSString *)displayName {
+    if (self.tileViews[identity]) { return; }
+    if (displayName.length > 0) {
+        self.participantDisplayNames[identity] = displayName;
+    }
+    InterRemoteVideoView *videoView = [self cameraViewForParticipant:identity];
+    InterRemoteVideoTileView *tile = [self tileForKey:identity videoView:videoView];
+    [tile updateAvatarInitialFromDisplayName:[self displayNameForTileKey:identity]];
+    [tile setCameraOff:YES];   // avatar until first frame flips cameraOn in the snapshot
+}
+
+- (void)applyParticipantSnapshot:(NSArray<InterParticipantSnapshotEntry *> *)entries {
+    NSAssert([NSThread isMainThread], @"applyParticipantSnapshot: must run on main");
+
+    // 1. Build the set of remote identities the snapshot wants on screen.
+    NSMutableSet<NSString *> *wantedRemote = [NSMutableSet set];
+    InterParticipantSnapshotEntry *localEntry = nil;
+    for (InterParticipantSnapshotEntry *e in entries) {
+        if (e.isLocal) { localEntry = e; continue; }
+        [wantedRemote addObject:e.identity];
+    }
+
+    // 2. Removals: any current remote tile not in the snapshot is torn down.
+    NSArray<NSString *> *currentKeys = self.tileViews.allKeys.copy;
+    for (NSString *key in currentKeys) {
+        if ([key isEqualToString:@"__screenshare__"] || [key isEqualToString:@"__localself__"]) {
+            continue;
+        }
+        if (![wantedRemote containsObject:key]) {
+            [self removeCameraViewForParticipant:key];
+        }
+    }
+
+    // 3. Additions + updates for remote entries.
+    for (InterParticipantSnapshotEntry *e in entries) {
+        if (e.isLocal) { continue; }
+        [self ensureTileForParticipant:e.identity displayName:e.displayName];
+        InterRemoteVideoTileView *tile = self.tileViews[e.identity];
+        if (!tile) { continue; }
+
+        // State is DERIVED from the snapshot every pass — avatar can never float over
+        // a live feed because its visibility is recomputed here, not mutated ad-hoc.
+        [tile updateAvatarInitialFromDisplayName:e.displayName];
+        tile.nameLabel.stringValue = e.displayName;
+        [tile setCameraOff:!e.cameraOn];
+        // Persist so tileForKey: restores correctly after tile teardown/recreation.
+        self.cameraOffStates[e.identity] = @(!e.cameraOn);
+        tile.isMicMuted = e.micMuted;
+        [tile setHandRaised:e.handRaised];
+        tile.isSpeaking = e.isSpeaking;
+        // Register display name so displayNameForTileKey: returns the latest value.
+        if (e.displayName.length > 0) {
+            self.participantDisplayNames[e.identity] = e.displayName;
+        }
+    }
+
+    // 4. Local self entry: drive the existing local preview path.
+    if (localEntry) {
+        self.localSelfCameraOn = localEntry.cameraOn;
+    }
+
+    // 5. Keep count + active-speaker bookkeeping in sync, then lay out.
+    self.remoteParticipantCount = wantedRemote.count;
+    NSString *speaker = @"";
+    for (InterParticipantSnapshotEntry *e in entries) {
+        if (e.isSpeaking) { speaker = e.identity; break; }
+    }
+    self.activeSpeakerIdentity = speaker;
+    [self updateLayoutAnimated:NO];
+}
+
 - (void)removeCameraViewForParticipant:(NSString *)participantId {
+    // Clear any pending first-frame dispatch so a stale dispatch does not
+    // recreate the tile after the participant has already left.
+    os_unfair_lock_lock(&_pendingFirstFrameLock);
+    [self.pendingFirstFrameIdentifiers removeObject:participantId];
+    os_unfair_lock_unlock(&_pendingFirstFrameLock);
+
     InterRemoteVideoView *view = self.remoteCameraViews[participantId];
     if (view) {
         // Phase 7.3.3: Recycle view instead of destroying it (up to 10 pooled).
@@ -1038,6 +1319,9 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
         [self.cameraParticipantOrder removeObject:participantId];
         [self.participantDisplayNames removeObjectForKey:participantId];
     }
+
+    // Clear persisted camera-off (placeholder) state for this participant.
+    [self.cameraOffStates removeObjectForKey:participantId];
 
     // Remove from visible set
     [self.visibleParticipantIds removeObject:participantId];
@@ -1074,16 +1358,74 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
     InterRemoteVideoView *view = self.remoteCameraViews[participantId];
     if (view) {
         [view updateFrame:pixelBuffer];
+        // First frame after the camera turns on (or after a presence-created tile):
+        // hide the avatar placeholder and reveal the live video. Cheap guard — only
+        // touches the UI when the placeholder is currently shown.
+        if ([self.cameraOffStates[participantId] boolValue]) {
+            self.cameraOffStates[participantId] = @NO;
+            self.tileViews[participantId].cameraOff = NO;
+        }
         return;
     }
 
-    // First frame from a new participant
+    // ── First frame from a new participant ──────────────────────────────────
+    // Guard: only queue ONE dispatch per participant until the main thread
+    // creates the view. Without this, a 30 fps stream arriving before the
+    // main thread processes the first dispatch would queue ~30 identical
+    // dispatch blocks per second. Each block calls updateLayoutAnimated:
+    // which detaches and re-adds tiles on every call, causing animated
+    // layout thrash that freezes the host UI and leaves the screen blank.
+    os_unfair_lock_lock(&_pendingFirstFrameLock);
+    BOOL alreadyPending = [self.pendingFirstFrameIdentifiers containsObject:participantId];
+    if (!alreadyPending) {
+        [self.pendingFirstFrameIdentifiers addObject:participantId];
+    }
+    os_unfair_lock_unlock(&_pendingFirstFrameLock);
+
+    if (alreadyPending) {
+        // A dispatch is already in flight; drop this frame. The view will
+        // be created by the pending dispatch, after which subsequent frames
+        // take the lock-free fast path above.
+        return;
+    }
+
     CVPixelBufferRetain(pixelBuffer);
     dispatch_async(dispatch_get_main_queue(), ^{
+        // Remove pending flag before creating the view so that any frames
+        // that arrive between now and remoteCameraViews being populated
+        // fall through to the fast path once the view is visible.
+        os_unfair_lock_lock(&self->_pendingFirstFrameLock);
+        [self.pendingFirstFrameIdentifiers removeObject:participantId];
+        os_unfair_lock_unlock(&self->_pendingFirstFrameLock);
+
         InterRemoteVideoView *v = [self cameraViewForParticipant:participantId];
         [v updateFrame:pixelBuffer];
         CVPixelBufferRelease(pixelBuffer);
-        [self updateLayoutAnimated:YES];
+
+        // Frames are flowing — ensure the avatar placeholder is hidden for this tile.
+        self.cameraOffStates[participantId] = @NO;
+        self.tileViews[participantId].cameraOff = NO;
+
+        // Use non-animated layout for the first appearance.
+        // tile.animator.frame bypasses setFrame:, so layout() on the
+        // InterRemoteVideoView is deferred 300 ms, leaving
+        // metalLayer.drawableSize at CGSizeZero and producing a blank
+        // screen until the animation completes. A direct setFrame: call
+        // (animated:NO) triggers layout() immediately, ensuring
+        // metalLayer.drawableSize is correct on the very next display-link
+        // tick and the video appears without any blank period.
+        [self updateLayoutAnimated:NO];
+
+        // Re-attach the local self-view preview layer's session connection.
+        // When the previous participant left and the layout entered .none mode,
+        // the self-view tile was detached from the view hierarchy. AVCaptureVideoPreviewLayer
+        // can enter a stale/frozen state after being removed from a visible hierarchy.
+        // Re-setting .session forces it to re-establish its internal sample buffer
+        // connection, restoring live video. This is the same technique used by
+        // refreshLocalPreviewLayout for the toggle-camera path.
+        if (self.localPreviewLayer && self.localCaptureSession) {
+            self.localPreviewLayer.session = self.localCaptureSession;
+        }
     });
 }
 
@@ -1109,6 +1451,9 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
         InterRemoteVideoView *view = self.remoteCameraViews[participantId];
         [view clearFrame];
         self.tileViews[participantId].isCameraMuted = YES;
+        // Camera turned off — show the avatar placeholder (tile stays; presence owns removal).
+        self.cameraOffStates[participantId] = @YES;
+        self.tileViews[participantId].cameraOff = YES;
     } else if (trackKind == InterTrackKindMicrophone) {
         self.tileViews[participantId].isMicMuted = YES;
     } else if (trackKind == InterTrackKindScreenShare) {
@@ -1121,6 +1466,8 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
 - (void)handleRemoteTrackUnmuted:(NSUInteger)trackKind forParticipant:(NSString *)participantId {
     if (trackKind == InterTrackKindCamera) {
         self.tileViews[participantId].isCameraMuted = NO;
+        // Camera coming back on. Keep the avatar placeholder until the first frame
+        // arrives (handleRemoteCameraFrame: clears cameraOff), avoiding a black flash.
     } else if (trackKind == InterTrackKindMicrophone) {
         self.tileViews[participantId].isMicMuted = NO;
     }
@@ -1129,7 +1476,14 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
 
 - (void)handleRemoteTrackEnded:(NSUInteger)trackKind forParticipant:(NSString *)participantId {
     if (trackKind == InterTrackKindCamera) {
-        [self removeCameraViewForParticipant:participantId];
+        // Presence-driven model: a camera track ending means the participant turned
+        // their camera off / unpublished — NOT that they left. Show the avatar
+        // placeholder and keep the tile. Tile removal happens only on participant
+        // disconnect (removeRemoteParticipant:).
+        InterRemoteVideoView *view = self.remoteCameraViews[participantId];
+        [view clearFrame];
+        self.cameraOffStates[participantId] = @YES;
+        self.tileViews[participantId].cameraOff = YES;
     } else if (trackKind == InterTrackKindScreenShare) {
         if ([self.screenShareParticipantId isEqualToString:participantId]) {
             [self.remoteScreenShareView shutdownRenderingSynchronously];
@@ -1225,11 +1579,17 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
         return InterRemoteVideoLayoutModeScreenShareOnly;
     }
 
-    // Count the local self-view tile as an extra camera in BOTH grid mode and stage
-    // mode so that 1 remote + self-view is never treated as a single-camera fill.
-    // In grid mode it produces a 2×1 grid; in stage mode it produces stage+filmstrip.
-    BOOL addLocalSelf = (self.localCaptureSession != nil && camCount >= 1 &&
-                         (self.gridLayoutEnabled || self.preferStageLayoutForMultipleCameras));
+    // Count the local self-view tile as an extra camera in grid/stage mode.
+    //
+    // Key fix: include the local self-view whenever remote participants are present
+    // even if their cameras are all off (camCount == 0 but remoteParticipantCount > 0).
+    // Without this, computeLayoutMode returns .none the moment a participant joins with
+    // camera-off — the host's own preview disappears and the screen stays blank until
+    // the remote participant turns their camera on.
+    BOOL hasRemoteParticipants = (self.remoteParticipantCount > 0);
+    BOOL addLocalSelf = (self.localCaptureSession != nil &&
+                         (self.gridLayoutEnabled || self.preferStageLayoutForMultipleCameras) &&
+                         (camCount >= 1 || hasRemoteParticipants));
     NSUInteger effectiveCamCount = camCount + (addLocalSelf ? 1 : 0);
 
     if (effectiveCamCount > 1) {
@@ -1238,7 +1598,9 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
         }
         return InterRemoteVideoLayoutModeMultiCamera;
     }
-    if (camCount == 1) {
+    if (effectiveCamCount == 1) {
+        // Either 1 remote camera, or just the local self-view tile (host camera on,
+        // participant present but camera off). Both render as a single full-frame tile.
         return InterRemoteVideoLayoutModeSingleCamera;
     }
     return InterRemoteVideoLayoutModeNone;
@@ -1304,21 +1666,46 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
             break;
 
         case InterRemoteVideoLayoutModeSingleCamera: {
-            // Single camera fills the entire area (no filmstrip)
+            // Single camera fills the entire area (no filmstrip).
+            // May be a remote camera OR the local self-view only (host camera on,
+            // remote participant present but camera off).
             NSString *pid = self.cameraParticipantOrder.firstObject;
-            if (!pid) break;
-            InterRemoteVideoView *camView = self.remoteCameraViews[pid];
-            if (!camView) break;
+            if (pid) {
+                InterRemoteVideoView *camView = self.remoteCameraViews[pid];
+                if (!camView) break;
 
-            camView.aspectFill = NO;
-            InterRemoteVideoTileView *tile = [self tileForKey:pid videoView:camView];
-            tile.nameLabel.hidden = YES; // no label in full-view mode
-            tile.layer.cornerRadius = 0;
-            tile.isSpeaking = [pid isEqualToString:self.activeSpeakerIdentity];
-            [self addSubview:tile positioned:NSWindowBelow relativeTo:self.participantOverlay];
-            tile.hidden = NO;
-            camView.hidden = NO;
-            [self setTile:tile frame:NSMakeRect(0, 0, W, H) animated:animated];
+                camView.aspectFill = NO;
+                InterRemoteVideoTileView *tile = [self tileForKey:pid videoView:camView];
+                tile.nameLabel.hidden = YES; // no label in full-view mode
+                tile.layer.cornerRadius = 0;
+                tile.isSpeaking = [pid isEqualToString:self.activeSpeakerIdentity];
+                [self addSubview:tile positioned:NSWindowBelow relativeTo:self.participantOverlay];
+                tile.hidden = NO;
+                camView.hidden = NO;
+                [self setTile:tile frame:NSMakeRect(0, 0, W, H) animated:animated];
+            } else if (self.localCaptureSession) {
+                // No remote cameras yet — show local self-view tile filling the area
+                // so the host can see themselves while waiting for the participant's camera.
+                [self setupLocalSelfTileIfNeeded];
+                NSView *selfTile = self.localSelfTileView;
+                if (!selfTile) break;
+                [self addSubview:selfTile positioned:NSWindowBelow relativeTo:self.participantOverlay];
+                selfTile.hidden = NO;
+                self.localPreviewLayer.frame = CGRectMake(0, 0, W, H);
+                CGFloat lblH = 20.0, lblPad = 6.0;
+                self.localSelfNameLabel.frame = NSMakeRect(lblPad, lblPad,
+                                                           MIN(60.0, W - 2 * lblPad), lblH);
+                if (animated) {
+                    selfTile.animator.frame = NSMakeRect(0, 0, W, H);
+                } else {
+                    selfTile.frame = NSMakeRect(0, 0, W, H);
+                }
+                self.localPreviewLayer.frame = CGRectMake(0, 0, W, H);
+                // Refresh the preview layer connection so it doesn't show a frozen frame.
+                if (self.localCaptureSession) {
+                    self.localPreviewLayer.session = self.localCaptureSession;
+                }
+            }
             break;
         }
 
@@ -2182,12 +2569,20 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
 #pragma mark - Participant Count Badge
 
 - (void)setRemoteParticipantCount:(NSUInteger)remoteParticipantCount {
+    BOOL changed = (_remoteParticipantCount != remoteParticipantCount);
     _remoteParticipantCount = remoteParticipantCount;
     [self updateParticipantCountBadge];
     // Re-evaluate the toggle: participant count affects whether the call has
     // enough people to make a layout switch meaningful, even before video
     // frames have arrived from all participants.
     [self updateLayoutToggleButton];
+    // Re-run layout: computeLayoutMode now uses remoteParticipantCount to decide
+    // whether to show the local self-view tile (host camera on, participant camera off).
+    // Without this, the host's self-view only appears after the participant's first frame
+    // arrives — a multi-second blank screen when "mute camera on join" is set.
+    if (changed) {
+        [self updateLayoutAnimated:NO];
+    }
 }
 
 - (void)updateParticipantCountBadge {
