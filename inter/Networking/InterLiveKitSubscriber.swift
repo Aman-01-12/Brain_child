@@ -80,8 +80,23 @@ import LiveKit
 
     // MARK: - Public Properties
 
-    /// Delegate receiving decoded remote frames.
-    @objc public weak var trackRenderer: InterRemoteTrackRenderer?
+    /// The presence roster — single source of truth for tiles. Owned here so it can
+    /// be fed from the same delegate callbacks that drive media.
+    @objc public let roster = InterParticipantRoster()
+
+    /// Delegate receiving decoded remote frames + roster snapshots.
+    @objc public weak var trackRenderer: InterRemoteTrackRenderer? {
+        didSet {
+            // Pipe roster snapshots to whatever delegate is current, then resync so a
+            // late-wired delegate (the participant-side race) immediately gets the full
+            // roster — including participants already present when we attached.
+            let weakRenderer = trackRenderer
+            roster.onSnapshot = { entries in
+                weakRenderer?.applyParticipantSnapshot?(entries)
+            }
+            roster.resync()
+        }
+    }
 
     /// [Phase 10] Secondary delegate for recording frame observation.
     /// When non-nil, receives the same remote camera frames as `trackRenderer`.
@@ -125,19 +140,23 @@ import LiveKit
         room.add(delegate: self)
         interLogInfo(InterLog.media, "Subscriber: attached to room")
 
-        // Seed presence tiles for participants who are ALREADY in the room at the moment
-        // we attach (e.g. a participant joining a room where the host is already present).
-        // LiveKit only fires participantDidConnect for participants who join AFTER us, so
-        // without this seeding a participant who is already present with their camera off
-        // would never get a tile until they toggled their camera.
-        let existing = room.remoteParticipants.values.compactMap { p -> (String, String)? in
-            guard let id = p.identity?.stringValue, !id.isEmpty else { return nil }
-            return (id, p.name ?? id)
-        }
-        if !existing.isEmpty {
-            DispatchQueue.main.async {
-                for (id, name) in existing {
-                    self.trackRenderer?.remoteParticipantDidJoin?(id, displayName: name)
+        // Seed the roster with participants already present at attach time. Feeding the
+        // roster (not the delegate) means the snapshot survives until the delegate is
+        // wired, so a participant joining a room where the host is already present always
+        // gets the host tile — no ordering race.
+        for p in room.remoteParticipants.values {
+            guard let id = p.identity?.stringValue, !id.isEmpty else { continue }
+            roster.participantJoined(id, displayName: p.name ?? id)
+            for (_, pub) in p.trackPublications {
+                if pub.source == .camera {
+                    roster.cameraSubscribed(id)
+                    roster.cameraMuted(id, muted: pub.isMuted)
+                }
+                if pub.source == .microphone {
+                    roster.micMuted(id, muted: pub.isMuted)
+                }
+                if pub.source == .screenShareVideo {
+                    roster.screenSharing(id, sharing: true)
                 }
             }
         }
@@ -228,6 +247,8 @@ import LiveKit
             cleanUpTrack(source: .screenShareVideo, participantId: pid)
         }
 
+        roster.reset()
+
         if let room = room {
             room.remove(delegate: self)
         }
@@ -271,6 +292,7 @@ extension InterLiveKitSubscriber: RoomDelegate {
         interLogInfo(InterLog.media, "Subscriber: participant connected %{public}@", pid)
         DispatchQueue.main.async {
             self.trackRenderer?.remoteParticipantDidJoin?(pid, displayName: name)
+            self.roster.participantJoined(pid, displayName: name)
         }
     }
 
@@ -288,6 +310,7 @@ extension InterLiveKitSubscriber: RoomDelegate {
             self.cleanUpTrack(source: .camera, participantId: pid)
             self.cleanUpTrack(source: .screenShareVideo, participantId: pid)
             self.trackRenderer?.remoteParticipantDidLeave?(pid)
+            self.roster.participantLeft(pid)
         }
     }
 
@@ -336,10 +359,16 @@ extension InterLiveKitSubscriber: RoomDelegate {
                     self?.trackRenderer?.didReceiveRemoteCameraFrame(pixelBuffer, fromParticipant: participantId)
                     // [Phase 10] Forward to recording frame delegate
                     self?.recordingFrameDelegate?.didReceiveRemoteCameraFrame(pixelBuffer, fromParticipant: participantId)
+                    // Signal first frame to roster so cameraOn flips in the snapshot.
+                    self?.roster.cameraFirstFrame(participantId)
                 }
                 self.cameraRenderers[participantId] = renderer
                 self.cameraTracks[participantId] = videoTrack
                 videoTrack.add(videoRenderer: renderer)
+                // Seed the roster for this camera subscription.
+                roster.participantJoined(participantId, displayName: participantName)
+                roster.cameraSubscribed(participantId)
+                roster.cameraMuted(participantId, muted: publication.isMuted)
 
                 interLogInfo(InterLog.media, "Subscriber: camera renderer attached for %{public}@", participantId)
 
@@ -361,6 +390,7 @@ extension InterLiveKitSubscriber: RoomDelegate {
                 self.screenShareRenderers[participantId] = renderer
                 self.screenShareTracks[participantId] = videoTrack
                 videoTrack.add(videoRenderer: renderer)
+                roster.screenSharing(participantId, sharing: true)
 
                 interLogInfo(InterLog.media, "Subscriber: screen share renderer attached for %{public}@", participantId)
 
@@ -393,10 +423,12 @@ extension InterLiveKitSubscriber: RoomDelegate {
             cleanUpTrack(source: .camera, participantId: participantId)
             trackRenderer?.remoteTrackDidEnd(.camera, forParticipant: participantId)
             recordingFrameDelegate?.remoteTrackDidEnd(.camera, forParticipant: participantId)
+            roster.cameraEnded(participantId)
         case .screenShareVideo:
             cleanUpTrack(source: .screenShareVideo, participantId: participantId)
             trackRenderer?.remoteTrackDidEnd(.screenShare, forParticipant: participantId)
             recordingFrameDelegate?.remoteTrackDidEnd(.screenShare, forParticipant: participantId)
+            roster.screenSharing(participantId, sharing: false)
         default:
             break
         }
@@ -427,12 +459,14 @@ extension InterLiveKitSubscriber: RoomDelegate {
                 trackRenderer?.remoteTrackDidUnmute(.camera, forParticipant: participantId)
                 recordingFrameDelegate?.remoteTrackDidUnmute(.camera, forParticipant: participantId)
             }
+            roster.cameraMuted(participantId, muted: isMuted)
         case .microphone:
             if isMuted {
                 trackRenderer?.remoteTrackDidMute(.microphone, forParticipant: participantId)
             } else {
                 trackRenderer?.remoteTrackDidUnmute(.microphone, forParticipant: participantId)
             }
+            roster.micMuted(participantId, muted: isMuted)
         case .screenShareVideo:
             if isMuted {
                 trackRenderer?.remoteTrackDidMute(.screenShare, forParticipant: participantId)
@@ -469,6 +503,7 @@ extension InterLiveKitSubscriber: RoomDelegate {
                      participantId, displayName)
 
         trackRenderer?.remoteParticipantDidUpdateDisplayName?(displayName, forParticipant: participantId)
+        roster.updateDisplayName(displayName, for: participantId)
     }
 }
 
