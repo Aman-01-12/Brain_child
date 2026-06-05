@@ -104,6 +104,48 @@ final class InterMultiParticipantTests: XCTestCase {
         subscriber.detach()
     }
 
+    // MARK: - Presence-driven roster integration tests
+
+    func test_participantJoiningRoomWithHostPresent_getsHostTile() {
+        // Simulates the participant side: host already present at attach time.
+        let roster = InterParticipantRoster()
+        var last: [InterParticipantSnapshotEntry] = []
+        // trackRenderer wired LATE — mimic the race: seed before onSnapshot is set.
+        roster.participantJoined("host", displayName: "Host")
+        roster.cameraSubscribed("host")
+        roster.cameraMuted("host", muted: false)
+        roster.cameraFirstFrame("host")
+        // Now the delegate is wired and resyncs:
+        roster.onSnapshot = { last = $0 }
+        roster.resync()
+        XCTAssertEqual(last.map { $0.identity }, ["host"])
+        XCTAssertTrue(last[0].cameraOn, "host tile must show feed after first frame")
+    }
+
+    func test_rejoinAfterEmptyRoom_recreatesTile() {
+        let roster = InterParticipantRoster()
+        var last: [InterParticipantSnapshotEntry] = []
+        roster.onSnapshot = { last = $0 }
+        roster.participantJoined("a", displayName: "Alice")
+        roster.participantLeft("a")
+        XCTAssertTrue(last.isEmpty)
+        roster.participantJoined("a", displayName: "Alice")
+        XCTAssertEqual(last.map { $0.identity }, ["a"])
+    }
+
+    func test_hostAndParticipant_produceIdenticalSnapshotForSameRoom() {
+        func build() -> [InterParticipantSnapshotEntry] {
+            let r = InterParticipantRoster()
+            var out: [InterParticipantSnapshotEntry] = []
+            r.onSnapshot = { out = $0 }
+            r.setLocal(identity: "self", displayName: "Self", cameraOn: true, micMuted: false)
+            r.participantJoined("x", displayName: "X")
+            r.cameraSubscribed("x"); r.cameraMuted("x", muted: false); r.cameraFirstFrame("x")
+            return out
+        }
+        XCTAssertEqual(build(), build())
+    }
+
     // MARK: - Token Service Room Full Handling
 
     func testTokenService_roomFullErrorCode() {

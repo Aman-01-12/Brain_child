@@ -1224,7 +1224,7 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
     if (displayName.length > 0) {
         self.participantDisplayNames[identity] = displayName;
     }
-    InterRemoteVideoView *videoView = [self cameraViewForParticipant:identity];
+    InterRemoteSampleBufferView *videoView = [self cameraViewForParticipant:identity];
     InterRemoteVideoTileView *tile = [self tileForKey:identity videoView:videoView];
     [tile updateAvatarInitialFromDisplayName:[self displayNameForTileKey:identity]];
     [tile setCameraOff:YES];   // avatar until first frame flips cameraOn in the snapshot
@@ -2435,8 +2435,8 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
     [self.tileViews removeAllObjects];
 
     // Clean camera state
-    for (InterRemoteVideoView *view in self.remoteCameraViews.allValues) {
-        [view shutdownRenderingSynchronously];
+    for (InterRemoteSampleBufferView *view in self.remoteCameraViews.allValues) {
+        [view shutdownRendering];
         [view removeFromSuperview];
     }
     [self.remoteCameraViews removeAllObjects];
