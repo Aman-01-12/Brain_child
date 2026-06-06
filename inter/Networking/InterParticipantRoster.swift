@@ -105,7 +105,10 @@ import os.log
     // MARK: - Remote media
 
     @objc public func cameraSubscribed(_ identity: String) {
-        mutateRemote(identity) { $0.subscribed = true }
+        mutateRemote(identity) {
+            print("[CB] ROSTER-CAM-SUBSCRIBED …\(identity.suffix(5))")
+            $0.subscribed = true
+        }
     }
 
     @objc public func cameraEnded(_ identity: String) {
@@ -118,17 +121,31 @@ import os.log
 
     @objc public func cameraMuted(_ identity: String, muted: Bool) {
         mutateRemote(identity) {
+            let suffix = String(identity.suffix(5))
+            print("[CB] CAM-MUTED …\(suffix) muted=\(muted ? 1 : 0) prev(cameraMuted=\($0.cameraMuted ? 1 : 0) firstFrameSeen=\($0.firstFrameSeen ? 1 : 0))")
             $0.cameraMuted = muted
-            if muted { $0.firstFrameSeen = false }
+            // Reset firstFrameSeen on BOTH mute and unmute. On mute it keeps camOn=false.
+            // On unmute it forces us to wait for a genuinely fresh post-unmute frame before
+            // revealing video — so a stale in-flight frame from before the mute can never
+            // flash a frozen image. camOn = subscribed && !cameraMuted && firstFrameSeen.
+            $0.firstFrameSeen = false
         }
     }
 
     @objc public func cameraFirstFrame(_ identity: String) {
-        // Hot-path guarded: only emit when this actually flips state.
+        // Hot-path guarded: only emit when this actually flips firstFrameSeen.
         runOnMain {
             guard var s = self.remote[identity], !s.firstFrameSeen else { return }
+            // Record only that a frame has been seen. We deliberately do NOT clear
+            // cameraMuted here: the LiveKit mute/unmute signals are the single authority
+            // for mute state. camOn = subscribed && !cameraMuted && firstFrameSeen, so a
+            // frame that arrives while muted sets firstFrameSeen but leaves camOn false —
+            // the avatar stays up, no frozen frame is revealed. When the genuine unmute
+            // arrives it resets firstFrameSeen, and the next real frame flips camOn true.
             s.firstFrameSeen = true
             self.remote[identity] = s
+            let suffix = String(identity.suffix(5))
+            print("[CB] FIRST-FRAME …\(suffix) muted=\(s.cameraMuted ? 1 : 0)")
             self.emitNow()
         }
     }

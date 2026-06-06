@@ -128,6 +128,7 @@ static const CGFloat InterChatAnimationDuration = 0.25;
     [self.exportButton setTarget:self];
     [self.exportButton setAction:@selector(exportAction:)];
     self.exportButton.toolTip = @"Export chat transcript";
+    self.exportButton.hidden = YES;  // revealed by host/co-host on pro+ tier
     [headerBar addSubview:self.exportButton];
 
     self.closeButton = [[NSButton alloc] initWithFrame:NSMakeRect(containerW - 42, 6, 36, 24)];
@@ -492,9 +493,21 @@ static const CGFloat InterChatAnimationDuration = 0.25;
             break;
         }
         case InterChatMessageTypeDirectMessage: {
-            NSString *dmPrefix = message.isFromLocalUser
-                ? [NSString stringWithFormat:@"To %@", message.recipientIdentity]
-                : [NSString stringWithFormat:@"DM from %@", message.senderName];
+            NSString *dmPrefix;
+            if (message.isFromLocalUser) {
+                // Resolve recipient identity to display name using the selector menu.
+                NSString *recipientName = message.recipientIdentity;
+                for (NSMenuItem *item in self.recipientSelector.itemArray) {
+                    if ([item.representedObject isKindOfClass:[NSString class]] &&
+                        [item.representedObject isEqualToString:message.recipientIdentity]) {
+                        recipientName = item.title;
+                        break;
+                    }
+                }
+                dmPrefix = [NSString stringWithFormat:@"To %@", recipientName];
+            } else {
+                dmPrefix = [NSString stringWithFormat:@"DM from %@", message.senderName];
+            }
             NSString *header = [NSString stringWithFormat:@"%@ · %@", dmPrefix, message.formattedTime];
             nameLabel.stringValue = header;
             nameLabel.textColor = [NSColor systemPurpleColor];
@@ -662,7 +675,7 @@ static const CGFloat InterChatAnimationDuration = 0.25;
 #pragma mark - Phase 9: Moderation
 
 - (void)setChatInputEnabled:(BOOL)enabled {
-    self.chatInputEnabled = enabled;
+    _chatInputEnabled = enabled;
     self.inputField.enabled = enabled;
     self.sendButton.enabled = enabled;
     self.attachButton.enabled = enabled;
@@ -675,7 +688,9 @@ static const CGFloat InterChatAnimationDuration = 0.25;
         self.inputField.placeholderString = @"Type a message…";
     }
 }
-
+- (void)setExportButtonHidden:(BOOL)hidden {
+    self.exportButton.hidden = hidden;
+}
 - (void)setUploadInProgress:(BOOL)inProgress {
     // Only re-enable the attach button when chat input is also enabled;
     // setUploadInProgress:NO must not override a prior setChatInputEnabled:NO.

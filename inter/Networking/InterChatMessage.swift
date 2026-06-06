@@ -117,7 +117,7 @@ import Foundation
     case liftCameraLockAll = 39
 
     /// Host changed the screen-share permission mode mid-meeting.
-    /// Payload carries `mode` ("everyone" | "request" | "hostOnly") in the body field.
+    /// Payload carries `mode` ("everyone" | "request" | "hostOnly") in `extraData["mode"]`.
     /// Broadcast to all — native co-hosts use this to sync their segmented control.
     case screenshareModeChanged = 40
 
@@ -137,6 +137,35 @@ import Foundation
     /// Host approves a participant's mic unlock request.
     /// Participant may unmute once; muting again reverts to "Ask to Unmute".
     case approveMicUnlock    = 44
+
+    /// Host/co-host renamed a participant's session display name.
+    /// targetIdentity = the renamed participant. extraData["newDisplayName"] = new name.
+    /// Session-only — not persisted.
+    case renameParticipant = 45
+
+    /// Host broadcast whether co-hosts may record locally to their own machine.
+    /// extraData["allowed"] = "1" (permitted) or "0" (denied). Default: denied.
+    case allowCoHostLocalRecording = 46
+
+    /// Host/co-host denied a participant's camera unlock request.
+    /// targetIdentity = the requester. Participant should clear its pending-request flag.
+    case denyCameraUnlock = 47
+
+    /// Host/co-host denied a participant's mic unlock request.
+    /// targetIdentity = the requester. Participant should clear its pending-request flag.
+    case denyMicUnlock = 48
+
+    /// Host/co-host (or any permitted participant) forcibly stops a specific participant's
+    /// active screen share. targetIdentity = the current sharer.
+    /// Used when the shareConflictPolicy allows preemption.
+    case stopScreenShare = 49
+
+    /// Host/co-host changed the "who can share when someone is already sharing" policy.
+    /// Payload carries the new policy string in extraData["policy"]:
+    ///   "oneattime"      — nobody can start until the current sharer stops
+    ///   "hostCanPreempt" — only host/co-host can preempt the current sharer
+    ///   "anyCanPreempt"  — anyone with share permission can preempt the current sharer
+    case shareConflictPolicyChanged = 50
 }
 
 // MARK: - Chat Message

@@ -200,6 +200,12 @@ enum InterMicrophoneNetworkAction {
     /// Empty string means no password.
     @objc public var meetingPassword: String
 
+    /// Policy for handling a new share request while another participant is already sharing.
+    ///   "oneattime"      — nobody can start until the current sharer stops (default)
+    ///   "hostCanPreempt" — only host/co-host can preempt the current sharer
+    ///   "anyCanPreempt"  — anyone with share permission can preempt the current sharer
+    @objc public var shareConflictPolicy: String
+
     @objc public init(serverURL: String,
                       tokenServerURL: String,
                       roomCode: String = "",
@@ -228,6 +234,7 @@ enum InterMicrophoneNetworkAction {
         self.autoTranscript = false
         self.lobbyEnabled = false
         self.meetingPassword = ""
+        self.shareConflictPolicy = "oneattime"
         super.init()
     }
 
@@ -254,6 +261,7 @@ enum InterMicrophoneNetworkAction {
         copy.autoTranscript       = autoTranscript
         copy.lobbyEnabled         = lobbyEnabled
         copy.meetingPassword      = meetingPassword
+        copy.shareConflictPolicy  = shareConflictPolicy
         return copy
     }
 
@@ -266,11 +274,12 @@ enum InterMicrophoneNetworkAction {
             "joinBeforeHost":     joinBeforeHost,
             "allowUnmuting":      allowUnmuting,
             "chatPermissions":    chatPermissions,
-            "sharingPermissions": sharingPermissions,
-            "autoRecord":         autoRecord,
-            "autoTranscript":     autoTranscript,
-            "lobbyEnabled":       lobbyEnabled,
-            "password":           meetingPassword
+            "sharingPermissions":   sharingPermissions,
+            "autoRecord":           autoRecord,
+            "autoTranscript":       autoTranscript,
+            "lobbyEnabled":         lobbyEnabled,
+            "password":             meetingPassword,
+            "shareConflictPolicy":  shareConflictPolicy
         ]
     }
 

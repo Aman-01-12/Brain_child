@@ -61,6 +61,10 @@ NS_ASSUME_NONNULL_BEGIN
 /// Enable or disable the chat input field (Phase 9 — moderation).
 - (void)setChatInputEnabled:(BOOL)enabled;
 
+/// Show or hide the export/save-transcript button.
+/// Hidden by default; revealed only for host/co-host on pro tier.
+- (void)setExportButtonHidden:(BOOL)hidden;
+
 /// Display a system message in the chat panel (Phase 9 — moderation).
 - (void)displaySystemMessage:(NSString *)text;
 

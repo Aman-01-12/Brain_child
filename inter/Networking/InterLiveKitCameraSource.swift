@@ -124,7 +124,16 @@ import LiveKit
         }
 
         isCapturing = true
-        cameraState = .active
+        // Preserve a pre-muted state set by preMute() before start() was called.
+        // If not pre-muted, set .active so captureOutput forwards frames normally.
+        if cameraState != .muted {
+            cameraState = .active
+        }
+        // NOTE: track.mute() for the startMuted path is handled by the publisher
+        // (InterLiveKitPublisher.publishCamera) which calls it sequentially before
+        // participant.publish(), guaranteeing the SFU sees isMuted=true from the start.
+        // A racing Task here was removed because it had no ordering guarantee relative
+        // to the publish Task and was called on an unpublished track.
         framesSent = 0
         framesDropped = 0
 
@@ -166,11 +175,49 @@ import LiveKit
 
     // MARK: - G2: Mute/Unmute State Machine
 
+    /// Pre-mute: put the source into .muted state before start() is called.
+    /// Used when publishing a camera track that must be silenced from frame 0
+    /// (e.g. cameraOffOnJoin) to prevent any frames escaping during the async
+    /// publish → muteCameraTrack window. Safe to call before start().
+    @objc public func preMute() {
+        cameraState = .muted
+    }
+
     /// Begin muting: mute the LiveKit track first, then caller stops the capture device.
     @objc public func beginMute(completion: @escaping () -> Void) {
+        // Idempotent: already muted — just call completion so the caller can stop the device.
+        if cameraState == .muted {
+            DispatchQueue.main.async { completion() }
+            return
+        }
+
+        // If a G2 enable is pending (waiting for first frame to auto-unmute), cancel it
+        // and mute immediately. This handles the case where the user turns camera off
+        // before the first frame arrives after an enable call.
+        if cameraState == .enabling {
+            pendingUnmuteCallback = nil
+            cameraState = .muted
+            if let track = videoTrack {
+                Task {
+                    try? await track.mute()
+                    interLogInfo(InterLog.media, "CameraSource: track muted (cancelled enable)")
+                    DispatchQueue.main.async { completion() }
+                }
+            } else {
+                DispatchQueue.main.async { completion() }
+            }
+            return
+        }
+
         guard let nextState = cameraState.nextState(for: .beginMute) else {
-            interLogError(InterLog.media, "CameraSource: invalid mute transition from %{public}@",
+            // Unexpected state (e.g. .muting — another mute is already in flight).
+            // Call completion so the caller's device-stop is not orphaned, preventing a
+            // button freeze. The in-flight mute will still complete; the second
+            // setCameraEnabled:NO call is idempotent.
+            interLogError(InterLog.media,
+                          "CameraSource: unexpected mute transition from %{public}@ — calling completion to prevent freeze",
                           String(describing: cameraState))
+            DispatchQueue.main.async { completion() }
             return
         }
         cameraState = nextState
@@ -195,6 +242,16 @@ import LiveKit
 
     /// Begin enabling: caller starts the capture device first. We unmute on first real frame.
     @objc public func beginEnable() {
+        // If already active, the track is already unmuted and publishing — no action needed.
+        // This happens when twoPhaseToggleCamera is called while cameraSource.cameraState is
+        // still .active (e.g. publishCameraWithCaptureSession: sets cameraSource synchronously
+        // with the initial .active state before the async start() has a chance to run).
+        if cameraState == .active { return }
+
+        // If already enabling (waiting for first frame), a pendingUnmuteCallback is already
+        // set. Don't override it — the existing callback fires on the first frame.
+        if cameraState == .enabling { return }
+
         guard let nextState = cameraState.nextState(for: .beginEnable) else {
             interLogError(InterLog.media, "CameraSource: invalid enable transition from %{public}@",
                           String(describing: cameraState))
@@ -226,6 +283,12 @@ import LiveKit
         from connection: AVCaptureConnection
     ) {
         guard isCapturing, let capturer = bufferCapturer else { return }
+
+        // [G2] Drop frames silently when muted — no data should reach the network.
+        guard cameraState != .muted && cameraState != .muting else {
+            framesDropped += 1
+            return
+        }
 
         // [G2] If enabling, this is the first real frame — trigger unmute.
         if cameraState == .enabling, let callback = pendingUnmuteCallback {

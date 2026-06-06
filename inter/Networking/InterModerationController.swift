@@ -143,6 +143,9 @@ import LiveKit
     /// reverts to the "Ask to Unlock" state until the host lifts the lock from the tile.
     @objc optional func moderationControllerCameraUnlockApproved(_ controller: InterModerationController)
 
+    /// Host/co-host denied our camera unlock request. Participant should clear its pending flag.
+    @objc optional func moderationControllerCameraUnlockDenied(_ controller: InterModerationController)
+
     /// A mic-locked participant is requesting the host to grant a temporary unmute.
     /// Only the host receives this; non-host participants ignore it.
     @objc optional func moderationController(_ controller: InterModerationController,
@@ -152,10 +155,35 @@ import LiveKit
     /// Host has approved our mic unlock request — participant may unmute once.
     @objc optional func moderationControllerMicUnlockApproved(_ controller: InterModerationController)
 
+    /// Host/co-host denied our mic unlock request. Participant should clear its pending flag.
+    @objc optional func moderationControllerMicUnlockDenied(_ controller: InterModerationController)
+
     /// Host changed the screen-share permission mode mid-meeting.
     /// All participants (including native co-hosts) receive this to sync their UI.
     @objc optional func moderationController(_ controller: InterModerationController,
                                              receivedScreenShareModeChange mode: String)
+
+    /// Host changed the share-conflict policy mid-meeting.
+    /// All participants receive this to sync enforcement of "who can share when sharing".
+    @objc optional func moderationController(_ controller: InterModerationController,
+                                             receivedShareConflictPolicyChange policy: String)
+
+    /// A host/co-host (or a participant with sufficient policy rights) is asking the
+    /// local participant to stop their active screen share.
+    /// The local participant should stop sharing and show a dismissible notice.
+    @objc optional func moderationControllerReceivedStopScreenShare(
+        _ controller: InterModerationController,
+        requestedByIdentity senderIdentity: String)
+
+    /// A participant's session display name was changed.
+    /// Received by all participants including the renamed one.
+    @objc optional func moderationController(_ controller: InterModerationController,
+                                             participantRenamed identity: String,
+                                             newDisplayName: String)
+
+    /// Host changed the "allow co-host local recording" setting.
+    @objc optional func moderationControllerAllowCoHostLocalRecordingChanged(
+        _ controller: InterModerationController, allowed: Bool)
 }
 
 // MARK: - InterModerationController
@@ -172,6 +200,16 @@ import LiveKit
 
     /// Whether chat is currently disabled by the host.
     @objc public private(set) dynamic var isChatDisabled: Bool = false
+
+    /// Current "who can share when someone is already sharing" policy.
+    ///   "oneattime"      — nobody can start until the current sharer stops (default)
+    ///   "hostCanPreempt" — only host/co-host can preempt the current sharer
+    ///   "anyCanPreempt"  — anyone with share permission can preempt the current sharer
+    @objc public private(set) var shareConflictPolicy: String = "oneattime"
+
+    /// Whether the host has enabled local recording for co-hosts in this session.
+    /// Defaults to false; updated via `.allowCoHostLocalRecording` DataChannel signal.
+    @objc public private(set) dynamic var coHostLocalRecordingAllowed: Bool = false
 
     /// Whether the meeting is currently locked.
     @objc public private(set) dynamic var isMeetingLocked: Bool = false
@@ -263,12 +301,20 @@ import LiveKit
         roomCode = ""
         localRole = .participant
         isChatDisabled = false
+        coHostLocalRecordingAllowed = false
         isMeetingLocked = false
         isLocalSuspended = false
         isAllMuted = false
         forceSpotlightIdentity = ""
         forceSpotlightIdentities = []
         lobbyWaitingParticipants = []
+    }
+
+    /// Update the local participant's display name. Call when the host renames this user
+    /// so future outgoing control signals carry the updated name.
+    @objc public func updateLocalDisplayName(_ newName: String) {
+        guard !newName.isEmpty else { return }
+        localDisplayName = newName
     }
 
     // MARK: - Role Management (9.1.3)
@@ -292,6 +338,13 @@ import LiveKit
             completion(false, makeError("Insufficient permissions"))
             return
         }
+        // Assigning or revoking co-host status is a host-only action.
+        // Co-hosts can promote participants to lower roles (presenter, panelist)
+        // but cannot create or remove other co-hosts.
+        if (newRole == .coHost || newRole == .host) && localRole != .host {
+            completion(false, makeError("Only the meeting host can assign or revoke co-host status"))
+            return
+        }
 
         let body: [String: Any] = [
             "roomCode": roomCode,
@@ -307,7 +360,13 @@ import LiveKit
                 // Broadcast role change via DataChannel
                 self.sendControlSignal(type: .roleChanged, targetIdentity: identity,
                                        extraData: ["newRole": newRole.stringValue])
-                self.completeOnMain { completion(true, nil) }
+                self.completeOnMain {
+                    // Apply locally — the DataChannel sender does not receive its own
+                    // broadcast, so the host's tile would never update without this echo.
+                    self.delegate?.moderationController(self, participantRoleChanged: identity,
+                                                        newRole: newRole.stringValue)
+                    completion(true, nil)
+                }
             case .failure(let error):
                 self.completeOnMain { completion(false, error) }
             }
@@ -432,6 +491,33 @@ import LiveKit
         }
     }
 
+    /// Renames a participant's display name for this session only (host/co-host only).
+    /// Broadcasts `.renameParticipant` to all participants; no server persistence.
+    @objc public func renameParticipant(identity: String, newDisplayName: String) {
+        guard InterPermissionMatrix.role(localRole, hasPermission: .canMuteOthers) else { return }
+        guard !identity.isEmpty, !newDisplayName.isEmpty else { return }
+        sendControlSignal(type: .renameParticipant,
+                          targetIdentity: identity,
+                          extraData: ["newDisplayName": newDisplayName])
+        // Apply locally — the DataChannel sender does not receive its own broadcast,
+        // so the renaming moderator's own tile for this participant would not update.
+        completeOnMain {
+            self.delegate?.moderationController?(self, participantRenamed: identity,
+                                                 newDisplayName: newDisplayName)
+        }
+    }
+
+    /// Broadcasts whether co-hosts may record locally (host only).
+    @objc(setCoHostRecordingAllowed:) public func setCoHostLocalRecordingAllowed(_ allowed: Bool) {
+        guard localRole == .host else { return }
+        sendControlSignal(type: .allowCoHostLocalRecording,
+                          extraData: ["allowed": allowed ? "1" : "0"])
+        completeOnMain {
+            self.coHostLocalRecordingAllowed = allowed
+            self.delegate?.moderationControllerAllowCoHostLocalRecordingChanged?(self, allowed: allowed)
+        }
+    }
+
     // MARK: - Remove Participant (9.2.3)
 
     /// Remove a participant from the room. Server-authoritative.
@@ -524,6 +610,14 @@ import LiveKit
         interLogInfo(InterLog.room, "ModerationController: approveCameraUnlock → %{private}@", identity)
     }
 
+    /// Host/co-host denies a participant's camera unlock request.
+    /// Sends a signal so the participant can clear its pending-request flag.
+    @objc public func denyCameraUnlock(identity: String) {
+        guard InterPermissionMatrix.role(localRole, hasPermission: .canMuteOthers) else { return }
+        sendControlSignal(type: .denyCameraUnlock, targetIdentity: identity)
+        interLogInfo(InterLog.room, "ModerationController: denyCameraUnlock → %{private}@", identity)
+    }
+
     /// Participant requests host to grant a temporary mic unmute.
     @objc public func requestMicUnlock() {
         sendControlSignal(type: .requestMicUnlock)
@@ -538,12 +632,89 @@ import LiveKit
         interLogInfo(InterLog.room, "ModerationController: approveMicUnlock → %{private}@", identity)
     }
 
+    /// Host/co-host denies a participant's mic unlock request.
+    /// Sends a signal so the participant can clear its pending-request flag.
+    @objc public func denyMicUnlock(identity: String) {
+        guard InterPermissionMatrix.role(localRole, hasPermission: .canMuteOthers) else { return }
+        sendControlSignal(type: .denyMicUnlock, targetIdentity: identity)
+        interLogInfo(InterLog.room, "ModerationController: denyMicUnlock → %{private}@", identity)
+    }
+
     /// Host broadcasts a screen-share permission mode change to all native clients.
     /// The `mode` payload is encoded in the signal's `extraData["mode"]` field.
     @objc public func broadcastScreenShareMode(_ mode: String) {
         guard InterPermissionMatrix.role(localRole, hasPermission: .canMuteOthers) else { return }
         sendControlSignal(type: .screenshareModeChanged, extraData: ["mode": mode])
         interLogInfo(InterLog.room, "ModerationController: broadcastScreenShareMode=%{public}@", mode)
+    }
+
+    /// Apply the initial chat permissions at meeting start WITHOUT broadcasting a DataChannel signal.
+    /// Called once after all controllers are wired, so that the local client reflects the
+    /// host-configured state from the very beginning of the session.
+    /// - Parameter permissions: "everyone" | "hostOnly" | "disabled"
+    @objc public func applyInitialChatPermissions(_ permissions: String) {
+        // "hostOnly" and "disabled" both map to isChatDisabled = true.
+        // The AppDelegate delegate handler gates the input field:
+        //   isModerator || !isDisabled — so moderators always retain chat regardless.
+        let shouldDisable = (permissions == "disabled" || permissions == "hostOnly")
+        isChatDisabled = shouldDisable
+        if shouldDisable {
+            delegate?.moderationController(self, chatDisabledStateChanged: true)
+        }
+        interLogInfo(InterLog.room, "ModerationController: applyInitialChatPermissions=%{public}@ → disabled=%d",
+                     permissions, shouldDisable ? 1 : 0)
+    }
+
+    /// Set the local share-conflict policy without broadcasting (used at meeting start).
+    @objc public func applyInitialShareConflictPolicy(_ policy: String) {
+        let valid = ["oneattime", "hostCanPreempt", "anyCanPreempt"]
+        guard valid.contains(policy) else { return }
+        shareConflictPolicy = policy
+    }
+
+    /// Broadcast a change to the "who can share when someone is already sharing" policy.
+    /// Host/co-host only. Also persists the new policy to the server so late joiners receive it.
+    @objc public func broadcastShareConflictPolicy(_ policy: String) {
+        guard InterPermissionMatrix.role(localRole, hasPermission: .canMuteOthers) else { return }
+        let valid = ["oneattime", "hostCanPreempt", "anyCanPreempt"]
+        guard valid.contains(policy) else { return }
+        shareConflictPolicy = policy
+        sendControlSignal(type: .shareConflictPolicyChanged, extraData: ["policy": policy])
+        // Persist to server so late joiners receive the updated policy in the join response
+        let body: [String: Any] = ["roomCode": roomCode, "callerIdentity": localIdentity, "policy": policy]
+        performPOST(endpoint: "/room/share-conflict-policy", body: body) { result in
+            if case .failure(let err) = result {
+                interLogError(InterLog.room,
+                              "ModerationController: failed to persist shareConflictPolicy: %{public}@",
+                              err.localizedDescription)
+            }
+        }
+        interLogInfo(InterLog.room, "ModerationController: broadcastShareConflictPolicy=%{public}@", policy)
+    }
+
+    /// Send a targeted signal to a specific participant asking them to stop their screen share.
+    /// The sender's authority is validated by the receiver according to the current policy.
+    /// - Parameter identity: The identity of the participant who is currently sharing.
+    @objc public func sendStopScreenShare(toIdentity identity: String) {
+        // Enforce that only participants with the required authority send this signal.
+        // Policy validation at the receiver side is the authoritative check; this is a
+        // defence-in-depth gate so unauthorised senders don't even produce the signal.
+        let canStop: Bool
+        switch shareConflictPolicy {
+        case "anyCanPreempt":
+            canStop = true
+        case "hostCanPreempt":
+            canStop = InterPermissionMatrix.role(localRole, hasPermission: .canMuteOthers)
+        default:
+            canStop = false
+        }
+        guard canStop else {
+            interLogInfo(InterLog.room, "ModerationController: sendStopScreenShare blocked by policy=%{public}@",
+                         shareConflictPolicy)
+            return
+        }
+        sendControlSignal(type: .stopScreenShare, targetIdentity: identity)
+        interLogInfo(InterLog.room, "ModerationController: sent stopScreenShare → %{private}@", identity)
     }
 
     // MARK: - Request to Speak / Allow to Speak
@@ -1098,7 +1269,9 @@ import LiveKit
         switch signal.type {
         case .disableChat:
             isChatDisabled = true
-            delegate?.moderationController(self, chatDisabledStateChanged: true)
+            // Moderators keep their chat input — only participants are blocked.
+            let isModerator = InterPermissionMatrix.role(localRole, hasPermission: .canDisableChat)
+            delegate?.moderationController(self, chatDisabledStateChanged: !isModerator)
 
         case .enableChat:
             isChatDisabled = false
@@ -1287,10 +1460,10 @@ import LiveKit
 
         case .requestCameraUnlock:
             // A locked participant is asking the host to unlock their camera.
-            // Only the host handles this; participants ignore requests from others.
-            if !senderIsLocal {
-                let senderIdentity = signal.senderIdentity ?? ""
-                let senderName = signal.senderName ?? senderIdentity
+            // Only local moderators (host/co-host) handle this; participants ignore it.
+            if !senderIsLocal && InterPermissionMatrix.role(localRole, hasPermission: .canMuteOthers) {
+                let senderIdentity = signal.senderIdentity
+                let senderName = signal.senderName
                 interLogInfo(InterLog.room, "ModerationController: received requestCameraUnlock from %{private}@", senderName)
                 delegate?.moderationController?(self, receivedCameraUnlockRequest: senderIdentity, displayName: senderName)
             }
@@ -1303,7 +1476,7 @@ import LiveKit
             // This is defense-in-depth: the proper fix is server-authoritative
             // delivery (see TODO: route approveCameraUnlock via server).
             if targetIsLocal {
-                let senderIdentity = signal.senderIdentity ?? ""
+                let senderIdentity = signal.senderIdentity
                 let senderRole = roomController?.role(forParticipantIdentity: senderIdentity) ?? .participant
                 guard InterPermissionMatrix.role(senderRole, hasPermission: .canMuteOthers) else {
                     interLogInfo(InterLog.room,
@@ -1317,10 +1490,10 @@ import LiveKit
 
         case .requestMicUnlock:
             // A mic-locked participant is asking the host for a temporary unmute.
-            // Only the host handles this; other participants ignore it.
-            if !senderIsLocal {
-                let senderIdentity = signal.senderIdentity ?? ""
-                let senderName = signal.senderName ?? senderIdentity
+            // Only local moderators (host/co-host) handle this; participants ignore it.
+            if !senderIsLocal && InterPermissionMatrix.role(localRole, hasPermission: .canMuteOthers) {
+                let senderIdentity = signal.senderIdentity
+                let senderName = signal.senderName
                 interLogInfo(InterLog.room,
                     "ModerationController: received requestMicUnlock from %{private}@", senderName)
                 delegate?.moderationController?(self,
@@ -1331,7 +1504,7 @@ import LiveKit
         case .approveMicUnlock:
             // Host approved our mic unlock — apply only if targeted at us and sender is privileged.
             if targetIsLocal {
-                let senderIdentity = signal.senderIdentity ?? ""
+                let senderIdentity = signal.senderIdentity
                 let senderRole = roomController?.role(forParticipantIdentity: senderIdentity) ?? .participant
                 guard InterPermissionMatrix.role(senderRole, hasPermission: .canMuteOthers) else {
                     interLogInfo(InterLog.room,
@@ -1341,6 +1514,118 @@ import LiveKit
                 }
                 interLogInfo(InterLog.room, "ModerationController: mic unlock approved by host")
                 delegate?.moderationControllerMicUnlockApproved?(self)
+            }
+
+        case .denyCameraUnlock:
+            // Host/co-host denied our camera unlock request — clear the pending flag.
+            if targetIsLocal {
+                let senderIdentity = signal.senderIdentity
+                let senderRole = roomController?.role(forParticipantIdentity: senderIdentity) ?? .participant
+                guard InterPermissionMatrix.role(senderRole, hasPermission: .canMuteOthers) else {
+                    interLogInfo(InterLog.room,
+                        "ModerationController: discarded denyCameraUnlock from unprivileged sender %{private}@",
+                        senderIdentity)
+                    break
+                }
+                interLogInfo(InterLog.room, "ModerationController: camera unlock denied by host")
+                delegate?.moderationControllerCameraUnlockDenied?(self)
+            }
+
+        case .denyMicUnlock:
+            // Host/co-host denied our mic unlock request — clear the pending flag.
+            if targetIsLocal {
+                let senderIdentity = signal.senderIdentity
+                let senderRole = roomController?.role(forParticipantIdentity: senderIdentity) ?? .participant
+                guard InterPermissionMatrix.role(senderRole, hasPermission: .canMuteOthers) else {
+                    interLogInfo(InterLog.room,
+                        "ModerationController: discarded denyMicUnlock from unprivileged sender %{private}@",
+                        senderIdentity)
+                    break
+                }
+                interLogInfo(InterLog.room, "ModerationController: mic unlock denied by host")
+                delegate?.moderationControllerMicUnlockDenied?(self)
+            }
+
+        case .renameParticipant:
+            let senderIdentity = signal.senderIdentity
+            let senderRole = roomController?.role(forParticipantIdentity: senderIdentity) ?? .participant
+            guard InterPermissionMatrix.role(senderRole, hasPermission: .canMuteOthers) else {
+                interLogInfo(InterLog.room,
+                    "ModerationController: discarded renameParticipant from unprivileged sender %{private}@",
+                    senderIdentity)
+                break
+            }
+            if let target = signal.targetIdentity,
+               let newName = signal.extraData?["newDisplayName"],
+               !newName.isEmpty {
+                delegate?.moderationController?(self, participantRenamed: target, newDisplayName: newName)
+            }
+
+        case .allowCoHostLocalRecording:
+            let senderIdentity = signal.senderIdentity
+            let senderRole = roomController?.role(forParticipantIdentity: senderIdentity) ?? .participant
+            guard senderRole == .host else {
+                interLogInfo(InterLog.room,
+                    "ModerationController: discarded allowCoHostLocalRecording from non-host sender %{private}@",
+                    senderIdentity)
+                break
+            }
+            let allowed = signal.extraData?["allowed"] == "1"
+            coHostLocalRecordingAllowed = allowed
+            delegate?.moderationControllerAllowCoHostLocalRecordingChanged?(self, allowed: allowed)
+
+        case .shareConflictPolicyChanged:
+            // Policy updates are broadcast by the host — accept only from privileged senders.
+            if !senderIsLocal {
+                let senderIdentity = signal.senderIdentity
+                let senderRole = roomController?.role(forParticipantIdentity: senderIdentity) ?? .participant
+                guard InterPermissionMatrix.role(senderRole, hasPermission: .canMuteOthers) else {
+                    interLogInfo(InterLog.room,
+                        "ModerationController: discarded shareConflictPolicyChanged from unprivileged sender %{private}@",
+                        senderIdentity)
+                    break
+                }
+                if let policy = signal.extraData?["policy"] {
+                    let valid = ["oneattime", "hostCanPreempt", "anyCanPreempt"]
+                    guard valid.contains(policy) else { break }
+                    shareConflictPolicy = policy
+                    interLogInfo(InterLog.room,
+                        "ModerationController: shareConflictPolicy changed to %{public}@ by %{private}@",
+                        policy, senderIdentity)
+                    delegate?.moderationController?(self, receivedShareConflictPolicyChange: policy)
+                }
+            }
+
+        case .stopScreenShare:
+            // A targeted signal asking the local participant to stop their active screen share.
+            // Validate:
+            //   1. The signal is targeted at us specifically.
+            //   2. The sender has the authority to preempt us under the current policy.
+            if targetIsLocal && !senderIsLocal {
+                let senderIdentity = signal.senderIdentity
+                let senderRole = roomController?.role(forParticipantIdentity: senderIdentity) ?? .participant
+                let authorised: Bool
+                switch shareConflictPolicy {
+                case "anyCanPreempt":
+                    authorised = true
+                case "hostCanPreempt":
+                    authorised = InterPermissionMatrix.role(senderRole, hasPermission: .canMuteOthers)
+                default:
+                    // "oneattime" — nobody should be sending this unless the policy changed
+                    // in transit; discard to prevent spoofed preemption.
+                    authorised = false
+                }
+                if authorised {
+                    interLogInfo(InterLog.room,
+                        "ModerationController: received stopScreenShare from %{private}@ (policy=%{public}@)",
+                        senderIdentity, shareConflictPolicy)
+                    delegate?.moderationControllerReceivedStopScreenShare?(self,
+                        requestedByIdentity: senderIdentity)
+                } else {
+                    interLogInfo(InterLog.room,
+                        "ModerationController: discarded stopScreenShare from %{private}@ — unauthorised under policy=%{public}@",
+                        senderIdentity, shareConflictPolicy)
+                }
             }
 
         default:

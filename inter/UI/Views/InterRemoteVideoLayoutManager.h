@@ -162,7 +162,12 @@ typedef NS_ENUM(NSUInteger, InterRemoteVideoLayoutMode) {
 /// Presence-driven: call when a remote participant leaves the room. Removes their tile
 /// entirely. This is the authoritative tile-removal path (track-end only toggles the
 /// avatar placeholder; it never removes the tile).
-- (void)removeRemoteParticipant:(NSString *)participantId;/// Call when a remote screen share frame arrives from a participant.
+/// Presence-driven: call when a remote participant leaves the room. Removes their tile
+/// entirely. This is the authoritative tile-removal path (track-end only toggles the
+/// avatar placeholder; it never removes the tile).
+- (void)removeRemoteParticipant:(NSString *)participantId;
+
+/// Call when a remote screen share frame arrives from a participant.
 - (void)handleRemoteScreenShareFrame:(CVPixelBufferRef)pixelBuffer fromParticipant:(NSString *)participantId;
 
 /// Call when a remote track mutes.

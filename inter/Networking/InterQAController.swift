@@ -272,6 +272,13 @@ private struct InterQAMessage: Codable {
         roomController = nil
     }
 
+    /// Update whether the local participant is acting as host/co-host.
+    /// Call when the local role changes mid-meeting (e.g. promotion to co-host).
+    @objc public func updateHostStatus(_ newIsHost: Bool) {
+        isHost = newIsHost
+        interLogInfo(InterLog.room, "QAController: host status updated to %d", newIsHost ? 1 : 0)
+    }
+
     /// Clear all state.
     @objc public func reset() {
         questions.removeAll()

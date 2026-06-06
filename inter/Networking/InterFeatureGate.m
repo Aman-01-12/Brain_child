@@ -5,7 +5,7 @@
 //   1. Add entry to InterFeature enum in InterFeatureGate.h.
 //   2. Add matching entries to sTierMinRank and sDisplayName below.
 //      (sMinTierName is derived automatically from sTierMinRank — do not edit it.)
-//   3. Call [self requireFeature:] in AppDelegate at the action site.
+//   3. Call [InterFeatureGate isFeature:… availableForTier:…] at the action site.
 // ============================================================================
 
 #import "InterFeatureGate.h"
@@ -49,6 +49,7 @@ static NSDictionary<NSNumber *, NSString *> *sDisplayName;
         @(InterFeatureHostInterview):     @1,  // pro
         @(InterFeatureCloudRecording):    @1,  // pro
         @(InterFeatureScheduledMeetings): @1,  // pro
+        @(InterFeatureChatExport):          @1,  // pro
     };
 
     // Derive sMinTierName from sTierMinRank so the two cannot drift.
@@ -69,6 +70,7 @@ static NSDictionary<NSNumber *, NSString *> *sDisplayName;
         @(InterFeatureHostInterview):     @"Interview Mode",
         @(InterFeatureCloudRecording):    @"Cloud Recording",
         @(InterFeatureScheduledMeetings): @"Scheduled Meetings",
+        @(InterFeatureChatExport):          @"Chat Export",
     };
 }
 

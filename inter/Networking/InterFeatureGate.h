@@ -38,6 +38,10 @@ typedef NS_ENUM(NSUInteger, InterFeature) {
     /// Minimum tier: pro
     InterFeatureScheduledMeetings,
 
+    /// Chat transcript export — host/co-host can save the chat log.
+    /// Minimum tier: pro
+    InterFeatureChatExport,
+
     // ── Add future features below this line ──────────────────────────────
     // Example:
     //   InterFeatureAITranscription,   // pro

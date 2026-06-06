@@ -54,7 +54,16 @@ import Foundation
     }
 
     public override var hash: Int {
-        return identity.hashValue
+        var h = Hasher()
+        h.combine(identity)
+        h.combine(displayName)
+        h.combine(isLocal)
+        h.combine(cameraOn)
+        h.combine(micMuted)
+        h.combine(handRaised)
+        h.combine(isSpeaking)
+        h.combine(isScreenSharing)
+        return h.finalize()
     }
 
     public override var description: String {

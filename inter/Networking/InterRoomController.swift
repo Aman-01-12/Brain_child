@@ -124,6 +124,8 @@ import LiveKit
     @objc public private(set) dynamic var activeChatPermissions: String = "everyone"
     /// Screen sharing permission: "hostOnly" | "everyone" | "request".
     @objc public private(set) dynamic var activeSharingPermissions: String = "hostOnly"
+    /// Share-conflict policy: "oneattime" | "hostCanPreempt" | "anyCanPreempt".
+    @objc public private(set) dynamic var activeShareConflictPolicy: String = "oneattime"
     /// Whether cloud recording should auto-start when the host joins.
     @objc public private(set) dynamic var activeAutoRecord: Bool = false
     /// Whether AI transcription should auto-start when the host joins.
@@ -142,8 +144,16 @@ import LiveKit
         activeAllowUnmuting      = dict["allowUnmuting"]      as? Bool ?? true
         activeChatPermissions    = dict["chatPermissions"]    as? String ?? "everyone"
         activeSharingPermissions = dict["sharingPermissions"] as? String ?? "hostOnly"
+        activeShareConflictPolicy = dict["shareConflictPolicy"] as? String ?? "oneattime"
         activeAutoRecord         = dict["autoRecord"]         as? Bool ?? false
         activeAutoTranscript     = dict["autoTranscript"]     as? Bool ?? false
+    }
+
+    /// Update the active share-conflict policy mid-meeting.
+    @objc public func updateShareConflictPolicy(_ policy: String) {
+        let valid = ["oneattime", "hostCanPreempt", "anyCanPreempt"]
+        guard valid.contains(policy) else { return }
+        activeShareConflictPolicy = policy
     }
 
     /// Update the active screen sharing permissions mid-meeting.
@@ -284,20 +294,22 @@ import LiveKit
                 serverURL: configuration.tokenServerURL,
                 roomCode: configuration.roomCode,
                 identity: configuration.participantIdentity,
-                displayName: configuration.participantName
+                displayName: configuration.participantName,
+                password: configuration.meetingPassword
             ) { [weak self] response, error in
                 if let self = self, let r = response, error == nil {
                     // Apply server-returned meeting settings for participants
                     DispatchQueue.main.async {
-                        self.activeMeetingDisplayName = r.meetingDisplayName
-                        self.activeMuteOnJoin         = r.muteOnJoin
-                        self.activeCameraOffOnJoin    = r.cameraOffOnJoin
-                        self.activeJoinBeforeHost     = r.joinBeforeHost
-                        self.activeAllowUnmuting      = r.allowUnmuting
-                        self.activeChatPermissions    = r.chatPermissions
-                        self.activeSharingPermissions = r.sharingPermissions
-                        self.activeAutoRecord         = r.autoRecord
-                        self.activeAutoTranscript     = r.autoTranscript
+                        self.activeMeetingDisplayName  = r.meetingDisplayName
+                        self.activeMuteOnJoin          = r.muteOnJoin
+                        self.activeCameraOffOnJoin     = r.cameraOffOnJoin
+                        self.activeJoinBeforeHost      = r.joinBeforeHost
+                        self.activeAllowUnmuting       = r.allowUnmuting
+                        self.activeChatPermissions     = r.chatPermissions
+                        self.activeSharingPermissions  = r.sharingPermissions
+                        self.activeShareConflictPolicy = r.shareConflictPolicy
+                        self.activeAutoRecord          = r.autoRecord
+                        self.activeAutoTranscript      = r.autoTranscript
                     }
                 }
                 self?.handleTokenResponse(
@@ -812,6 +824,16 @@ import LiveKit
                 "name": participant.name ?? participant.identity?.stringValue ?? "Unknown"
             ]
         }
+    }
+
+    /// Returns the display name for a remote participant by their identity.
+    /// Returns an empty string if the identity is not found in the room.
+    @objc public func displayNameForParticipantIdentity(_ identity: String) -> String {
+        guard let room = room else { return "" }
+        let participant = room.remoteParticipants.values.first {
+            $0.identity?.stringValue == identity
+        }
+        return participant?.name ?? participant?.identity?.stringValue ?? ""
     }
 
     /// Returns the role of a remote participant by reading their LiveKit metadata.

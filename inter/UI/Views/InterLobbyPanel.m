@@ -169,6 +169,10 @@
     _lobbyToggle.state = lobbyEnabled ? NSControlStateValueOn : NSControlStateValueOff;
 }
 
+- (void)setLobbyToggleEnabled:(BOOL)enabled {
+    _lobbyToggle.enabled = enabled;
+}
+
 // MARK: - Actions
 
 - (void)lobbyToggleClicked:(NSButton *)sender {

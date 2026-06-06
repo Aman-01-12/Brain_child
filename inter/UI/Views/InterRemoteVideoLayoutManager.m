@@ -222,9 +222,34 @@ static NSString *const kInterPreferGridLayoutKey = @"InterPreferGridLayout";
 /// Show/hide the avatar placeholder. When YES, the video view is hidden and the
 /// circular initial badge is shown (participant present but camera off).
 - (void)setCameraOff:(BOOL)cameraOff {
+    if (_cameraOff == cameraOff) return;
     _cameraOff = cameraOff;
+
+    if (!cameraOff) {
+        // Revealing video: prepare the display layer for new frames first.
+        // Rapid mute/unmute cycles can leave AVSampleBufferDisplayLayer in .failed
+        // state; prepareForResume clears it so the first incoming frame is not dropped.
+        if ([self.videoView respondsToSelector:@selector(prepareForResume)]) {
+            [(id)self.videoView prepareForResume];
+        }
+    } else {
+        // Going to camera-off: flush the last decoded frame out of the display layer.
+        // This is the SINGLE place that clears the frozen frame — so even if a layout
+        // pass momentarily shows the video view, there is nothing to draw but black
+        // behind the avatar. Without this, the retained last frame shows around the
+        // avatar circle (the "avatar floating over frozen video" glitch).
+        if ([self.videoView respondsToSelector:@selector(shutdownRendering)]) {
+            [(id)self.videoView shutdownRendering];
+        }
+    }
+
+    // Swap avatar and video in a single composite pass so there is never a
+    // frame where both are visible or both are hidden.
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
     self.avatarPlaceholder.hidden = !cameraOff;
     self.videoView.hidden = cameraOff;
+    [CATransaction commit];
 }
 
 /// Update the avatar's initial letter when the display name becomes known.
@@ -1137,8 +1162,18 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
         if (isHost) tile.isHostParticipant = isHost.boolValue;
         tile.localUserCanAssignCoHost = _localUserCanAssignCoHost;
         // Restore camera-off (avatar placeholder) state so it survives tile recreation.
+        // Default to YES (avatar) when the state is unknown — NEVER NO. A camera tile
+        // whose state is not yet known must show the avatar, not an empty video view:
+        // defaulting to NO renders a BLANK tile (avatar hidden, no frames) until a
+        // snapshot corrects it, and if this recreation happens from a layout pass the
+        // correction may never come (the "host tile goes blank on the participant's
+        // first camera publish" bug). This matches the roster default (cameraMuted=true)
+        // and ensureTileForParticipant:, which both assume camera-off until proven on.
         NSNumber *camOff = self.cameraOffStates[key];
-        tile.cameraOff = camOff ? camOff.boolValue : NO;
+        if (!camOff) {
+            NSLog(@"[CB] TILE-RECREATE …%@ camOffState=nil→YES", [key substringFromIndex:MAX(0,(NSInteger)key.length-5)]);
+        }
+        tile.cameraOff = camOff ? camOff.boolValue : YES;
     }
 
     self.tileViews[key] = tile;
@@ -1181,38 +1216,34 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
 - (void)addRemoteParticipant:(NSString *)participantId displayName:(NSString *)displayName {
     if (participantId.length == 0) return;
 
+    // SINGLE SOURCE OF TRUTH: remote tile lifecycle (create/remove) and per-tile state
+    // (cameraOff, mic, hand, speaking) are owned EXCLUSIVELY by the roster → snapshot →
+    // applyParticipantSnapshot path. This legacy presence hook now only registers the
+    // display name so labels are ready early; it must NOT create camera views or tiles
+    // or trigger layout. Creating tiles here races the snapshot reconciler and lets one
+    // participant's join/leave mutate another participant's tile (the "missing host tile"
+    // and "tile affected by unrelated events" bugs). The snapshot creates the tile from
+    // roster.participantJoined, which is seeded by attach / participantDidConnect /
+    // reseedPresence / didSubscribeTrack.
     if (displayName.length > 0) {
         self.participantDisplayNames[participantId] = displayName;
-    }
-
-    // Create the camera view + register the participant immediately so a tile exists
-    // even before any video frame arrives. The tile shows the avatar placeholder until
-    // the first frame flips cameraOff → NO.
-    BOOL isNew = (self.remoteCameraViews[participantId] == nil);
-    if (isNew) {
-        // Default to camera-off (avatar placeholder) until a frame proves otherwise.
-        self.cameraOffStates[participantId] = @YES;
-        (void)[self cameraViewForParticipant:participantId];
-    }
-
-    // Ensure the tile exists and reflects the avatar placeholder + correct name.
-    InterRemoteSampleBufferView *view = self.remoteCameraViews[participantId];
-    if (view) {
-        InterRemoteVideoTileView *tile = [self tileForKey:participantId videoView:view];
-        [tile updateAvatarInitialFromDisplayName:[self displayNameForTileKey:participantId]];
-        if (isNew) {
-            tile.cameraOff = YES;
+        InterRemoteVideoTileView *existing = self.tileViews[participantId];
+        if (existing) {
+            existing.nameLabel.stringValue = [self displayNameForTileKey:participantId];
+            [existing updateAvatarInitialFromDisplayName:[self displayNameForTileKey:participantId]];
         }
     }
-
-    [self updateLayoutAnimated:NO];
 }
 
 - (void)removeRemoteParticipant:(NSString *)participantId {
     if (participantId.length == 0) return;
-    [self.cameraOffStates removeObjectForKey:participantId];
-    [self removeCameraViewForParticipant:participantId];
-    [self updateLayoutAnimated:NO];
+    NSLog(@"[CB] LEGACY-REMOVE …%@ (ignored — snapshot owns removal)", [participantId substringFromIndex:MAX(0,(NSInteger)participantId.length-5)]);
+    // SINGLE SOURCE OF TRUTH: tile removal is owned EXCLUSIVELY by applyParticipantSnapshot,
+    // which tears down any tile not present in the latest roster snapshot (and runs the full
+    // cleanup via removeCameraViewForParticipant). This legacy hook is intentionally a no-op:
+    // a stray, duplicate, or mis-ordered leave event must never remove a tile that the roster
+    // still considers present. roster.participantLeft (from participantDidDisconnect) drives
+    // the authoritative removal through the snapshot.
 }
 
 #pragma mark - Presence-Driven Reconciler (snapshot-based)
@@ -1263,6 +1294,9 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
         // a live feed because its visibility is recomputed here, not mutated ad-hoc.
         [tile updateAvatarInitialFromDisplayName:e.displayName];
         tile.nameLabel.stringValue = e.displayName;
+        NSLog(@"[CB] SNAP …%@ camOn=%d (muted=%@ firstFrame=%@)",
+              [e.identity substringFromIndex:MAX(0,(NSInteger)e.identity.length-5)],
+              e.cameraOn, self.cameraOffStates[e.identity], self.cameraOffStates[e.identity]);
         [tile setCameraOff:!e.cameraOn];
         // Persist so tileForKey: restores correctly after tile teardown/recreation.
         self.cameraOffStates[e.identity] = @(!e.cameraOn);
@@ -1291,6 +1325,7 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
 }
 
 - (void)removeCameraViewForParticipant:(NSString *)participantId {
+    NSLog(@"[CB] REMOVE-CAMVIEW …%@", [participantId substringFromIndex:MAX(0,(NSInteger)participantId.length-5)]);
     // Clear any pending first-frame dispatch so a stale dispatch does not
     // recreate the tile after the participant has already left.
     os_unfair_lock_lock(&_pendingFirstFrameLock);
@@ -1345,13 +1380,12 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
     InterRemoteSampleBufferView *view = self.remoteCameraViews[participantId];
     if (view) {
         [view updateFrame:pixelBuffer];
-        // First frame after the camera turns on (or after a presence-created tile):
-        // hide the avatar placeholder and reveal the live video. Cheap guard — only
-        // touches the UI when the placeholder is currently shown.
-        if ([self.cameraOffStates[participantId] boolValue]) {
-            self.cameraOffStates[participantId] = @NO;
-            self.tileViews[participantId].cameraOff = NO;
-        }
+        // cameraOff state (avatar vs. live video) is driven exclusively by the
+        // roster → snapshot → applyParticipantSnapshot path, which runs on the
+        // main thread via cameraFirstFrame → emitNow. Do NOT mutate cameraOffStates
+        // or tile.cameraOff here — this callback runs on the WebRTC decode thread
+        // and those mutations race with main-thread mute handlers, causing the
+        // "frozen frame / avatar flicker" bug on rapid toggles.
         return;
     }
 
@@ -1389,11 +1423,15 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
         [v updateFrame:pixelBuffer];
         CVPixelBufferRelease(pixelBuffer);
 
-        // Frames are flowing — ensure the avatar placeholder is hidden for this tile.
-        self.cameraOffStates[participantId] = @NO;
-        self.tileViews[participantId].cameraOff = NO;
+        NSLog(@"[CB] FIRST-FRAME-CREATE …%@", [participantId substringFromIndex:MAX(0,(NSInteger)participantId.length-5)]);
 
-        // Use non-animated layout for the first appearance.
+        // Do NOT touch cameraOffStates / tile.cameraOff here. Avatar-vs-video is owned
+        // exclusively by the roster → snapshot → setCameraOff: path. The same frame that
+        // reached us also drives roster.cameraFirstFrame, which flips camOn and emits a
+        // snapshot that reveals the video. Writing cameraOff here would race that path.
+
+        // Use non-animated layout for the first appearance so the freshly created
+        // view is placed in the hierarchy; the snapshot governs its visibility.
         [self updateLayoutAnimated:NO];
 
         // Re-attach the local self-view preview layer's session connection.
@@ -1428,12 +1466,10 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
 
 - (void)handleRemoteTrackMuted:(NSUInteger)trackKind forParticipant:(NSString *)participantId {
     if (trackKind == InterTrackKindCamera) {
-        InterRemoteSampleBufferView *view = self.remoteCameraViews[participantId];
-        [view shutdownRendering];  // clear last frame; no CVDisplayLink to stop
-        self.tileViews[participantId].isCameraMuted = YES;
-        // Camera turned off — show the avatar placeholder (tile stays; presence owns removal).
-        self.cameraOffStates[participantId] = @YES;
-        self.tileViews[participantId].cameraOff = YES;
+        // Camera avatar-vs-video is owned exclusively by the roster → snapshot →
+        // setCameraOff: path (fed by the same didUpdateIsMuted callback via
+        // roster.cameraMuted). Doing any view work here would race that owner and
+        // re-introduce the frozen-frame / avatar-flicker glitch. No-op for camera.
     } else if (trackKind == InterTrackKindMicrophone) {
         self.tileViews[participantId].isMicMuted = YES;
     } else if (trackKind == InterTrackKindScreenShare) {
@@ -1445,25 +1481,20 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
 
 - (void)handleRemoteTrackUnmuted:(NSUInteger)trackKind forParticipant:(NSString *)participantId {
     if (trackKind == InterTrackKindCamera) {
-        self.tileViews[participantId].isCameraMuted = NO;
-        // Camera coming back on. Keep the avatar placeholder until the first frame
-        // arrives (handleRemoteCameraFrame: clears cameraOff), avoiding a black flash.
+        // Owned by the roster → snapshot → setCameraOff: path. setCameraOff:NO calls
+        // prepareForResume and reveals the video when camOn flips true. No-op here.
     } else if (trackKind == InterTrackKindMicrophone) {
         self.tileViews[participantId].isMicMuted = NO;
     }
-    // No other work needed: view exists, frames will flow again.
 }
 
 - (void)handleRemoteTrackEnded:(NSUInteger)trackKind forParticipant:(NSString *)participantId {
     if (trackKind == InterTrackKindCamera) {
-        // Presence-driven model: a camera track ending means the participant turned
-        // their camera off / unpublished — NOT that they left. Show the avatar
-        // placeholder and keep the tile. Tile removal happens only on participant
-        // disconnect (removeRemoteParticipant:).
-        InterRemoteSampleBufferView *view = self.remoteCameraViews[participantId];
-        [view shutdownRendering];  // clear last frame
-        self.cameraOffStates[participantId] = @YES;
-        self.tileViews[participantId].cameraOff = YES;
+        // Presence-driven model: a camera track ending (unpublish/unsubscribe) is
+        // reported to the roster via cameraEnded, which clears camOn and emits a
+        // snapshot that calls setCameraOff:YES (which flushes the frame and shows the
+        // avatar). Tile removal happens only on participant disconnect. No-op here so
+        // we never race the snapshot owner.
     } else if (trackKind == InterTrackKindScreenShare) {
         if ([self.screenShareParticipantId isEqualToString:participantId]) {
             [self.remoteScreenShareView shutdownRenderingSynchronously];
@@ -1661,7 +1692,13 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
                 tile.isSpeaking = [pid isEqualToString:self.activeSpeakerIdentity];
                 [self addSubview:tile positioned:NSWindowBelow relativeTo:self.participantOverlay];
                 tile.hidden = NO;
-                camView.hidden = NO;
+                // Re-assert the authoritative camera-off state from cameraOffStates
+                // (owned by the snapshot), defaulting to YES (avatar) when unknown. This
+                // guarantees a camera-off remote tile renders as the avatar and never as a
+                // blank video view, even if the tile's internal cameraOff drifted.
+                NSNumber *camOffState = self.cameraOffStates[pid];
+                [tile setCameraOff:(camOffState ? camOffState.boolValue : YES)];
+                camView.hidden = tile.cameraOff;
                 [self setTile:tile frame:NSMakeRect(0, 0, W, H) animated:animated];
             } else if (self.localCaptureSession) {
                 // No remote cameras yet — show local self-view tile filling the area
@@ -2299,7 +2336,10 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
 
         // --- Remote camera tile ---
         InterRemoteSampleBufferView *view = self.remoteCameraViews[pid];
-        if (!view) continue;
+        if (!view) {
+            NSLog(@"[CB] GRID-SKIP …%@", [pid substringFromIndex:MAX(0,(NSInteger)pid.length-5)]);
+            continue;
+        }
 
         view.aspectFill = NO; // aspect-fit: downscale 2x keeps compression artifacts invisible
         InterRemoteVideoTileView *tile = [self tileForKey:pid videoView:view];
@@ -2307,7 +2347,14 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
         tile.layer.cornerRadius = 8.0;
         [self addSubview:tile positioned:NSWindowBelow relativeTo:self.participantOverlay];
         tile.hidden = NO;
-        view.hidden = NO;
+        // Re-assert the authoritative camera-off state from cameraOffStates (owned by
+        // the snapshot), defaulting to YES (avatar) when unknown. This guarantees a
+        // camera-off remote tile renders as the avatar and never as a blank video view
+        // — the fix for the host tile going blank on the participant's first camera
+        // publish, where a layout pass could recreate the host tile with no known state.
+        NSNumber *camOffState = self.cameraOffStates[pid];
+        [tile setCameraOff:(camOffState ? camOffState.boolValue : YES)];
+        view.hidden = tile.cameraOff;
 
         tile.isSpeaking = [pid isEqualToString:self.activeSpeakerIdentity];
 

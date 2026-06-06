@@ -158,6 +158,13 @@ import LiveKit
         roomController = nil
     }
 
+    /// Update the local participant's display name. Call when the host renames this user
+    /// so future outgoing chat messages carry the updated name.
+    @objc public func updateLocalDisplayName(_ newName: String) {
+        guard !newName.isEmpty else { return }
+        localDisplayName = newName
+    }
+
     /// Clear all messages and reset state. Call on mode transition or disconnect.
     @objc public func reset() {
         messages.removeAll()
@@ -596,7 +603,8 @@ import LiveKit
              .askToUnmuteCamera, .requestMuteCameraOne, .requestMuteCameraAll,
              .liftCameraLockOne, .liftCameraLockAll, .screenshareModeChanged,
              .requestCameraUnlock, .approveCameraUnlock,
-             .requestMicUnlock, .approveMicUnlock:
+             .requestMicUnlock, .approveMicUnlock,
+             .renameParticipant, .allowCoHostLocalRecording:
             guard signal.senderIdentity != localIdentity else { return }
             moderationController?.handleControlSignal(signal)
 

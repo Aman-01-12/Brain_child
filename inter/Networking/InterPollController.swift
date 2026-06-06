@@ -287,6 +287,13 @@ private struct InterPollMessage: Codable {
         roomController = nil
     }
 
+    /// Update whether the local participant is acting as host/co-host.
+    /// Call when the local role changes mid-meeting (e.g. promotion to co-host).
+    @objc public func updateHostStatus(_ newIsHost: Bool) {
+        isHost = newIsHost
+        interLogInfo(InterLog.room, "PollController: host status updated to %d", newIsHost ? 1 : 0)
+    }
+
     /// Clear all state. Call on mode transition or disconnect.
     @objc public func reset() {
         activePoll = nil
@@ -508,9 +515,8 @@ private struct InterPollMessage: Codable {
             interLogError(InterLog.room, "PollController: launchPoll message missing poll data")
             return
         }
-
-        // Don't process our own broadcast
-        guard poll.createdBy != localIdentity else { return }
+        // Note: LiveKit DataChannel never delivers a sender's own broadcast back to
+        // them, so an explicit self-echo guard is not needed here.
 
         activePoll = poll
         let info = InterPollInfo(from: poll)
@@ -549,8 +555,25 @@ private struct InterPollMessage: Codable {
             return
         }
 
-        // Don't process our own broadcast (host already has local state)
-        guard poll.createdBy != localIdentity else { return }
+        // Only apply to the currently active poll.
+        // A stale pollResults message in-flight when endPoll was sent could arrive
+        // after handleEndPoll already set activePoll.status = .ended.  Applying it
+        // would silently reset the status back to .active, re-showing voting UI.
+        guard let localActivePoll = activePoll,
+              localActivePoll.id == poll.id,
+              localActivePoll.status != .ended else {
+            interLogDebug(InterLog.room,
+                          "PollController: ignoring pollResults — poll is ended or ID mismatch")
+            return
+        }
+
+        // If we are the aggregator for this poll, our local vote counts are
+        // authoritative. Accept the status/question but keep our own counts.
+        if voteRecords[poll.id] != nil {
+            // Nothing to do: we are the source of truth; our activePoll is already
+            // up-to-date and was just broadcast by aggregateVote.
+            return
+        }
 
         activePoll = poll
         let hasVoted = localVotes[poll.id] != nil
@@ -565,25 +588,76 @@ private struct InterPollMessage: Codable {
     }
 
     private func handleEndPoll(_ message: InterPollMessage) {
-        guard let poll = message.poll else {
+        guard let receivedPoll = message.poll else {
             interLogError(InterLog.room, "PollController: endPoll message missing poll data")
             return
         }
 
-        // Don't process our own broadcast
-        guard poll.createdBy != localIdentity else { return }
+        // Ignore stale endPoll messages for a poll that is no longer the active one
+        // (e.g. a delayed message arriving after a new poll was already launched).
+        guard let localActivePoll = activePoll,
+              localActivePoll.id == receivedPoll.id else {
+            interLogDebug(InterLog.room,
+                          "PollController: ignoring endPoll — poll ID mismatch or no active poll")
+            return
+        }
 
-        activePoll = poll
-        let hasVoted = localVotes[poll.id] != nil
-        let votes = localVotes[poll.id] ?? []
-        let info = InterPollInfo(from: poll, hasVoted: hasVoted, localVotes: votes)
-        activePollInfo = info
-
-        addToHistory(info)
-
-        delegate?.pollController(self, didEndPoll: info)
-
-        interLogInfo(InterLog.room, "PollController: poll '%{public}@' ended", poll.question)
+        if voteRecords[receivedPoll.id] != nil {
+            // ── Aggregator path ──────────────────────────────────────────────────────
+            // We created this poll and own the authoritative vote counts.
+            // This endPoll was sent by the other moderator (e.g. host ending a
+            // co-host-created poll). End the poll using OUR counts, then re-broadcast
+            // the authoritative final state so everyone — including the original ender
+            // — can display the correct final results.
+            guard localActivePoll.status == .active else {
+                // Race condition: we already ended the poll ourselves before this
+                // remote message arrived. Our own endCurrentPoll() already broadcast
+                // the authoritative final state, so nothing more to do.
+                interLogDebug(InterLog.room,
+                              "PollController: ignoring remote endPoll — already ended (aggregator)")
+                return
+            }
+            var finalPoll = localActivePoll
+            finalPoll.status = .ended
+            activePoll = finalPoll
+            let hasVoted = localVotes[finalPoll.id] != nil
+            let votes = localVotes[finalPoll.id] ?? []
+            let info = InterPollInfo(from: finalPoll, hasVoted: hasVoted, localVotes: votes)
+            activePollInfo = info
+            addToHistory(info)
+            // Re-broadcast with our authoritative final counts. The original ender
+            // and all participants will receive this and update their displays.
+            let finalMessage = InterPollMessage(type: .endPoll, poll: finalPoll)
+            publishPollMessage(finalMessage)
+            delegate?.pollController(self, didEndPoll: info)
+            interLogInfo(InterLog.room,
+                         "PollController: poll '%{public}@' ended on remote request — re-broadcast authoritative counts",
+                         finalPoll.question)
+        } else {
+            // ── Non-aggregator path ──────────────────────────────────────────────────
+            // Accept the received state. If we already ended the poll ourselves
+            // (both parties clicked End Poll simultaneously), don't call didEndPoll
+            // a second time — just refresh the displayed vote counts.
+            let alreadyEnded = localActivePoll.status == .ended
+            activePoll = receivedPoll
+            let hasVoted = localVotes[receivedPoll.id] != nil
+            let votes = localVotes[receivedPoll.id] ?? []
+            let info = InterPollInfo(from: receivedPoll, hasVoted: hasVoted, localVotes: votes)
+            activePollInfo = info
+            addToHistory(info)
+            if alreadyEnded {
+                // UI is already showing the ended state; update the vote counts with
+                // whatever the aggregator sent (might be more accurate than our own
+                // endCurrentPoll snapshot).
+                delegate?.pollController(self, didUpdateResults: info)
+                interLogDebug(InterLog.room,
+                              "PollController: refreshed final vote counts from aggregator's endPoll")
+            } else {
+                delegate?.pollController(self, didEndPoll: info)
+                interLogInfo(InterLog.room, "PollController: poll '%{public}@' ended (remote)",
+                             receivedPoll.question)
+            }
+        }
     }
 
     // MARK: - Private — Vote Aggregation (Host-Only)
@@ -630,6 +704,11 @@ private struct InterPollMessage: Codable {
 
         delegate?.pollController?(self, didReceiveVoteForPoll: pollId, fromParticipant: voterIdentity)
         delegate?.pollController(self, didUpdateResults: info)
+
+        // Broadcast updated results so all participants — including the original
+        // host when a co-host created the poll — see live vote counts.
+        let resultsMessage = InterPollMessage(type: .pollResults, poll: poll)
+        publishPollMessage(resultsMessage)
 
         interLogDebug(InterLog.room, "PollController: aggregated vote from %{public}@ (total voters=%d)",
                       voterIdentity, voteRecords[pollId]?.count ?? 0)

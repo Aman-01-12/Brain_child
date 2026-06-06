@@ -66,6 +66,8 @@ import CryptoKit
     @objc public let sharingPermissions: String
     @objc public let autoRecord: Bool
     @objc public let autoTranscript: Bool
+    /// Share-conflict policy returned by the server (host-configured).
+    @objc public let shareConflictPolicy: String
 
     @objc public init(roomName: String,
                       token: String,
@@ -79,7 +81,8 @@ import CryptoKit
                       chatPermissions: String = "everyone",
                       sharingPermissions: String = "hostOnly",
                       autoRecord: Bool = false,
-                      autoTranscript: Bool = false) {
+                      autoTranscript: Bool = false,
+                      shareConflictPolicy: String = "oneattime") {
         self.roomName             = roomName
         self.token                = token
         self.serverURL            = serverURL
@@ -93,6 +96,7 @@ import CryptoKit
         self.sharingPermissions   = sharingPermissions
         self.autoRecord           = autoRecord
         self.autoTranscript       = autoTranscript
+        self.shareConflictPolicy  = shareConflictPolicy
         super.init()
     }
 }
@@ -913,9 +917,19 @@ private struct TokenCacheEntry {
         if !roomType.isEmpty && roomType != "call" {
             body["roomType"] = roomType
         }
-        // Merge meeting settings into the request body when provided
+        // Merge meeting settings into the request body when provided.
+        // Protected keys are already set above and must not be overwritten by the caller.
         if let settings = settings {
-            for (k, v) in settings { body[k] = v }
+            let protectedKeys: Set<String> = ["identity", "displayName", "roomType"]
+            for (k, v) in settings {
+                if protectedKeys.contains(k) {
+                    interLogError(InterLog.networking,
+                                  "Token: createRoom ignoring settings key '%{public}@' — conflicts with a protected request parameter",
+                                  k)
+                } else {
+                    body[k] = v
+                }
+            }
         }
 
         interLogInfo(InterLog.networking, "Token: creating room (identity=%{private}@)", identity)
@@ -973,11 +987,15 @@ private struct TokenCacheEntry {
     ///
     /// Calls `POST /room/join` on the token server.
     /// Returns `InterNetworkErrorCode.roomCodeInvalid` (404) or `.roomCodeExpired` (410)
-    /// for bad room codes.
+    /// for bad room codes. Returns `.passwordRequired` (1011) if the room is password-protected
+    /// and no password (or the wrong password) was supplied.
+    /// - Parameter password: Optional meeting password. Pass an empty string if the room is not
+    ///   password-protected. The server compares via bcrypt — never stored in plain text after compare.
     @objc public func joinRoom(serverURL: String,
                                roomCode: String,
                                identity: String,
                                displayName: String,
+                               password: String = "",
                                completion: @escaping (InterJoinRoomResponse?, NSError?) -> Void) {
         // Check cache first
         if let cached = cachedToken(forRoom: roomCode, identity: identity) {
@@ -986,11 +1004,15 @@ private struct TokenCacheEntry {
             // For simplicity, always fetch from server on join (cache is mainly for refresh).
         }
 
-        let body: [String: Any] = [
+        var body: [String: Any] = [
             "roomCode": roomCode,
             "identity": identity,
             "displayName": displayName
         ]
+        // Include password only when provided — avoids leaking empty strings to the server.
+        if !password.isEmpty {
+            body["password"] = password
+        }
 
         interLogInfo(InterLog.networking, "Token: joining room (code=***, identity=%{private}@)", identity)
 
@@ -1062,6 +1084,7 @@ private struct TokenCacheEntry {
                 let sharingPermissions  = json["sharingPermissions"] as? String ?? "hostOnly"
                 let autoRecord          = json["autoRecord"] as? Bool ?? false
                 let autoTranscript      = json["autoTranscript"] as? Bool ?? false
+                let shareConflictPolicy = json["shareConflictPolicy"] as? String ?? "oneattime"
 
                 let response = InterJoinRoomResponse(
                     roomName: roomName,
@@ -1076,7 +1099,8 @@ private struct TokenCacheEntry {
                     chatPermissions: chatPermissions,
                     sharingPermissions: sharingPermissions,
                     autoRecord: autoRecord,
-                    autoTranscript: autoTranscript
+                    autoTranscript: autoTranscript,
+                    shareConflictPolicy: shareConflictPolicy
                 )
                 interLogInfo(InterLog.networking, "Token: room joined (code=***, type=%{public}@)", responseRoomType)
                 self?.completeOnMain { completion(response, nil) }

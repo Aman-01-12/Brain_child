@@ -109,9 +109,21 @@ import LiveKit
     ///   - captureSession: The existing AVCaptureSession from InterLocalMediaController.
     ///   - sessionQueue: The serial queue protecting the capture session.
     ///   - completion: Called on main queue with optional error.
+    /// Publish the camera track (not muted). ObjC-facing convenience.
     @objc public func publishCamera(
         captureSession: AVCaptureSession,
         sessionQueue: DispatchQueue,
+        completion: ((NSError?) -> Void)? = nil
+    ) {
+        publishCamera(captureSession: captureSession, sessionQueue: sessionQueue,
+                      startMuted: false, completion: completion)
+    }
+
+    /// Publish the camera track with optional pre-mute (used for cameraOffOnJoin).
+    @objc public func publishCamera(
+        captureSession: AVCaptureSession,
+        sessionQueue: DispatchQueue,
+        startMuted: Bool,
         completion: ((NSError?) -> Void)? = nil
     ) {
         guard let participant = localParticipant else {
@@ -121,10 +133,18 @@ import LiveKit
             return
         }
 
-        interLogInfo(InterLog.media, "Publisher: publishing camera")
+        interLogInfo(InterLog.media, "Publisher: publishing camera (startMuted=%{public}@)",
+                     startMuted ? "YES" : "NO")
 
         // Create and start camera source on the session queue
         let source = InterLiveKitCameraSource()
+        // Pre-mute before start() so no frames escape while the track is being published.
+        // The caller is responsible for calling muteCameraTrack + disabling the device
+        // after the publish completion fires. This prevents the ~100ms flash window
+        // that would otherwise occur between publish-completion and muteCameraTrack.
+        if startMuted {
+            source.preMute()
+        }
         self.cameraSource = source
 
         sessionQueue.async {
@@ -146,6 +166,13 @@ import LiveKit
 
             Task {
                 do {
+                    // When startMuted, mute the track BEFORE publishing so the SFU
+                    // signals isMuted=true to all subscribers from the very first moment.
+                    // Doing this after publish causes a race window where subscribers
+                    // briefly see isMuted=false and can incorrectly compute camOn=true.
+                    if startMuted {
+                        try? await track.mute()
+                    }
                     let pub = try await participant.publish(videoTrack: track, options: options)
                     self.cameraPublication = pub
                     self.cameraNetworkState = .active
@@ -486,10 +513,27 @@ import LiveKit
         let group = DispatchGroup()
 
         // Camera
-        if cameraPublication != nil, let session = captureSession, let queue = sessionQueue {
-            group.enter()
-            unpublishCamera(captureSession: session, sessionQueue: queue) {
-                group.leave()
+        if cameraPublication != nil {
+            if let session = captureSession, let queue = sessionQueue {
+                group.enter()
+                unpublishCamera(captureSession: session, sessionQueue: queue) {
+                    group.leave()
+                }
+            } else {
+                // Full teardown with no capture session (room disconnect path). The
+                // published track dies with the room, so we only need to DROP our stale
+                // references. Leaving cameraSource/cameraPublication set is a cross-session
+                // state leak: on the next join the camera-toggle ENABLE path sees
+                // `cameraSource != nil` and tries to unmute the dead old-room track instead
+                // of publishing fresh — so nothing is published into the new room and remote
+                // peers never receive a camera publication (the "host can't see the rejoined
+                // participant" bug). Fire-and-forget the unpublish for tidiness, then clear.
+                if let pub = cameraPublication, let participant = localParticipant {
+                    Task { try? await participant.unpublish(publication: pub) }
+                }
+                cameraPublication = nil
+                cameraSource = nil
+                cameraNetworkState = .active
             }
         }
 

@@ -67,6 +67,17 @@ static void *InterWiringParticipantCountContext = &InterWiringParticipantCountCo
 @property (nonatomic, assign, readwrite) BOOL micUnlockApproved;
 @property (nonatomic, assign) BOOL micWasUnmutedWhileApproved;
 @property (nonatomic, strong, nullable) NSTimer *micUnlockRequestTimer;
+/// Synchronous desired camera on/off intent for twoPhaseToggleCamera. Flipped
+/// immediately on each user click so rapid toggles are interpreted from a stable
+/// value rather than the async-lagging media.isCameraEnabled (which only updates
+/// after the AVCaptureSession reconfiguration completes). Re-seeded from the actual
+/// device state whenever no transition is in flight, so external changes (host
+/// moderation, join defaults) cannot desync it.
+@property (nonatomic, assign) BOOL cameraDesiredOn;
+/// YES while a camera enable/disable transition is running. A click during this
+/// window only updates cameraDesiredOn; the in-flight transition reconciles to the
+/// latest intent on completion, so overlapping transitions can never race.
+@property (nonatomic, assign) BOOL cameraTransitionInFlight;
 @end
 
 @implementation InterMediaWiringController
@@ -123,14 +134,19 @@ static void *InterWiringParticipantCountContext = &InterWiringParticipantCountCo
 #pragma mark - Simple Device Toggles
 
 - (void)toggleCamera {
+    [self toggleCameraWithCompletion:nil];
+}
+
+- (void)toggleCameraWithCompletion:(void (^ _Nullable)(void))completion {
     InterLocalMediaController *media = self.mediaController;
-    if (!media) return;
+    if (!media) { if (completion) completion(); return; }
 
     BOOL shouldEnable = !media.isCameraEnabled;
     __weak typeof(self) weakSelf = self;
     [media setCameraEnabled:shouldEnable completion:^(BOOL success) {
         if (!success) {
             [weakSelf.controlPanel setMediaStatusText:@"Unable to change camera state."];
+            if (completion) completion();
             return;
         }
         [weakSelf.controlPanel setCameraEnabled:weakSelf.mediaController.isCameraEnabled];
@@ -151,6 +167,8 @@ static void *InterWiringParticipantCountContext = &InterWiringParticipantCountCo
         // Push local camera state to roster so snapshot reflects it.
         BOOL cameraOn = weakSelf.mediaController.isCameraEnabled;
         [weakSelf.roomController.subscriber.roster setLocalCameraOn:cameraOn];
+
+        if (completion) completion();
     }];
 }
 
@@ -182,66 +200,115 @@ static void *InterWiringParticipantCountContext = &InterWiringParticipantCountCo
     // Safety net: if camera is locked by host (per-participant or global) AND the
     // participant has not been individually approved via the unlock-request flow, ignore.
     if ((self.isHostCameraLocked || self.globalCameraLockActive) && !self.cameraUnlockApproved) { return; }
-    InterLocalMediaController *media = self.mediaController;
-    InterRoomController *rc = self.roomController;
-    BOOL shouldEnable = !media.isCameraEnabled;
-    BOOL isConnected = rc && rc.connectionState == InterRoomConnectionStateConnected;
+
+    // Derive the new desired state from a SYNCHRONOUS intent flag, not from the
+    // async-lagging media.isCameraEnabled. When no transition is in flight the state
+    // is settled, so we re-seed the intent from the actual device state first — this
+    // keeps us in sync with external changes (host moderation, join defaults). When a
+    // transition IS in flight, we keep the pending intent and just flip it, so a rapid
+    // off→on (or on→off) is interpreted correctly even though the device hasn't caught
+    // up yet. Without this, an immediate on-after-off reads a stale isCameraEnabled and
+    // is misread as another disable — the "toggle does nothing until I wait" bug.
+    if (!self.cameraTransitionInFlight) {
+        self.cameraDesiredOn = self.mediaController.isCameraEnabled;
+    }
+    self.cameraDesiredOn = !self.cameraDesiredOn;
 
     // Track that the camera was turned on during an approved-unlock window so
     // deriveCameraButton's revoke branch can distinguish "still off at approval
     // time" from "participant voluntarily turned it back off".
-    if (shouldEnable && self.cameraUnlockApproved) {
+    if (self.cameraDesiredOn && self.cameraUnlockApproved) {
         self.cameraWasEnabledWhileApproved = YES;
     }
 
+    // If a transition is already running, it will reconcile to the latest desired
+    // state when it completes (see finishCameraTransition). Don't start a second,
+    // overlapping transition — that is what races the mute/unmute state machine.
+    if (self.cameraTransitionInFlight) { return; }
+
+    [self driveCameraToDesiredState];
+}
+
+/// Drive the actual capture device + LiveKit track to match cameraDesiredOn.
+/// Serialized via cameraTransitionInFlight so transitions never overlap.
+- (void)driveCameraToDesiredState {
+    InterLocalMediaController *media = self.mediaController;
+    InterRoomController *rc = self.roomController;
+
+    BOOL desired = self.cameraDesiredOn;
+
+    // Device already matches the desired state — nothing to do.
+    if (desired == media.isCameraEnabled) {
+        self.cameraTransitionInFlight = NO;
+        return;
+    }
+
+    self.cameraTransitionInFlight = YES;
+    BOOL isConnected = rc && rc.connectionState == InterRoomConnectionStateConnected;
     __weak typeof(self) weakSelf = self;
 
-    if (!shouldEnable) {
+    if (!desired) {
         // DISABLE: [G2] Mute LiveKit track FIRST → then stop capture device.
         //
         // [R6] Guard against nil cameraSource: if the camera was never published
         // (e.g. activeCameraOffOnJoin was YES and wireNetworkPublish skipped it),
         // muteCameraTrackWithCompletion: is a nil-safe no-op whose completion block
-        // is never called. Fall back to a direct toggleCamera so the button and
+        // is never called. Fall back to a direct toggle so the button and
         // isCameraEnabled always reflect reality.
         if (isConnected && rc.publisher.cameraSource != nil) {
             [rc.publisher muteCameraTrackWithCompletion:^{
-                [weakSelf toggleCamera];
+                [weakSelf toggleCameraWithCompletion:^{
+                    [weakSelf finishCameraTransition];
+                }];
             }];
         } else {
-            // No published camera source — disable the local device directly.
-            [self toggleCamera];
+            [self toggleCameraWithCompletion:^{
+                [weakSelf finishCameraTransition];
+            }];
         }
     } else {
         // ENABLE: [G2] Start capture device FIRST → first frame → unmute LiveKit track.
-        //
-        // [R6] If no camera track has been published yet (cameraSource is nil), we cannot
-        // just unmute — there is nothing to unmute. Publish fresh so the remote side gets
-        // video. Both toggleCamera and publishCamera dispatch onto the same serial
-        // sessionQueue, so publishCamera's source.start() runs after the device input is
-        // already added, guaranteeing correct ordering without additional synchronisation.
-        [self toggleCamera];
-        if (isConnected) {
-            if (rc.publisher.cameraSource != nil) {
-                // Track exists but is muted — first real frame will auto-unmute via the
-                // cameraSource state machine (beginEnable → captureOutput → unmute).
-                [rc.publisher unmuteCameraTrack];
-            } else {
-                // No track yet — publish from scratch using the existing capture session.
-                AVCaptureSession *session = media.captureSession;
-                dispatch_queue_t sessionQueue = media.sessionQueue;
-                if (session && sessionQueue) {
-                    [rc.publisher publishCameraWithCaptureSession:session
-                                                    sessionQueue:sessionQueue
-                                                      completion:^(NSError * _Nullable error) {
-                        if (error) {
-                            NSLog(@"[R6] Camera re-publish on enable failed: %@",
-                                  error.localizedDescription);
-                        }
-                    }];
+        // Unmute/publish is armed in the device-on completion so the device is already
+        // producing (or about to produce) frames — serialization guarantees the source
+        // is in a settled .muted/.active state here, never mid-transition.
+        [self toggleCameraWithCompletion:^{
+            __strong typeof(weakSelf) strongSelf = weakSelf;
+            if (!strongSelf) { return; }
+            if (isConnected) {
+                if (rc.publisher.cameraSource != nil) {
+                    // Track exists but is muted — first real frame will auto-unmute via the
+                    // cameraSource state machine (beginEnable → captureOutput → unmute).
+                    NSLog(@"[CB] TOGGLE-CAM-ENABLE path=unmute (cameraSource present)");
+                    [rc.publisher unmuteCameraTrack];
+                } else {
+                    // No track yet — publish from scratch using the existing capture session.
+                    NSLog(@"[CB] TOGGLE-CAM-ENABLE path=publish-fresh (cameraSource nil)");
+                    AVCaptureSession *session = media.captureSession;
+                    dispatch_queue_t sessionQueue = media.sessionQueue;
+                    if (session && sessionQueue) {
+                        [rc.publisher publishCameraWithCaptureSession:session
+                                                        sessionQueue:sessionQueue
+                                                          completion:^(NSError * _Nullable error) {
+                            if (error) {
+                                NSLog(@"[R6] Camera re-publish on enable failed: %@",
+                                      error.localizedDescription);
+                            }
+                        }];
+                    }
                 }
             }
-        }
+            [strongSelf finishCameraTransition];
+        }];
+    }
+}
+
+/// Called when a camera transition's device change has completed. Clears the
+/// in-flight flag and reconciles against the latest desired intent — so any clicks
+/// that landed during the transition are honoured, converging on the user's last choice.
+- (void)finishCameraTransition {
+    self.cameraTransitionInFlight = NO;
+    if (self.cameraDesiredOn != self.mediaController.isCameraEnabled) {
+        [self driveCameraToDesiredState];
     }
 }
 
@@ -723,8 +790,21 @@ static void *InterWiringParticipantCountContext = &InterWiringParticipantCountCo
         return;
     }
 
-    // Publish camera
-    if (media.isCameraEnabled) {
+    // Publish camera — PUBLISH-ON-DEMAND.
+    // When cameraOffOnJoin is set (isCameraEnabled == NO), we do NOT publish a camera
+    // track at join. A muted, frame-less BufferCapturer track does not reliably establish
+    // a downstream on the SFU, so remote peers never receive `didSubscribeTrack` for it
+    // and stay stuck on the avatar forever. Presence/avatar comes from the participant
+    // roster (participantJoined), which is independent of any camera track — so the
+    // remote side still shows the avatar with no published camera.
+    //
+    // The camera track is published fresh the first time the user turns the camera on
+    // (twoPhaseToggleCamera's ENABLE path: cameraSource == nil → publishCamera). One
+    // standard renegotiation happens at that point. Every subsequent toggle is a plain
+    // mute/unmute on the already-negotiated track (no further renegotiation), because
+    // the DISABLE path mutes instead of unpublishing.
+    BOOL cameraEnabledAtJoin = media.isCameraEnabled;
+    if (cameraEnabledAtJoin) {
         [rc.publisher publishCameraWithCaptureSession:session
                                          sessionQueue:sessionQueue
                                            completion:^(NSError * _Nullable error) {

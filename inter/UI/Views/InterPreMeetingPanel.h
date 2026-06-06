@@ -19,6 +19,16 @@ extern NSString *const InterSharingPermissionsEveryone;
 extern NSString *const InterSharingPermissionsRequest;
 
 // ---------------------------------------------------------------------------
+// MARK: - Share-conflict policy constants
+// ---------------------------------------------------------------------------
+/// Nobody can start a new share until the current sharer stops (default).
+extern NSString *const InterSharingConflictOneAtATime;
+/// Only the host / co-host can preempt the current sharer.
+extern NSString *const InterSharingConflictHostCanPreempt;
+/// Any participant with share permission can preempt the current sharer.
+extern NSString *const InterSharingConflictAnyCanPreempt;
+
+// ---------------------------------------------------------------------------
 // MARK: - InterPreMeetingSettings
 // ---------------------------------------------------------------------------
 
@@ -44,10 +54,15 @@ extern NSString *const InterSharingPermissionsRequest;
 @property (nonatomic, copy)   NSString *chatPermissions;
 /// Screen sharing availability: one of the InterSharingPermissions* constants.
 @property (nonatomic, copy)   NSString *sharingPermissions;
+/// Share-conflict policy: one of the InterSharingConflict* constants.
+/// Controls what happens when a participant tries to share while someone else is sharing.
+@property (nonatomic, copy)   NSString *shareConflictPolicy;
 /// Auto-start cloud recording when host joins (pro+ only).
 @property (nonatomic, assign) BOOL autoRecord;
 /// Auto-start AI transcription when host joins (pro+ only).
 @property (nonatomic, assign) BOOL autoTranscript;
+/// Allow co-hosts to record locally to their own machine (disabled by default; pro-gated; host controls).
+@property (nonatomic, assign) BOOL allowCoHostLocalRecording;
 
 /// Returns default settings pre-filled from UserDefaults.
 + (instancetype)settingsWithDefaults;

@@ -350,7 +350,8 @@ typedef NS_ENUM(NSUInteger, InterPollViewMode) {
     self.viewMode = mode;
     switch (mode) {
         case InterPollViewModeCreate:
-            self.createScrollView.hidden = NO;
+            // Only hosts and co-hosts may create polls. Participants see a placeholder instead.
+            self.createScrollView.hidden = !self.isHost;
             self.resultsScrollView.hidden = YES;
             break;
         case InterPollViewModeActive:

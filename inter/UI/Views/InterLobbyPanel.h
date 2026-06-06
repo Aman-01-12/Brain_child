@@ -38,6 +38,10 @@ NS_ASSUME_NONNULL_BEGIN
 /// Whether the lobby toggle is enabled.
 @property (nonatomic, assign) BOOL lobbyEnabled;
 
+/// Enable or disable the lobby on/off checkbox.
+/// Pass NO for co-hosts: they can admit/deny participants but cannot toggle the waiting room.
+- (void)setLobbyToggleEnabled:(BOOL)enabled;
+
 @end
 
 NS_ASSUME_NONNULL_END

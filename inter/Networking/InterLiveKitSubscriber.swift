@@ -134,6 +134,45 @@ import LiveKit
 
     // MARK: - Attach / Detach
 
+    /// Re-seed the ROSTER (single source of truth) with every participant currently in
+    /// the room. Call once after the room has connected.
+    ///
+    /// **Why this is required:** `attach(to:)` runs BEFORE `room.connect()`, when
+    /// `room.remoteParticipants` is still empty — so it seeds nothing. And LiveKit does
+    /// NOT fire `participantDidConnect` for participants who were already in the room when
+    /// we joined. Without this post-connect reseed, the roster never learns about
+    /// pre-existing **camera-off** participants (e.g. a host who joined first with camera
+    /// off): they publish no track, so `didSubscribeTrack` never fires for them either.
+    /// The snapshot would then omit them and the reconciler would remove their tiles —
+    /// the "missing host tile until they turn their camera on" bug. Camera-ON participants
+    /// were unaffected because `didSubscribeTrack` (autoSubscribe) seeds the roster for them.
+    ///
+    /// Idempotent: the roster's mutators no-op when a participant is already present, so
+    /// this is safe to call alongside `attach`/`participantDidConnect` seeding.
+    @objc public func reseedPresence() {
+        guard let room = room else { return }
+        for p in room.remoteParticipants.values {
+            guard let id = p.identity?.stringValue, !id.isEmpty else { continue }
+            let name = p.name?.isEmpty == false ? p.name! : id
+            roster.participantJoined(id, displayName: name)
+            for (_, pub) in p.trackPublications {
+                switch pub.source {
+                case .camera:
+                    roster.cameraSubscribed(id)
+                    roster.cameraMuted(id, muted: pub.isMuted)
+                case .microphone:
+                    roster.micMuted(id, muted: pub.isMuted)
+                case .screenShareVideo:
+                    roster.screenSharing(id, sharing: true)
+                default:
+                    break
+                }
+            }
+        }
+        interLogInfo(InterLog.media, "Subscriber: reseedPresence seeded roster for %lu participants",
+                     UInt(room.remoteParticipants.count))
+    }
+
     /// Register as a delegate on the room to receive track subscription events.
     @objc public func attach(to room: Room) {
         self.room = room
@@ -279,6 +318,61 @@ import LiveKit
     }
 }
 
+// MARK: - Subscription Health Check
+
+extension InterLiveKitSubscriber {
+    /// Poll every 3 s for up to 30 s (10 attempts) for a participant whose
+    /// camera subscription was silently dropped by a VideoToolbox decoder
+    /// failure (kVTVideoDecoderNotAvailableNowErr / -12900). Stops as soon
+    /// as a renderer arrives. On each tick, if a camera publication exists
+    /// but no renderer does, force off→on to trigger a fresh decoder init.
+    func scheduleSubscriptionCheck(pid: String, attempt: Int) {
+        guard attempt < 10 else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) { [weak self] in
+            guard let self, let room = self.room else { return }
+            // Renderer arrived between schedule and fire — we're done.
+            guard self.cameraRenderers[pid] == nil else { return }
+            // Participant left — stop checking.
+            guard room.remoteParticipants.values.contains(where: { $0.identity?.stringValue == pid }) else { return }
+
+            for (_, p) in room.remoteParticipants {
+                guard p.identity?.stringValue == pid else { continue }
+                var foundCamPub = false
+                for (_, pub) in p.trackPublications {
+                    guard pub.source == .camera, let rp = pub as? RemoteTrackPublication else { continue }
+                    foundCamPub = true
+                    // A renderer may have just been created by didSubscribeTrack (which
+                    // runs on LiveKit's delegate thread) since the guard above. Re-check
+                    // and bail so we never tear down a subscription that just succeeded.
+                    if self.cameraRenderers[pid] != nil { break }
+                    let subscribed = rp.isSubscribed
+                    // Only force off→on when the publication is genuinely NOT subscribed
+                    // (normal rejoin recovery), OR it claims subscribed but produced no
+                    // renderer after a few ticks (a VideoToolbox decoder stall). Toggling
+                    // a freshly-subscribed publication on the first tick can cancel an
+                    // in-flight didSubscribeTrack and leave the host stuck on the avatar.
+                    if !subscribed || attempt >= 2 {
+                        print("[CB] RESUBSCRIBE-TOGGLE …\(pid.suffix(5)) attempt=\(attempt + 1) isSubscribed=\(subscribed ? 1 : 0)")
+                        Task {
+                            try? await rp.set(subscribed: false)
+                            try? await rp.set(subscribed: true)
+                        }
+                    } else {
+                        print("[CB] RESUBSCRIBE-DEFER …\(pid.suffix(5)) attempt=\(attempt + 1) isSubscribed=1 — waiting for didSubscribeTrack")
+                    }
+                }
+                if !foundCamPub {
+                    print("[CB] RESUBSCRIBE-WAIT …\(pid.suffix(5)) attempt=\(attempt + 1) — no cam publication yet")
+                }
+                break
+            }
+            // Schedule the next check regardless: even after a toggle attempt
+            // the renderer may not appear immediately.
+            self.scheduleSubscriptionCheck(pid: pid, attempt: attempt + 1)
+        }
+    }
+}
+
 // MARK: - RoomDelegate
 
 extension InterLiveKitSubscriber: RoomDelegate {
@@ -294,6 +388,16 @@ extension InterLiveKitSubscriber: RoomDelegate {
             self.trackRenderer?.remoteParticipantDidJoin?(pid, displayName: name)
             self.roster.participantJoined(pid, displayName: name)
         }
+
+        // Retry guard: kVTVideoDecoderNotAvailableNowErr (-12900) is a transient
+        // VideoToolbox failure that occurs under memory pressure when the previous
+        // participant's GPU/decoder sessions haven't fully released. When it hits,
+        // LiveKit silently fails to subscribe and never calls didSubscribeTrack.
+        // We can't rely on a single delayed check because the participant may not
+        // have published their camera yet (e.g. cameraOffOnJoin). Instead, poll
+        // every 3 s for up to 30 s: whenever a camera publication exists but no
+        // renderer does, toggle off→on to force a fresh decoder init attempt.
+        self.scheduleSubscriptionCheck(pid: pid, attempt: 0)
     }
 
     /// A remote participant disconnected. Presence-driven: forward so the UI removes the
@@ -323,6 +427,8 @@ extension InterLiveKitSubscriber: RoomDelegate {
         guard let track = publication.track else {
             interLogError(InterLog.media, "Subscriber: didSubscribe but track is nil (sid=%{public}@)",
                           publication.sid.stringValue)
+            let pid = participant.identity?.stringValue ?? "?"
+            print("[CB] SUBSCRIBED-NIL-TRACK …\(pid.suffix(5)) source=\(publication.source.rawValue)")
             return
         }
 
@@ -345,6 +451,7 @@ extension InterLiveKitSubscriber: RoomDelegate {
             case .camera:
                 // Clean up previous renderer for this participant if any
                 cleanUpTrack(source: .camera, participantId: participantId)
+                print("[CB] SUBSCRIBED-CAM …\(participantId.suffix(5)) isMuted=\(publication.isMuted ? 1 : 0)")
 
                 let renderer = RemoteFrameRenderer(kind: .camera) { [weak self] pixelBuffer, format in
                     if self?.detectedCameraFormat == 0 {

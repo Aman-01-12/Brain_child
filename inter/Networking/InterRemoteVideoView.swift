@@ -121,6 +121,18 @@ enum DetectedFormat {
     public override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         commonInit()
+        // Eagerly prime drawableSize so the first display-link callback has a valid
+        // render target. AppKit calls layout() lazily (in the next display cycle), so
+        // without this the CAMetalLayer defaults to drawableSize=(0,0), causing
+        // nextDrawable() to return nil and rendering black until layout fires.
+        if !frameRect.isEmpty {
+            let scale = NSScreen.main?.backingScaleFactor ?? 2.0
+            metalLayer?.frame = CGRect(origin: .zero, size: frameRect.size)
+            metalLayer?.drawableSize = CGSize(
+                width: frameRect.width * scale,
+                height: frameRect.height * scale
+            )
+        }
     }
 
     required init?(coder: NSCoder) {

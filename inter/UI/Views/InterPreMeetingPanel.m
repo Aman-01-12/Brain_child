@@ -12,6 +12,10 @@ NSString *const InterSharingPermissionsHostOnly = @"hostOnly";
 NSString *const InterSharingPermissionsEveryone = @"everyone";
 NSString *const InterSharingPermissionsRequest  = @"request";
 
+NSString *const InterSharingConflictOneAtATime    = @"oneattime";
+NSString *const InterSharingConflictHostCanPreempt = @"hostCanPreempt";
+NSString *const InterSharingConflictAnyCanPreempt  = @"anyCanPreempt";
+
 // ---------------------------------------------------------------------------
 // MARK: - UserDefaults keys
 // ---------------------------------------------------------------------------
@@ -23,8 +27,10 @@ static NSString *const kUDJoinBeforeHost       = @"InterPreMeeting_JoinBeforeHos
 static NSString *const kUDAllowUnmuting        = @"InterPreMeeting_AllowUnmuting";
 static NSString *const kUDChatPermissions      = @"InterPreMeeting_ChatPermissions";
 static NSString *const kUDSharingPermissions   = @"InterPreMeeting_SharingPermissions";
+static NSString *const kUDShareConflictPolicy  = @"InterPreMeeting_ShareConflictPolicy";
 static NSString *const kUDAutoRecord           = @"InterPreMeeting_AutoRecord";
 static NSString *const kUDAutoTranscript       = @"InterPreMeeting_AutoTranscript";
+static NSString *const kUDAllowCoHostLocalRecording = @"InterPreMeeting_AllowCoHostLocalRecording";
 
 // ---------------------------------------------------------------------------
 // MARK: - InterPreMeetingSettings
@@ -47,8 +53,10 @@ static NSString *const kUDAutoTranscript       = @"InterPreMeeting_AutoTranscrip
                              ? YES : [ud boolForKey:kUDAllowUnmuting];
     s.chatPermissions      = [ud stringForKey:kUDChatPermissions] ?: InterChatPermissionsEveryone;
     s.sharingPermissions   = [ud stringForKey:kUDSharingPermissions] ?: InterSharingPermissionsHostOnly;
+    s.shareConflictPolicy  = [ud stringForKey:kUDShareConflictPolicy] ?: InterSharingConflictOneAtATime;
     s.autoRecord           = [ud boolForKey:kUDAutoRecord];
     s.autoTranscript       = [ud boolForKey:kUDAutoTranscript];
+    s.allowCoHostLocalRecording = [ud boolForKey:kUDAllowCoHostLocalRecording];
     return s;
 }
 
@@ -61,8 +69,10 @@ static NSString *const kUDAutoTranscript       = @"InterPreMeeting_AutoTranscrip
     [ud setBool:self.allowUnmuting      forKey:kUDAllowUnmuting];
     [ud setObject:self.chatPermissions      forKey:kUDChatPermissions];
     [ud setObject:self.sharingPermissions   forKey:kUDSharingPermissions];
+    [ud setObject:self.shareConflictPolicy  forKey:kUDShareConflictPolicy];
     [ud setBool:self.autoRecord         forKey:kUDAutoRecord];
     [ud setBool:self.autoTranscript     forKey:kUDAutoTranscript];
+    [ud setBool:self.allowCoHostLocalRecording forKey:kUDAllowCoHostLocalRecording];
     [ud synchronize];
 }
 
@@ -77,8 +87,10 @@ static NSString *const kUDAutoTranscript       = @"InterPreMeeting_AutoTranscrip
     c.allowUnmuting        = self.allowUnmuting;
     c.chatPermissions      = [self.chatPermissions copy];
     c.sharingPermissions   = [self.sharingPermissions copy];
+    c.shareConflictPolicy  = [self.shareConflictPolicy copy];
     c.autoRecord           = self.autoRecord;
     c.autoTranscript       = self.autoTranscript;
+    c.allowCoHostLocalRecording = self.allowCoHostLocalRecording;
     return c;
 }
 
@@ -89,7 +101,7 @@ static NSString *const kUDAutoTranscript       = @"InterPreMeeting_AutoTranscrip
 // ---------------------------------------------------------------------------
 
 /// Height of the scrollable content.
-static const CGFloat kContentH = 720.0;
+static const CGFloat kContentH = 756.0;
 static const CGFloat kPanelW   = 440.0;
 
 /// Horizontal margins and column positions.
@@ -126,10 +138,12 @@ static const CGFloat kControlW   = 140.0; // width of popup/button controls
     // Chat & Sharing
     NSPopUpButton *_chatPermissionsPopup;
     NSPopUpButton *_sharingPermissionsPopup;
+    NSPopUpButton *_shareConflictPopup;
 
     // Pro features
     NSButton     *_autoRecordToggle;
     NSButton     *_autoTranscriptToggle;
+    NSButton     *_allowCoHostLocalRecordingToggle;
     NSTextField  *_proNoteLabel;
 
     // Bottom buttons
@@ -230,6 +244,8 @@ static const CGFloat kControlW   = 140.0; // width of popup/button controls
     y += 32.0;
     _autoRecordToggle = [self _addToggleRowWithLabel:@"Auto-Record to Cloud" y:y inView:_contentView];
     y += 32.0;
+    _allowCoHostLocalRecordingToggle = [self _addToggleRowWithLabel:@"Allow Co-Host Local Recording" y:y inView:_contentView];
+    y += 32.0;
 
     // Pro badge / note
     _proNoteLabel = [self _makeLabel:@"✦ Requires Pro or Pro+ subscription"
@@ -244,6 +260,11 @@ static const CGFloat kControlW   = 140.0; // width of popup/button controls
 
     // ---- CHAT & SHARING section ----
     y = [self _addSeparatorAt:y inView:_contentView];
+    _shareConflictPopup = [self _addPopupRowWithLabel:@"Share Takeover"
+                                              options:@[@"One at a Time", @"Host Can Take Over", @"Anyone Can Take Over"]
+                                                    y:y
+                                               inView:_contentView];
+    y += 36.0;
     _sharingPermissionsPopup = [self _addPopupRowWithLabel:@"Screen Sharing"
                                                   options:@[@"Host Only", @"Everyone", @"Request to Share"]
                                                         y:y
@@ -457,12 +478,14 @@ static const CGFloat kControlW   = 140.0; // width of popup/button controls
 - (void)_refreshProGating {
     _autoRecordToggle.enabled   = _isPro;
     _autoTranscriptToggle.enabled = _isPro;
+    _allowCoHostLocalRecordingToggle.enabled = _isPro;
     _proNoteLabel.hidden = _isPro;
 
     // Reset pro toggles when user is not pro so they can't be activated
     if (!_isPro) {
         _autoRecordToggle.state    = NSControlStateValueOff;
         _autoTranscriptToggle.state = NSControlStateValueOff;
+        _allowCoHostLocalRecordingToggle.state = NSControlStateValueOff;
     }
 }
 
@@ -479,6 +502,7 @@ static const CGFloat kControlW   = 140.0; // width of popup/button controls
     _allowUnmutingToggle.state    = s.allowUnmuting     ? NSControlStateValueOn : NSControlStateValueOff;
     _autoRecordToggle.state       = s.autoRecord        ? NSControlStateValueOn : NSControlStateValueOff;
     _autoTranscriptToggle.state   = s.autoTranscript    ? NSControlStateValueOn : NSControlStateValueOff;
+    _allowCoHostLocalRecordingToggle.state = s.allowCoHostLocalRecording ? NSControlStateValueOn : NSControlStateValueOff;
 
     // Chat permissions popup
     NSDictionary<NSString *, NSString *> *chatTitles = @{
@@ -498,9 +522,19 @@ static const CGFloat kControlW   = 140.0; // width of popup/button controls
     NSString *shareTitle = shareTitles[s.sharingPermissions] ?: @"Host Only";
     [_sharingPermissionsPopup selectItemWithTitle:shareTitle];
 
+    // Share-conflict policy popup
+    NSDictionary<NSString *, NSString *> *conflictTitles = @{
+        InterSharingConflictOneAtATime:    @"One at a Time",
+        InterSharingConflictHostCanPreempt: @"Host Can Take Over",
+        InterSharingConflictAnyCanPreempt:  @"Anyone Can Take Over"
+    };
+    NSString *conflictTitle = conflictTitles[s.shareConflictPolicy] ?: @"One at a Time";
+    [_shareConflictPopup selectItemWithTitle:conflictTitle];
+
     // Disable pro toggles initially (until setUserTier: is called)
     _autoRecordToggle.enabled   = NO;
     _autoTranscriptToggle.enabled = NO;
+    _allowCoHostLocalRecordingToggle.enabled = NO;
 }
 
 // ---------------------------------------------------------------------------
@@ -540,6 +574,7 @@ static const CGFloat kControlW   = 140.0; // width of popup/button controls
     s.allowUnmuting      = (_allowUnmutingToggle.state == NSControlStateValueOn);
     s.autoRecord         = (_autoRecordToggle.state == NSControlStateValueOn) && _isPro;
     s.autoTranscript     = (_autoTranscriptToggle.state == NSControlStateValueOn) && _isPro;
+    s.allowCoHostLocalRecording = (_allowCoHostLocalRecordingToggle.state == NSControlStateValueOn) && _isPro;
 
     // Password — only include when toggle is on and field has content
     if (_passwordToggle.state == NSControlStateValueOn &&
@@ -568,6 +603,16 @@ static const CGFloat kControlW   = 140.0; // width of popup/button controls
     NSInteger shareIdx = _sharingPermissionsPopup.indexOfSelectedItem;
     s.sharingPermissions = (shareIdx >= 0 && shareIdx < (NSInteger)shareKeys.count)
         ? shareKeys[shareIdx] : InterSharingPermissionsHostOnly;
+
+    // Share-conflict policy
+    NSArray<NSString *> *conflictKeys = @[
+        InterSharingConflictOneAtATime,
+        InterSharingConflictHostCanPreempt,
+        InterSharingConflictAnyCanPreempt
+    ];
+    NSInteger conflictIdx = _shareConflictPopup.indexOfSelectedItem;
+    s.shareConflictPolicy = (conflictIdx >= 0 && conflictIdx < (NSInteger)conflictKeys.count)
+        ? conflictKeys[conflictIdx] : InterSharingConflictOneAtATime;
 
     return s;
 }
