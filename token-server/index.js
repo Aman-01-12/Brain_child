@@ -2037,10 +2037,16 @@ async function getParticipantRole(code, identity) {
 /// Validate that the caller has moderator privileges. Returns { valid, role, error }.
 /// When userId is provided, also cross-checks that callerIdentity is bound to that user,
 /// preventing authenticated participants from impersonating the host via body-supplied identity.
+/// If no binding exists (room created unauthenticated / guest host), the check is skipped and
+/// only the role stored in Redis is used — impersonation is then constrained by knowledge of
+/// the room code and the host's private identity UUID.
 async function validateModerator(code, callerIdentity, userId = null) {
   if (userId != null) {
     const boundUser = await redis.hget(roomUserBindingKey(code), callerIdentity);
-    // If a binding exists and it doesn't match, reject immediately.
+    // Only reject when a binding was written AND it doesn't match — that indicates
+    // an authenticated user claiming a different participant's identity.
+    // When boundUser is null the room was created without auth (guest host); fall
+    // through to the role-only check below rather than blocking the legitimate host.
     if (boundUser !== null && String(boundUser) !== String(userId)) {
       console.warn(`[SECURITY] validateModerator identity mismatch: code=${code} claimed=${callerIdentity} userId=${userId} boundTo=${boundUser}`);
       return { valid: false, role: null, error: 'Identity mismatch: caller does not match authenticated user.' };
@@ -2140,7 +2146,7 @@ async function admitAllFromLobby(code, roomData) {
 // POST /room/create
 // Body: { identity, displayName, roomType?, meetingDisplayName?, muteOnJoin?, cameraOffOnJoin?,
 //         joinBeforeHost?, allowUnmuting?, chatPermissions?, sharingPermissions?,
-//         autoRecord?, autoTranscript?, lobbyEnabled?, password? }
+//         shareConflictPolicy?, autoRecord?, autoTranscript?, lobbyEnabled?, password? }
 // Returns: { roomCode, roomName, token, serverURL, roomType }
 // ---------------------------------------------------------------------------
 app.post('/room/create', requireIdempotencyKey, async (req, res) => {
@@ -2154,6 +2160,7 @@ app.post('/room/create', requireIdempotencyKey, async (req, res) => {
     allowUnmuting,
     chatPermissions: rawChatPermissions,
     sharingPermissions: rawSharingPermissions,
+    shareConflictPolicy: rawShareConflictPolicy,
     autoRecord,
     autoTranscript,
     lobbyEnabled,
@@ -2170,8 +2177,10 @@ app.post('/room/create', requireIdempotencyKey, async (req, res) => {
   // Validate enum fields
   const VALID_CHAT_PERMS    = ['everyone', 'hostOnly', 'disabled'];
   const VALID_SHARE_PERMS   = ['hostOnly', 'everyone', 'request'];
+  const VALID_CONFLICT_POLICY = ['oneattime', 'hostCanPreempt', 'anyCanPreempt'];
   const chatPermissions     = VALID_CHAT_PERMS.includes(rawChatPermissions)     ? rawChatPermissions     : 'everyone';
   const sharingPermissions  = VALID_SHARE_PERMS.includes(rawSharingPermissions) ? rawSharingPermissions  : 'hostOnly';
+  const shareConflictPolicy = VALID_CONFLICT_POLICY.includes(rawShareConflictPolicy) ? rawShareConflictPolicy : 'oneattime';
 
   if (!(await checkRateLimit(identity))) {
     return res.status(429).json({ error: 'Rate limit exceeded. Try again in 1 minute.' });
@@ -2225,6 +2234,7 @@ app.post('/room/create', requireIdempotencyKey, async (req, res) => {
     'allowUnmuting',       allowUnmuting === false ? 'false' : 'true',
     'chatPermissions',     chatPermissions,
     'sharingPermissions',  sharingPermissions,
+    'shareConflictPolicy', shareConflictPolicy,
     'autoRecord',          autoRecord         ? 'true' : 'false',
     'autoTranscript',      autoTranscript     ? 'true' : 'false',
     'lobbyEnabled',        lobbyEnabled       ? 'true' : 'false',
@@ -2462,6 +2472,7 @@ app.post('/room/join', async (req, res) => {
       allowUnmuting:       roomData.allowUnmuting       !== 'false', // default true
       chatPermissions:     roomData.chatPermissions     || 'everyone',
       sharingPermissions:  roomData.sharingPermissions  || 'hostOnly',
+      shareConflictPolicy: roomData.shareConflictPolicy || 'oneattime',
       autoRecord:          roomData.autoRecord          === 'true',
       autoTranscript:      roomData.autoTranscript      === 'true',
     });
@@ -3370,16 +3381,58 @@ app.post('/room/record/start', auth.requireAuth, async (req, res) => {
   }
   const estimatedMinutes = Math.ceil(rawEstimate);
 
-  // Check quota using the room's creation-time tier (same grace period logic)
-  const quotaCheck = await checkRecordingQuota(req.user.userId, roomTier);
-  if (!quotaCheck.allowed) {
-    return res.status(403).json({ error: quotaCheck.reason, quota: quotaCheck });
-  }
-  if (quotaCheck.remainingMinutes < estimatedMinutes) {
-    return res.status(403).json({
-      error: `Estimated duration (${estimatedMinutes}m) exceeds remaining quota (${quotaCheck.remainingMinutes}m)`,
-      quota: quotaCheck,
-    });
+  // Attribute the recording to the host's account.
+  // If a co-host initiated the recording, resolve the host's userId and run
+  // quota checks against the host — so recordings land in the host's library.
+  let recordingUserId = req.user.userId;
+  const isCallerHost = roomData.hostIdentity === callerIdentity;
+  if (!isCallerHost) {
+    // validateModerator above allows 'host', 'co-host', and 'interviewer'.
+    // Only co-hosts may attribute recordings to the host's account.
+    if (validation.role !== 'co-host') {
+      return res.status(403).json({ error: 'Only a co-host may start a recording attributed to the host account.' });
+    }
+    const hostBoundId = await redis.hget(roomUserBindingKey(code), roomData.hostIdentity);
+    if (!hostBoundId) {
+      return res.status(403).json({ error: 'Host has not joined this room yet; recording cannot be started.' });
+    }
+    const hostNumericId = parseInt(hostBoundId, 10);
+    if (!Number.isFinite(hostNumericId) || hostNumericId <= 0) {
+      return res.status(500).json({ error: 'Corrupt host binding in room data.' });
+    }
+    const { rows: hostRows } = await db.query('SELECT tier FROM users WHERE id = $1', [hostNumericId]);
+    if (!hostRows.length) return res.status(403).json({ error: 'Host account not found.' });
+    const hostTierFromDb = hostRows[0].tier || 'free';
+    // Use the room snapshot tier for feature-availability gating (stable, set at room creation).
+    const roomHostTier = roomData.hostTier || 'free';
+    const TIER_LEVELS_CHECK = { free: 0, pro: 1, hiring: 2 };
+    if ((TIER_LEVELS_CHECK[roomHostTier] ?? 0) < (TIER_LEVELS_CHECK['pro'] ?? 0)) {
+      return res.status(403).json({ error: "Host's account does not support cloud recording.", requiredTier: 'pro' });
+    }
+    recordingUserId = hostNumericId;
+    // Use the live DB tier for quota enforcement so downgrades take effect immediately.
+    const hostQuotaCheck = await checkRecordingQuota(recordingUserId, hostTierFromDb);
+    if (!hostQuotaCheck.allowed) {
+      return res.status(403).json({ error: hostQuotaCheck.reason, quota: hostQuotaCheck });
+    }
+    if (hostQuotaCheck.remainingMinutes < estimatedMinutes) {
+      return res.status(403).json({
+        error: `Estimated duration (${estimatedMinutes}m) exceeds host's remaining quota (${hostQuotaCheck.remainingMinutes}m)`,
+        quota: hostQuotaCheck,
+      });
+    }
+  } else {
+    // Caller is the host — use normal quota check
+    const quotaCheck = await checkRecordingQuota(req.user.userId, roomTier);
+    if (!quotaCheck.allowed) {
+      return res.status(403).json({ error: quotaCheck.reason, quota: quotaCheck });
+    }
+    if (quotaCheck.remainingMinutes < estimatedMinutes) {
+      return res.status(403).json({
+        error: `Estimated duration (${estimatedMinutes}m) exceeds remaining quota (${quotaCheck.remainingMinutes}m)`,
+        quota: quotaCheck,
+      });
+    }
   }
 
   // Check for existing active recording in this room (prevent double-start)
@@ -3486,7 +3539,7 @@ app.post('/room/record/start', auth.requireAuth, async (req, res) => {
         `INSERT INTO recording_sessions (user_id, room_name, room_code, egress_id, recording_mode, watermarked, status)
          VALUES ($1, $2, $3, $4, $5, $6, 'active')
          RETURNING id`,
-        [req.user.userId, roomData.roomName, code, egressInfo.egressId, recordingMode, validatedTier === 'free']
+        [recordingUserId, roomData.roomName, code, egressInfo.egressId, recordingMode, validatedTier === 'free']
       );
       sessionId = sessionResult.rows[0].id;
 
@@ -4220,6 +4273,34 @@ app.post('/room/screen-share-mode', auth.requireAuth, async (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// POST /room/share-conflict-policy — Host changes screen-share takeover policy mid-meeting.
+// Body: { roomCode, callerIdentity, policy }  policy: "oneattime"|"hostCanPreempt"|"anyCanPreempt"
+// ---------------------------------------------------------------------------
+app.post('/room/share-conflict-policy', auth.requireAuth, async (req, res) => {
+  const { roomCode, callerIdentity, policy } = req.body;
+  const VALID_POLICIES = ['oneattime', 'hostCanPreempt', 'anyCanPreempt'];
+  if (!roomCode || !callerIdentity || !VALID_POLICIES.includes(policy)) {
+    return res.status(400).json({ error: 'roomCode, callerIdentity, and a valid policy are required' });
+  }
+  const code = String(roomCode).toUpperCase().replace(/[^A-Z0-9]/g, '');
+  const roomData = await getRoomData(code);
+  if (!roomData) return res.status(404).json({ error: 'Invalid or expired room code' });
+
+  const validation = await validateModerator(code, callerIdentity, req.user?.userId);
+  if (!validation.valid) return res.status(403).json({ error: validation.error });
+
+  try {
+    await redis.hset(roomKey(code), 'shareConflictPolicy', policy);
+    io.to(code).emit('room:share-conflict-policy-changed', { policy, callerIdentity });
+    console.log(`[audit] Share conflict policy changed: code=${code} policy=${policy} by=${callerIdentity}`);
+    res.json({ success: true });
+  } catch (err) {
+    console.error('[error] share-conflict-policy failed:', err.message);
+    res.status(500).json({ error: 'Failed to update share conflict policy' });
+  }
+});
+
+// ---------------------------------------------------------------------------
 // POST /room/camera-lock-one — Host locks a specific participant's camera off.
 // Body: { roomCode, callerIdentity, targetIdentity }
 // ---------------------------------------------------------------------------
@@ -4280,8 +4361,9 @@ app.post('/room/camera-lock-all', auth.requireAuth, async (req, res) => {
     }
     // Always set/refresh expiry and global flag regardless of tolock count.
     await redis.expire(roomCameraLockedKey(code), ROOM_CODE_EXPIRY_SECONDS);
-    // Set global lock flag so late joiners are also locked when they join.
-    await redis.hset(roomKey(code), 'globalCameraLock', 'true');
+    // Set global lock flag and the role that triggered it so late joiners
+    // can be evaluated against the same policy.
+    await redis.hset(roomKey(code), 'globalCameraLock', 'true', 'globalCameraLockRole', callerRole);
     io.to(code).emit('room:camera-lock-changed', { identity: null, locked: true, all: true });
     console.log(`[audit] camera-lock-all: code=${code} locked=${tolock.length} by=${callerIdentity}`);
     res.json({ success: true });
@@ -4884,22 +4966,38 @@ io.on('connection', (socket) => {
       }
 
       // Camera lock snapshot — emit locked identities to the rejoining participant.
-      // If globalCameraLock is set, also add the joining participant themselves.
+      // If globalCameraLock is set, evaluate the joiner against the original lock
+      // policy before mutating Redis, and only send the full list to moderators.
       try {
-        const [lockedIdentities, roomData] = await Promise.all([
+        const [lockedIdentities, roomData, joinerRole] = await Promise.all([
           redis.smembers(roomCameraLockedKey(code)),
           getRoomData(code),
+          getParticipantRole(code, identity),
         ]);
         const isGlobalLock = roomData?.globalCameraLock === 'true';
-        const finalLocked = isGlobalLock
-          ? Array.from(new Set([...lockedIdentities, identity]))
-          : lockedIdentities;
-        if (isGlobalLock) {
-          // Add late joiner to the locked set so the REST snapshot is consistent
+        // Use stored locking role to reproduce the original policy; fall back to
+        // 'co-host' (the minimum role that can trigger lock-all) if not stored.
+        const lockingRole = roomData?.globalCameraLockRole || 'co-host';
+        const joinerShouldBeLocked =
+          isGlobalLock && roleLevel(joinerRole) < roleLevel(lockingRole);
+        if (joinerShouldBeLocked) {
           await redis.sadd(roomCameraLockedKey(code), identity).catch(() => {});
         }
-        if (finalLocked.length > 0) {
-          socket.emit('room:camera-state-snapshot', { locked: finalLocked, globalLock: isGlobalLock });
+        const isModerator = roleLevel(joinerRole) >= roleLevel('co-host');
+        const finalLocked = isGlobalLock && joinerShouldBeLocked
+          ? Array.from(new Set([...lockedIdentities, identity]))
+          : lockedIdentities;
+        if (finalLocked.length > 0 || isGlobalLock) {
+          if (isModerator) {
+            // Moderators get the full locked list so they can manage tiles.
+            socket.emit('room:camera-state-snapshot', { locked: finalLocked, globalLock: isGlobalLock });
+          } else {
+            // Non-moderators only learn their own state to avoid exposing other identities.
+            const selfLocked = finalLocked.includes(identity);
+            if (selfLocked) {
+              socket.emit('room:camera-state-snapshot', { locked: [identity], globalLock: isGlobalLock });
+            }
+          }
         }
       } catch (_) { /* best-effort */ }
     } catch (_) { /* best-effort */ }
