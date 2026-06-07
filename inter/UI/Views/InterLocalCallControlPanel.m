@@ -131,15 +131,13 @@
     self.shareModePopUpButton = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(16, 150, self.bounds.size.width - 32, 26)
                                                             pullsDown:NO];
     self.shareModePopUpButton.autoresizingMask = NSViewWidthSizable | NSViewMaxYMargin;
-    [self.shareModePopUpButton addItemWithTitle:@"Share This App"];
     [self.shareModePopUpButton addItemWithTitle:@"Share Window"];
     [self.shareModePopUpButton addItemWithTitle:@"Share Entire Screen"];
     [self.shareModePopUpButton setTarget:self];
     [self.shareModePopUpButton setAction:@selector(handleShareModeChange:)];
 
-    [self.shareModePopUpButton.itemArray[0] setTag:InterShareModeThisApp];
-    [self.shareModePopUpButton.itemArray[1] setTag:InterShareModeWindow];
-    [self.shareModePopUpButton.itemArray[2] setTag:InterShareModeEntireScreen];
+    [self.shareModePopUpButton.itemArray[0] setTag:InterShareModeWindow];
+    [self.shareModePopUpButton.itemArray[1] setTag:InterShareModeEntireScreen];
 
     [self addSubview:self.shareModePopUpButton];
 
@@ -230,7 +228,7 @@
     [self.shareButton setAction:@selector(handleShareToggle:)];
     [self addSubview:self.shareButton];
 
-    [self setShareMode:InterShareModeThisApp];
+    [self setShareMode:InterShareModeWindow];
     [self setSelectedInterviewToolKind:InterInterviewToolKindNone];
     [self setInterviewToolSelectorHidden:YES];
     [self updateShareButtonPresentation];

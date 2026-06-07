@@ -2327,7 +2327,7 @@ didRequestDeleteTeamId:(NSString *)teamId {
     self.normalControlPanel.autoresizingMask = NSViewMinXMargin | NSViewMaxYMargin;
     [self.normalControlPanel setPanelTitleText:@"Normal Call Controls"];
     [self.normalControlPanel setShareModeSelectorHidden:NO];
-    [self.normalControlPanel setShareMode:InterShareModeThisApp];
+    [self.normalControlPanel setShareMode:InterShareModeWindow];
     [self.normalControlPanel setShareSystemAudioEnabled:NO];
     [self.normalControlPanel setShareSystemAudioToggleHidden:YES];
     [self.normalControlPanel setShareModeOptionEnabled:YES forMode:InterShareModeWindow];
