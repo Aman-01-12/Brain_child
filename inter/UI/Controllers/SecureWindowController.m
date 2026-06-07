@@ -3,7 +3,6 @@
 #import "InterLocalMediaController.h"
 #import "InterMediaWiringController.h"
 #import "InterSurfaceShareController.h"
-#import "MetalSurfaceView.h"
 #import "SecureWindow.h"
 #import "InterRemoteVideoLayoutManager.h"
 #import "InterTrackRendererBridge.h"
@@ -30,7 +29,7 @@ static const CGFloat InterSecureLeftMargin = 40.0;
 static const CGFloat InterSecureBottomWorkspaceMargin = 100.0;
 
 @interface SecureWindowController () <InterParticipantOverlayDelegate, InterChatPanelDelegate, InterChatControllerDelegate>
-@property (nonatomic, strong) MetalSurfaceView *renderView;
+@property (nonatomic, strong) NSView *renderView;
 @property (nonatomic, strong) InterSecureInterviewStageView *stageView;
 @property (nonatomic, strong) InterSecureToolHostView *toolHostView;
 @property (nonatomic, strong) InterLocalCallControlPanel *controlPanel;
@@ -84,7 +83,7 @@ static const CGFloat InterSecureBottomWorkspaceMargin = 100.0;
     view.layer.backgroundColor = [NSColor blackColor].CGColor;
     [self.secureWindow setContentView:view];
 
-    self.renderView = [[MetalSurfaceView alloc] initWithFrame:view.bounds];
+    self.renderView = [[NSView alloc] initWithFrame:view.bounds];
     self.renderView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
     [view addSubview:self.renderView];
 
@@ -223,11 +222,6 @@ static const CGFloat InterSecureBottomWorkspaceMargin = 100.0;
 
 - (void)hideSecureWindow {
     if (self.secureWindow) {
-        // Ordering the borderless secure window out before the Metal view is
-        // quiesced leaves a window where the CAMetalLayer can lose its drawable
-        // while the display-link thread is still issuing work. Stop rendering
-        // first so exit never races layer teardown.
-        [self.renderView shutdownRenderingSynchronously];
         [self.secureWindow orderOut:nil];
     }
 }
@@ -243,8 +237,7 @@ static const CGFloat InterSecureBottomWorkspaceMargin = 100.0;
         self.controlPanel.interviewToolChangedHandler = nil;
     }
 
-    [self.renderView shutdownRenderingSynchronously];
-    [self.surfaceShareController stopSharingFromSurfaceView:self.renderView];
+    [self.surfaceShareController stopSharingFromSurfaceView:nil];
     // [2.6.5] Clear network sink but do NOT disconnect room
     self.surfaceShareController.networkPublishSink = nil;
     self.surfaceShareController = nil;
@@ -580,7 +573,7 @@ static const CGFloat InterSecureBottomWorkspaceMargin = 100.0;
     if (sharing || startPending) {
         // Unpublish screen share track from LiveKit before stopping
         [self.roomController.publisher unpublishScreenShareWithCompletion:nil];
-        [self.surfaceShareController stopSharingFromSurfaceView:self.renderView];
+        [self.surfaceShareController stopSharingFromSurfaceView:nil];
         self.surfaceShareController.networkPublishSink = nil;
         [self.controlPanel setShareStartPending:self.surfaceShareController.isStartPending];
         [self.controlPanel setSharingEnabled:self.surfaceShareController.isSharing];
@@ -597,7 +590,7 @@ static const CGFloat InterSecureBottomWorkspaceMargin = 100.0;
     // [2.6.4] Wire network sink before starting (interview: always ThisApp)
     [self.mediaWiring wireNetworkSinkOnSurfaceShareController:self.surfaceShareController];
 
-    [self.surfaceShareController startSharingFromSurfaceView:self.renderView];
+    [self.surfaceShareController startSharingFromSurfaceView:nil];
     [self.controlPanel setShareStartPending:self.surfaceShareController.isStartPending];
     [self.controlPanel setSharingEnabled:self.surfaceShareController.isSharing];
     // Don't optimistically read isSharing here — it may be YES momentarily
