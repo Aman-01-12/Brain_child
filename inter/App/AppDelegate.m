@@ -48,7 +48,7 @@
 @property (nonatomic, strong) NSView *setupRenderView;
 @property (nonatomic, strong) NSWindow *settingsWindow;
 @property (nonatomic, strong) NSWindow *normalCallWindow;
-@property (nonatomic, strong) MetalSurfaceView *normalRenderView;
+@property (nonatomic, strong) NSView *normalRenderView;
 @property (nonatomic, strong) InterLocalMediaController *normalMediaController;
 @property (nonatomic, strong) InterSurfaceShareController *normalSurfaceShareController;
 @property (nonatomic, strong) InterLocalCallControlPanel *normalControlPanel;
@@ -2027,7 +2027,7 @@ didRequestDeleteTeamId:(NSString *)teamId {
     view.layer.backgroundColor = [NSColor blackColor].CGColor;
     [self.normalCallWindow setBackgroundColor:[NSColor blackColor]];
 
-    self.normalRenderView = [[MetalSurfaceView alloc] initWithFrame:view.bounds];
+    self.normalRenderView = [[NSView alloc] initWithFrame:view.bounds];
     self.normalRenderView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
     [view addSubview:self.normalRenderView];
 
@@ -2065,7 +2065,6 @@ didRequestDeleteTeamId:(NSString *)teamId {
     self.normalMediaWiring.controlPanel = self.normalControlPanel;
     self.normalMediaWiring.remoteLayout = self.normalRemoteLayout;
     self.normalMediaWiring.networkStatusView = self.normalNetworkStatusView;
-    self.normalMediaWiring.renderView = self.normalRenderView;
     __weak typeof(self) weakMediaSummarySelf = self;
     self.normalMediaWiring.mediaStateSummaryBlock = ^NSString *{
         return [weakMediaSummarySelf normalMediaStateSummary];
@@ -2708,10 +2707,6 @@ didRequestDeleteTeamId:(NSString *)teamId {
 // [B1] toggleNormalCamera + toggleNormalMicrophone removed — now in InterMediaWiringController.
 
 - (void)toggleNormalSurfaceShare {
-    if (!self.normalRenderView) {
-        return;
-    }
-
     // Sync button state — an async error may have reset sharing behind our back
     BOOL currentlySharing = self.normalSurfaceShareController.isSharing;
     BOOL startPending = self.normalSurfaceShareController.isStartPending;
@@ -2725,7 +2720,7 @@ didRequestDeleteTeamId:(NSString *)teamId {
         self.normalPendingShareRequestIdentity = nil;
         // Unpublish screen share track from LiveKit before stopping
         [self.roomController.publisher unpublishScreenShareWithCompletion:nil];
-        [self.normalSurfaceShareController stopSharingFromSurfaceView:self.normalRenderView];
+        [self.normalSurfaceShareController stopSharingFromSurfaceView:nil];
         // Clear network sink on stop
         self.normalSurfaceShareController.networkPublishSink = nil;
         [self.normalControlPanel setShareStartPending:self.normalSurfaceShareController.isStartPending];
@@ -2842,7 +2837,7 @@ didRequestDeleteTeamId:(NSString *)teamId {
     // [2.5.5] Wire network sink before starting share
     [self.normalMediaWiring wireNetworkSinkOnSurfaceShareController:self.normalSurfaceShareController];
 
-    [self.normalSurfaceShareController startSharingFromSurfaceView:self.normalRenderView];
+    [self.normalSurfaceShareController startSharingFromSurfaceView:nil];
     [self.normalControlPanel setShareStartPending:self.normalSurfaceShareController.isStartPending];
     [self.normalControlPanel setSharingEnabled:self.normalSurfaceShareController.isSharing];
     // Don't optimistically read isSharing here — it may be YES momentarily
@@ -4715,7 +4710,7 @@ didRequestDeleteTeamId:(NSString *)teamId {
     self.normalShareRequestPending = NO;
     self.normalPendingShareRequestIdentity = nil;
     [self.roomController.publisher unpublishScreenShareWithCompletion:nil];
-    [self.normalSurfaceShareController stopSharingFromSurfaceView:self.normalRenderView];
+    [self.normalSurfaceShareController stopSharingFromSurfaceView:nil];
     self.normalSurfaceShareController.networkPublishSink = nil;
     [self.normalControlPanel setShareStartPending:NO];
     [self.normalControlPanel setSharingEnabled:NO];
@@ -5801,7 +5796,7 @@ didRequestDeleteTeamId:(NSString *)teamId {
         [self.normalControlPanel setScreenSharePermissionMode:nil];
     }
 
-    [self.normalSurfaceShareController stopSharingFromSurfaceView:self.normalRenderView];
+    [self.normalSurfaceShareController stopSharingFromSurfaceView:nil];
     self.normalSurfaceShareController = nil;
 
     self.normalMediaController.audioInputOptionsChangedHandler = nil;
@@ -5912,7 +5907,6 @@ didRequestDeleteTeamId:(NSString *)teamId {
     }
 
     if (self.normalRenderView != nil) {
-        [self.normalRenderView shutdownRenderingSynchronously];
         [self.normalRenderView removeFromSuperview];
         self.normalRenderView = nil;
     }

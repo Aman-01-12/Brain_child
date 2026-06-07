@@ -13,7 +13,6 @@
 #import "InterRemoteVideoLayoutManager.h"
 #import "InterParticipantOverlayView.h"
 #import "InterNetworkStatusView.h"
-#import "MetalSurfaceView.h"
 
 #if __has_include("inter-Swift.h")
 #import "inter-Swift.h"

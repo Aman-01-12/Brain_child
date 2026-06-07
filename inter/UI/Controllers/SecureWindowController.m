@@ -414,7 +414,6 @@ static const CGFloat InterSecureBottomWorkspaceMargin = 100.0;
     self.mediaWiring.remoteLayout = self.remoteLayout;
     self.mediaWiring.networkStatusView = self.networkStatusView;
     self.mediaWiring.surfaceShareController = self.surfaceShareController;
-    self.mediaWiring.renderView = self.renderView;
     self.mediaWiring.mediaStateSummaryBlock = ^NSString *{
         return [weakSelf secureMediaStateSummary];
     };

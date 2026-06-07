@@ -27,7 +27,6 @@
 @class InterRemoteVideoLayoutManager;
 @class InterNetworkStatusView;
 @class InterSurfaceShareController;
-@class MetalSurfaceView;
 
 NS_ASSUME_NONNULL_BEGIN
 
@@ -63,7 +62,6 @@ NS_ASSUME_NONNULL_BEGIN
 @property (nonatomic, weak, nullable) InterRemoteVideoLayoutManager *remoteLayout;
 @property (nonatomic, weak, nullable) InterNetworkStatusView *networkStatusView;
 @property (nonatomic, weak, nullable) InterSurfaceShareController *surfaceShareController;
-@property (nonatomic, weak, nullable) MetalSurfaceView *renderView;
 
 /// Delegate for mode-specific actions.
 @property (nonatomic, weak, nullable) id<InterMediaWiringDelegate> delegate;
