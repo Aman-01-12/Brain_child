@@ -45,7 +45,7 @@
 @property (nonatomic, strong) NSMutableArray<CapWindow *> *capWindows;
 @property (nonatomic, strong) SecureWindowController *secureController;
 @property (nonatomic, strong) NSWindow *setupWindow;
-@property (nonatomic, strong) MetalSurfaceView *setupRenderView;
+@property (nonatomic, strong) NSView *setupRenderView;
 @property (nonatomic, strong) NSWindow *settingsWindow;
 @property (nonatomic, strong) NSWindow *normalCallWindow;
 @property (nonatomic, strong) MetalSurfaceView *normalRenderView;
@@ -204,11 +204,10 @@ static BOOL InterShouldEnforceInterviewExternalDisplayPolicy(void) {
 }
 
 static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
-                                     MetalSurfaceView *__strong *renderViewRef,
+                                     NSView *__strong *renderViewRef,
                                      InterConnectionSetupPanel *__strong *connectionPanelRef) {
-    MetalSurfaceView *renderView = *renderViewRef;
+    NSView *renderView = *renderViewRef;
     if (renderView != nil) {
-        [renderView shutdownRenderingSynchronously];
         [renderView removeFromSuperview];
         *renderViewRef = nil;
     }
@@ -664,7 +663,7 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
     view.layer.backgroundColor = [NSColor blackColor].CGColor;
     [self.setupWindow setContentView:view];
 
-    self.setupRenderView = [[MetalSurfaceView alloc] initWithFrame:view.bounds];
+    self.setupRenderView = [[NSView alloc] initWithFrame:view.bounds];
     self.setupRenderView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
     [view addSubview:self.setupRenderView];
 
@@ -5908,7 +5907,6 @@ didRequestDeleteTeamId:(NSString *)teamId {
     }
 
     if (self.setupRenderView != nil) {
-        [self.setupRenderView shutdownRenderingSynchronously];
         [self.setupRenderView removeFromSuperview];
         self.setupRenderView = nil;
     }
