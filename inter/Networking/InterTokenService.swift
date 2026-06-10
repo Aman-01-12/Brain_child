@@ -35,13 +35,17 @@ import CryptoKit
     @objc public let serverURL: String
     /// Room type: "call" or "interview". Defaults to "call" for backward compatibility.
     @objc public let roomType: String
+    /// Whether the authenticated caller is the host of this room. Server-authoritative;
+    /// used by the scheduled-meeting path so the host's client shows host UI.
+    @objc public let isHost: Bool
 
-    @objc public init(roomCode: String, roomName: String, token: String, serverURL: String, roomType: String = "call") {
+    @objc public init(roomCode: String, roomName: String, token: String, serverURL: String, roomType: String = "call", isHost: Bool = false) {
         self.roomCode = roomCode
         self.roomName = roomName
         self.token = token
         self.serverURL = serverURL
         self.roomType = roomType
+        self.isHost = isHost
         super.init()
     }
 }
@@ -68,6 +72,9 @@ import CryptoKit
     @objc public let autoTranscript: Bool
     /// Share-conflict policy returned by the server (host-configured).
     @objc public let shareConflictPolicy: String
+    /// Whether the server restored this caller as the room host (e.g. the original
+    /// host rejoining after leaving). Drives host UI on the client.
+    @objc public let isHost: Bool
 
     @objc public init(roomName: String,
                       token: String,
@@ -82,7 +89,8 @@ import CryptoKit
                       sharingPermissions: String = "hostOnly",
                       autoRecord: Bool = false,
                       autoTranscript: Bool = false,
-                      shareConflictPolicy: String = "oneattime") {
+                      shareConflictPolicy: String = "oneattime",
+                      isHost: Bool = false) {
         self.roomName             = roomName
         self.token                = token
         self.serverURL            = serverURL
@@ -97,6 +105,7 @@ import CryptoKit
         self.autoRecord           = autoRecord
         self.autoTranscript       = autoTranscript
         self.shareConflictPolicy  = shareConflictPolicy
+        self.isHost               = isHost
         super.init()
     }
 }
@@ -938,7 +947,8 @@ private struct TokenCacheEntry {
             url: "\(serverURL)/room/create",
             body: body,
             retryCount: 0,
-            idempotencyKey: UUID().uuidString
+            idempotencyKey: UUID().uuidString,
+            bearerToken: currentAccessToken
         ) { [weak self] result in
             switch result {
             case .success(let data):
@@ -1019,7 +1029,8 @@ private struct TokenCacheEntry {
         performRequest(
             url: "\(serverURL)/room/join",
             body: body,
-            retryCount: 0
+            retryCount: 0,
+            bearerToken: currentAccessToken
         ) { [weak self] result in
             switch result {
             case .success(let data):
@@ -1085,6 +1096,7 @@ private struct TokenCacheEntry {
                 let autoRecord          = json["autoRecord"] as? Bool ?? false
                 let autoTranscript      = json["autoTranscript"] as? Bool ?? false
                 let shareConflictPolicy = json["shareConflictPolicy"] as? String ?? "oneattime"
+                let isHost              = json["isHost"] as? Bool ?? false
 
                 let response = InterJoinRoomResponse(
                     roomName: roomName,
@@ -1100,7 +1112,8 @@ private struct TokenCacheEntry {
                     sharingPermissions: sharingPermissions,
                     autoRecord: autoRecord,
                     autoTranscript: autoTranscript,
-                    shareConflictPolicy: shareConflictPolicy
+                    shareConflictPolicy: shareConflictPolicy,
+                    isHost: isHost
                 )
                 interLogInfo(InterLog.networking, "Token: room joined (code=***, type=%{public}@)", responseRoomType)
                 self?.completeOnMain { completion(response, nil) }
@@ -2084,6 +2097,7 @@ private struct TokenCacheEntry {
         serverURL: String,
         identity: String,
         displayName: String,
+        password: String?,
         completion: @escaping (InterCreateRoomResponse?, NSError?) -> Void
     ) {
         guard let accessToken = currentAccessToken else {
@@ -2094,10 +2108,15 @@ private struct TokenCacheEntry {
             return
         }
 
-        let body: [String: Any] = [
+        var body: [String: Any] = [
             "identity": identity,
             "displayName": displayName
         ]
+        // Include the meeting password (if the host set one) so the server can
+        // validate it. Empty is omitted so a non-protected meeting is unaffected.
+        if let password = password, !password.isEmpty {
+            body["password"] = password
+        }
 
         interLogInfo(InterLog.networking, "Token: starting scheduled meeting (id=***)")
 
@@ -2143,6 +2162,51 @@ private struct TokenCacheEntry {
                 return
             }
 
+            // Password required / incorrect (parity with /room/join). 401 carries
+            // { passwordRequired: true } and an "Incorrect password" message on a wrong guess.
+            if httpResponse.statusCode == 401, let data = data {
+                let bodyStr = String(data: data, encoding: .utf8) ?? ""
+                if bodyStr.contains("passwordRequired") {
+                    if bodyStr.contains("Incorrect password") {
+                        let err = InterNetworkErrorCode.passwordIncorrect.error(message: "Incorrect password")
+                        self.completeOnMain { completion(nil, err) }
+                        return
+                    }
+                    let err = InterNetworkErrorCode.passwordRequired.error(message: "This meeting requires a password")
+                    self.completeOnMain { completion(nil, err) }
+                    return
+                }
+            }
+
+            // Too many password attempts (brute-force lockout).
+            if httpResponse.statusCode == 429 {
+                let err = InterNetworkErrorCode.tooManyAttempts.error(
+                    message: "Too many password attempts. Please wait a few minutes and try again."
+                )
+                self.completeOnMain { completion(nil, err) }
+                return
+            }
+
+            // Waiting room: 200 with { status: "waiting", position, pollToken } — mirror
+            // the /room/join lobby response so the existing waiting-room UI + poll work.
+            if (200..<300).contains(httpResponse.statusCode), let data = data,
+               let json = self.parseJSON(data),
+               (json["status"] as? String) == "waiting" {
+                let position = json["position"] as? Int ?? 0
+                let pollToken = json["pollToken"] as? String ?? ""
+                var userInfo: [String: Any] = [
+                    NSLocalizedDescriptionKey: "You are in the waiting room (position \(position)). The host will admit you shortly.",
+                    "position": position,
+                ]
+                if !pollToken.isEmpty { userInfo["pollToken"] = pollToken }
+                let err = NSError(domain: InterNetworkErrorDomain,
+                                  code: InterNetworkErrorCode.lobbyWaiting.rawValue,
+                                  userInfo: userInfo)
+                interLogInfo(InterLog.networking, "Token: /meetings/:id/start → lobby waiting (position=%d)", position)
+                self.completeOnMain { completion(nil, err) }
+                return
+            }
+
             guard (200..<300).contains(httpResponse.statusCode),
                   let data = data,
                   let json = self.parseJSON(data),
@@ -2159,6 +2223,7 @@ private struct TokenCacheEntry {
             }
 
             let responseRoomType = json["roomType"] as? String ?? "call"
+            let responseIsHost = json["isHost"] as? Bool ?? false
             self.cacheToken(token, forRoom: roomCode, identity: identity)
 
             // Store leave token if the scheduled-meeting endpoint returns one
@@ -2171,7 +2236,8 @@ private struct TokenCacheEntry {
                 roomName: roomName,
                 token: token,
                 serverURL: wsURL,
-                roomType: responseRoomType
+                roomType: responseRoomType,
+                isHost: responseIsHost
             )
             interLogInfo(InterLog.networking, "Token: scheduled meeting started (code=***)")
             self.completeOnMain { completion(response, nil) }
@@ -2824,6 +2890,7 @@ private struct TokenCacheEntry {
         body: [String: Any],
         retryCount: Int,
         idempotencyKey: String? = nil,
+        bearerToken: String? = nil,
         completion: @escaping (Result<Data, NSError>) -> Void
     ) {
         // T9: Circuit breaker — fail fast if server is confirmed unreachable.
@@ -2851,6 +2918,14 @@ private struct TokenCacheEntry {
             request.setValue(key, forHTTPHeaderField: "X-Idempotency-Key")
         }
 
+        // Attach the access token when the caller is authenticated. Guests pass nil and
+        // the request is sent unauthenticated (these endpoints are guest-allowed). The
+        // server uses this to identify the user — e.g. to bind the host's userId at
+        // /room/create and to detect a returning host at /room/join.
+        if let bearerToken = bearerToken, !bearerToken.isEmpty {
+            request.setValue("Bearer \(bearerToken)", forHTTPHeaderField: "Authorization")
+        }
+
         do {
             request.httpBody = try JSONSerialization.data(withJSONObject: body)
         } catch {
@@ -2873,7 +2948,7 @@ private struct TokenCacheEntry {
                 if self.shouldRetry(statusCode: nil, nsError: nsError, retryCount: retryCount) {
                     interLogInfo(InterLog.networking, "Token: retrying after transport error (%{public}@)", nsError.localizedDescription)
                     self.performRequest(url: urlString, body: body, retryCount: retryCount + 1,
-                                        idempotencyKey: idempotencyKey, completion: completion)
+                                        idempotencyKey: idempotencyKey, bearerToken: bearerToken, completion: completion)
                     return
                 }
                 let wrappedError = InterNetworkErrorCode.serverUnreachable.error(
@@ -2921,6 +2996,17 @@ private struct TokenCacheEntry {
             }
 
             if statusCode == 429 {
+                // Distinguish the per-room password brute-force lockout from a generic
+                // rate limit so the join flow shows a clear, terminal message rather than
+                // a vague "rate limit exceeded".
+                let bodyStr = String(data: data, encoding: .utf8) ?? ""
+                if bodyStr.contains("password attempts") {
+                    let error = InterNetworkErrorCode.tooManyAttempts.error(
+                        message: "Too many password attempts. Please wait a few minutes and try again."
+                    )
+                    completion(.failure(error))
+                    return
+                }
                 let error = InterNetworkErrorCode.tokenFetchFailed.error(
                     message: "Rate limit exceeded"
                 )
@@ -2929,6 +3015,23 @@ private struct TokenCacheEntry {
             }
 
             if statusCode == 403 {
+                let bodyStr = String(data: data, encoding: .utf8) ?? ""
+                // 403 is returned for three distinct conditions — disambiguate so the
+                // UI shows the right message instead of a misleading "Room is full".
+                if bodyStr.contains("hostNotYetJoined") {
+                    let error = InterNetworkErrorCode.hostNotPresent.error(
+                        message: "The host hasn't started the meeting yet."
+                    )
+                    completion(.failure(error))
+                    return
+                }
+                if bodyStr.contains("banned") {
+                    let error = InterNetworkErrorCode.roomBanned.error(
+                        message: "You have been removed from this meeting."
+                    )
+                    completion(.failure(error))
+                    return
+                }
                 let error = InterNetworkErrorCode.roomFull.error(
                     message: "Room is full"
                 )
@@ -2946,8 +3049,16 @@ private struct TokenCacheEntry {
 
             if statusCode == 401 {
                 let bodyStr = String(data: data, encoding: .utf8) ?? ""
-                let isPasswordRequired = bodyStr.contains("passwordRequired")
-                if isPasswordRequired {
+                if bodyStr.contains("passwordRequired") {
+                    // Distinguish "no password supplied" from "wrong password" so the
+                    // retry prompt can tell the user their password was incorrect.
+                    if bodyStr.contains("Incorrect password") {
+                        let error = InterNetworkErrorCode.passwordIncorrect.error(
+                            message: "Incorrect password"
+                        )
+                        completion(.failure(error))
+                        return
+                    }
                     let error = InterNetworkErrorCode.passwordRequired.error(
                         message: "This meeting requires a password"
                     )
@@ -2967,8 +3078,8 @@ private struct TokenCacheEntry {
 
             // 503 — call server (LiveKit) is offline; don't retry, show friendly message
             if statusCode == 503 {
-                let error = InterNetworkErrorCode.serverUnreachable.error(
-                    message: "The call server is currently unavailable. Please try again shortly."
+                let error = InterNetworkErrorCode.callServerUnavailable.error(
+                    message: "The call server is temporarily unavailable. Please try again shortly."
                 )
                 interLogError(InterLog.networking, "Token: call server unavailable (503)")
                 completion(.failure(error))
@@ -2978,7 +3089,8 @@ private struct TokenCacheEntry {
             // Server errors (5xx) — retry once
             if self.shouldRetry(statusCode: statusCode, nsError: nil, retryCount: retryCount) {
                 interLogInfo(InterLog.networking, "Token: retrying after %{public}d", statusCode)
-                self.performRequest(url: urlString, body: body, retryCount: retryCount + 1, completion: completion)
+                self.performRequest(url: urlString, body: body, retryCount: retryCount + 1,
+                                    idempotencyKey: idempotencyKey, bearerToken: bearerToken, completion: completion)
                 return
             }
 

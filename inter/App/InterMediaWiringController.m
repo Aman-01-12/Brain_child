@@ -31,6 +31,11 @@ static void *InterWiringParticipantCountContext = &InterWiringParticipantCountCo
 @property (nonatomic, strong, nullable) dispatch_source_t reconnectionTimeoutTimer;
 /// Whether the connection-lost alert is currently visible.
 @property (nonatomic, assign) BOOL isShowingConnectionLostAlert;
+/// Previous connection state seen via KVO. Used to decide whether a transition to
+/// .disconnectedWithError means an ESTABLISHED connection was lost (show the
+/// "Connection Lost" alert) versus a failure during the initial join (surfaced
+/// inline by the setup panel — no modal).
+@property (nonatomic, assign) InterRoomConnectionState lastConnectionState;
 /// Tracks whether the mic LiveKit track is muted while connected.
 /// Used by twoPhaseToggleMicrophone to avoid AVCaptureSession reconfiguration.
 @property (nonatomic, assign, readwrite) BOOL isMicNetworkMuted;
@@ -659,10 +664,16 @@ static void *InterWiringParticipantCountContext = &InterWiringParticipantCountCo
             // causing the next user toggle (enable path) to call beginEnable() from
             // .active — an invalid transition that silently drops the unmute.
             [rc.publisher muteCameraTrackWithCompletion:^{
-                [weakSelf toggleCamera];
-                dispatch_async(dispatch_get_main_queue(), ^{
-                    [weakSelf deriveCameraButton];
-                });
+                // Derive the button INSIDE the toggle completion so it runs AFTER
+                // toggleCameraWithCompletion's [controlPanel setCameraEnabled:] (which
+                // unconditionally rewrites the title). Otherwise a racy deriveCameraButton
+                // would set "Ask to Unlock Camera" only to be clobbered back to
+                // "Turn Camera On" by the later setCameraEnabled: call.
+                [weakSelf toggleCameraWithCompletion:^{
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        [weakSelf deriveCameraButton];
+                    });
+                }];
             }];
         } else {
             [media setCameraEnabled:NO completion:^(BOOL success) {
@@ -713,14 +724,32 @@ static void *InterWiringParticipantCountContext = &InterWiringParticipantCountCo
 }
 
 /// Host approved this participant's camera unlock request.
-/// For per-tile lock: lifts isHostCameraLocked entirely so the participant
-/// can toggle freely (mirrors mic unlock per-tile approval semantics).
+/// Mirrors `applyMicUnlockApproved`: a per-tile lock is lifted entirely (free
+/// toggle), while under a global camera-lock-all the approval is a ONE-TIME slot
+/// (the participant may turn their camera on once; turning it back off reverts to
+/// "Ask to Unlock Camera").
 - (void)applyHostCameraApprovalForParticipant {
-    self.isHostCameraLocked = NO;
-    self.cameraUnlockApproved = NO;
+    // If no lock is active, the approval is moot.
+    if (!self.isHostCameraLocked && !self.globalCameraLockActive) { return; }
+
+    if (self.isHostCameraLocked && !self.globalCameraLockActive) {
+        // Per-tile lock approval: lift the restriction entirely so the participant
+        // can freely toggle their camera (no one-time slot).
+        self.isHostCameraLocked = NO;
+        self.cameraUnlockApproved = NO;
+        self.cameraUnlockRequestPending = NO;
+        self.cameraWasEnabledWhileApproved = NO;
+        self.cameraWasEnabledBeforeHostLock = NO;
+        [self deriveCameraButton];
+        return;
+    }
+
+    // Global camera-lock-all path: one-time approval slot. deriveCameraButton's
+    // revoke branch reverts to "Ask to Unlock Camera" if the participant turns the
+    // camera back off after using the slot.
+    self.cameraUnlockApproved = YES;
     self.cameraUnlockRequestPending = NO;
     self.cameraWasEnabledWhileApproved = NO;
-    self.cameraWasEnabledBeforeHostLock = NO;
     [self deriveCameraButton];
 }
 
@@ -743,16 +772,36 @@ static void *InterWiringParticipantCountContext = &InterWiringParticipantCountCo
     // Use the global flag — independent of the per-participant flag so that
     // liftCameraLockAll does NOT accidentally clear individual per-participant locks.
     self.globalCameraLockActive = YES;
+    // Clear any stale per-participant unlock flow so the global lock forces the
+    // participant back through "Ask to Unlock Camera" (mirrors applyRemoteMicMute).
+    self.cameraUnlockApproved = NO;
+    self.cameraUnlockRequestPending = NO;
+    self.cameraWasEnabledWhileApproved = NO;
     InterLocalMediaController *media = self.mediaController;
     if (!media) { [self deriveCameraButton]; return; }
     __weak typeof(self) weakSelf = self;
     if (media.isCameraEnabled) {
-        [media setCameraEnabled:NO completion:^(BOOL success) {
+        InterRoomController *rc = self.roomController;
+        BOOL isConnected = rc && rc.connectionState == InterRoomConnectionStateConnected;
+        if (isConnected && rc.publisher.cameraSource != nil) {
+            // [G2] Mute the LiveKit track FIRST so remote peers see camera-off rather
+            // than a frozen last frame, THEN stop the capture device. Without this the
+            // track stays published with its last frame and freezes on every remote.
+            [rc.publisher muteCameraTrackWithCompletion:^{
+                [weakSelf toggleCameraWithCompletion:^{
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        [weakSelf deriveCameraButton];
+                    });
+                }];
+            }];
+        } else {
+            [media setCameraEnabled:NO completion:^(BOOL success) {
 #pragma unused(success)
-            dispatch_async(dispatch_get_main_queue(), ^{
-                [weakSelf deriveCameraButton];
-            });
-        }];
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    [weakSelf deriveCameraButton];
+                });
+            }];
+        }
     } else {
         [self deriveCameraButton];
     }
@@ -926,15 +975,40 @@ static void *InterWiringParticipantCountContext = &InterWiringParticipantCountCo
         case InterRoomConnectionStateConnected:
             [self cancelReconnectionTimeout];
             break;
-        case InterRoomConnectionStateDisconnectedWithError:
+        case InterRoomConnectionStateDisconnectedWithError: {
             [self cancelReconnectionTimeout];
-            [self showConnectionLostAlert];
+            // A host-driven removal or meeting-end is intentional — surface the
+            // specific message via the delegate rather than the generic
+            // "Connection Lost" alert.
+            InterRoomController *rc = self.roomController;
+            InterRoomDisconnectReason reason = rc ? rc.lastDisconnectReason : InterRoomDisconnectReasonError;
+            if (reason == InterRoomDisconnectReasonRemovedByHost) {
+                if ([self.delegate respondsToSelector:@selector(mediaWiringControllerDidDetectRemovalByHost)]) {
+                    [self.delegate mediaWiringControllerDidDetectRemovalByHost];
+                }
+            } else if (reason == InterRoomDisconnectReasonRoomEnded) {
+                if ([self.delegate respondsToSelector:@selector(mediaWiringControllerDidDetectRoomEndedByHost)]) {
+                    [self.delegate mediaWiringControllerDidDetectRoomEndedByHost];
+                }
+            } else if (self.lastConnectionState == InterRoomConnectionStateConnected ||
+                       self.lastConnectionState == InterRoomConnectionStateReconnecting) {
+                // Only show the mid-call "Connection Lost" alert when an established
+                // connection was actually lost. Reaching this state from .connecting
+                // (or .disconnected) is a failed *initial* join — those are shown
+                // inline by the setup panel, and "Continue Offline" is meaningless for
+                // a call the user never entered.
+                [self showConnectionLostAlert];
+            }
             break;
+        }
         case InterRoomConnectionStateDisconnected:
         case InterRoomConnectionStateConnecting:
             [self cancelReconnectionTimeout];
             break;
     }
+
+    // Remember the state so the next transition can be classified correctly.
+    self.lastConnectionState = state;
 
     // Notify delegate for mode-specific follow-up actions
     if ([self.delegate respondsToSelector:@selector(mediaWiringControllerDidChangeConnectionState:)]) {

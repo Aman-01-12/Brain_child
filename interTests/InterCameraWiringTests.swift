@@ -20,6 +20,15 @@ final class InterCameraWiringTests: XCTestCase {
         XCTAssertEqual(InterControlSignalType.liftCameraLockAll.rawValue, 39)
     }
 
+    func testSignalTypes_stopScreenShareAllRawValue() {
+        // New broadcast signal for the "Stop All Screen Shares" control.
+        XCTAssertEqual(InterControlSignalType.stopScreenShareAll.rawValue, 51)
+        // Must not collide with the per-identity stop (49) or the policy signal (50).
+        XCTAssertEqual(InterControlSignalType.stopScreenShare.rawValue, 49)
+        XCTAssertNotEqual(InterControlSignalType.stopScreenShareAll.rawValue,
+                          InterControlSignalType.stopScreenShare.rawValue)
+    }
+
     func testSignalTypes_cameraDistinctFromExistingTypes() {
         let cameraTypes: [InterControlSignalType] = [
             .requestMuteCameraOne, .requestMuteCameraAll,
@@ -83,6 +92,18 @@ final class InterCameraWiringTests: XCTestCase {
         controller.muteCameraAll()
         controller.liftCameraLockOne(identity: "frank")
         controller.liftCameraLockAll()
+    }
+
+    func testModerationController_stopAllScreenSharesExists() {
+        let controller = InterModerationController()
+        // Should be a no-op (not crash) on an unattached controller.
+        controller.stopAllScreenShares()
+    }
+
+    func testModerationController_isAllCameraMutedDefaultsFalse() {
+        let controller = InterModerationController()
+        XCTAssertFalse(controller.isAllCameraMuted,
+                       "Global camera-mute toggle should default to false")
     }
 
     // MARK: - InterMicUnlockQueue

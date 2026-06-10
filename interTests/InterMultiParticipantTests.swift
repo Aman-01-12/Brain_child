@@ -19,8 +19,8 @@ final class InterMultiParticipantTests: XCTestCase {
     // MARK: - Constants
 
     func testMaxParticipantsConstant() {
-        XCTAssertEqual(InterMaxParticipantsPerRoom, 4,
-                       "Phase A soft cap should be 4")
+        XCTAssertEqual(InterMaxParticipantsPerRoom, 50,
+                       "Phase 7 scaled the per-room cap to 50")
     }
 
     // MARK: - Room Full Error Code

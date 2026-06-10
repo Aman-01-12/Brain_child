@@ -166,6 +166,11 @@ import Foundation
     ///   "hostCanPreempt" — only host/co-host can preempt the current sharer
     ///   "anyCanPreempt"  — anyone with share permission can preempt the current sharer
     case shareConflictPolicyChanged = 50
+
+    /// Host/co-host stops ALL active screen shares at once (broadcast, no target).
+    /// Every participant that is currently sharing stops locally. One-shot — new
+    /// shares afterwards are still governed by shareConflictPolicy.
+    case stopScreenShareAll = 51
 }
 
 // MARK: - Chat Message
@@ -250,6 +255,25 @@ public struct InterChatMessage: Codable, Identifiable, Equatable {
     public static func fromJSONData(_ data: Data) -> InterChatMessage? {
         try? JSONDecoder().decode(InterChatMessage.self, from: data)
     }
+
+    /// Returns a copy with the sender identity and display name replaced. The receive path
+    /// uses this to reconcile the self-declared sender in the JSON payload against the
+    /// LiveKit-attested participant identity and name, preventing chat impersonation.
+    public func withSender(identity: String, name: String) -> InterChatMessage {
+        InterChatMessage(
+            id: id,
+            senderIdentity: identity,
+            senderName: name,
+            text: text,
+            timestamp: timestamp,
+            type: type,
+            recipientIdentity: recipientIdentity,
+            fileId: fileId,
+            fileName: fileName,
+            fileSizeBytes: fileSizeBytes,
+            mimeType: mimeType
+        )
+    }
 }
 
 // MARK: - Control Signal
@@ -306,6 +330,22 @@ public struct InterControlSignal: Codable {
 
     public static func fromJSONData(_ data: Data) -> InterControlSignal? {
         try? JSONDecoder().decode(InterControlSignal.self, from: data)
+    }
+
+    /// Returns a copy of this signal with the sender identity and display name replaced.
+    /// The receive path uses this to reconcile the self-declared sender in the JSON
+    /// payload against the LiveKit-attested participant identity and name (the SFU stamps
+    /// both and a participant cannot forge another's), neutralising spoofed control
+    /// signals and impersonated display names.
+    public func withSender(identity: String, name: String) -> InterControlSignal {
+        InterControlSignal(
+            type: type,
+            senderIdentity: identity,
+            senderName: name,
+            targetIdentity: targetIdentity,
+            timestamp: timestamp,
+            extraData: extraData
+        )
     }
 }
 

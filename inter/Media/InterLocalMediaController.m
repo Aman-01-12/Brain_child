@@ -335,6 +335,12 @@ static const void *InterLocalMediaSessionQueueKey = &InterLocalMediaSessionQueue
         }
 
         BOOL success = [strongSelf setVideoInputEnabledLocked:enabled];
+        if (success) {
+            // Notify the recording coordinator of the camera on/off transition so it can
+            // swap in a placeholder (off) or resume video (on) instead of freezing.
+            InterLocalMediaCameraStateObserver camObserver = strongSelf.recordingCameraStateObserver;
+            if (camObserver) camObserver(enabled);
+        }
         dispatch_async(dispatch_get_main_queue(), ^{
             if (completion) {
                 completion(success);

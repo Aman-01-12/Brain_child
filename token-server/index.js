@@ -16,6 +16,7 @@
 //   POST /room/mute        — Mute a specific participant's track
 //   POST /room/mute-all    — Mute all participants' audio
 //   POST /room/remove      — Remove a participant from the room
+//   POST /room/end         — Host ends the meeting for everyone
 //   POST /room/lock        — Lock the meeting (prevent new joins)
 //   POST /room/unlock      — Unlock the meeting
 //   POST /room/suspend     — Suspend a participant (mute all + disable chat)
@@ -2211,11 +2212,10 @@ app.post('/room/create', requireIdempotencyKey, async (req, res) => {
   // tier the host had when the room was created, not the current JWT tier.
   const hostTier = (req.user && req.user.tier) ? req.user.tier : 'free';
 
-  // Hash password server-side before storage (bcrypt is already available in auth.js
-  // but we use the same crypto helper for consistency)
+  // Hash password server-side before storage using the module-level bcrypt
+  // (bcryptjs), the same library used for password validation on /room/join.
   let passwordHash = '';
   if (password && typeof password === 'string' && password.length > 0) {
-    const bcrypt = require('bcrypt');
     passwordHash = await bcrypt.hash(password, 10);
   }
 
@@ -2343,31 +2343,62 @@ app.post('/room/join', async (req, res) => {
   const isBanned = await redis.sismember(roomBannedKey(code), identity);
   if (isBanned) {
     console.log(`[audit] Join blocked (banned): code=${code} identity=${identity}`);
-    return res.status(403).json({ error: 'You have been removed from this meeting.' });
+    return res.status(403).json({ error: 'You have been removed from this meeting.', banned: true });
   }
 
-  // Phase 9.2.6 — Check if meeting is locked
-  const isLocked = await redis.exists(roomLockedKey(code));
-  if (isLocked) {
-    return res.status(423).json({ error: 'This meeting is locked. No new participants can join.' });
+  // Returning-host restoration: if the AUTHENTICATED caller is the room's original
+  // host (matched by the verified userId bound at room creation — NOT the spoofable
+  // body identity), restore host privileges. A host who left via "Leave" rejoins with
+  // a fresh identity; without this they would be demoted to participant and could even
+  // be locked out by their own join-before-host setting (their old identity is gone, so
+  // the host-presence check fails). The ban check above still applies first.
+  let isReturningHost = false;
+  if (req.user?.userId != null && roomData.hostIdentity) {
+    const hostBoundId = await redis.hget(roomUserBindingKey(code), roomData.hostIdentity);
+    if (hostBoundId && String(hostBoundId) === String(req.user.userId)) {
+      isReturningHost = true;
+      console.log(`[audit] Returning host restored: code=${code} identity=${identity} user=${req.user.userId}`);
+    }
   }
 
-  // Phase 9.4 — Check if meeting has a password
+  // Phase 9.2.6 — Check if meeting is locked (the returning host bypasses their own lock).
+  if (!isReturningHost) {
+    const isLocked = await redis.exists(roomLockedKey(code));
+    if (isLocked) {
+      return res.status(423).json({ error: 'This meeting is locked. No new participants can join.' });
+    }
+  }
+
+  // Phase 9.4 — Check if meeting has a password (returning host owns it; no re-entry).
   const passwordHash = roomData.passwordHash;
-  if (passwordHash) {
+  if (passwordHash && !isReturningHost) {
     const { password } = req.body;
     if (!password) {
+      // No password yet — prompt for it (not counted as a guess).
       return res.status(401).json({ error: 'This meeting requires a password', passwordRequired: true });
+    }
+    // Per-principal brute-force lockout. The body `identity` is client-generated and
+    // rotatable, so the per-identity checkRateLimit above is trivially bypassed by
+    // rotating it. Key the password-guess counter on the authenticated userId when
+    // present, else the source IP, scoped to this room. Window: 5 min, 8 guesses.
+    const pwdPrincipal = req.user?.userId != null ? `u:${req.user.userId}` : `ip:${req.ip}`;
+    const pwdRlKey = `ratelimit:join-pwd:${code}:${pwdPrincipal}`;
+    const pwdAttempts = await redis.incr(pwdRlKey);
+    if (pwdAttempts === 1) await redis.expire(pwdRlKey, 300);
+    if (pwdAttempts > 8) {
+      console.log(`[audit] Join pwd rate-limited: code=${code} principal=${pwdPrincipal}`);
+      return res.status(429).json({ error: 'Too many password attempts. Please wait a few minutes and try again.' });
     }
     const passwordValid = await bcrypt.compare(password, passwordHash);
     if (!passwordValid) {
       return res.status(401).json({ error: 'Incorrect password', passwordRequired: true });
     }
+    await redis.del(pwdRlKey); // correct password — reset the counter
   }
 
-  // Phase 9.3 — Check if lobby is enabled
+  // Phase 9.3 — Check if lobby is enabled (the returning host skips their own lobby).
   const lobbyEnabled = roomData.lobbyEnabled === 'true';
-  if (lobbyEnabled) {
+  if (lobbyEnabled && !isReturningHost) {
     // Check if this participant is already admitted (reconnecting)
     const alreadyAdmitted = await isParticipant(code, identity);
     if (!alreadyAdmitted) {
@@ -2393,9 +2424,10 @@ app.post('/room/join', async (req, res) => {
   const participantCount = await getParticipantCount(code);
 
   // Join Before Host enforcement: if disabled, non-host participants cannot join until
-  // the host is present in the participants set.
+  // the host is present in the participants set. The returning host is exempt (otherwise
+  // they would be deadlocked out of their own meeting).
   const joinBeforeHostEnabled = roomData.joinBeforeHost === 'true';
-  if (!joinBeforeHostEnabled && !alreadyIn) {
+  if (!joinBeforeHostEnabled && !alreadyIn && !isReturningHost) {
     const hostIdentity = roomData.hostIdentity;
     const hostPresent = hostIdentity ? await isParticipant(code, hostIdentity) : false;
     if (!hostPresent) {
@@ -2417,17 +2449,28 @@ app.post('/room/join', async (req, res) => {
   }
 
   try {
-    // Assign role based on room type — Phase 9: always include role in metadata
-    const joinerRole = (roomData.roomType === 'interview') ? 'interviewee' : 'participant';
+    // Assign role based on room type. A returning host is re-granted host privileges
+    // (host JWT grants + 'host' role + {role:host} metadata) so their client restores
+    // the host UI; everyone else joins as a participant/interviewee.
+    const joinerRole = isReturningHost
+      ? ((roomData.roomType === 'interview') ? 'interviewer' : 'host')
+      : ((roomData.roomType === 'interview') ? 'interviewee' : 'participant');
     const metadata = { role: joinerRole };
-    const jwt = await createToken(identity, displayName, roomData.roomName, false, metadata);
+    const jwt = await createToken(identity, displayName, roomData.roomName, isReturningHost, metadata);
     await addParticipant(code, identity);
 
     // Store identity → displayName mapping for token refresh
     await redis.hset(roomNamesKey(code), identity, displayName);
 
     // Store participant role in Redis for server-side validation (Phase 9)
-    await redis.hset(roomRolesKey(code), identity, joinerRole === 'interviewee' ? 'participant' : joinerRole);
+    const storedRole = isReturningHost ? joinerRole : (joinerRole === 'interviewee' ? 'participant' : joinerRole);
+    await redis.hset(roomRolesKey(code), identity, storedRole);
+
+    // When the host rejoins with a fresh identity, repoint hostIdentity at it so
+    // host-presence and join-before-host checks for OTHER participants stay correct.
+    if (isReturningHost) {
+      await redis.hset(roomKey(code), 'hostIdentity', identity);
+    }
 
     // Bind authenticated userId → identity so validateModerator can cross-check
     if (req.user?.userId != null) {
@@ -2475,6 +2518,8 @@ app.post('/room/join', async (req, res) => {
       shareConflictPolicy: roomData.shareConflictPolicy || 'oneattime',
       autoRecord:          roomData.autoRecord          === 'true',
       autoTranscript:      roomData.autoTranscript      === 'true',
+      // True when the server restored this caller as the room host (original host rejoining).
+      isHost:              isReturningHost,
     });
   } catch (err) {
     console.error(`[error] Token creation failed for ${identity}:`, err.message);
@@ -2728,6 +2773,12 @@ app.post('/room/mute-all', auth.requireAuth, async (req, res) => {
 
     console.log(`[audit] Mute all: code=${code} muted=${mutedCount} skipped=${skippedCount} by=${callerIdentity}`);
 
+    // Persist a GLOBAL mic-mute rule so participants who join AFTER mute-all are also
+    // muted (mirrors globalCameraLock for cameras). The muting role is stored so late
+    // joiners are evaluated against the same policy — only participants strictly below
+    // the muting role are auto-muted; co-hosts/host who join later are not.
+    await redis.hset(roomKey(code), 'globalMicMute', 'true', 'globalMicMuteRole', callerRole);
+
     // Persist global-mute state for Socket.IO mic-state checks (Bug 1 server fix)
     await redis.set(globalMuteKey(code), '1', 'EX', 86400);
     // Broadcast to all connected Socket.IO clients in the room
@@ -2740,9 +2791,32 @@ app.post('/room/mute-all', auth.requireAuth, async (req, res) => {
   }
 });
 
-// NOTE: /room/unmute-all removed — LiveKit does not allow server-side unmute
-// ("remote unmute not enabled"). Unmute is now handled client-side via the
-// requestUnmuteAll DataChannel control signal broadcast by the host.
+// NOTE: /room/unmute-all does NOT unmute LiveKit tracks (the SFU forbids server-side
+// remote unmute). It only clears the GLOBAL mic-mute rule so future joiners are not
+// auto-muted. Live participants are unmuted client-side via the requestUnmuteAll
+// DataChannel broadcast.
+// Body: { roomCode, callerIdentity }
+app.post('/room/unmute-all', auth.requireAuth, async (req, res) => {
+  const { roomCode, callerIdentity } = req.body;
+  if (!roomCode || !callerIdentity) {
+    return res.status(400).json({ error: 'roomCode and callerIdentity are required' });
+  }
+  const code = roomCode.toUpperCase();
+  const roomData = await getRoomData(code);
+  if (!roomData) return res.status(404).json({ error: 'Invalid or expired room code' });
+  const validation = await validateModerator(code, callerIdentity, req.user?.userId);
+  if (!validation.valid) return res.status(403).json({ error: validation.error });
+  try {
+    await redis.hdel(roomKey(code), 'globalMicMute', 'globalMicMuteRole');
+    await redis.del(globalMuteKey(code));
+    io.to(code).emit('room:global-mute-changed', { isAllMuted: false });
+    console.log(`[audit] Unmute all (cleared global mic rule): code=${code} by=${callerIdentity}`);
+    res.json({ success: true });
+  } catch (err) {
+    console.error('[error] Unmute all failed:', err.message);
+    res.status(500).json({ error: 'Failed to clear global mute' });
+  }
+});
 
 // ---------------------------------------------------------------------------
 // POST /room/remove — Remove a participant from the room
@@ -2787,6 +2861,56 @@ app.post('/room/remove', auth.requireAuth, async (req, res) => {
   } catch (err) {
     console.error(`[error] Remove failed:`, err.message);
     res.status(500).json({ error: 'Failed to remove participant' });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// POST /room/end — Host ends the meeting for everyone
+// Body: { roomCode, callerIdentity }
+// Returns: { success }
+// Deletes the LiveKit room (disconnecting all participants with a roomDeleted
+// reason) and clears the room's Redis state. Host-only.
+// ---------------------------------------------------------------------------
+app.post('/room/end', auth.requireAuth, async (req, res) => {
+  const { roomCode, callerIdentity } = req.body;
+
+  if (!roomCode || !callerIdentity) {
+    return res.status(400).json({ error: 'roomCode and callerIdentity are required' });
+  }
+
+  const code = roomCode.toUpperCase();
+  const roomData = await getRoomData(code);
+  if (!roomData) return res.status(404).json({ error: 'Invalid or expired room code' });
+
+  // Only the original host may end the meeting for everyone. Co-hosts/moderators
+  // can remove individuals but cannot tear down the whole meeting.
+  const validation = await validateModerator(code, callerIdentity, req.user?.userId);
+  if (!validation.valid) return res.status(403).json({ error: validation.error });
+  if (validation.role !== 'host') {
+    return res.status(403).json({ error: 'Only the host can end the meeting for everyone.' });
+  }
+
+  try {
+    // Delete the LiveKit room — evicts every participant with a roomDeleted reason.
+    await roomService.deleteRoom(roomData.roomName);
+
+    // Clear the room's core Redis state. Remaining per-room keys (lobby, banned,
+    // locked, etc.) carry their own TTLs and will expire.
+    const pipeline = redis.pipeline();
+    pipeline.del(roomKey(code));
+    pipeline.del(roomParticipantsKey(code));
+    pipeline.del(roomRolesKey(code));
+    pipeline.del(roomNamesKey(code));
+    pipeline.del(roomLockedKey(code));
+    await pipeline.exec();
+
+    deleteRoomFiles(code).catch(() => {});
+
+    console.log(`[audit] Meeting ended for all: code=${code} by=${callerIdentity}`);
+    res.json({ success: true });
+  } catch (err) {
+    console.error(`[error] End meeting failed:`, err.message);
+    res.status(500).json({ error: 'Failed to end meeting' });
   }
 });
 
@@ -4442,11 +4566,16 @@ app.get('/room/camera-locked', auth.requireAuth, async (req, res) => {
     // Moderators receive the full set; participants receive only their own lock state
     // to avoid leaking which peers are locked.
     const callerRole = await getParticipantRole(code, callerIdentity);
+    // Evaluate the GLOBAL camera-lock rule for this caller so participants who join
+    // after a camera-lock-all are locked too (parity with existing participants).
+    const isGlobalLock = roomData.globalCameraLock === 'true';
+    const lockingRole = roomData.globalCameraLockRole || 'co-host';
+    const selfGloballyLocked = isGlobalLock && roleLevel(callerRole) < roleLevel(lockingRole);
     if (isModeratorRole(callerRole)) {
-      res.json({ locked });
+      res.json({ locked, globalLock: isGlobalLock });
     } else {
-      const selfLocked = locked.includes(callerIdentity);
-      res.json({ locked: selfLocked ? [callerIdentity] : [] });
+      const selfLocked = locked.includes(callerIdentity) || selfGloballyLocked;
+      res.json({ locked: selfLocked ? [callerIdentity] : [], globalLock: selfGloballyLocked });
     }
   } catch (err) {
     console.error('[error] camera-locked fetch failed:', err.message);
@@ -4494,11 +4623,16 @@ app.get('/room/mic-locked', auth.requireAuth, async (req, res) => {
     const locked = await redis.smembers(roomMicLockedKey(code));
     // Moderators receive the full set; participants receive only their own lock state.
     const callerRole = await getParticipantRole(code, callerIdentity);
+    // Evaluate the GLOBAL mic-mute rule for this caller so participants who join after
+    // a mute-all are muted too (parity with existing participants).
+    const isGlobalMute = roomData.globalMicMute === 'true';
+    const mutingRole = roomData.globalMicMuteRole || 'co-host';
+    const selfGloballyMuted = isGlobalMute && roleLevel(callerRole) < roleLevel(mutingRole);
     if (isModeratorRole(callerRole)) {
-      res.json({ locked });
+      res.json({ locked, globalMute: isGlobalMute });
     } else {
-      const selfLocked = locked.includes(callerIdentity);
-      res.json({ locked: selfLocked ? [callerIdentity] : [] });
+      const selfLocked = locked.includes(callerIdentity) || selfGloballyMuted;
+      res.json({ locked: selfLocked ? [callerIdentity] : [], globalMute: selfGloballyMuted });
     }
   } catch (err) {
     console.error('[error] mic-locked fetch failed:', err.message);

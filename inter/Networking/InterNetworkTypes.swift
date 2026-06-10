@@ -289,6 +289,25 @@ enum InterMicrophoneNetworkAction {
     }
 }
 
+// MARK: - Disconnect Reason
+
+/// Why the room transitioned to a disconnected state. Lets the UI distinguish a
+/// genuine connection failure (show "Connection Lost" / retry) from an
+/// intentional, host-driven removal or meeting end (show a specific message and
+/// auto-close) and from a clean user-initiated leave.
+@objc public enum InterRoomDisconnectReason: Int {
+    /// No disconnect has occurred, or a fresh connect attempt is in progress.
+    case none = 0
+    /// Disconnected due to a connection error (network loss, server drop, etc.).
+    case error = 1
+    /// The local participant was removed from the meeting by the host.
+    case removedByHost = 2
+    /// The host ended the meeting for everyone (the room was deleted).
+    case roomEnded = 3
+    /// The local participant left the call (clean, user-initiated disconnect).
+    case clientInitiated = 4
+}
+
 // MARK: - Multi-Participant Constants
 
 /// Maximum number of participants allowed per room.
@@ -333,6 +352,16 @@ public let InterNetworkErrorDomain = "com.secure.inter.network"
     case sessionExpired = 1013
     /// Auth session compromised — theft detected, forced re-login.
     case sessionCompromised = 1014
+    /// Wrong password supplied for a password-protected meeting (401 from token server).
+    case passwordIncorrect = 1015
+    /// Joiner has been removed/banned from this meeting (403 from token server).
+    case roomBanned = 1016
+    /// Host has not started the meeting yet and join-before-host is disabled (403).
+    case hostNotPresent = 1017
+    /// Call (LiveKit) server is temporarily unavailable (503 from token server).
+    case callServerUnavailable = 1018
+    /// Too many password attempts — brute-force lockout (429 from token server).
+    case tooManyAttempts = 1019
 }
 
 // MARK: - Error Helpers
@@ -345,5 +374,23 @@ extension InterNetworkErrorCode {
             userInfo[NSUnderlyingErrorKey] = underlying
         }
         return NSError(domain: InterNetworkErrorDomain, code: self.rawValue, userInfo: userInfo)
+    }
+
+    /// Whether this code represents an expected, benign join rejection (bad/expired
+    /// code, password required/incorrect, lobby waiting, locked, full, banned, or
+    /// host-not-present) rather than a genuine connection failure.
+    ///
+    /// These outcomes are surfaced inline by the setup panel and must NOT drive the
+    /// room into `.disconnectedWithError`, which would otherwise trigger the mid-call
+    /// "Connection Lost" reconnection alert during the initial join.
+    var isExpectedJoinRejection: Bool {
+        switch self {
+        case .roomCodeInvalid, .roomCodeExpired, .roomFull, .meetingLocked,
+             .lobbyWaiting, .passwordRequired, .passwordIncorrect,
+             .roomBanned, .hostNotPresent:
+            return true
+        default:
+            return false
+        }
     }
 }

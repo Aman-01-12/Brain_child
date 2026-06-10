@@ -16,6 +16,7 @@
 
 const express = require('express');
 const crypto  = require('crypto');
+const bcrypt  = require('bcryptjs');
 const db      = require('./db');
 const auth    = require('./auth');
 const redis   = require('./redis');
@@ -37,16 +38,45 @@ const _ROOM_CODE_EXPIRY   = 24 * 60 * 60;  // 24 hours
 const _rKey  = code => `room:${code}`;
 const _rPKey = code => `room:${code}:participants`;
 const _rRKey = code => `room:${code}:roles`;
+// Lobby / ban keys — MUST match index.js exactly so the existing host lobby panel,
+// /room/admit, and /room/lobby-status flows handle scheduled-meeting waiters with no changes.
+const _rBannedKey      = code => `room:${code}:banned`;
+const _rLobbyKey       = code => `room:${code}:lobby`;
+const _rLobbyNamesKey  = code => `room:${code}:lobby:names`;
+// identity -> userId binding (MUST match index.js roomUserBindingKey exactly so
+// validateModerator cross-checks work across both endpoints).
+const roomUserBindingKey = code => `room:${code}:user-binding`;
+
+// Scheduled-join password brute-force limit (per authenticated user, per meeting).
+// Keyed on the verified JWT userId (not a client-rotatable identity), so it is a
+// robust control: an attacker cannot reset it by generating a new identity.
+const _PWD_RL_WINDOW = 300;  // seconds
+const _PWD_RL_MAX    = 8;     // guesses per window before a 429 lockout
+
+/// Constant-time, length-independent string comparison (SHA-256 digests are always
+/// 32 bytes, so timingSafeEqual never throws and no length is leaked).
+function _constantTimeStrEqual(a, b) {
+  const ha = crypto.createHash('sha256').update(String(a)).digest();
+  const hb = crypto.createHash('sha256').update(String(b)).digest();
+  return crypto.timingSafeEqual(ha, hb);
+}
 
 // Single shared client — avoids constructing a new instance per request.
 const _roomSvc = new RoomServiceClient(_LIVEKIT_HTTP_URL, _LIVEKIT_API_KEY, _LIVEKIT_API_SECRET);
 
-async function _createLiveKitToken(identity, displayName, roomName, isHost) {
-  const lvToken = new AccessToken(_LIVEKIT_API_KEY, _LIVEKIT_API_SECRET, {
+async function _createLiveKitToken(identity, displayName, roomName, isHost, role = null) {
+  const tokenOpts = {
     identity,
     name: displayName,
     ttl: _TOKEN_TTL_SECONDS,
-  });
+  };
+  // Stamp the participant role into the JWT metadata (mirrors index.js createToken),
+  // so LiveKit delivers it to all participants and the client can reconcile the
+  // local role from authoritative server state.
+  if (role) {
+    tokenOpts.metadata = JSON.stringify({ role });
+  }
+  const lvToken = new AccessToken(_LIVEKIT_API_KEY, _LIVEKIT_API_SECRET, tokenOpts);
   lvToken.addGrant({
     room: roomName,
     roomJoin: true,
@@ -526,6 +556,66 @@ router.post('/:id/start', auth.requireAuth, async (req, res) => {
     const roomName = `inter-${roomCode}`;
     const roomType = meeting.room_type || 'call';
 
+    // -----------------------------------------------------------------------
+    // Non-host enforcement: password + waiting room (parity with /room/join).
+    //
+    // SECURITY: previously the Join button issued a LiveKit token directly from
+    // this endpoint, bypassing the meeting's password and lobby entirely. The host
+    // (who owns the meeting) bypasses these checks; every other invitee must pass
+    // them before a token is ever created. All rejection paths `return` before any
+    // token is issued or the room is registered.
+    // -----------------------------------------------------------------------
+    if (!isHost) {
+      // Ban check (parity with /room/join; defense-in-depth, identity-scoped).
+      const isBanned = await redis.sismember(_rBannedKey(roomCode), identity);
+      if (isBanned) {
+        console.log(`[audit] Scheduled join blocked (banned): meeting=${id} identity=${identity}`);
+        return res.status(403).json({ error: 'You have been removed from this meeting.', banned: true });
+      }
+
+      // Password enforcement: constant-time compare + per-user brute-force lockout.
+      if (meeting.password) {
+        const supplied = req.body.password;
+        if (!supplied) {
+          // No password yet — prompt for it (the client shows a password dialog).
+          return res.status(401).json({ error: 'This meeting requires a password', passwordRequired: true });
+        }
+        // Rate-limit ACTUAL guesses (a missing password above is not counted).
+        const rlKey = `ratelimit:sched-pwd:${id}:${req.user.userId}`;
+        const attempts = await redis.incr(rlKey);
+        if (attempts === 1) await redis.expire(rlKey, _PWD_RL_WINDOW);
+        if (attempts > _PWD_RL_MAX) {
+          console.log(`[audit] Scheduled join pwd rate-limited: meeting=${id} user=${req.user.userId}`);
+          return res.status(429).json({ error: 'Too many password attempts. Please wait a few minutes and try again.' });
+        }
+        if (!_constantTimeStrEqual(supplied, meeting.password)) {
+          return res.status(401).json({ error: 'Incorrect password', passwordRequired: true });
+        }
+        await redis.del(rlKey); // correct password — reset the counter
+      }
+
+      // Waiting room enforcement: place the invitee in the lobby and return a
+      // waiting response. Uses the SAME Redis keys + pollToken as /room/join so the
+      // host's lobby panel, /room/admit, and /room/lobby-status work unchanged.
+      if (meeting.lobby_enabled === true) {
+        const alreadyAdmitted = await redis.sismember(_rPKey(roomCode), identity);
+        if (!alreadyAdmitted) {
+          const score = Date.now();
+          const pipe = redis.pipeline();
+          pipe.zadd(_rLobbyKey(roomCode), score, identity);
+          pipe.expire(_rLobbyKey(roomCode), _ROOM_CODE_EXPIRY);
+          pipe.hset(_rLobbyNamesKey(roomCode), identity, displayName);
+          pipe.expire(_rLobbyNamesKey(roomCode), _ROOM_CODE_EXPIRY);
+          await pipe.exec();
+          const position = await redis.zrank(_rLobbyKey(roomCode), identity);
+          const pollToken = crypto.randomBytes(32).toString('hex');
+          await redis.set(`room:${roomCode}:lobby:${identity}:pollToken`, pollToken, 'EX', _ROOM_CODE_EXPIRY);
+          console.log(`[audit] Scheduled lobby wait: meeting=${id} identity=${identity} position=${(position || 0) + 1}`);
+          return res.json({ status: 'waiting', position: (position || 0) + 1, pollToken, roomCode });
+        }
+      }
+    }
+
     // Verify LiveKit is reachable before touching Redis or issuing a token.
     // listRooms() makes a real HTTP call to the server; if it throws we know
     // the server is offline and we should fail fast rather than handing the
@@ -542,6 +632,18 @@ router.post('/:id/start', auth.requireAuth, async (req, res) => {
     // Register room in Redis if not already active (idempotent)
     const alreadyExists = await redis.exists(_rKey(roomCode));
     if (!alreadyExists) {
+      // Apply the meeting's lobby + password settings into the room hash so they
+      // are actually ENFORCED at join time (mirrors /room/create). Without this,
+      // /room/join — which reads `lobbyEnabled` and `passwordHash` from the room
+      // hash — never saw the scheduled meeting's settings, so a scheduled password
+      // or waiting room had no effect. Hash the password (bcrypt, 10 rounds) so it
+      // is never stored in plaintext in Redis.
+      const lobbyEnabledStr = (meeting.lobby_enabled === true) ? 'true' : 'false';
+      let passwordHash = '';
+      if (meeting.password && typeof meeting.password === 'string' && meeting.password.length > 0) {
+        passwordHash = await bcrypt.hash(meeting.password, 10);
+      }
+
       const pipe = redis.pipeline();
       pipe.hset(_rKey(roomCode),
         'roomName',     roomName,
@@ -549,7 +651,9 @@ router.post('/:id/start', auth.requireAuth, async (req, res) => {
         'hostIdentity', identity,
         'roomType',     roomType,
         'hostTier',     req.user.tier || 'free',
-        'meetingId',    id
+        'meetingId',    id,
+        'lobbyEnabled', lobbyEnabledStr,
+        'passwordHash', passwordHash
       );
       pipe.expire(_rKey(roomCode), _ROOM_CODE_EXPIRY);
       pipe.sadd(_rPKey(roomCode), identity);
@@ -566,7 +670,25 @@ router.post('/:id/start', auth.requireAuth, async (req, res) => {
       await redis.sadd(_rPKey(roomCode), identity);
     }
 
-    const jwt = await _createLiveKitToken(identity, displayName, roomName, isHost);
+    // Bind authenticated userId -> identity so validateModerator can cross-check
+    // request-body callerIdentity against the verified user (parity with /room/create).
+    // Refreshed on every start so a host who rejoins with a new identity is re-bound.
+    if (req.user?.userId != null) {
+      await redis.hset(roomUserBindingKey(roomCode), identity, String(req.user.userId));
+      await redis.expire(roomUserBindingKey(roomCode), _ROOM_CODE_EXPIRY);
+    }
+    // If the HOST rejoins (e.g. left and came back), their identity changes; point
+    // hostIdentity at the current identity so host-presence / join-before-host checks
+    // and moderation host-binding stay correct.
+    if (isHost) {
+      await redis.hset(_rKey(roomCode), 'hostIdentity', identity);
+    }
+
+    // Role for the JWT metadata (authoritative; the client reconciles local role from it).
+    const tokenRole = isHost
+      ? ((roomType === 'interview') ? 'interviewer' : 'host')
+      : ((roomType === 'interview') ? 'interviewee' : 'participant');
+    const jwt = await _createLiveKitToken(identity, displayName, roomName, isHost, tokenRole);
 
     console.log(`[audit] Scheduled meeting started: meeting=${id} code=${roomCode} isHost=${isHost}`);
 
@@ -576,6 +698,7 @@ router.post('/:id/start', auth.requireAuth, async (req, res) => {
       token: jwt,
       serverURL: _LIVEKIT_SERVER_URL,
       roomType,
+      isHost,
     });
   } catch (err) {
     console.error('[scheduling] POST /:id/start error:', err.message);

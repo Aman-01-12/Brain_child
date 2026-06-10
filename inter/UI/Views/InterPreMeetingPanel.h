@@ -67,6 +67,11 @@ extern NSString *const InterSharingConflictAnyCanPreempt;
 /// Returns default settings pre-filled from UserDefaults.
 + (instancetype)settingsWithDefaults;
 
+/// Whether the host has configured (and saved) their meeting defaults at least
+/// once. Used to decide whether to show the full setup panel (first run) or the
+/// compact panel (returning host).
++ (BOOL)hasConfiguredDefaults;
+
 /// Persists toggle/dropdown values to UserDefaults.
 /// meetingDisplayName and meetingPassword are intentionally not saved.
 - (void)saveToUserDefaults;
@@ -88,6 +93,18 @@ extern NSString *const InterSharingConflictAnyCanPreempt;
 /// User cancelled — dismiss and take no action.
 - (void)preMeetingPanelDidCancel:(InterPreMeetingPanel *)panel;
 
+@optional
+/// The user tapped "Advanced ▸" in compact mode and the full settings are now
+/// visible. The owner may grow the hosting window to `height` for a nicer fit.
+/// Optional: the panel works without this (the full controls scroll within the
+/// existing window if the host does not resize).
+- (void)preMeetingPanel:(InterPreMeetingPanel *)panel
+  didRequestExpandToHeight:(CGFloat)height;
+
+/// The user saved their default settings from the defaults-editor mode.
+/// No meeting is started; the values have been persisted.
+- (void)preMeetingPanelDidSaveDefaults:(InterPreMeetingPanel *)panel;
+
 @end
 
 // ---------------------------------------------------------------------------
@@ -103,6 +120,19 @@ extern NSString *const InterSharingConflictAnyCanPreempt;
 
 @property (nonatomic, weak, nullable) id<InterPreMeetingPanelDelegate> delegate;
 
+/// Designated content height of the full settings panel.
++ (CGFloat)fullPanelHeight;
+/// Content height of the compact panel (name + optional password + summary).
++ (CGFloat)compactPanelHeight;
+
+/// Initialise in compact mode: shows a meeting-name field, an opt-in password
+/// field, a read-only summary of the saved default settings, and an "Advanced ▸"
+/// disclosure that reveals the full settings for a one-off override.
+/// The full settings still load from the saved defaults under the hood, so the
+/// same `-_collectSettings` path is used for both modes (no divergent logic).
+/// Passing NO is identical to `-initWithFrame:`.
+- (instancetype)initWithFrame:(NSRect)frame compactMode:(BOOL)compactMode;
+
 /// Pre-fills the "Meeting Name" field with "{name}'s Meeting".
 /// Must be called before the view appears.
 - (void)setDisplayName:(NSString *)displayName;
@@ -110,6 +140,18 @@ extern NSString *const InterSharingConflictAnyCanPreempt;
 /// Gates the pro-only toggles (Auto-Record, Auto-Transcript).
 /// Pass the user's tier string: "free", "pro", "pro+", or "hiring".
 - (void)setUserTier:(NSString *)tier;
+
+/// Reconfigures the (full) panel as a defaults editor: the action button becomes
+/// "Save", the title reflects "Default Meeting Settings", and pressing Save
+/// persists the defaults without starting a meeting (fires
+/// -preMeetingPanelDidSaveDefaults:). Prefer -initWithFrame:defaultsEditor: so the
+/// per-meeting Meeting Name / Password rows are omitted entirely.
+- (void)configureAsDefaultsEditor;
+
+/// Initialise as a defaults editor. Builds the full settings panel WITHOUT the
+/// per-meeting fields (Meeting Name, Password) since those are never defaults.
+/// Passing NO is identical to `-initWithFrame:`.
+- (instancetype)initWithFrame:(NSRect)frame defaultsEditor:(BOOL)defaultsEditor;
 
 @end
 

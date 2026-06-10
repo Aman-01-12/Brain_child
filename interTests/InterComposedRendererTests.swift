@@ -80,14 +80,17 @@ final class InterComposedRendererTests: XCTestCase {
         XCTAssertEqual(renderer.currentLayout, .cameraOnlyFull)
     }
 
-    func testScreenSharePiP_layoutWhenScreenShareAndCamera() {
+    func testScreenShareFilmstrip_whenScreenShareAndParticipants() {
         guard renderer != nil else { return }
         guard let pb = makePixelBuffer() else { return XCTFail("makePixelBuffer") }
+        // Screen share + grid participants → filmstrip sidebar layout (the composite
+        // that replaced the legacy screen-share picture-in-picture layout).
         renderer.updateScreenShareFrame(pb)
-        renderer.updateActiveSpeakerFrame(pb, identity: "alice")
+        renderer.setParticipantOrder(["alice"])
+        renderer.updateParticipantFrame(pb, identity: "alice")
 
         _ = renderer.renderComposedFrame()
-        XCTAssertEqual(renderer.currentLayout, .screenSharePiP)
+        XCTAssertEqual(renderer.currentLayout, .screenShareFilmstrip)
     }
 
     func testScreenShareOnly_layoutWhenNoCameras() {
@@ -115,9 +118,11 @@ final class InterComposedRendererTests: XCTestCase {
         renderer.updateScreenShareFrame(pb)
         renderer.updateActiveSpeakerFrame(pb, identity: "alice")
         _ = renderer.renderComposedFrame()
-        XCTAssertEqual(renderer.currentLayout, .screenSharePiP)
+        // Legacy active-speaker frames are not grid participants, so an active screen
+        // share takes the full stage (screen-share-only) rather than a composite.
+        XCTAssertEqual(renderer.currentLayout, .screenShareOnly)
 
-        // Now clear screen share
+        // Now clear screen share — the active speaker camera becomes the full frame.
         renderer.updateScreenShareFrame(nil)
         _ = renderer.renderComposedFrame()
         XCTAssertEqual(renderer.currentLayout, .cameraOnlyFull)
@@ -181,27 +186,29 @@ final class InterComposedRendererTests: XCTestCase {
 
     func testPlaceholderFrame_returnsNonNil() {
         guard renderer != nil else { return }
-        let pb = renderer.placeholderFrame(forIdentity: "alice")
-        // Placeholder should always return a valid pixel buffer
-        XCTAssertNotNil(pb, "Placeholder frame must not be nil")
+        // `placeholderFrameForIdentity:` returns a borrowed (+0) CVPixelBufferRef,
+        // which Swift imports as Unmanaged — take an unretained reference to inspect it.
+        let pb = renderer.placeholderFrame(forIdentity: "alice").takeUnretainedValue()
+        // Placeholder should always return a valid, non-empty pixel buffer
+        XCTAssertGreaterThan(CVPixelBufferGetWidth(pb), 0, "Placeholder frame must be valid")
     }
 
     func testPlaceholderFrame_cachesPerIdentity() {
         guard renderer != nil else { return }
-        let pb1 = renderer.placeholderFrame(forIdentity: "alice")
-        let pb2 = renderer.placeholderFrame(forIdentity: "alice")
+        let pb1 = renderer.placeholderFrame(forIdentity: "alice").takeUnretainedValue()
+        let pb2 = renderer.placeholderFrame(forIdentity: "alice").takeUnretainedValue()
         // Same identity should return the same cached buffer (pointer equality)
         XCTAssertTrue(pb1 === pb2, "Same identity should return cached placeholder")
     }
 
     func testPlaceholderFrame_differentForDifferentIdentity() {
         guard renderer != nil else { return }
-        let pb1 = renderer.placeholderFrame(forIdentity: "alice")
-        let pb2 = renderer.placeholderFrame(forIdentity: "bob")
+        let pb1 = renderer.placeholderFrame(forIdentity: "alice").takeUnretainedValue()
+        let pb2 = renderer.placeholderFrame(forIdentity: "bob").takeUnretainedValue()
         // Different identities may or may not share textures (implementation detail)
-        // but both must be non-nil
-        XCTAssertNotNil(pb1)
-        XCTAssertNotNil(pb2)
+        // but both must be valid pixel buffers.
+        XCTAssertGreaterThan(CVPixelBufferGetWidth(pb1), 0)
+        XCTAssertGreaterThan(CVPixelBufferGetWidth(pb2), 0)
     }
 
     // MARK: - Watermark Toggle
@@ -221,10 +228,20 @@ final class InterComposedRendererTests: XCTestCase {
         let spy = ComposedRendererDelegateSpy()
         renderer.delegate = spy
 
+        // The renderer delivers layout-change callbacks asynchronously on the main
+        // queue (see InterComposedRenderer.m), so wait for delivery rather than
+        // reading the spy synchronously.
+        let exp = expectation(description: "layout change delivered")
+        exp.assertForOverFulfill = false
+        spy.onChange = { layout in
+            if layout == .cameraOnlyFull { exp.fulfill() }
+        }
+
         guard let pb = makePixelBuffer() else { return XCTFail() }
         renderer.updateActiveSpeakerFrame(pb, identity: "alice")
         _ = renderer.renderComposedFrame()
 
+        wait(for: [exp], timeout: 2.0)
         XCTAssertTrue(spy.layoutChanges.contains(.cameraOnlyFull),
                       "Delegate should receive .cameraOnlyFull layout change")
     }
@@ -249,8 +266,10 @@ final class InterComposedRendererTests: XCTestCase {
 
 private class ComposedRendererDelegateSpy: NSObject, InterComposedRendererDelegate {
     var layoutChanges: [InterComposedLayout] = []
+    var onChange: ((InterComposedLayout) -> Void)?
 
-    func composedRenderer(_ renderer: Any, didChangeLayout newLayout: InterComposedLayout) {
+    func composedRenderer(_ renderer: Any, didChange newLayout: InterComposedLayout) {
         layoutChanges.append(newLayout)
+        onChange?(newLayout)
     }
 }

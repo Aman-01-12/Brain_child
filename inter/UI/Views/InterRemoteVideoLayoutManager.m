@@ -1777,7 +1777,7 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
         }
     }
 
-    InterRemoteVideoView *spotlightVideoView = nil;
+    NSView *spotlightVideoView = nil;
     if ([spotlightKey isEqualToString:kScreenShareTileKey]) {
         spotlightVideoView = self.remoteScreenShareView;
     } else if (spotlightKey.length > 0) {
@@ -1929,7 +1929,7 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
             continue;
         }
 
-        InterRemoteVideoView *videoView = [key isEqualToString:kScreenShareTileKey]
+        NSView *videoView = [key isEqualToString:kScreenShareTileKey]
                                           ? self.remoteScreenShareView
                                           : self.remoteCameraViews[key];
         if (!videoView) continue;
@@ -2018,7 +2018,7 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
                                                        MIN(80.0, stageFrame.size.width - 2 * lblPad), lblH);
         }
     } else {
-        InterRemoteVideoView *spotlightVideoView = nil;
+        NSView *spotlightVideoView = nil;
         if ([spotlightKey isEqualToString:kScreenShareTileKey]) {
             spotlightVideoView = self.remoteScreenShareView;
         } else if (spotlightKey) {
@@ -2117,7 +2117,7 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
         }
 
         // --- Remote camera / screen share tile ---
-        InterRemoteVideoView *videoView = nil;
+        NSView *videoView = nil;
         if ([key isEqualToString:kScreenShareTileKey]) {
             videoView = self.remoteScreenShareView;
         } else {

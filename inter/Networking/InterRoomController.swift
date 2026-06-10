@@ -41,6 +41,13 @@ import LiveKit
     /// Current connection state. KVO-observable from Objective-C.
     @objc public private(set) dynamic var connectionState: InterRoomConnectionState = .disconnected
 
+    /// Why the room last became disconnected. Read by the media-wiring layer when
+    /// `connectionState` transitions to `.disconnectedWithError` to decide whether
+    /// to show a generic "Connection Lost" alert or a specific host-action message
+    /// (removed / meeting ended). Updated before the state change so observers see
+    /// a consistent value.
+    @objc public private(set) dynamic var lastDisconnectReason: InterRoomDisconnectReason = .none
+
     /// Participant presence state with 3-second grace period. [G6]
     @objc public private(set) dynamic var participantPresenceState: InterParticipantPresenceState = .alone
 
@@ -118,6 +125,9 @@ import LiveKit
     @objc public private(set) dynamic var activeCameraOffOnJoin: Bool = false
     /// Whether participants can join before the host.
     @objc public private(set) dynamic var activeJoinBeforeHost: Bool = false
+    /// Whether the waiting room / lobby is enabled for this meeting (host-configured).
+    /// Used to initialise the in-session lobby toggle so it reflects the pre-meeting choice.
+    @objc public private(set) dynamic var activeLobbyEnabled: Bool = false
     /// Whether participants can unmute themselves.
     @objc public private(set) dynamic var activeAllowUnmuting: Bool = true
     /// Chat permission level: "everyone" | "hostOnly" | "disabled".
@@ -247,8 +257,19 @@ import LiveKit
                 meetingId: configuration.scheduledMeetingId,
                 serverURL: configuration.tokenServerURL,
                 identity: configuration.participantIdentity,
-                displayName: configuration.participantName
+                displayName: configuration.participantName,
+                password: configuration.meetingPassword
             ) { [weak self] response, error in
+                // The scheduled host is the same user who created the meeting, but the
+                // client cannot know that until the server confirms it. Propagate the
+                // server-authoritative isHost onto our stored configuration so
+                // `roomController.isHost` (and the moderation controller's localRole,
+                // derived from it in attach()) reflect host status and the host UI loads.
+                if let self = self, let r = response, error == nil, r.isHost {
+                    DispatchQueue.main.async {
+                        self.configuration?.isHost = true
+                    }
+                }
                 self?.handleTokenResponse(
                     token: response?.token,
                     serverURL: response?.serverURL ?? configuration.serverURL,
@@ -273,6 +294,7 @@ import LiveKit
                         self.activeMuteOnJoin         = configuration.muteOnJoin
                         self.activeCameraOffOnJoin    = configuration.cameraOffOnJoin
                         self.activeJoinBeforeHost     = configuration.joinBeforeHost
+                        self.activeLobbyEnabled       = configuration.lobbyEnabled
                         self.activeAllowUnmuting      = configuration.allowUnmuting
                         self.activeChatPermissions    = configuration.chatPermissions
                         self.activeSharingPermissions = configuration.sharingPermissions
@@ -310,6 +332,10 @@ import LiveKit
                         self.activeShareConflictPolicy = r.shareConflictPolicy
                         self.activeAutoRecord          = r.autoRecord
                         self.activeAutoTranscript      = r.autoTranscript
+                        // The server restores host status when the original host
+                        // rejoins (matched by authenticated userId). Reflect it so the
+                        // returning host's client shows host UI again.
+                        if r.isHost { self.configuration?.isHost = true }
                     }
                 }
                 self?.handleTokenResponse(
@@ -374,10 +400,14 @@ import LiveKit
             interLogError(InterLog.networking, "RoomController: token fetch failed: %{public}@",
                           error.localizedDescription)
             isConnecting = false
-            // Lobby waiting (1010) is not a connection failure — use .disconnected
-            // so the media wiring controller does not show a "Connection Lost" alert.
-            let isLobbyWaiting = error.code == 1010
-            setConnectionState(isLobbyWaiting ? .disconnected : .disconnectedWithError)
+            // Expected join rejections (bad/expired code, password required/incorrect,
+            // lobby waiting, locked, full, banned, host-not-present) are NOT connection
+            // failures. Mapping them to .disconnected prevents the media wiring
+            // controller from layering the mid-call "Connection Lost" alert on top of
+            // the specific, inline message the setup panel already displays.
+            let isExpectedRejection = error.domain == InterNetworkErrorDomain
+                && (InterNetworkErrorCode(rawValue: error.code)?.isExpectedJoinRejection ?? false)
+            setConnectionState(isExpectedRejection ? .disconnected : .disconnectedWithError)
             completion(error)
             return
         }
@@ -578,6 +608,9 @@ import LiveKit
         sessionStartTime = 0
         connectStartTime = 0
 
+        // Drop all session rename overrides — the next meeting starts from attested names.
+        clearAllSessionDisplayNames()
+
         setConnectionState(.disconnected)
 
         DispatchQueue.main.async {
@@ -761,6 +794,8 @@ import LiveKit
         DispatchQueue.main.async {
             let oldState = self.connectionState
             guard oldState != newState else { return }
+            // A fresh connect attempt clears any stale disconnect reason.
+            if newState == .connecting { self.lastDisconnectReason = .none }
             self.connectionState = newState
             interLogInfo(InterLog.networking, "RoomController: state %d → %d", oldState.rawValue, newState.rawValue)
         }
@@ -836,6 +871,51 @@ import LiveKit
         return participant?.name ?? participant?.identity?.stringValue ?? ""
     }
 
+    // MARK: - Session display-name overrides
+
+    /// Session-only display-name overrides (identity → name), set when a participant is
+    /// renamed — by a host or by themselves — via the `.renameParticipant` control signal.
+    /// This is the single authority for a participant's *effective* name: chat, tiles, and
+    /// notifications all resolve through `effectiveDisplayName(for:)`. Ephemeral — cleared
+    /// when the participant leaves or the session resets, so a rejoining participant
+    /// reverts to their attested (server-stamped) join name. Guarded by a lock because the
+    /// rename-accept write and the chat-receive read can arrive on different queues.
+    private var sessionDisplayNames: [String: String] = [:]
+    private let sessionDisplayNamesLock = NSLock()
+
+    /// Set or update the session display-name override for a participant.
+    @objc public func setSessionDisplayName(_ name: String, forIdentity identity: String) {
+        guard !identity.isEmpty, !name.isEmpty else { return }
+        sessionDisplayNamesLock.lock()
+        sessionDisplayNames[identity] = name
+        sessionDisplayNamesLock.unlock()
+    }
+
+    /// Remove a participant's session display-name override (e.g. when they leave the room).
+    @objc public func clearSessionDisplayName(forIdentity identity: String) {
+        sessionDisplayNamesLock.lock()
+        sessionDisplayNames.removeValue(forKey: identity)
+        sessionDisplayNamesLock.unlock()
+    }
+
+    /// Clear every session display-name override. Call on disconnect/teardown.
+    @objc public func clearAllSessionDisplayNames() {
+        sessionDisplayNamesLock.lock()
+        sessionDisplayNames.removeAll()
+        sessionDisplayNamesLock.unlock()
+    }
+
+    /// The effective display name for a participant: a session rename override if one
+    /// exists, otherwise the attested (server-stamped) LiveKit name. Returns "" if unknown.
+    /// This is the single source of truth for how a participant's name is shown.
+    @objc public func effectiveDisplayName(for identity: String) -> String {
+        sessionDisplayNamesLock.lock()
+        let override = sessionDisplayNames[identity]
+        sessionDisplayNamesLock.unlock()
+        if let override = override, !override.isEmpty { return override }
+        return displayNameForParticipantIdentity(identity)
+    }
+
     /// Returns the role of a remote participant by reading their LiveKit metadata.
     /// Falls back to `.participant` if the identity is not found or has no role metadata.
     @objc public func role(forParticipantIdentity identity: String) -> InterParticipantRole {
@@ -894,9 +974,26 @@ extension InterRoomController: RoomDelegate {
     }
 
     public nonisolated func room(_ room: Room, didDisconnectWithError error: LiveKitError?) {
+        // Classify the disconnect so the UI can show the right thing. A host-driven
+        // removal or meeting-end is intentional — it must NOT surface as a generic
+        // "Connection Lost" alert.
+        let reason: InterRoomDisconnectReason
         if let error = error {
-            interLogError(InterLog.networking, "RoomController: disconnected with error: %{public}@",
-                          error.localizedDescription)
+            switch error.type {
+            case .participantRemoved: reason = .removedByHost
+            case .roomDeleted:        reason = .roomEnded
+            default:                  reason = .error
+            }
+        } else {
+            reason = .clientInitiated
+        }
+        // Publish the reason on main BEFORE the state change so the connectionState
+        // observer reads the up-to-date value (both hops are FIFO on the main queue).
+        DispatchQueue.main.async { self.lastDisconnectReason = reason }
+
+        if error != nil {
+            interLogError(InterLog.networking, "RoomController: disconnected with error (reason=%d): %{public}@",
+                          reason.rawValue, error?.localizedDescription ?? "")
             self.setConnectionState(.disconnectedWithError)
         } else {
             interLogInfo(InterLog.networking, "RoomController: disconnected cleanly")
@@ -932,7 +1029,26 @@ extension InterRoomController: RoomDelegate {
     public nonisolated func room(_ room: Room, participantDidDisconnect participant: RemoteParticipant) {
         interLogInfo(InterLog.networking, "RoomController: participant disconnected: %{public}@",
                      participant.identity?.stringValue ?? "(unknown)")
+        // Drop any session rename override so the map stays bounded and a future joiner
+        // reusing the identity cannot inherit a stale name.
+        if let id = participant.identity?.stringValue {
+            self.clearSessionDisplayName(forIdentity: id)
+        }
         self.updateParticipantPresence()
+    }
+
+    // MARK: Participant Metadata [role reconciliation]
+
+    /// A participant's metadata changed. For the LOCAL participant this carries an
+    /// authoritative role update — the server stamps `{role:...}` into LiveKit metadata
+    /// on promotion/demotion. Reconcile the local role here so moderation UI recovers
+    /// even when the one-shot `.roleChanged` DataChannel signal was missed (reconnect,
+    /// late join). Remote participants' roles are read on demand by the tile layer.
+    public nonisolated func room(_ room: Room, participant: Participant, didUpdateMetadata metadata: String?) {
+        guard participant is LocalParticipant else { return }
+        DispatchQueue.main.async {
+            self.chatController?.moderationController?.updateLocalRole(from: metadata)
+        }
     }
 
     // MARK: Active Speakers

@@ -135,6 +135,10 @@ typedef struct {
     // Placeholder cache: identity → CVPixelBuffer (dark bg + name text).
     NSMutableDictionary<NSString *, id> *_placeholderCache;
 
+    // Identity → display name, for camera-off placeholders. Guarded by
+    // @synchronized(_placeholderCache) since a name change invalidates the cache.
+    NSMutableDictionary<NSString *, NSString *> *_displayNames;
+
     BOOL _invalidated;
 }
 
@@ -157,6 +161,7 @@ typedef struct {
     _invalidated = NO;
 
     _placeholderCache = [NSMutableDictionary dictionary];
+    _displayNames = [NSMutableDictionary dictionary];
     _gridFrames = [NSMutableDictionary dictionary];
     _gridParticipantOrder = @[];
     _ciContext = [CIContext contextWithMTLDevice:device
@@ -414,12 +419,16 @@ typedef struct {
 // ---------------------------------------------------------------------------
 
 - (CVPixelBufferRef)placeholderFrameForIdentity:(NSString *)identity {
+    NSString *displayName = nil;
     @synchronized (_placeholderCache) {
         id cached = _placeholderCache[identity];
         if (cached) {
             return (__bridge CVPixelBufferRef)cached;
         }
+        displayName = _displayNames[identity];
     }
+    // Never render the raw identity (a UUID). Fall back to a friendly label.
+    if (displayName.length == 0) displayName = @"Participant";
 
     // Generate a dark-background placeholder with the participant's name centered.
     int width = (int)_outputSize.width;
@@ -456,7 +465,9 @@ typedef struct {
         }
     }
 
-    // Draw the participant name in the center using Core Graphics.
+    // Draw an avatar circle (coloured by identity) with the display-name initial,
+    // and the display name below it — mirroring the in-call camera-off tile so the
+    // recording shows a friendly name/avatar rather than a blank frame or raw id.
     CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
     CGContextRef ctx = CGBitmapContextCreate(baseAddress, width, height, 8,
                                              bytesPerRow,
@@ -464,21 +475,45 @@ typedef struct {
                                              kCGBitmapByteOrder32Little | kCGImageAlphaPremultipliedFirst);
     if (ctx) {
         CGFloat scaleFactor = _outputSize.width / 1920.0;
-        CGFloat fontSize = 36.0 * scaleFactor;
 
+        // --- Avatar circle (stable colour derived from the identity hash) ---
+        CGFloat avatarD = MIN(width, height) * 0.26;
+        CGFloat avatarX = (width - avatarD) / 2.0;
+        CGFloat avatarY = (height - avatarD) / 2.0 + avatarD * 0.35; // slightly above center
+        NSUInteger hash = [(identity ?: displayName) hash];
+        CGFloat rr = (((hash >> 16) & 0xFF) / 255.0) * 0.45 + 0.20;
+        CGFloat gg = (((hash >> 8)  & 0xFF) / 255.0) * 0.45 + 0.20;
+        CGFloat bb = ((hash         & 0xFF) / 255.0) * 0.45 + 0.20;
+        CGContextSetRGBFillColor(ctx, rr, gg, bb, 1.0);
+        CGContextFillEllipseInRect(ctx, CGRectMake(avatarX, avatarY, avatarD, avatarD));
+
+        // --- Initial inside the avatar ---
+        NSString *initial = [[displayName substringToIndex:1] uppercaseString];
+        NSDictionary *initialAttrs = @{
+            NSFontAttributeName: [NSFont systemFontOfSize:avatarD * 0.42 weight:NSFontWeightSemibold],
+            NSForegroundColorAttributeName: [NSColor colorWithWhite:0.97 alpha:1.0],
+        };
+        NSAttributedString *initialStr = [[NSAttributedString alloc] initWithString:initial attributes:initialAttrs];
+        CTLineRef initialLine = CTLineCreateWithAttributedString((__bridge CFAttributedStringRef)initialStr);
+        CGRect initialBounds = CTLineGetBoundsWithOptions(initialLine, 0);
+        CGFloat initialX = avatarX + (avatarD - initialBounds.size.width) / 2.0 - initialBounds.origin.x;
+        CGFloat initialY = avatarY + (avatarD - initialBounds.size.height) / 2.0 - initialBounds.origin.y;
+        CGContextSetTextPosition(ctx, initialX, initialY);
+        CTLineDraw(initialLine, ctx);
+        CFRelease(initialLine);
+
+        // --- Display name below the avatar ---
+        CGFloat fontSize = 36.0 * scaleFactor;
         NSDictionary *textAttrs = @{
             NSFontAttributeName: [NSFont systemFontOfSize:fontSize weight:NSFontWeightMedium],
             NSForegroundColorAttributeName: [NSColor colorWithWhite:0.85 alpha:1.0],
         };
-
-        NSAttributedString *attrStr = [[NSAttributedString alloc] initWithString:(identity ?: @"Participant")
+        NSAttributedString *attrStr = [[NSAttributedString alloc] initWithString:displayName
                                                                       attributes:textAttrs];
         CTLineRef line = CTLineCreateWithAttributedString((__bridge CFAttributedStringRef)attrStr);
         CGRect textBounds = CTLineGetBoundsWithOptions(line, 0);
-
         CGFloat textX = (width - textBounds.size.width) / 2.0 - textBounds.origin.x;
-        CGFloat textY = (height - textBounds.size.height) / 2.0 - textBounds.origin.y;
-
+        CGFloat textY = avatarY - textBounds.size.height - (avatarD * 0.18);
         CGContextSetTextPosition(ctx, textX, textY);
         CTLineDraw(line, ctx);
         CFRelease(line);
@@ -499,6 +534,22 @@ typedef struct {
         cached = (__bridge CVPixelBufferRef)_placeholderCache[identity];
     }
     return cached;
+}
+
+- (void)setDisplayName:(NSString *)displayName forIdentity:(NSString *)identity {
+    if (identity.length == 0) return;
+    NSString *name = displayName ?: @"";
+    @synchronized (_placeholderCache) {
+        NSString *existing = _displayNames[identity];
+        if ([existing isEqualToString:name]) return; // unchanged — keep cached placeholder
+        if (name.length > 0) {
+            _displayNames[identity] = name;
+        } else {
+            [_displayNames removeObjectForKey:identity];
+        }
+        // Invalidate the cached placeholder so it regenerates with the new name.
+        [_placeholderCache removeObjectForKey:identity];
+    }
 }
 
 // ---------------------------------------------------------------------------

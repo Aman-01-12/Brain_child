@@ -115,6 +115,10 @@ typedef NS_ENUM(NSInteger, InterComposedLayout) {
 /// or CFBridgingRelease on the returned value.
 - (CVPixelBufferRef _Nonnull)placeholderFrameForIdentity:(NSString *)identity;
 
+/// Set the display name used for a participant's camera-off placeholder (avatar + name).
+/// Thread-safe. Changing the name invalidates that participant's cached placeholder.
+- (void)setDisplayName:(nullable NSString *)displayName forIdentity:(NSString *)identity;
+
 /// Render one composed frame from the current video sources.
 ///
 /// Returns an IOSurface-backed CVPixelBuffer from the internal triple-buffer pool.

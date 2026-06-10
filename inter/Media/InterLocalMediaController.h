@@ -7,6 +7,8 @@ NS_ASSUME_NONNULL_BEGIN
 typedef void (^InterLocalMediaPrepareCompletion)(BOOL success, NSString * _Nullable failureReason);
 typedef void (^InterLocalMediaAudioSampleBufferHandler)(CMSampleBufferRef sampleBuffer);
 typedef void (^InterLocalMediaVideoFrameObserver)(CVPixelBufferRef pixelBuffer);
+/// Notifies observers when the local camera is enabled/disabled (recording placeholder).
+typedef void (^InterLocalMediaCameraStateObserver)(BOOL enabled);
 
 @interface InterLocalMediaController : NSObject
 
@@ -24,6 +26,12 @@ typedef void (^InterLocalMediaVideoFrameObserver)(CVPixelBufferRef pixelBuffer);
 /// Set to nil to stop video frame delivery and remove the data output.
 /// Atomic: written on _sessionQueue, read on _videoFrameOutputQueue.
 @property (atomic, copy, nullable) InterLocalMediaVideoFrameObserver recordingFrameObserver;
+
+/// [2B] Observer invoked when the local camera enabled state changes (on/off).
+/// Used by the recording coordinator to swap in an avatar/name placeholder when the
+/// local camera turns off (preventing a frozen last-frame in the composed recording),
+/// and to resume video when it turns back on.
+@property (atomic, copy, nullable) InterLocalMediaCameraStateObserver recordingCameraStateObserver;
 
 /// The underlying AVCaptureSession. Callers MUST use sessionQueue for all
 /// session-related work. Callers MUST NOT call startRunning/stopRunning.

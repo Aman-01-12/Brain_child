@@ -175,6 +175,12 @@ import LiveKit
         _ controller: InterModerationController,
         requestedByIdentity senderIdentity: String)
 
+    /// The host/co-host stopped ALL active screen shares. Every participant that is
+    /// currently sharing should stop locally and show a dismissible notice.
+    @objc optional func moderationControllerReceivedStopScreenShareAll(
+        _ controller: InterModerationController,
+        requestedByIdentity senderIdentity: String)
+
     /// A participant's session display name was changed.
     /// Received by all participants including the renamed one.
     @objc optional func moderationController(_ controller: InterModerationController,
@@ -219,6 +225,10 @@ import LiveKit
 
     /// Whether all participants are currently muted (host-side toggle state).
     @objc public private(set) dynamic var isAllMuted: Bool = false
+
+    /// Whether all participants' cameras are currently locked off (host-side toggle
+    /// state). Mirrors `isAllMuted` for the camera "Turn Off All Cameras" control.
+    @objc public private(set) dynamic var isAllCameraMuted: Bool = false
 
     /// The identity of the force-spotlighted participant (first pinned, empty when none).
     /// Kept for backward-compat; prefer forceSpotlightIdentities.
@@ -320,6 +330,15 @@ import LiveKit
     // MARK: - Role Management (9.1.3)
 
     /// Update local role when metadata changes (e.g. after promotion).
+    ///
+    /// Reconciles against the authoritative LiveKit participant metadata. This is the
+    /// recovery path for cases where the one-shot `.roleChanged` DataChannel signal was
+    /// missed (reconnect, late join): the server stamps `{role:...}` into the local
+    /// participant's metadata, LiveKit delivers it here, and we re-derive the role.
+    ///
+    /// The `newRole != localRole` guard makes this idempotent — when the DataChannel
+    /// signal already applied the change, the metadata callback is a no-op, so no
+    /// duplicate role-change notification is emitted.
     @objc public func updateLocalRole(from metadata: String?) {
         let newRole = InterParticipantMetadata.parseRole(from: metadata)
         if newRole != localRole {
@@ -327,6 +346,11 @@ import LiveKit
             localRole = newRole
             interLogInfo(InterLog.room, "ModerationController: local role changed %{public}@ -> %{public}@",
                          oldRole.stringValue, newRole.stringValue)
+            // Drive UI reconciliation through the same delegate path the
+            // `.roleChanged` DataChannel signal uses, so moderation controls
+            // (the ⚙️ Moderate button, permissions, badges) recover correctly.
+            delegate?.moderationController(self, participantRoleChanged: localIdentity,
+                                           newRole: newRole.stringValue)
         }
     }
 
@@ -450,6 +474,21 @@ import LiveKit
             return
         }
 
+        // Clear the server-side GLOBAL mic-mute rule so participants who join AFTER this
+        // unmute-all are not auto-muted. Best-effort: live participants are unmuted by the
+        // DataChannel broadcast below; this POST only clears the persistent rule.
+        let body: [String: Any] = [
+            "roomCode": roomCode,
+            "callerIdentity": localIdentity,
+        ]
+        performPOST(endpoint: "/room/unmute-all", body: body) { result in
+            if case .failure(let error) = result {
+                interLogError(InterLog.room,
+                    "ModerationController: unmute-all flag clear failed: %{public}@",
+                    error.localizedDescription)
+            }
+        }
+
         sendControlSignal(type: .requestUnmuteAll)
         interLogInfo(InterLog.room, "ModerationController: broadcast requestUnmuteAll signal")
         completeOnMain {
@@ -495,16 +534,61 @@ import LiveKit
     /// Broadcasts `.renameParticipant` to all participants; no server persistence.
     @objc public func renameParticipant(identity: String, newDisplayName: String) {
         guard InterPermissionMatrix.role(localRole, hasPermission: .canMuteOthers) else { return }
-        guard !identity.isEmpty, !newDisplayName.isEmpty else { return }
+        guard !identity.isEmpty, let cleanName = Self.sanitizedDisplayName(newDisplayName) else { return }
         sendControlSignal(type: .renameParticipant,
                           targetIdentity: identity,
-                          extraData: ["newDisplayName": newDisplayName])
+                          extraData: ["newDisplayName": cleanName])
         // Apply locally — the DataChannel sender does not receive its own broadcast,
         // so the renaming moderator's own tile for this participant would not update.
         completeOnMain {
             self.delegate?.moderationController?(self, participantRenamed: identity,
-                                                 newDisplayName: newDisplayName)
+                                                 newDisplayName: cleanName)
         }
+    }
+
+    /// Whether the LOCAL participant may rename themselves. Allowed in any non-interview
+    /// room, and in an interview room only for a moderator (the interviewer). Drives the
+    /// self-rename UI visibility; the receive side enforces the identical rule independently
+    /// so the gate holds even against a hand-crafted signal.
+    @objc public var canLocalParticipantSelfRename: Bool {
+        let isModerator = InterPermissionMatrix.role(localRole, hasPermission: .canMuteOthers)
+        let isInterview = (roomController?.roomType == "interview")
+        return isModerator || !isInterview
+    }
+
+    /// Renames the LOCAL participant's own display name for this session.
+    /// Blocked only for an interviewee in an interview room (identity integrity is the
+    /// point of the interview). Broadcasts `.renameParticipant` targeting self; ephemeral
+    /// (reverts to the join name on rejoin).
+    @objc public func renameSelf(newDisplayName: String) {
+        guard canLocalParticipantSelfRename else {
+            interLogInfo(InterLog.room, "ModerationController: self-rename blocked (interviewee in interview room)")
+            return
+        }
+        guard !localIdentity.isEmpty, let cleanName = Self.sanitizedDisplayName(newDisplayName) else { return }
+        sendControlSignal(type: .renameParticipant,
+                          targetIdentity: localIdentity,
+                          extraData: ["newDisplayName": cleanName])
+        // Apply locally — the sender does not receive its own broadcast.
+        completeOnMain {
+            self.delegate?.moderationController?(self, participantRenamed: self.localIdentity,
+                                                 newDisplayName: cleanName)
+        }
+    }
+
+    /// Sanitises a display name before it is broadcast or applied: strips control
+    /// characters and newlines (prevents UI-breaking names and log injection), trims
+    /// surrounding whitespace, and caps the length. Returns nil if nothing usable remains.
+    /// Applied on BOTH the send and receive paths so a hand-crafted signal is also cleaned.
+    static func sanitizedDisplayName(_ raw: String) -> String? {
+        let scalars = raw.unicodeScalars.filter { !CharacterSet.controlCharacters.contains($0) }
+        var name = String(String.UnicodeScalarView(scalars)).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty else { return nil }
+        let maxLength = 50
+        if name.count > maxLength {
+            name = String(name.prefix(maxLength))
+        }
+        return name
     }
 
     /// Broadcasts whether co-hosts may record locally (host only).
@@ -549,6 +633,35 @@ import LiveKit
         }
     }
 
+    // MARK: - End Meeting For All
+
+    /// End the meeting for every participant. Host-only. The server deletes the
+    /// LiveKit room, which disconnects all participants (including the host) with
+    /// a `roomDeleted` reason.
+    @objc(endMeetingForAll:)
+    public func endMeetingForAll(completion: @escaping (Bool, NSError?) -> Void) {
+        guard localRole == .host else {
+            completion(false, makeError("Only the host can end the meeting for everyone"))
+            return
+        }
+
+        let body: [String: Any] = [
+            "roomCode": roomCode,
+            "callerIdentity": localIdentity,
+        ]
+
+        performPOST(endpoint: "/room/end", body: body) { [weak self] result in
+            guard let self = self else { return }
+            switch result {
+            case .success:
+                interLogInfo(InterLog.room, "ModerationController: ended meeting for all")
+                self.completeOnMain { completion(true, nil) }
+            case .failure(let error):
+                self.completeOnMain { completion(false, error) }
+            }
+        }
+    }
+
     // MARK: - Ask to Unmute (9.2.4)
 
     /// Send a soft unmute request to a participant via DataChannel.
@@ -578,6 +691,7 @@ import LiveKit
     @objc public func muteCameraAll() {
         guard InterPermissionMatrix.role(localRole, hasPermission: .canMuteOthers) else { return }
         sendControlSignal(type: .requestMuteCameraAll)
+        completeOnMain { self.isAllCameraMuted = true }
         interLogInfo(InterLog.room, "ModerationController: muteCameraAll broadcast")
     }
 
@@ -592,7 +706,18 @@ import LiveKit
     @objc public func liftCameraLockAll() {
         guard InterPermissionMatrix.role(localRole, hasPermission: .canMuteOthers) else { return }
         sendControlSignal(type: .liftCameraLockAll)
+        completeOnMain { self.isAllCameraMuted = false }
         interLogInfo(InterLog.room, "ModerationController: liftCameraLockAll broadcast")
+    }
+
+    /// Sync `isAllCameraMuted` when THIS client observes a global camera mute/lift
+    /// initiated by ANOTHER moderator (co-host scenario), so this client's menu
+    /// label ("Turn Off All Cameras" vs "Allow All Cameras") reflects the room's
+    /// true state. Mirrors `applyExternalGlobalMuteChanged` for microphones.
+    @objc public func applyExternalGlobalCameraMuteChanged(_ newValue: Bool) {
+        DispatchQueue.main.async { [weak self] in
+            self?.isAllCameraMuted = newValue
+        }
     }
 
     /// Locked participant sends a camera unlock request to the host.
@@ -715,6 +840,18 @@ import LiveKit
         }
         sendControlSignal(type: .stopScreenShare, targetIdentity: identity)
         interLogInfo(InterLog.room, "ModerationController: sent stopScreenShare → %{private}@", identity)
+    }
+
+    /// Stop ALL active screen shares at once. Host/co-host only. Broadcasts a
+    /// `stopScreenShareAll` signal; every sharing client stops locally. One-shot —
+    /// subsequent shares are still governed by `shareConflictPolicy`.
+    @objc public func stopAllScreenShares() {
+        guard InterPermissionMatrix.role(localRole, hasPermission: .canMuteOthers) else {
+            interLogInfo(InterLog.room, "ModerationController: stopAllScreenShares blocked — insufficient role")
+            return
+        }
+        sendControlSignal(type: .stopScreenShareAll)
+        interLogInfo(InterLog.room, "ModerationController: stopAllScreenShares broadcast")
     }
 
     // MARK: - Request to Speak / Allow to Speak
@@ -1252,6 +1389,29 @@ import LiveKit
 
     /// Process an incoming control signal from the DataChannel.
     /// Called by the chat controller when it receives a Phase 9 signal type.
+    /// Host-only control-signal types: these drive moderation state or UI that only a
+    /// host/co-host may legitimately initiate. The receive path verifies the (attested)
+    /// sender holds a moderator role before acting (in_call.md C10). Participant→host
+    /// REQUEST signals (raiseHand, requestToSpeak, requestScreenShare, request*Unlock,
+    /// lobbyJoin) are deliberately excluded — anyone may send those. Types that already
+    /// carry their own per-case sender-role check (approve/deny/rename/sharePolicy/
+    /// stopScreenShare*) are also excluded to leave their existing logic untouched.
+    private static let hostOnlySignalTypes: Set<InterControlSignalType> = [
+        .disableChat, .enableChat,
+        .askToUnmute, .askToUnmuteCamera,
+        .meetingLocked, .meetingUnlocked,
+        .suspended, .unsuspended,
+        .forceSpotlight, .clearForceSpotlight,
+        .participantRemoved, .roleChanged,
+        .requestUnmuteAll, .requestMuteAll,
+        .requestMuteOne, .requestUnmuteOne,
+        .allowToSpeak,
+        .approveScreenShare, .denyScreenShare,
+        .requestMuteCameraOne, .requestMuteCameraAll,
+        .liftCameraLockOne, .liftCameraLockAll,
+        .screenshareModeChanged,
+    ]
+
     public func handleControlSignal(_ signal: InterControlSignal) {
         // DataChannel callbacks arrive off-main; dispatch all state mutations
         // and delegate invocations to the main queue.
@@ -1265,6 +1425,23 @@ import LiveKit
     private func _handleControlSignal(_ signal: InterControlSignal) {
         let targetIsLocal = signal.targetIdentity == localIdentity
         let senderIsLocal = signal.senderIdentity == localIdentity
+
+        // SECURITY (in_call.md C10): host-only signals must originate from a moderator.
+        // `signal.senderIdentity` is the LiveKit-attested identity (reconciled in
+        // InterChatController before forwarding) and the role is read from the sender's
+        // server-stamped metadata (tokens do not grant canUpdateOwnMetadata), so this is
+        // authoritative. The server remains the source of truth for permanent state
+        // (remove/mute/lock via validateModerator); this blocks spoofed client-side
+        // state/UI changes. Own broadcasts (senderIsLocal) are trusted at send time.
+        if !senderIsLocal && Self.hostOnlySignalTypes.contains(signal.type) {
+            let senderRole = roomController?.role(forParticipantIdentity: signal.senderIdentity) ?? .participant
+            guard InterPermissionMatrix.role(senderRole, hasPermission: .canMuteOthers) else {
+                interLogInfo(InterLog.room,
+                    "ModerationController: discarded host-only signal type=%d from unprivileged sender %{private}@",
+                    signal.type.rawValue, signal.senderIdentity)
+                return
+            }
+        }
 
         switch signal.type {
         case .disableChat:
@@ -1430,6 +1607,9 @@ import LiveKit
                 interLogInfo(InterLog.room, "ModerationController: broadcast requestMuteCameraAll")
             } else {
                 interLogInfo(InterLog.room, "ModerationController: received requestMuteCameraAll from %{public}@", signal.senderName)
+                // Keep this client's host-side toggle label in sync when a co-host
+                // initiated the global camera mute.
+                applyExternalGlobalCameraMuteChanged(true)
                 delegate?.moderationControllerReceivedCameraMuteAll?(self)
             }
 
@@ -1448,6 +1628,9 @@ import LiveKit
                 interLogInfo(InterLog.room, "ModerationController: broadcast liftCameraLockAll")
             } else {
                 interLogInfo(InterLog.room, "ModerationController: received liftCameraLockAll from %{public}@", signal.senderName)
+                // Keep this client's host-side toggle label in sync when a co-host
+                // initiated the global camera lift.
+                applyExternalGlobalCameraMuteChanged(false)
                 delegate?.moderationControllerReceivedCameraLiftAll?(self)
             }
 
@@ -1547,17 +1730,25 @@ import LiveKit
             }
 
         case .renameParticipant:
+            // Accept a rename when the sender is a moderator (host/co-host renaming anyone)
+            // OR it is a self-rename in a non-interview room. Blocks: an interviewee
+            // renaming themselves, and any non-moderator renaming someone else. The sender
+            // identity is the LiveKit-attested one (reconciled in InterChatController) and
+            // the role is read from server-stamped metadata, so this cannot be spoofed.
             let senderIdentity = signal.senderIdentity
             let senderRole = roomController?.role(forParticipantIdentity: senderIdentity) ?? .participant
-            guard InterPermissionMatrix.role(senderRole, hasPermission: .canMuteOthers) else {
+            let isModerator = InterPermissionMatrix.role(senderRole, hasPermission: .canMuteOthers)
+            let isSelfRename = (signal.targetIdentity == senderIdentity)
+            let isInterview = (roomController?.roomType == "interview")
+            guard isModerator || (isSelfRename && !isInterview) else {
                 interLogInfo(InterLog.room,
-                    "ModerationController: discarded renameParticipant from unprivileged sender %{private}@",
+                    "ModerationController: discarded renameParticipant from unauthorised sender %{private}@",
                     senderIdentity)
                 break
             }
             if let target = signal.targetIdentity,
-               let newName = signal.extraData?["newDisplayName"],
-               !newName.isEmpty {
+               let rawName = signal.extraData?["newDisplayName"],
+               let newName = Self.sanitizedDisplayName(rawName) {
                 delegate?.moderationController?(self, participantRenamed: target, newDisplayName: newName)
             }
 
@@ -1625,6 +1816,25 @@ import LiveKit
                     interLogInfo(InterLog.room,
                         "ModerationController: discarded stopScreenShare from %{private}@ — unauthorised under policy=%{public}@",
                         senderIdentity, shareConflictPolicy)
+                }
+            }
+
+        case .stopScreenShareAll:
+            // Broadcast from a moderator to stop everyone's screen share. Validate the
+            // sender actually has moderator authority before acting (defence in depth);
+            // ignore our own broadcast (we stop our share locally at send time).
+            if !senderIsLocal {
+                let senderIdentity = signal.senderIdentity
+                let senderRole = roomController?.role(forParticipantIdentity: senderIdentity) ?? .participant
+                if InterPermissionMatrix.role(senderRole, hasPermission: .canMuteOthers) {
+                    interLogInfo(InterLog.room,
+                        "ModerationController: received stopScreenShareAll from %{private}@", senderIdentity)
+                    delegate?.moderationControllerReceivedStopScreenShareAll?(self,
+                        requestedByIdentity: senderIdentity)
+                } else {
+                    interLogInfo(InterLog.room,
+                        "ModerationController: discarded stopScreenShareAll from %{private}@ — unauthorised",
+                        senderIdentity)
                 }
             }
 

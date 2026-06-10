@@ -31,6 +31,8 @@ static NSString *const kUDShareConflictPolicy  = @"InterPreMeeting_ShareConflict
 static NSString *const kUDAutoRecord           = @"InterPreMeeting_AutoRecord";
 static NSString *const kUDAutoTranscript       = @"InterPreMeeting_AutoTranscript";
 static NSString *const kUDAllowCoHostLocalRecording = @"InterPreMeeting_AllowCoHostLocalRecording";
+/// Set once the host saves their meeting defaults; gates compact-vs-full panel.
+static NSString *const kUDHasConfiguredDefaults = @"InterPreMeeting_HasConfiguredDefaults";
 
 // ---------------------------------------------------------------------------
 // MARK: - InterPreMeetingSettings
@@ -73,7 +75,13 @@ static NSString *const kUDAllowCoHostLocalRecording = @"InterPreMeeting_AllowCoH
     [ud setBool:self.autoRecord         forKey:kUDAutoRecord];
     [ud setBool:self.autoTranscript     forKey:kUDAutoTranscript];
     [ud setBool:self.allowCoHostLocalRecording forKey:kUDAllowCoHostLocalRecording];
+    // Mark that defaults have been configured so future host-calls use the compact panel.
+    [ud setBool:YES forKey:kUDHasConfiguredDefaults];
     [ud synchronize];
+}
+
++ (BOOL)hasConfiguredDefaults {
+    return [[NSUserDefaults standardUserDefaults] boolForKey:kUDHasConfiguredDefaults];
 }
 
 - (id)copyWithZone:(NSZone *)zone {
@@ -150,6 +158,18 @@ static const CGFloat kControlW   = 140.0; // width of popup/button controls
     NSButton     *_cancelButton;
     NSButton     *_startButton;
 
+    // Compact mode (additive overlay; full controls still built + hidden)
+    BOOL              _compactMode;
+    BOOL              _advancedExpanded;
+    NSView           *_compactContainer;
+    NSTextField      *_compactNameField;
+    NSButton         *_compactPasswordToggle;
+    NSSecureTextField *_compactPasswordField;
+    NSButton         *_advancedButton;
+
+    // Defaults-editor mode (Save instead of Start; no meeting launch)
+    BOOL              _defaultsEditorMode;
+
     BOOL _isPro;
 }
 @end
@@ -161,11 +181,46 @@ static const CGFloat kControlW   = 140.0; // width of popup/button controls
 // ---------------------------------------------------------------------------
 
 - (instancetype)initWithFrame:(NSRect)frame {
+    return [self initWithFrame:frame compactMode:NO];
+}
+
+- (instancetype)initWithFrame:(NSRect)frame compactMode:(BOOL)compactMode {
     self = [super initWithFrame:frame];
     if (!self) return nil;
+    _compactMode = compactMode;
     [self _buildUI];
     [self _loadDefaults];
+    if (compactMode) {
+        // Build the compact overlay AFTER defaults are loaded so the summary chips
+        // reflect the actual saved settings. The full controls remain built (hidden),
+        // so -_collectSettings keeps reading the single canonical set of controls.
+        [self _buildCompactOverlay];
+    }
     return self;
+}
+
+- (instancetype)initWithFrame:(NSRect)frame defaultsEditor:(BOOL)defaultsEditor {
+    self = [super initWithFrame:frame];
+    if (!self) return nil;
+    // Set the flag BEFORE -_buildUI so the per-meeting rows are omitted entirely
+    // (avoids leaving empty gaps that hiding-after-build would produce).
+    _defaultsEditorMode = defaultsEditor;
+    [self _buildUI];
+    [self _loadDefaults];
+    if (defaultsEditor) {
+        [self configureAsDefaultsEditor];
+    }
+    return self;
+}
+
++ (CGFloat)fullPanelHeight { return 620.0; }
++ (CGFloat)compactPanelHeight { return 380.0; }
+
+- (void)configureAsDefaultsEditor {
+    _defaultsEditorMode = YES;
+    _startButton.title = @"Save";
+    _cancelButton.title = @"Close";
+    _titleLabel.stringValue = @"Default Meeting Settings";
 }
 
 // ---------------------------------------------------------------------------
@@ -174,8 +229,10 @@ static const CGFloat kControlW   = 140.0; // width of popup/button controls
 
 - (void)setDisplayName:(NSString *)displayName {
     if (displayName.length > 0) {
-        _meetingNameField.stringValue =
-            [NSString stringWithFormat:@"%@'s Meeting", displayName];
+        NSString *t = [NSString stringWithFormat:@"%@'s Meeting", displayName];
+        _meetingNameField.stringValue = t;
+        // Mirror into the compact field too (no-op when not in compact mode).
+        _compactNameField.stringValue = t;
     }
 }
 
@@ -282,8 +339,11 @@ static const CGFloat kControlW   = 140.0; // width of popup/button controls
     _joinBeforeHostToggle = [self _addToggleRowWithLabel:@"Join Before Host" y:y inView:_contentView];
     y += 32.0;
 
-    // Password row: toggle + inline text field
-    y = [self _addPasswordRowAt:y inView:_contentView];
+    // Password row: toggle + inline text field.
+    // Omitted in defaults-editor mode — a password is per-meeting, never a default.
+    if (!_defaultsEditorMode) {
+        y = [self _addPasswordRowAt:y inView:_contentView];
+    }
 
     _lobbyToggle = [self _addToggleRowWithLabel:@"Enable Waiting Room" y:y inView:_contentView];
     y += 32.0;
@@ -300,9 +360,12 @@ static const CGFloat kControlW   = 140.0; // width of popup/button controls
     y = [self _addSectionHeader:@"PARTICIPANT CONTROLS" y:y inView:_contentView];
 
     // ---- GENERAL section ----
-    y = [self _addSeparatorAt:y inView:_contentView];
-    y = [self _addMeetingNameRowAt:y inView:_contentView];
-    y = [self _addSectionHeader:@"GENERAL" y:y inView:_contentView];
+    // Meeting Name is per-meeting (not a default), so omit it in defaults-editor mode.
+    if (!_defaultsEditorMode) {
+        y = [self _addSeparatorAt:y inView:_contentView];
+        y = [self _addMeetingNameRowAt:y inView:_contentView];
+        y = [self _addSectionHeader:@"GENERAL" y:y inView:_contentView];
+    }
 
     // ---- Title ----
     y = [self _addSeparatorAt:y inView:_contentView];
@@ -314,11 +377,192 @@ static const CGFloat kControlW   = 140.0; // width of popup/button controls
     y += 34.0;
     y = [self _addSeparatorAt:y inView:_contentView];
 
+    // Size the document view to the actual content height so there is no empty
+    // gap at the top — important in defaults-editor mode where the Meeting Name
+    // and Password rows are omitted and the content is shorter than kContentH.
+    CGFloat usedHeight = MAX(y, _scrollView.bounds.size.height);
+    NSRect cvFrame = _contentView.frame;
+    cvFrame.size.height = usedHeight;
+    _contentView.frame = cvFrame;
+
     // Scroll to top after building so the title area is visible first
     dispatch_async(dispatch_get_main_queue(), ^{
         [self->_scrollView.documentView
-            scrollPoint:NSMakePoint(0, kContentH - self->_scrollView.bounds.size.height)];
+            scrollPoint:NSMakePoint(0, usedHeight - self->_scrollView.bounds.size.height)];
     });
+}
+
+// ---------------------------------------------------------------------------
+// MARK: - Compact overlay (additive — full controls remain built + hidden)
+// ---------------------------------------------------------------------------
+
+/// Builds the compact UI: a meeting-name field, an opt-in password field, a
+/// read-only summary of the saved default settings, and an "Advanced ▸"
+/// disclosure. The full controls (already built by -_buildUI and populated by
+/// -_loadDefaults) are hidden but retained, so -_collectSettings keeps reading
+/// the single canonical set of controls — no divergent settings logic.
+- (void)_buildCompactOverlay {
+    // Hide the full settings scroll view; the compact container takes its place.
+    _scrollView.hidden = YES;
+
+    CGFloat W  = kPanelW;
+    CGFloat Hc = self.bounds.size.height - 56.0; // area above the bottom buttons
+    _compactContainer = [[NSView alloc] initWithFrame:NSMakeRect(0, 56.0, W, Hc)];
+    _compactContainer.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+    [self addSubview:_compactContainer];
+
+    CGFloat yy = Hc - 40.0;
+
+    // Title
+    NSTextField *title = [self _makeLabel:@"New Meeting" fontSize:17.0 isBold:YES];
+    title.frame = NSMakeRect(kMarginL, yy, W - kMarginL * 2, 26.0);
+    [_compactContainer addSubview:title];
+    yy -= 26.0;
+
+    // Helper text
+    NSTextField *helper = [self _makeLabel:@"Using your saved default settings"
+                                  fontSize:11.0 isBold:NO];
+    helper.textColor = [NSColor secondaryLabelColor];
+    helper.frame = NSMakeRect(kMarginL, yy, W - kMarginL * 2, 16.0);
+    [_compactContainer addSubview:helper];
+    yy -= 26.0;
+
+    // Effective-settings chips (read from the same defaults the full controls hold)
+    InterPreMeetingSettings *s = [InterPreMeetingSettings settingsWithDefaults];
+    NSArray<NSString *> *chips = @[
+        [NSString stringWithFormat:@"🚪 Waiting room: %@", s.lobbyEnabled ? @"On" : @"Off"],
+        [NSString stringWithFormat:@"🎤 Mic: %@", s.muteOnJoin ? @"Muted" : @"On"],
+        [NSString stringWithFormat:@"📷 Camera: %@", s.cameraOffOnJoin ? @"Off" : @"On"],
+        [NSString stringWithFormat:@"📺 Sharing: %@", [self _shareSummaryFor:s.sharingPermissions]],
+    ];
+    CGFloat chipX = kMarginL;
+    CGFloat chipRowY = yy - 20.0;
+    for (NSString *text in chips) {
+        NSView *chip = [self _makeChipWithText:text];
+        CGFloat cw = chip.frame.size.width;
+        if (chipX + cw > W - kMarginL) {        // wrap to next row
+            chipX = kMarginL;
+            chipRowY -= 26.0;
+        }
+        chip.frame = NSMakeRect(chipX, chipRowY, cw, chip.frame.size.height);
+        [_compactContainer addSubview:chip];
+        chipX += cw + 6.0;
+    }
+    yy = chipRowY - 18.0;
+
+    // Meeting name
+    NSTextField *nameLbl = [self _makeLabel:@"Meeting Name" fontSize:12.0 isBold:NO];
+    nameLbl.frame = NSMakeRect(kMarginL, yy, W - kMarginL * 2, 16.0);
+    [_compactContainer addSubview:nameLbl];
+    yy -= 28.0;
+
+    _compactNameField = [[NSTextField alloc]
+        initWithFrame:NSMakeRect(kMarginL, yy, W - kMarginL * 2, 26.0)];
+    _compactNameField.placeholderString = @"Meeting name";
+    _compactNameField.bezeled  = YES;
+    _compactNameField.editable = YES;
+    [_compactNameField setAppearance:[NSAppearance appearanceNamed:NSAppearanceNameDarkAqua]];
+    // Mirror whatever the canonical field already holds (e.g. from -setDisplayName:).
+    _compactNameField.stringValue = _meetingNameField.stringValue ?: @"";
+    [_compactContainer addSubview:_compactNameField];
+    yy -= 38.0;
+
+    // Opt-in password (NEVER persisted — per-meeting only)
+    _compactPasswordToggle = [[NSButton alloc]
+        initWithFrame:NSMakeRect(kMarginL, yy, W - kMarginL * 2, 22.0)];
+    [_compactPasswordToggle setButtonType:NSButtonTypeSwitch];
+    _compactPasswordToggle.title = @"  Require a password";
+    _compactPasswordToggle.state = NSControlStateValueOff;
+    _compactPasswordToggle.target = self;
+    _compactPasswordToggle.action = @selector(_compactPasswordToggleChanged:);
+    [_compactContainer addSubview:_compactPasswordToggle];
+    yy -= 30.0;
+
+    _compactPasswordField = [[NSSecureTextField alloc]
+        initWithFrame:NSMakeRect(kMarginL, yy, W - kMarginL * 2, 24.0)];
+    _compactPasswordField.placeholderString = @"Meeting password";
+    _compactPasswordField.bezeled  = YES;
+    _compactPasswordField.editable = YES;
+    _compactPasswordField.hidden   = YES;   // shown only when the toggle is on
+    [_compactPasswordField setAppearance:[NSAppearance appearanceNamed:NSAppearanceNameDarkAqua]];
+    [_compactContainer addSubview:_compactPasswordField];
+
+    // Advanced disclosure (reveals the full settings for a one-off override)
+    _advancedButton = [[NSButton alloc]
+        initWithFrame:NSMakeRect(kMarginL, 10.0, 180.0, 24.0)];
+    _advancedButton.title = @"Advanced ▸";
+    _advancedButton.bezelStyle = NSBezelStyleInline;
+    _advancedButton.bordered = NO;
+    _advancedButton.contentTintColor = [NSColor systemBlueColor];
+    _advancedButton.alignment = NSTextAlignmentLeft;
+    _advancedButton.target = self;
+    _advancedButton.action = @selector(_advancedTapped:);
+    [_compactContainer addSubview:_advancedButton];
+}
+
+/// Short human-readable summary for the sharing-permission constant.
+- (NSString *)_shareSummaryFor:(NSString *)mode {
+    if ([mode isEqualToString:InterSharingPermissionsEveryone]) return @"Everyone";
+    if ([mode isEqualToString:InterSharingPermissionsRequest])  return @"Request";
+    return @"Host only";
+}
+
+/// Builds a small rounded "chip" view wrapping a centered label.
+- (NSView *)_makeChipWithText:(NSString *)text {
+    NSTextField *lbl = [[NSTextField alloc] initWithFrame:NSZeroRect];
+    lbl.stringValue = text;
+    lbl.font = [NSFont systemFontOfSize:11.0];
+    lbl.textColor  = [NSColor colorWithWhite:0.92 alpha:1.0];
+    lbl.editable   = NO;
+    lbl.selectable = NO;
+    lbl.bezeled    = NO;
+    lbl.drawsBackground = NO;
+    lbl.alignment  = NSTextAlignmentCenter;
+    [lbl sizeToFit];
+    NSSize ts = lbl.frame.size;
+    CGFloat padX = 9.0, h = 20.0;
+    NSView *wrap = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, ts.width + padX * 2, h)];
+    wrap.wantsLayer = YES;
+    wrap.layer.backgroundColor = [NSColor colorWithWhite:0.24 alpha:1.0].CGColor;
+    wrap.layer.cornerRadius = 9.0;
+    lbl.frame = NSMakeRect(padX, (h - ts.height) / 2.0, ts.width, ts.height);
+    [wrap addSubview:lbl];
+    return wrap;
+}
+
+- (void)_compactPasswordToggleChanged:(NSButton *)sender {
+    _compactPasswordField.hidden = (sender.state == NSControlStateValueOff);
+    if (sender.state == NSControlStateValueOff) {
+        _compactPasswordField.stringValue = @"";
+    } else {
+        [self.window makeFirstResponder:_compactPasswordField];
+    }
+}
+
+/// "Advanced ▸" — reveal the full settings for this one meeting. Carries the
+/// compact name/password into the canonical controls so the full panel shows them.
+- (void)_advancedTapped:(NSButton *)sender {
+#pragma unused(sender)
+    _advancedExpanded = YES;
+    [self _mirrorCompactIntoCanonical];
+    _passwordField.hidden = (_passwordToggle.state == NSControlStateValueOff);
+
+    _compactContainer.hidden = YES;
+    _scrollView.hidden = NO;
+
+    if ([self.delegate respondsToSelector:@selector(preMeetingPanel:didRequestExpandToHeight:)]) {
+        [self.delegate preMeetingPanel:self didRequestExpandToHeight:[[self class] fullPanelHeight]];
+    }
+}
+
+/// Copies the compact name/password into the canonical controls that
+/// -_collectSettings reads. Returns NO if password is enabled but empty.
+- (BOOL)_mirrorCompactIntoCanonical {
+    _meetingNameField.stringValue = _compactNameField.stringValue ?: @"";
+    BOOL pwOn = (_compactPasswordToggle.state == NSControlStateValueOn);
+    _passwordToggle.state = pwOn ? NSControlStateValueOn : NSControlStateValueOff;
+    _passwordField.stringValue = pwOn ? (_compactPasswordField.stringValue ?: @"") : @"";
+    return !(pwOn && _compactPasswordField.stringValue.length == 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -553,8 +797,25 @@ static const CGFloat kControlW   = 140.0; // width of popup/button controls
 }
 
 - (void)_startTapped:(id)sender {
+    // In compact mode (not yet expanded to Advanced), mirror the compact
+    // name/password into the canonical controls so the single -_collectSettings
+    // path reads them. The advanced controls already hold the saved defaults.
+    if (_compactMode && !_advancedExpanded) {
+        if (![self _mirrorCompactIntoCanonical]) {
+            // Password enabled but empty — don't create a falsely "protected" room.
+            [self.window makeFirstResponder:_compactPasswordField];
+            NSBeep();
+            return;
+        }
+    }
     InterPreMeetingSettings *s = [self _collectSettings];
     [s saveToUserDefaults];
+    if (_defaultsEditorMode) {
+        if ([self.delegate respondsToSelector:@selector(preMeetingPanelDidSaveDefaults:)]) {
+            [self.delegate preMeetingPanelDidSaveDefaults:self];
+        }
+        return;
+    }
     [self.delegate preMeetingPanel:self didStartWithSettings:s];
 }
 

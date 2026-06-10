@@ -151,7 +151,6 @@ import LiveKit
     /// When true, frames are routed to composedRenderer.updateParticipantFrame
     /// instead of the active/secondary speaker pair.
     private var _useGridLayout: Bool = false
-
     /// Host participant identity for screen share priority.
     /// When multiple participants screen share, the host's share takes precedence.
     private var _hostIdentity: String?
@@ -169,6 +168,11 @@ import LiveKit
 
     /// Local participant identity — captured at recording start for thread-safe access.
     private var _localParticipantIdentity: String?
+
+    /// Identity → display name cache for camera-off placeholders. Populated even before
+    /// the renderer exists (names may arrive before recording starts) and replayed onto
+    /// the renderer when it is created. Guarded by coordinatorQueue.
+    private var _participantDisplayNames: [String: String] = [:]
 
     /// [Gap #14] Extracted audio capture subsystem — owns the tap, ring buffer, and drain.
     private lazy var audioCapture = InterRecordingAudioCapture(coordinatorQueue: coordinatorQueue)
@@ -385,6 +389,30 @@ import LiveKit
             }
             // When camera unmutes, the next frame delivery will naturally update the renderer.
         }
+    }
+
+    /// Provide a participant's display name for camera-off placeholders (avatar + name)
+    /// in the recording. Safe to call at any time; ignored if not currently recording.
+    @objc public func setParticipantDisplayName(_ name: String, forIdentity identity: String) {
+        guard !identity.isEmpty else { return }
+        coordinatorQueue.async { [weak self] in
+            guard let self = self else { return }
+            self._participantDisplayNames[identity] = name
+            self.composedRenderer?.setDisplayName(name, forIdentity: identity)
+        }
+    }
+
+    /// Called when the LOCAL participant turns their camera on/off during recording.
+    /// When the local camera goes off, AVCaptureVideoDataOutput is removed and frame
+    /// delivery stops — without this hook the composed recording would FREEZE on the
+    /// last local frame. Routing through `participantCameraDidChange` swaps in the
+    /// avatar/name placeholder; the next real frame restores video on un-mute.
+    @objc public func localCameraDidChange(_ isOff: Bool) {
+        os_unfair_lock_lock(&_stateLock)
+        let localId = _localParticipantIdentity ?? ""
+        os_unfair_lock_unlock(&_stateLock)
+        guard !localId.isEmpty else { return }
+        participantCameraDidChange(localId, isMuted: isOff)
     }
 
     /// Called when a new participant joins mid-recording — adds to grid tracking.
@@ -758,6 +786,11 @@ import LiveKit
         renderer.delegate = self
         renderer.designatedRenderQueue = coordinatorQueue
         self.composedRenderer = renderer
+        // Replay any display names captured before the renderer existed so the very
+        // first camera-off placeholders show names/avatars rather than raw identities.
+        for (identity, name) in _participantDisplayNames {
+            renderer.setDisplayName(name, forIdentity: identity)
+        }
 
         // 4. Create recording sink (for screen share frames + audio from surface share)
         let sink = InterRecordingSink()
@@ -1296,11 +1329,18 @@ import LiveKit
             // speaker routing. Identity was snapshotted under _stateLock at install time.
             self.didReceiveRemoteCameraFrame(pixelBuffer, fromParticipant: capturedIdentity)
         }
+
+        // Observe local camera on/off so the recording shows a placeholder (not a frozen
+        // frame) when the local camera is turned off, and restores video when turned on.
+        lmc.recordingCameraStateObserver = { [weak self] enabled in
+            self?.localCameraDidChange(!enabled)
+        }
     }
 
     /// Remove the recording frame observer from the local media controller.
     private func _removeLocalCameraObserver() {
         localMediaController?.recordingFrameObserver = nil
+        localMediaController?.recordingCameraStateObserver = nil
     }
 
     // -----------------------------------------------------------------------

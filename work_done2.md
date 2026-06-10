@@ -652,3 +652,129 @@ When mute-all was active and the host clicked "Unmute Mic" from a participant's 
 
 **Commit**: `f6ed039` | **Build: SUCCEEDED ✅**
 
+---
+
+## [5–7 June 2026] — Presence-Driven Tile Management (Normal Call Mode)
+
+### Overview
+
+Replaced the racy four-source tile state model in normal call mode with a single source of truth (`InterParticipantRoster`) that emits immutable snapshots to a declarative reconciler. Eliminated 4 categories of tile bugs — participant tiles missing on join, avatar floating over live feed, camera-on with no feed, and role/count inconsistency — by construction rather than patching individual events. Also replaced the custom Metal remote-camera renderer with `AVSampleBufferDisplayLayer`.
+
+**Spec**: `docs/superpowers/specs/2026-06-05-presence-driven-tiles-design.md`
+
+---
+
+### Root cause eliminated
+
+Tile state was being mutated from four independent racy sources (presence join/leave events, first-frame dispatch, track-end/mute/unmute events, and persisted dictionaries `cameraOffStates` / `pendingFirstFrameIdentifiers`). The participant-side "no remote tile" bug was a concrete instance: `InterLiveKitSubscriber.attach(to:)` seeded already-present participants via `trackRenderer?.remoteParticipantDidJoin?()`, but `trackRenderer` was wired *after* `attach(to:)`, so optional chaining on `nil` silently dropped those join events.
+
+---
+
+### New files
+
+**`inter/Networking/InterParticipantSnapshot.swift`**
+- `@objc public final class InterParticipantSnapshotEntry: NSObject` — immutable value type crossing the Swift→ObjC bridge
+- Fields: `identity`, `displayName`, `isLocal`, `cameraOn`, `micMuted`, `handRaised`, `isSpeaking`, `isScreenSharing`
+- `isEqual(_:)` and `hash` for snapshot diffing
+
+**`inter/Networking/InterParticipantRoster.swift`** — Single source of truth
+- Holds per-identity `RemoteState` + `LocalState`; emits complete ordered `[InterParticipantSnapshotEntry]` on every change (local first, then join order)
+- `cameraOn` (remote) requires all three gates: `subscribed && !cameraMuted && firstFrameSeen` — avoids black feed before first decode
+- Public mutators (all hop to main thread): `setLocal(identity:displayName:cameraOn:micMuted:)`, `setLocalCameraOn(_:)`, `setLocalMicMuted(_:)`, `participantJoined(_:displayName:)`, `participantLeft(_:)`, `cameraSubscribed(_:)`, `cameraEnded(_:)`, `cameraMuted(_:muted:)`, `cameraFirstFrame(_:)`, `micMuted(_:muted:)`, `handRaised(_:raised:)`, `screenSharing(_:sharing:)`, `updateDisplayName(_:for:)`, `setActiveSpeaker(_:)`, `resync()`, `reset()`
+- `resync()` — re-emits current snapshot; calling this after late `trackRenderer` wiring self-heals the attach-before-wire race
+
+**`inter/Networking/InterRemoteSampleBufferView.swift`** — `AVSampleBufferDisplayLayer`-backed remote camera renderer
+- Replaces `InterRemoteVideoView` (Metal) for all normal-call camera tiles
+- `updateFrame(_ pixelBuffer: CVPixelBuffer)` — thread-safe; wraps `CVPixelBuffer` → `CMSampleBuffer` via `CMSampleBufferCreateReadyWithImageBuffer`, enqueues to `AVSampleBufferDisplayLayer`
+- `shutdownRendering()` — `flushAndRemoveImage()` (no CVDisplayLink to stop)
+- Mirror via `CATransform3DScale` on layer transform instead of Metal shader
+- `aspectFill: Bool` property — drives `.resizeAspectFill` / `.resizeAspect` video gravity
+- Static `makeSampleBuffer(from:)` — `CMVideoFormatDescriptionCreateForImageBuffer` + `kCMSampleAttachmentKey_DisplayImmediately`; validates against NV12 and BGRA
+- Eliminates: `CVDisplayLink`, `CVMetalTextureCache`, BT.709 Metal shader, manual `drawableSize`, render semaphore, `shutdownRenderingSynchronously`
+
+**`interTests/InterParticipantRosterTests.swift`** — 9 unit tests
+- `test_localOnly_emitsSingleLocalEntry`
+- `test_localFirstThenRemoteJoinOrder`
+- `test_remoteCameraOn_requiresUnmuteAndFirstFrame` — verifies three-gate logic
+- `test_remoteCameraMute_turnsOffEvenAfterFrame`
+- `test_participantLeft_removesEntry`
+- `test_resync_reemitsCurrentSnapshot`
+- `test_activeSpeaker_setsIsSpeakingOnMatchingEntry`
+- `test_displayNameUpdate_reflectedInSnapshot`
+- `test_micMuteAndHandRaise_reflectedInSnapshot`
+
+**`interTests/InterRemoteSampleBufferViewTests.swift`** — 2 unit tests
+- `test_wrap_nv12_producesValidSampleBuffer` — 320×240 NV12 → valid `CMSampleBuffer`, 1 sample
+- `test_wrap_bgra_producesValidSampleBuffer` — 64×64 BGRA → valid `CMSampleBuffer`
+
+---
+
+### Modified files
+
+**`inter/Networking/InterLiveKitSubscriber.swift`**
+- Added `public let roster = InterParticipantRoster()` property
+- Replaced `trackRenderer: InterRemoteTrackRenderer?` with a `didSet` that pipes `roster.onSnapshot` → `trackRenderer?.applyParticipantSnapshot?()` and calls `roster.resync()` — so late wiring immediately gets the full current roster (race fix)
+- `attach(to:)`: replaced racy delegate-based seeding with direct roster seeding; reads `room.remoteParticipants` at attach time, calls `roster.participantJoined/cameraSubscribed/cameraMuted/micMuted/screenSharing` for each already-present participant
+- `participantDidConnect`: adds `roster.participantJoined`
+- `participantDidDisconnect`: adds `roster.participantLeft`
+- `didSubscribeTrack` camera case: adds `roster.participantJoined/cameraSubscribed/cameraMuted`; first-frame renderer callback adds `roster.cameraFirstFrame`
+- `didSubscribeTrack` screen share case: adds `roster.screenSharing(true)`
+- `didUnsubscribeTrack` camera case: adds `roster.cameraEnded`; screen share case: adds `roster.screenSharing(false)`
+- `didUpdateIsMuted` camera case: adds `roster.cameraMuted`; microphone case: adds `roster.micMuted`
+- `didUpdateName`: adds `roster.updateDisplayName`
+- `detach()`: adds `roster.reset()` before room removal
+- Added `@objc optional func applyParticipantSnapshot(_ entries: [InterParticipantSnapshotEntry])` to `InterRemoteTrackRenderer` protocol
+
+**`inter/UI/Views/InterTrackRendererBridge.m`**
+- Added `- (void)applyParticipantSnapshot:(NSArray<InterParticipantSnapshotEntry *> *)entries` — dispatches to main queue and calls `[mgr applyParticipantSnapshot:entries]`
+
+**`inter/UI/Views/InterRemoteVideoLayoutManager.h`**
+- Added `@class InterParticipantSnapshotEntry` forward declaration
+- Added `- (void)applyParticipantSnapshot:(NSArray<InterParticipantSnapshotEntry *> *)entries` declaration
+
+**`inter/UI/Views/InterRemoteVideoLayoutManager.m`**
+- `remoteCameraViews` dictionary type changed from `InterRemoteVideoView *` to `InterRemoteSampleBufferView *`
+- `cameraViewForParticipant:` now creates `InterRemoteSampleBufferView` (removed recycling pool for camera views)
+- `removeCameraViewForParticipant:` calls `[view shutdownRendering]` instead of `shutdownRenderingSynchronously`; removed `clearFrame` + recycling pool logic
+- `handleRemoteCameraFrame:fromParticipant:` updated to use `InterRemoteSampleBufferView`
+- `handleRemoteTrackMuted:` camera case: calls `[view shutdownRendering]` instead of `clearFrame`
+- `handleRemoteTrackEnded:` camera case: calls `[view shutdownRendering]` instead of `clearFrame`
+- `clearAllState` camera cleanup loop: uses `InterRemoteSampleBufferView` + `shutdownRendering`
+- `InterRemoteVideoTileView.videoView` type widened to `NSView *` so it accepts both `InterRemoteSampleBufferView` and the existing `InterRemoteVideoView` (screen share)
+- `tileForKey:videoView:` signature updated to `NSView *`
+- Added `localSelfCameraOn: BOOL` private property
+- Added `ensureTileForParticipant:displayName:` helper — creates a camera tile with avatar placeholder; used by reconciler for additions
+- Added `applyParticipantSnapshot:` declarative reconciler:
+  1. Removals: any current remote tile not in snapshot → `removeCameraViewForParticipant:`
+  2. Additions: `ensureTileForParticipant:` for new identities
+  3. Updates: per-entry `setCameraOff:`, `isMicMuted`, `setHandRaised:`, `isSpeaking`, `nameLabel.stringValue`, `updateAvatarInitialFromDisplayName:`, `cameraOffStates` persistence — recomputed every pass (avatar can never float over live feed)
+  4. Local entry: sets `localSelfCameraOn`
+  5. Updates `remoteParticipantCount`, `activeSpeakerIdentity`, calls `updateLayoutAnimated:NO`
+
+**`inter/App/InterMediaWiringController.m`**
+- `setRemoteLayout:` seeds local entry via `[rc.subscriber.roster setLocalWithIdentity:displayName:cameraOn:micMuted:]` on layout wire
+- `toggleCamera` completion: adds `[weakSelf.roomController.subscriber.roster setLocalCameraOn:cameraOn]`
+- `toggleMicrophone` completion: adds `[weakSelf.roomController.subscriber.roster setLocalMicMuted:micMuted]`
+- `handleActiveSpeakerChanged:`: adds `[rc.subscriber.roster setActiveSpeaker:speakerIdentity ?: @""]`
+
+---
+
+### Integration tests added (`interTests/InterMultiParticipantTests.swift`)
+- `test_participantJoiningRoomWithHostPresent_getsHostTile` — seeds roster before `onSnapshot` is wired (simulates the race), then calls `resync()`; asserts host tile is present with `cameraOn=true`
+- `test_rejoinAfterEmptyRoom_recreatesTile` — leave then re-join produces correct single entry
+- `test_hostAndParticipant_produceIdenticalSnapshotForSameRoom` — identical roster state produces equal snapshots regardless of role
+
+---
+
+### Bugs fixed by construction
+
+| Scenario | Fix |
+|---|---|
+| Participant side shows no remote tiles (host present at attach) | `resync()` on delegate set emits current full snapshot even if delegate was nil during `attach(to:)` |
+| Avatar floats above live camera feed | Avatar visibility recomputed from snapshot every reconcile pass — never stale |
+| Camera on but no feed shown | Three-gate `cameraOn`: `subscribed && !cameraMuted && firstFrameSeen` — flip on first decoded frame |
+| Inconsistent across roles / participant counts | Same roster logic for all roles at any participant count |
+
+**Commits**: `cfeaa73`, `7cd743c`, `46b00af`, `3263ad7`, `df141ac`, `b1a5c43`, `a23ae63`
+**Build: SUCCEEDED ✅**
+

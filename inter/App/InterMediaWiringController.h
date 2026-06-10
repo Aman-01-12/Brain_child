@@ -48,6 +48,13 @@ NS_ASSUME_NONNULL_BEGIN
 /// Called when the user taps "Continue Offline" after a reconnection timeout.
 /// The delegate should nil out the room controller and continue locally.
 - (void)mediaWiringControllerDidRequestContinueOffline;
+/// Called when the local participant was removed from the meeting by the host
+/// (detected from the LiveKit disconnect reason). The delegate should show a
+/// removal message and tear down the call — NOT a "Connection Lost" alert.
+- (void)mediaWiringControllerDidDetectRemovalByHost;
+/// Called when the host ended the meeting for everyone (the room was deleted).
+/// The delegate should show a "meeting ended" message and tear down the call.
+- (void)mediaWiringControllerDidDetectRoomEndedByHost;
 @end
 
 // ---------------------------------------------------------------------------

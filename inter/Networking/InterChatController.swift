@@ -119,6 +119,24 @@ import LiveKit
     /// Set of received message IDs for deduplication.
     private var receivedMessageIds: Set<String> = []
 
+    /// FIFO order of received message IDs, used to bound the dedup set so a long,
+    /// chat-heavy meeting cannot grow `receivedMessageIds` without limit.
+    private var receivedMessageIdOrder: [String] = []
+
+    /// Maximum number of message IDs retained for deduplication. Comfortably exceeds
+    /// any realistic reconnect-duplicate window while keeping memory bounded.
+    private static let maxDedupIds = 2000
+
+    /// Per-sender sliding-window state for inbound control-signal rate limiting,
+    /// keyed on the LiveKit-attested sender identity.
+    private var controlSignalWindowStart: [String: TimeInterval] = [:]
+    private var controlSignalWindowCount: [String: Int] = [:]
+
+    /// Maximum inbound control signals accepted from a single sender per 1s window.
+    /// Normal peak usage is 1–5/s; 30/s blocks a flood (in_call.md A1) without
+    /// affecting legitimate moderation bursts.
+    private static let maxControlSignalsPerSecond = 30
+
     /// DataChannel topic for chat messages.
     private static let chatTopic = "chat"
 
@@ -169,6 +187,9 @@ import LiveKit
     @objc public func reset() {
         messages.removeAll()
         receivedMessageIds.removeAll()
+        receivedMessageIdOrder.removeAll()
+        controlSignalWindowStart.removeAll()
+        controlSignalWindowCount.removeAll()
         unreadCount = 0
         interLogInfo(InterLog.room, "ChatController: reset")
     }
@@ -549,9 +570,21 @@ import LiveKit
     }
 
     private func handleChatData(_ data: Data, senderIdentity: String?) {
-        guard let message = InterChatMessage.fromJSONData(data) else {
+        guard let decoded = InterChatMessage.fromJSONData(data) else {
             interLogError(InterLog.room, "ChatController: failed to decode chat message (%d bytes)", data.count)
             return
+        }
+
+        // SECURITY (in_call.md C10): reconcile the sender identity AND display name against
+        // the LiveKit-attested participant so a peer cannot impersonate another user in
+        // chat. A nil identity is genuine server-sent data, which is trusted as-is.
+        let message: InterChatMessage
+        if let attested = senderIdentity, !attested.isEmpty {
+            let attestedName = roomController?.effectiveDisplayName(for: attested) ?? ""
+            let reconciledName = attestedName.isEmpty ? decoded.senderName : attestedName
+            message = decoded.withSender(identity: attested, name: reconciledName)
+        } else {
+            message = decoded
         }
 
         // Deduplication: skip if we already have this message ID
@@ -567,10 +600,39 @@ import LiveKit
     }
 
     private func handleControlData(_ data: Data, senderIdentity: String?) {
-        guard let signal = InterControlSignal.fromJSONData(data) else {
+        guard let decoded = InterControlSignal.fromJSONData(data) else {
             interLogError(InterLog.room, "ChatController: failed to decode control signal (%d bytes)", data.count)
             return
         }
+
+        // SECURITY (in_call.md C10 — in-call privilege escalation): trust the LiveKit-
+        // attested sender identity over the self-declared one in the JSON payload. The SFU
+        // stamps `participant.identity` and a participant cannot forge another's, so this
+        // neutralises spoofed control signals (e.g. a participant claiming to be the host
+        // to mute/remove others). `senderIdentity` is nil only for genuine server-sent
+        // data, which is trusted. The server remains authoritative for permanent state.
+        let signal: InterControlSignal
+        if let attested = senderIdentity, !attested.isEmpty {
+            if attested != decoded.senderIdentity {
+                interLogError(InterLog.room,
+                    "ChatController: control signal sender mismatch (claimed=%{private}@ attested=%{private}@) — using attested",
+                    decoded.senderIdentity, attested)
+            }
+            // Also reconcile the display name from the attested roster entry so a peer
+            // cannot show a forged name in notifications (e.g. "Host raised hand"). Fall
+            // back to the payload name only when the roster has no name yet (e.g. a
+            // just-connected sender or a lobby participant not in remoteParticipants).
+            let attestedName = roomController?.effectiveDisplayName(for: attested) ?? ""
+            let reconciledName = attestedName.isEmpty ? decoded.senderName : attestedName
+            signal = decoded.withSender(identity: attested, name: reconciledName)
+        } else {
+            signal = decoded
+        }
+
+        // DoS guard (in_call.md A1 — signaling flood): cap inbound control signals per
+        // sender. Keyed on the attested identity so a flooder cannot rotate the key by
+        // spoofing the payload identity.
+        guard isControlSignalWithinRateLimit(forSender: signal.senderIdentity) else { return }
 
         switch signal.type {
         case .raiseHand:
@@ -602,27 +664,48 @@ import LiveKit
              .requestScreenShare, .approveScreenShare, .denyScreenShare,
              .askToUnmuteCamera, .requestMuteCameraOne, .requestMuteCameraAll,
              .liftCameraLockOne, .liftCameraLockAll, .screenshareModeChanged,
-             .requestCameraUnlock, .approveCameraUnlock,
-             .requestMicUnlock, .approveMicUnlock,
+             .requestCameraUnlock, .approveCameraUnlock, .denyCameraUnlock,
+             .requestMicUnlock, .approveMicUnlock, .denyMicUnlock,
+             .stopScreenShare, .stopScreenShareAll, .shareConflictPolicyChanged,
              .renameParticipant, .allowCoHostLocalRecording:
             guard signal.senderIdentity != localIdentity else { return }
             moderationController?.handleControlSignal(signal)
 
-        // Phase 10 — Recording consent signals (host → all participants)
+        // Phase 10 — Recording consent signals (host → all participants).
+        // SECURITY: a recording-consent banner is a privacy signal — a spoofed
+        // `recordingStopped` could hide a REAL recording, and a spoofed `recordingStarted`
+        // could fake one. Accept these only from a moderator (host/co-host), verified via
+        // the sender's server-stamped metadata role.
         case .recordingStarted:
             guard signal.senderIdentity != localIdentity else { return }
+            guard senderIsModerator(signal.senderIdentity) else {
+                interLogInfo(InterLog.room, "ChatController: discarded recordingStarted from unprivileged sender")
+                return
+            }
             interLogInfo(InterLog.room, "ChatController: remote recording started by %{public}@", signal.senderName)
             recordingDelegate?.recordingDidStart()
         case .recordingPaused:
             guard signal.senderIdentity != localIdentity else { return }
+            guard senderIsModerator(signal.senderIdentity) else {
+                interLogInfo(InterLog.room, "ChatController: discarded recordingPaused from unprivileged sender")
+                return
+            }
             interLogInfo(InterLog.room, "ChatController: remote recording paused")
             recordingDelegate?.recordingDidPause()
         case .recordingResumed:
             guard signal.senderIdentity != localIdentity else { return }
+            guard senderIsModerator(signal.senderIdentity) else {
+                interLogInfo(InterLog.room, "ChatController: discarded recordingResumed from unprivileged sender")
+                return
+            }
             interLogInfo(InterLog.room, "ChatController: remote recording resumed")
             recordingDelegate?.recordingDidResume()
         case .recordingStopped:
             guard signal.senderIdentity != localIdentity else { return }
+            guard senderIsModerator(signal.senderIdentity) else {
+                interLogInfo(InterLog.room, "ChatController: discarded recordingStopped from unprivileged sender")
+                return
+            }
             interLogInfo(InterLog.room, "ChatController: remote recording stopped")
             recordingDelegate?.recordingDidStop()
 
@@ -631,8 +714,42 @@ import LiveKit
         }
     }
 
+    /// Returns true if the sender (identified by their LiveKit-attested identity) holds a
+    /// moderator role, read from their server-stamped metadata. Tokens do not grant
+    /// `canUpdateOwnMetadata`, so a participant cannot forge this.
+    private func senderIsModerator(_ identity: String) -> Bool {
+        let role = roomController?.role(forParticipantIdentity: identity) ?? .participant
+        return InterPermissionMatrix.role(role, hasPermission: .canMuteOthers)
+    }
+
+    /// Sliding-window rate limiter for inbound control signals, keyed on the attested
+    /// sender identity. Returns false (drop) when the sender exceeds the per-second cap.
+    private func isControlSignalWithinRateLimit(forSender identity: String) -> Bool {
+        let now = Date().timeIntervalSince1970
+        if let start = controlSignalWindowStart[identity], now - start < 1.0 {
+            let count = (controlSignalWindowCount[identity] ?? 0) + 1
+            controlSignalWindowCount[identity] = count
+            if count > Self.maxControlSignalsPerSecond {
+                interLogError(InterLog.room,
+                    "ChatController: rate-limited control signals from %{private}@ (>%d/s)",
+                    identity, Self.maxControlSignalsPerSecond)
+                return false
+            }
+            return true
+        }
+        controlSignalWindowStart[identity] = now
+        controlSignalWindowCount[identity] = 1
+        return true
+    }
+
     private func appendMessage(_ message: InterChatMessage, isLocal: Bool) {
         receivedMessageIds.insert(message.id)
+        receivedMessageIdOrder.append(message.id)
+        // Bound the dedup set: evict the oldest ID once over the cap.
+        if receivedMessageIdOrder.count > Self.maxDedupIds {
+            let evicted = receivedMessageIdOrder.removeFirst()
+            receivedMessageIds.remove(evicted)
+        }
 
         let info = InterChatMessageInfo(from: message, isLocal: isLocal)
         messages.append(info)
