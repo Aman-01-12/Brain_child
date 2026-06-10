@@ -162,6 +162,11 @@ static const CGFloat InterSecureBottomWorkspaceMargin = 100.0;
     [self.chatOverlayWindow setTitle:@"Chat"];
     [self.chatOverlayWindow setOpaque:YES];
     [self.chatOverlayWindow setHidesOnDeactivate:NO];
+    // Shield the chat panel from third-party capture/stream tools, exactly as the
+    // secure window itself is shielded (createSecureWindow). The panel floats above
+    // the secure surface during a live interview; without this it would be the one
+    // unshielded surface a capture tool could read while everything else is black.
+    [self.chatOverlayWindow setSharingType:NSWindowSharingNone];
 
     // InterChatPanel fills the window's content view (always expanded in overlay mode)
     NSView *contentView = self.chatOverlayWindow.contentView;

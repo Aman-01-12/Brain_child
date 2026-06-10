@@ -26,20 +26,32 @@ import os.log
     @objc public var onSnapshot: (([InterParticipantSnapshotEntry]) -> Void)?
 
     private struct RemoteState {
+        /// Server-attested LiveKit name (from `participant.name`). Re-stamped by presence /
+        /// track callbacks (e.g. on camera (re)subscribe).
         var displayName: String
+        /// Client-only, per-session rename override. When set it wins over `displayName`,
+        /// so a rename survives attested re-stamps (the camera-toggle revert) without any
+        /// server round-trip. Cleared automatically when the participant leaves (the whole
+        /// entry is removed), so it never persists past the session.
+        var nameOverride: String? = nil
         var subscribed: Bool = false
         var cameraMuted: Bool = true     // assume off until proven on
         var firstFrameSeen: Bool = false
         var micMuted: Bool = false
         var handRaised: Bool = false
         var isScreenSharing: Bool = false
+        /// Effective name shown in the snapshot: the override if present, else attested.
+        var effectiveName: String { nameOverride ?? displayName }
     }
 
     private struct LocalState {
         var identity: String
         var displayName: String
+        /// Client-only, per-session rename override (see RemoteState.nameOverride).
+        var nameOverride: String? = nil
         var cameraOn: Bool
         var micMuted: Bool
+        var effectiveName: String { nameOverride ?? displayName }
     }
 
     // Ordered remote identities (join order) + their state.
@@ -54,7 +66,10 @@ import os.log
 
     @objc public func setLocal(identity: String, displayName: String, cameraOn: Bool, micMuted: Bool) {
         runOnMain {
+            // Preserve any active per-session rename override across a local reseed.
+            let existingOverride = self.local?.nameOverride
             self.local = LocalState(identity: identity, displayName: displayName,
+                                    nameOverride: existingOverride,
                                     cameraOn: cameraOn, micMuted: micMuted)
             self.emitNow()
         }
@@ -162,8 +177,30 @@ import os.log
         mutateRemote(identity) { $0.isScreenSharing = sharing }
     }
 
+    /// Set a remote participant's ATTESTED display name (the LiveKit `participant.name`).
+    /// Called by presence / name-change callbacks. A per-session rename override, if set,
+    /// still wins over this in the emitted snapshot.
     @objc public func updateDisplayName(_ name: String, for identity: String) {
         mutateRemote(identity) { $0.displayName = name }
+    }
+
+    /// Set a per-session rename OVERRIDE for a remote participant. Wins over the attested
+    /// name so a rename survives attested re-stamps (camera (re)subscribe). Client-only —
+    /// no server round-trip. Cleared automatically when the participant leaves.
+    @objc public func setDisplayNameOverride(_ name: String, for identity: String) {
+        mutateRemote(identity) { $0.nameOverride = name }
+    }
+
+    /// Set a per-session rename OVERRIDE for the LOCAL participant (self-rename, or a host
+    /// rename of the local user). Wins over the attested name and survives camera toggles;
+    /// client-only and dropped on disconnect.
+    @objc public func setLocalDisplayNameOverride(_ name: String) {
+        runOnMain {
+            guard var l = self.local else { return }
+            l.nameOverride = name
+            self.local = l
+            self.emitNow()
+        }
     }
 
     @objc public func setActiveSpeaker(_ identity: String) {
@@ -208,7 +245,7 @@ import os.log
         var entries: [InterParticipantSnapshotEntry] = []
         if let l = local {
             entries.append(InterParticipantSnapshotEntry(
-                identity: l.identity, displayName: l.displayName, isLocal: true,
+                identity: l.identity, displayName: l.effectiveName, isLocal: true,
                 cameraOn: l.cameraOn, micMuted: l.micMuted, handRaised: false,
                 isSpeaking: activeSpeaker == l.identity, isScreenSharing: false))
         }
@@ -216,7 +253,7 @@ import os.log
             guard let s = remote[id] else { continue }
             let camOn = s.subscribed && !s.cameraMuted && s.firstFrameSeen
             entries.append(InterParticipantSnapshotEntry(
-                identity: id, displayName: s.displayName, isLocal: false,
+                identity: id, displayName: s.effectiveName, isLocal: false,
                 cameraOn: camOn, micMuted: s.micMuted, handRaised: s.handRaised,
                 isSpeaking: activeSpeaker == id, isScreenSharing: s.isScreenSharing))
         }

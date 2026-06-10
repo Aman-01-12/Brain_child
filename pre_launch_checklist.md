@@ -385,9 +385,55 @@ xcrun stapler staple inter.app
 
 ---
 
-## 8. Security — MFA (Phase E)
+## 8. Security — MFA (Phase E) + TLS Pinning
 
-🟡 **Status:** G7 (MFA) was explicitly deferred to Phase E. All other 23 security gaps are resolved.
+🟡 **Status:** G7 (MFA) was explicitly deferred to Phase E. TLS certificate pinning (§8.1) is
+code-complete but needs production SPKI hashes. All other 23 security gaps are resolved.
+
+### 8.1 TLS Certificate Pinning — Populate Production SPKI Hashes
+
+🟠 **Status:** Pinning logic is fully implemented but **inactive** — the pin set is an empty
+placeholder, so the client currently falls back to default system trust. **Do this once the
+production API certificate exists** (no keys yet at time of writing).
+
+**Why it's safe to ship dev like this:** With `pinnedSPKIHashes` empty, `InterPinnedSessionDelegate`
+calls `performDefaultHandling` (standard CA validation) — fine for `http://localhost` dev, but it
+means MITM protection via pinning is **off** until populated. Do not consider pinning "done" until
+the hashes are filled in AND every session routes through the pinned delegate.
+
+**What to do (when the prod cert is issued):**
+1. Generate the SPKI SHA-256 pin from the live endpoint:
+   ```sh
+   openssl s_client -connect api.inter.com:443 </dev/null 2>/dev/null \
+     | openssl x509 -noout -pubkey \
+     | openssl pkey -pubin -outform DER \
+     | openssl dgst -sha256 -binary | base64
+   ```
+2. Generate a **backup pin** from a pre-issued (not-yet-deployed) key pair so an emergency cert
+   rotation can't lock users out.
+3. Paste both into `pinnedSPKIHashes` in `InterPinnedSessionDelegate` (`inter/Networking/InterTokenService.swift`, ~L3550):
+   ```swift
+   private let pinnedSPKIHashes: Set<String> = [
+       "<primary-base64-sha256>", // api.inter.com primary (expires YYYY-MM)
+       "<backup-base64-sha256>",  // api.inter.com backup (pre-generated)
+   ]
+   ```
+4. **Route all server calls through the pinned session.** Today only `authSession` uses the pinned
+   delegate. These still use unpinned sessions and must be migrated (or given their own pinned
+   delegate) before pinning is meaningful:
+   - `InterTokenService` plain `session` (`InterTokenService.swift` ~L870)
+   - `InterModerationController` (`InterModerationController.swift` ~L268)
+   - `InterRecordingCoordinator` (`InterRecordingCoordinator.swift` ~L1617 and ~L1684)
+   - `InterRecordingListPanel` `NSURLSession.sharedSession` (`InterRecordingListPanel.m` ~L304)
+5. **Rotation policy:** add the new pin to the set and ship the app **before** deploying the new
+   cert; remove the old pin only after the rollover window (24–72 h). Never ship an empty set to prod.
+6. **Verify:** with pins populated, point the app at a proxy with a different cert (e.g. Charles/mitmproxy)
+   and confirm the connection is **rejected** (`SPKI hash mismatch` in logs), then confirm the real
+   endpoint connects normally.
+
+---
+
+### 8.2 MFA (Phase E)
 
 The database schema additions are already designed (from `auth_implementation.md` §10.3 G7):
 

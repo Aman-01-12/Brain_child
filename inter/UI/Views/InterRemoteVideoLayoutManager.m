@@ -30,12 +30,12 @@ static NSString *const kInterPreferGridLayoutKey = @"InterPreferGridLayout";
 @property (nonatomic, assign) BOOL isHovered;
 @property (nonatomic, assign) BOOL isSpeaking;
 @property (nonatomic, strong) NSTrackingArea *hoverTrackingArea;
-/// [Phase 8.2.3] Hand-raise badge (✋ emoji in top-left corner).
-@property (nonatomic, strong) NSTextField *handRaiseBadge;
+/// [Phase 8.2.3] Hand-raise badge (hand.raised SF Symbol, top-left corner).
+@property (nonatomic, strong) InterTileBadge *handRaiseBadge;
 @property (nonatomic, assign) BOOL handRaised;
-/// Mic-muted badge (🔇 emoji in bottom-right corner), shown when isMicMuted=YES.
+/// Mic-muted badge (mic.slash SF Symbol, bottom-right corner), shown when isMicMuted=YES.
 /// Updated by the setIsMicMuted: custom setter — driven by LiveKit track events.
-@property (nonatomic, strong) NSTextField *micMutedBadge;
+@property (nonatomic, strong) InterTileBadge *micMutedBadge;
 /// Three-dot moderation menu button shown at top-right on hover (host mode only).
 @property (nonatomic, strong) NSButton *moderationMenuButton;
 /// When YES, the moderation menu button is shown on hover.
@@ -57,11 +57,11 @@ static NSString *const kInterPreferGridLayoutKey = @"InterPreferGridLayout";
 @property (nonatomic, assign) BOOL allPinSlotsUsed;
 /// Called when the host selects an action from the tile's moderation menu.
 @property (nonatomic, copy, nullable) void (^moderationMenuHandler)(NSString *tileKey, NSString *action);
-/// Co-host crown badge (👑 emoji in top-right corner), shown when isCoHost=YES.
-@property (nonatomic, strong) NSTextField *coHostBadge;
+/// Co-host crown badge (crown SF Symbol, top-right corner), shown when isCoHost=YES.
+@property (nonatomic, strong) InterTileBadge *coHostBadge;
 @property (nonatomic, assign) BOOL isCoHost;
-/// Host-camera-locked badge (🔒 emoji), shown when the host has locked this participant's camera.
-@property (nonatomic, strong) NSTextField *cameraLockedBadge;
+/// Host-camera-locked badge (lock SF Symbol), shown when the host has locked this participant's camera.
+@property (nonatomic, strong) InterTileBadge *cameraLockedBadge;
 @property (nonatomic, assign) BOOL isHostCameraLocked;
 /// When YES, this tile belongs to the meeting host. The moderation menu shows only pin/unpin.
 @property (nonatomic, assign) BOOL isHostParticipant;
@@ -73,6 +73,13 @@ static NSString *const kInterPreferGridLayoutKey = @"InterPreferGridLayout";
 @property (nonatomic, strong) NSView *avatarPlaceholder;
 /// The initial-letter label inside the avatar placeholder circle.
 @property (nonatomic, strong) NSTextField *avatarInitial;
+/// Diagonal stage-surface gradient backing the tile (shown behind video / around the
+/// camera-off avatar). Matches the design catalogue's tile background (DESIGN-SPEC §7.5).
+@property (nonatomic, strong) CAGradientLayer *tileGradient;
+/// Bottom name scrim — a black→transparent gradient (`from-black/80 to-transparent`) that
+/// keeps the name legible over bright video. A layer-hosting view above the video/avatar
+/// and below the name label and badges.
+@property (nonatomic, strong) NSView *nameScrim;
 /// When YES, the avatar placeholder is shown and the video view is hidden
 /// (participant present but camera off). Driven by presence + track/frame events.
 @property (nonatomic, assign) BOOL cameraOff;
@@ -92,9 +99,19 @@ static NSString *const kInterPreferGridLayoutKey = @"InterPreferGridLayout";
     if (!self) return nil;
 
     self.wantsLayer = YES;
-    self.layer.backgroundColor = [NSColor blackColor].CGColor;
-    self.layer.cornerRadius = 8.0;
+    self.layer.backgroundColor = [InterDesignTokens tileGradientBottom].CGColor;
+    self.layer.cornerRadius = [InterDesignTokens tileCornerRadius];
     self.layer.masksToBounds = YES;
+
+    // Diagonal stage-surface gradient (neutral-800 → neutral-900, top-left → bottom-right),
+    // matching the catalogue tile background. Sits below the video/avatar/name subviews;
+    // shows behind a camera-off avatar and as letterbox fill. Resized in -layout.
+    self.tileGradient = [CAGradientLayer layer];
+    self.tileGradient.colors = @[ (__bridge id)[InterDesignTokens tileGradientTop].CGColor,
+                                  (__bridge id)[InterDesignTokens tileGradientBottom].CGColor ];
+    self.tileGradient.startPoint = CGPointMake(0.0, 1.0); // top-left
+    self.tileGradient.endPoint   = CGPointMake(1.0, 0.0); // bottom-right
+    [self.layer insertSublayer:self.tileGradient atIndex:0];
 
     self.tileKey = tileKey;
     self.videoView = videoView;
@@ -106,7 +123,7 @@ static NSString *const kInterPreferGridLayoutKey = @"InterPreferGridLayout";
     // the participant's initial, centred in the tile (standard video-call style).
     NSView *avatar = [[NSView alloc] initWithFrame:NSZeroRect];
     avatar.wantsLayer = YES;
-    avatar.layer.backgroundColor = [NSColor colorWithWhite:0.22 alpha:1.0].CGColor;
+    avatar.layer.backgroundColor = [InterDesignTokens avatarFill].CGColor;
     avatar.hidden = YES;
     [self addSubview:avatar];
     self.avatarPlaceholder = avatar;
@@ -120,45 +137,55 @@ static NSString *const kInterPreferGridLayoutKey = @"InterPreferGridLayout";
     [avatar addSubview:initial];
     self.avatarInitial = initial;
 
+    // Bottom name scrim — black→transparent gradient (from-black/80 to-transparent),
+    // above the video/avatar but below the name label, so names stay legible over
+    // bright video. Frame set in -layout. (DESIGN-SPEC §7.5 "name over scrim".)
+    self.nameScrim = [[NSView alloc] initWithFrame:NSZeroRect];
+    CAGradientLayer *scrimLayer = [CAGradientLayer layer];
+    scrimLayer.colors = @[ (__bridge id)[InterDesignTokens nameScrim].CGColor,
+                           (__bridge id)[NSColor clearColor].CGColor ];
+    scrimLayer.startPoint = CGPointMake(0.5, 0.0); // bottom (solid)
+    scrimLayer.endPoint   = CGPointMake(0.5, 1.0); // top (transparent)
+    self.nameScrim.layer = scrimLayer;
+    self.nameScrim.wantsLayer = YES;
+    [self addSubview:self.nameScrim];
+
     // Name label pinned to bottom
     self.nameLabel = [NSTextField labelWithString:displayName];
     self.nameLabel.font = [NSFont systemFontOfSize:11 weight:NSFontWeightMedium];
     self.nameLabel.textColor = [NSColor whiteColor];
-    self.nameLabel.backgroundColor = [NSColor colorWithWhite:0.0 alpha:0.55];
-    self.nameLabel.drawsBackground = YES;
+    self.nameLabel.backgroundColor = [NSColor clearColor];
+    self.nameLabel.drawsBackground = NO;
     self.nameLabel.alignment = NSTextAlignmentCenter;
     self.nameLabel.lineBreakMode = NSLineBreakByTruncatingTail;
     self.nameLabel.maximumNumberOfLines = 1;
     [self addSubview:self.nameLabel];
 
-    // [Phase 8.2.3] Hand raise badge — top-left corner
-    self.handRaiseBadge = [NSTextField labelWithString:@"✋"];
-    self.handRaiseBadge.font = [NSFont systemFontOfSize:16];
-    self.handRaiseBadge.frame = NSMakeRect(4, 0, 24, 24);
-    [self.handRaiseBadge setWantsLayer:YES];
-    self.handRaiseBadge.layer.backgroundColor = [NSColor colorWithWhite:0.0 alpha:0.6].CGColor;
-    self.handRaiseBadge.layer.cornerRadius = 4.0;
-    self.handRaiseBadge.alignment = NSTextAlignmentCenter;
+    // Hand-raise badge — SF Symbol via shared design tokens (spec §6.3)
+    self.handRaiseBadge = [[InterTileBadge alloc] initWithSymbolName:[InterDesignTokens symbolHandRaised]
+                                                                tint:[InterDesignTokens accentGold]];
     self.handRaiseBadge.hidden = YES;
     [self addSubview:self.handRaiseBadge];
 
     // Mic-muted indicator — bottom-right corner, shown when the participant's
     // microphone track is muted. Secondary indicator; does not affect host
     // controls (the three-dot menu label uses isHostMuted exclusively).
-    self.micMutedBadge = [NSTextField labelWithString:@"🔇"];
-    self.micMutedBadge.font = [NSFont systemFontOfSize:14];
-    self.micMutedBadge.frame = NSMakeRect(0, 0, 22, 22);
-    [self.micMutedBadge setWantsLayer:YES];
-    self.micMutedBadge.layer.backgroundColor = [NSColor colorWithWhite:0.0 alpha:0.55].CGColor;
-    self.micMutedBadge.layer.cornerRadius = 4.0;
-    self.micMutedBadge.alignment = NSTextAlignmentCenter;
+    self.micMutedBadge = [[InterTileBadge alloc] initWithSymbolName:[InterDesignTokens symbolMicMuted]
+                                                               tint:[InterDesignTokens accentDanger]];
     self.micMutedBadge.hidden = YES;
     [self addSubview:self.micMutedBadge];
 
     // Moderation three-dot button — top-right corner, visible on hover in host mode
     self.moderationMenuButton = [[NSButton alloc] initWithFrame:NSMakeRect(0, 0, 22, 22)];
-    self.moderationMenuButton.title = @"···";
-    self.moderationMenuButton.font = [NSFont systemFontOfSize:11 weight:NSFontWeightBold];
+    self.moderationMenuButton.title = @"";
+    NSImageSymbolConfiguration *menuCfg =
+        [NSImageSymbolConfiguration configurationWithPointSize:[InterDesignTokens badgeSymbolPointSize]
+                                                        weight:NSFontWeightSemibold];
+    self.moderationMenuButton.image =
+        [[NSImage imageWithSystemSymbolName:[InterDesignTokens symbolModerationMenu]
+                   accessibilityDescription:@"Moderation menu"]
+            imageWithSymbolConfiguration:menuCfg];
+    self.moderationMenuButton.imagePosition = NSImageOnly;
     self.moderationMenuButton.bezelStyle = NSBezelStyleRounded;
     self.moderationMenuButton.bordered = NO;
     [self.moderationMenuButton setWantsLayer:YES];
@@ -170,32 +197,44 @@ static NSString *const kInterPreferGridLayoutKey = @"InterPreferGridLayout";
     self.moderationMenuButton.hidden = YES;
     [self addSubview:self.moderationMenuButton];
 
-    self.coHostBadge = [NSTextField labelWithString:@"👑"];
-    self.coHostBadge.font = [NSFont systemFontOfSize:14];
-    self.coHostBadge.frame = NSMakeRect(0, 0, 22, 22);
-    [self.coHostBadge setWantsLayer:YES];
-    self.coHostBadge.layer.backgroundColor = [NSColor colorWithWhite:0.0 alpha:0.55].CGColor;
-    self.coHostBadge.layer.cornerRadius = 4.0;
-    self.coHostBadge.alignment = NSTextAlignmentCenter;
+    // Co-host crown badge — SF Symbol via shared design tokens (spec §6.3)
+    self.coHostBadge = [[InterTileBadge alloc] initWithSymbolName:[InterDesignTokens symbolCoHost]
+                                                             tint:[InterDesignTokens accentGold]];
     self.coHostBadge.hidden = YES;
     [self addSubview:self.coHostBadge];
 
-    self.cameraLockedBadge = [NSTextField labelWithString:@"🔒"];
-    self.cameraLockedBadge.font = [NSFont systemFontOfSize:12];
-    self.cameraLockedBadge.frame = NSMakeRect(0, 0, 22, 22);
-    [self.cameraLockedBadge setWantsLayer:YES];
-    self.cameraLockedBadge.layer.backgroundColor = [NSColor colorWithWhite:0.0 alpha:0.55].CGColor;
-    self.cameraLockedBadge.layer.cornerRadius = 4.0;
-    self.cameraLockedBadge.alignment = NSTextAlignmentCenter;
+    // Host-camera-locked badge — SF Symbol via shared design tokens (spec §6.3)
+    self.cameraLockedBadge = [[InterTileBadge alloc] initWithSymbolName:[InterDesignTokens symbolCameraLocked]
+                                                                   tint:[InterDesignTokens badgeForeground]];
     self.cameraLockedBadge.hidden = YES;
     [self addSubview:self.cameraLockedBadge];
 
     return self;
 }
 
+/// Fade a badge in/out instead of flipping `hidden` instantly (spec §6.3 motion).
+- (void)setBadge:(NSView *)badge visible:(BOOL)visible {
+    if (visible) {
+        badge.hidden = NO;
+        badge.alphaValue = 0.0;
+        [NSAnimationContext runAnimationGroup:^(NSAnimationContext *ctx) {
+            ctx.duration = 0.15;
+            badge.animator.alphaValue = 1.0;
+        } completionHandler:nil];
+    } else {
+        [NSAnimationContext runAnimationGroup:^(NSAnimationContext *ctx) {
+            ctx.duration = 0.15;
+            badge.animator.alphaValue = 0.0;
+        } completionHandler:^{
+            // Guard against a re-show that started during this fade-out.
+            if (badge.alphaValue == 0.0) { badge.hidden = YES; }
+        }];
+    }
+}
+
 - (void)setHandRaised:(BOOL)handRaised {
     _handRaised = handRaised;
-    self.handRaiseBadge.hidden = !handRaised;
+    [self setBadge:self.handRaiseBadge visible:handRaised];
 }
 
 /// Custom setter: propagate mic-muted state to the visual badge immediately.
@@ -204,19 +243,19 @@ static NSString *const kInterPreferGridLayoutKey = @"InterPreferGridLayout";
 - (void)setIsMicMuted:(BOOL)isMicMuted {
     if (_isMicMuted == isMicMuted) return;
     _isMicMuted = isMicMuted;
-    self.micMutedBadge.hidden = !isMicMuted;
+    [self setBadge:self.micMutedBadge visible:isMicMuted];
 }
 
 - (void)setIsCoHost:(BOOL)isCoHost {
     if (_isCoHost == isCoHost) return;
     _isCoHost = isCoHost;
-    self.coHostBadge.hidden = !isCoHost;
+    [self setBadge:self.coHostBadge visible:isCoHost];
 }
 
 - (void)setIsHostCameraLocked:(BOOL)isHostCameraLocked {
     if (_isHostCameraLocked == isHostCameraLocked) return;
     _isHostCameraLocked = isHostCameraLocked;
-    self.cameraLockedBadge.hidden = !isHostCameraLocked;
+    [self setBadge:self.cameraLockedBadge visible:isHostCameraLocked];
 }
 
 /// Show/hide the avatar placeholder. When YES, the video view is hidden and the
@@ -268,6 +307,13 @@ static NSString *const kInterPreferGridLayoutKey = @"InterPreferGridLayout";
 - (void)layout {
     [super layout];
     NSRect b = self.bounds;
+    // Stage-surface gradient fills the tile; name scrim sits in the bottom band.
+    // (No implicit animation during live resize.)
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    self.tileGradient.frame = b;
+    self.nameScrim.frame = NSMakeRect(0, 0, b.size.width, [InterDesignTokens nameScrimHeight]);
+    [CATransaction commit];
     // Video fills entire tile
     self.videoView.frame = b;
     // Avatar placeholder: centred circle sized to ~35% of the smaller dimension.
@@ -597,18 +643,26 @@ static NSString *const kInterPreferGridLayoutKey = @"InterPreferGridLayout";
 
 // -- Grid mode: local self-view tile --
 
-/// AVCaptureVideoPreviewLayer powering the local self-view tile.
+/// AVCaptureVideoPreviewLayer powering the local self-view tile. Deliberately a hardware
+/// preview layer (zero-CPU) — NOT an InterRemoteSampleBufferView. It is hosted inside
+/// `localVideoHostView`, which is the videoView of the common InterRemoteVideoTileView.
 @property (nonatomic, strong, nullable) AVCaptureVideoPreviewLayer *localPreviewLayer;
-/// Container NSView for the local self-view tile.
-@property (nonatomic, strong, nullable) NSView *localSelfTileView;
-/// "You" name label inside the self-view tile.
-@property (nonatomic, strong, nullable) NSTextField *localSelfNameLabel;
+/// Layer-backed NSView that hosts `localPreviewLayer` and serves as the videoView of the
+/// local self-tile, so the tile's -layout sizes the preview exactly like a remote feed.
+@property (nonatomic, strong, nullable) NSView *localVideoHostView;
+/// The local self-view tile. Now the SAME InterRemoteVideoTileView used for every remote
+/// participant (unified chrome: real name label, avatar on camera-off, mic/speaking
+/// badges, spotlight-on-click), rather than a bespoke view with a hardcoded "You" label.
+@property (nonatomic, strong, nullable) InterRemoteVideoTileView *localSelfTileView;
 /// Floating toggle button (top-right) for switching between Grid and Stage views.
 @property (nonatomic, strong, nullable) NSButton *layoutToggleButton;
 
-/// When YES, the local self-view tile shows the live preview; when NO, shows the
-/// avatar placeholder. Driven by the roster snapshot from the local camera state.
+/// Latest local self state from the roster snapshot. Stored so it can be (re)applied
+/// whenever the layout-driven tile is (re)created in setupLocalSelfTileIfNeeded — the
+/// snapshot is authoritative but the local tile's creation is layout-driven.
 @property (nonatomic, assign) BOOL localSelfCameraOn;
+@property (nonatomic, assign) BOOL localSelfMicMuted;
+@property (nonatomic, assign) BOOL localSelfSpeaking;
 
 @end
 
@@ -639,7 +693,7 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
     if (!self) return nil;
 
     self.wantsLayer = YES;
-    self.layer.backgroundColor = [NSColor blackColor].CGColor;
+    self.layer.backgroundColor = [InterDesignTokens stageSurface].CGColor;
 
     self.participantDisplayNames = [NSMutableDictionary dictionary];
     self.remoteCameraViews   = [NSMutableDictionary dictionary];
@@ -804,7 +858,7 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
     if (self.localSelfTileView) {
         [self.localSelfTileView removeFromSuperview];
         self.localSelfTileView  = nil;
-        self.localSelfNameLabel = nil;
+        self.localVideoHostView = nil;
     }
 
     // If the user had pinned themselves in the spotlight, release the pin now
@@ -928,51 +982,50 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
     // Guard: tile already built, or preview layer not yet ready.
     if (self.localSelfTileView || !self.localPreviewLayer) return;
 
-    NSView *tile = [[NSView alloc] initWithFrame:NSZeroRect];
-    tile.wantsLayer = YES;
-    tile.layer.backgroundColor = [NSColor blackColor].CGColor;
-    tile.layer.cornerRadius = 8.0;
-    tile.layer.masksToBounds = YES;
-
-    // Preview layer was already created eagerly in setLocalCaptureSession:.
-    // Just attach it to the tile's backing layer.
-    // Mirror the local self-view to MATCH the remote tiles, which render camera
-    // feeds with isMirrored = YES. Keeping both mirrored means the host sees their
-    // own tile and every remote tile with the same handedness (no odd "one tile is
-    // flipped" inconsistency).
+    // Host NSView for the hardware preview layer. This becomes the tile's videoView, so
+    // the common tile's -layout sizes it exactly like a remote feed (the preview layer
+    // autoresizes within it). Mirror to MATCH remote tiles (which render isMirrored=YES),
+    // so the host sees their own tile and every remote tile with the same handedness.
+    NSView *host = [[NSView alloc] initWithFrame:NSZeroRect];
+    host.wantsLayer = YES;
+    host.layer.backgroundColor = [NSColor blackColor].CGColor;
     AVCaptureVideoPreviewLayer *preview = self.localPreviewLayer;
     preview.connection.automaticallyAdjustsVideoMirroring = NO;
     preview.connection.videoMirrored = YES;
+    preview.frame = host.bounds;
     preview.autoresizingMask = kCALayerWidthSizable | kCALayerHeightSizable;
-    [tile.layer addSublayer:preview];
+    [host.layer addSublayer:preview];
+    self.localVideoHostView = host;
 
-    NSTextField *label = [NSTextField labelWithString:@"You"];
-    label.font        = [NSFont systemFontOfSize:11 weight:NSFontWeightMedium];
-    label.textColor   = [NSColor whiteColor];
-    label.backgroundColor = [NSColor colorWithWhite:0.0 alpha:0.55];
-    label.drawsBackground = YES;
-    label.alignment   = NSTextAlignmentCenter;
-    label.wantsLayer  = YES;
-    label.layer.cornerRadius = 4.0;
-    label.layer.masksToBounds = YES;
-    [tile addSubview:label];
+    // Build the local tile through the SAME class used for every remote participant.
+    // Spotlight-on-click, name label, avatar, mic/speaking badges all come for free.
+    InterRemoteVideoTileView *tile =
+        [[InterRemoteVideoTileView alloc] initWithVideoView:host
+                                                    tileKey:kLocalSelfTileKey
+                                                displayName:[self displayNameForTileKey:kLocalSelfTileKey]];
+    tile.spotlightTarget = self;
+    tile.spotlightAction = @selector(handleTileClicked:);
 
-    // Click gesture — promotes the local self-view into the main stage spotlight,
-    // exactly like clicking any remote participant tile in the filmstrip.
-    NSClickGestureRecognizer *tap = [[NSClickGestureRecognizer alloc]
-                                        initWithTarget:self
-                                                action:@selector(handleLocalSelfTileClicked:)];
-    [tile addGestureRecognizer:tap];
-    tile.wantsLayer = YES;   // ensure hit-testing works through the CALayer
+    self.localSelfTileView = tile;
 
-    self.localSelfTileView  = tile;
-    self.localSelfNameLabel = label;
+    // Apply the latest known local state (the snapshot is authoritative but the tile is
+    // created on demand by the layout pass, which may run after the snapshot arrived).
+    [self applyStoredLocalSelfState];
 }
 
-/// Tap handler wired to the local self-view tile's NSClickGestureRecognizer.
-- (void)handleLocalSelfTileClicked:(NSClickGestureRecognizer *)recognizer {
-    [self handleTileClicked:kLocalSelfTileKey];
+/// Apply the latest roster-snapshot local state to the local self-tile if it exists.
+/// Keeps the local tile snapshot-authoritative like every remote tile.
+- (void)applyStoredLocalSelfState {
+    InterRemoteVideoTileView *tile = self.localSelfTileView;
+    if (!tile) return;
+    NSString *name = [self displayNameForTileKey:kLocalSelfTileKey];
+    tile.nameLabel.stringValue = name;
+    [tile updateAvatarInitialFromDisplayName:name];
+    [tile setCameraOff:!self.localSelfCameraOn];
+    tile.isMicMuted = self.localSelfMicMuted;
+    tile.isSpeaking = self.localSelfSpeaking;
 }
+
 
 #pragma mark - Tile Factory
 
@@ -982,7 +1035,11 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
         return @"Screen Share";
     }
     NSString *registeredName = self.participantDisplayNames[key];
-    return registeredName.length > 0 ? registeredName : key;
+    if (registeredName.length > 0) return registeredName;
+    // The local self-tile falls back to "You" until the roster snapshot supplies the
+    // real (or renamed) display name — never the raw "__localself__" key.
+    if ([key isEqualToString:kLocalSelfTileKey]) return @"You";
+    return key;
 }
 
 - (void)registerDisplayName:(NSString *)displayName forParticipant:(NSString *)participantId {
@@ -1309,9 +1366,18 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
         }
     }
 
-    // 4. Local self entry: drive the existing local preview path.
+    // 4. Local self entry: drive the local self-tile from the snapshot, exactly like a
+    // remote tile (unified path). The tile is created on demand by the layout pass, so
+    // store the latest state and register the name; applyStoredLocalSelfState reapplies it
+    // both here (if the tile already exists) and at tile-creation time.
     if (localEntry) {
         self.localSelfCameraOn = localEntry.cameraOn;
+        self.localSelfMicMuted = localEntry.micMuted;
+        self.localSelfSpeaking = localEntry.isSpeaking;
+        if (localEntry.displayName.length > 0) {
+            self.participantDisplayNames[kLocalSelfTileKey] = localEntry.displayName;
+        }
+        [self applyStoredLocalSelfState];
     }
 
     // 5. Keep count + active-speaker bookkeeping in sync, then lay out.
@@ -1708,16 +1774,12 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
                 if (!selfTile) break;
                 [self addSubview:selfTile positioned:NSWindowBelow relativeTo:self.participantOverlay];
                 selfTile.hidden = NO;
-                self.localPreviewLayer.frame = CGRectMake(0, 0, W, H);
-                CGFloat lblH = 20.0, lblPad = 6.0;
-                self.localSelfNameLabel.frame = NSMakeRect(lblPad, lblPad,
-                                                           MIN(60.0, W - 2 * lblPad), lblH);
+                // The common tile's -layout sizes the preview (videoView) + name label.
                 if (animated) {
                     selfTile.animator.frame = NSMakeRect(0, 0, W, H);
                 } else {
                     selfTile.frame = NSMakeRect(0, 0, W, H);
                 }
-                self.localPreviewLayer.frame = CGRectMake(0, 0, W, H);
                 // Refresh the preview layer connection so it doesn't show a frozen frame.
                 if (self.localCaptureSession) {
                     self.localPreviewLayer.session = self.localCaptureSession;
@@ -1919,13 +1981,9 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
             NSView *selfTile = self.localSelfTileView;
             if (!selfTile) continue;
             selfTile.hidden = NO;
-            self.localPreviewLayer.frame = CGRectMake(0, 0, tileW, tileH);
-            CGFloat lblH = 20.0, lblPad = 6.0;
-            self.localSelfNameLabel.frame = NSMakeRect(lblPad, lblPad, MIN(60.0, tileW - 2 * lblPad), lblH);
             [self.filmstripContentView addSubview:selfTile];
             if (animated) { selfTile.animator.frame = tileFrame; }
             else          { selfTile.frame = tileFrame; }
-            self.localPreviewLayer.frame = CGRectMake(0, 0, tileFrame.size.width, tileFrame.size.height);
             continue;
         }
 
@@ -2011,11 +2069,6 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
             } else {
                 selfTile.frame = stageFrame;
             }
-            // Keep the preview layer in sync with the new stage bounds.
-            self.localPreviewLayer.frame = CGRectMake(0, 0, stageFrame.size.width, stageFrame.size.height);
-            CGFloat lblH = 20.0, lblPad = 8.0;
-            self.localSelfNameLabel.frame = NSMakeRect(lblPad, lblPad,
-                                                       MIN(80.0, stageFrame.size.width - 2 * lblPad), lblH);
         }
     } else {
         NSView *spotlightVideoView = nil;
@@ -2100,19 +2153,13 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
             NSView *selfTile = self.localSelfTileView;
             if (!selfTile) continue;
             selfTile.hidden = NO;
-            // Keep preview layer filling the tile
-            self.localPreviewLayer.frame = CGRectMake(0, 0, tileW, tileH);
-            // Name label: bottom-left pill
-            CGFloat lblH = 20.0, lblPad = 6.0;
-            self.localSelfNameLabel.frame = NSMakeRect(lblPad, lblPad, MIN(60.0, tileW - 2 * lblPad), lblH);
+            // The common tile's -layout sizes the preview (videoView) + name label.
             [self.filmstripContentView addSubview:selfTile];
             if (animated) {
                 selfTile.animator.frame = tileFrame;
             } else {
                 selfTile.frame = tileFrame;
             }
-            // Update preview layer to match new tile bounds
-            self.localPreviewLayer.frame = CGRectMake(0, 0, tileFrame.size.width, tileFrame.size.height);
             continue;
         }
 
@@ -2317,20 +2364,12 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
             [self addSubview:selfTile positioned:NSWindowBelow relativeTo:self.participantOverlay];
             selfTile.hidden = NO;
 
-            // Keep preview layer filling the tile
-            self.localPreviewLayer.frame = CGRectMake(0, 0, cellW, cellH);
-
-            // Name label: bottom-left pill
-            CGFloat lblH = 20.0, lblPad = 6.0;
-            self.localSelfNameLabel.frame = NSMakeRect(lblPad, lblPad,
-                                                       MIN(60.0, cellW - 2 * lblPad), lblH);
+            // The common tile's -layout sizes the preview (videoView) + name label.
             if (animated) {
                 selfTile.animator.frame = frame;
             } else {
                 selfTile.frame = frame;
             }
-            // Keep the preview layer in sync with the tile's new bounds.
-            self.localPreviewLayer.frame = CGRectMake(0, 0, frame.size.width, frame.size.height);
             continue;
         }
 

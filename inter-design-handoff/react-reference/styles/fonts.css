@@ -1,0 +1,24 @@
+/*
+ * General Sans — primary brand typeface (Indian Type Foundry, ITF Free Font License).
+ * Delivered via the Fontshare API. Weights: 300/400/500/600/700 (+ italics).
+ */
+@import url("https://api.fontshare.com/v2/css?f[]=general-sans@300,400,500,600,700,301,401,501,601,701&display=swap");
+
+/*
+ * SF Symbols — loaded from the macOS system font.
+ * Available after installing Xcode or the SF Symbols app from Apple.
+ * Falls back silently on non-Apple platforms.
+ *
+ * Usage:  <span style="font-family:'SF Symbols 6'">&#xE003;</span>
+ * Or use the <SFSymbol name="..." /> React component (src/app/components/ui/SFSymbol.tsx)
+ */
+@font-face {
+  font-family: "SF Symbols";
+  src: local("SF Symbols 6"),
+       local("SF Symbols 5"),
+       local("SF Symbols 4"),
+       local("Apple Symbols"),
+       local(".SF Symbols");
+  font-weight: normal;
+  font-style: normal;
+}

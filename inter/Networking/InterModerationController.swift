@@ -530,16 +530,21 @@ import LiveKit
         }
     }
 
-    /// Renames a participant's display name for this session only (host/co-host only).
-    /// Broadcasts `.renameParticipant` to all participants; no server persistence.
+    /// Renames a participant's display name (host/co-host only).
+    ///
+    /// Approach 3 — server-authoritative: persists the name via `/room/rename`, which calls
+    /// LiveKit `UpdateParticipant`. The SFU broadcasts the new name to every current client
+    /// (so it survives camera toggles, because the *attested* name itself becomes correct)
+    /// and delivers it to late joiners in `ParticipantInfo`. The DataChannel signal below
+    /// stays for instant in-session propagation; the optimistic delegate call updates the
+    /// renaming moderator's own view immediately (the sender does not receive its broadcast).
     @objc public func renameParticipant(identity: String, newDisplayName: String) {
         guard InterPermissionMatrix.role(localRole, hasPermission: .canMuteOthers) else { return }
         guard !identity.isEmpty, let cleanName = Self.sanitizedDisplayName(newDisplayName) else { return }
+        persistRename(targetIdentity: identity, newName: cleanName)
         sendControlSignal(type: .renameParticipant,
                           targetIdentity: identity,
                           extraData: ["newDisplayName": cleanName])
-        // Apply locally — the DataChannel sender does not receive its own broadcast,
-        // so the renaming moderator's own tile for this participant would not update.
         completeOnMain {
             self.delegate?.moderationController?(self, participantRenamed: identity,
                                                  newDisplayName: cleanName)
@@ -566,6 +571,7 @@ import LiveKit
             return
         }
         guard !localIdentity.isEmpty, let cleanName = Self.sanitizedDisplayName(newDisplayName) else { return }
+        persistRename(targetIdentity: localIdentity, newName: cleanName)
         sendControlSignal(type: .renameParticipant,
                           targetIdentity: localIdentity,
                           extraData: ["newDisplayName": cleanName])
@@ -573,6 +579,36 @@ import LiveKit
         completeOnMain {
             self.delegate?.moderationController?(self, participantRenamed: self.localIdentity,
                                                  newDisplayName: cleanName)
+        }
+    }
+
+    /// Persist a rename to the server for AUTHENTICATED users (Approach 3). The server updates
+    /// the LiveKit participant name — broadcast to all current clients and delivered to late
+    /// joiners — and the room's names hash (kept across token refresh / reconnect).
+    ///
+    /// Guests (no access token) are skipped entirely: their rename is handled purely
+    /// client-side by the DataChannel `.renameParticipant` signal plus the roster's per-session
+    /// name override, so it survives camera toggles in-session without any server round-trip
+    /// and does not persist after they leave. Best-effort: failures are logged.
+    private func persistRename(targetIdentity: String, newName: String) {
+        guard !roomCode.isEmpty, !serverURL.isEmpty else { return }
+        // Skip the server call for guests — /room/rename requires auth, so it would only 401.
+        // The client-side override (see InterParticipantRoster.setDisplayNameOverride) covers them.
+        guard let token = roomController?.tokenService.currentAccessToken, !token.isEmpty else {
+            interLogInfo(InterLog.room, "ModerationController: guest rename — client-side override only (no server persist)")
+            return
+        }
+        let body: [String: Any] = [
+            "roomCode": roomCode,
+            "callerIdentity": localIdentity,
+            "targetIdentity": targetIdentity,
+            "newDisplayName": newName,
+        ]
+        performPOST(endpoint: "/room/rename", body: body) { result in
+            if case .failure(let error) = result {
+                interLogError(InterLog.room, "ModerationController: /room/rename failed: %{public}@",
+                              error.localizedDescription)
+            }
         }
     }
 

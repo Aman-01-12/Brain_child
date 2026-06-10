@@ -128,6 +128,10 @@ import LiveKit
     /// Whether the waiting room / lobby is enabled for this meeting (host-configured).
     /// Used to initialise the in-session lobby toggle so it reflects the pre-meeting choice.
     @objc public private(set) dynamic var activeLobbyEnabled: Bool = false
+    /// Whether the meeting currently has a password set (server-authoritative boolean).
+    /// The plaintext is never delivered to non-setters — this only reflects whether one
+    /// exists, so a rejoining host / co-host can render the password menu state correctly.
+    @objc public private(set) dynamic var activeHasPassword: Bool = false
     /// Whether participants can unmute themselves.
     @objc public private(set) dynamic var activeAllowUnmuting: Bool = true
     /// Chat permission level: "everyone" | "hostOnly" | "disabled".
@@ -157,6 +161,14 @@ import LiveKit
         activeShareConflictPolicy = dict["shareConflictPolicy"] as? String ?? "oneattime"
         activeAutoRecord         = dict["autoRecord"]         as? Bool ?? false
         activeAutoTranscript     = dict["autoTranscript"]     as? Bool ?? false
+        activeHasPassword        = dict["hasPassword"]        as? Bool ?? false
+    }
+
+    /// Update the active "meeting has a password" flag mid-session. Called after the host
+    /// or a co-host successfully sets or removes the password so the moderation menu state
+    /// stays in sync with the server.
+    @objc public func updateHasMeetingPassword(_ hasPassword: Bool) {
+        activeHasPassword = hasPassword
     }
 
     /// Update the active share-conflict policy mid-meeting.
@@ -300,6 +312,7 @@ import LiveKit
                         self.activeSharingPermissions = configuration.sharingPermissions
                         self.activeAutoRecord         = configuration.autoRecord
                         self.activeAutoTranscript     = configuration.autoTranscript
+                        self.activeHasPassword        = !configuration.meetingPassword.isEmpty
                     }
                 }
                 self?.handleTokenResponse(
@@ -332,6 +345,7 @@ import LiveKit
                         self.activeShareConflictPolicy = r.shareConflictPolicy
                         self.activeAutoRecord          = r.autoRecord
                         self.activeAutoTranscript      = r.autoTranscript
+                        self.activeHasPassword         = r.hasPassword
                         // The server restores host status when the original host
                         // rejoins (matched by authenticated userId). Reflect it so the
                         // returning host's client shows host UI again.

@@ -1008,6 +1008,7 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
     self.normalScheduleWindow.minSize = NSMakeSize(680, 560);
     self.normalScheduleWindow.releasedWhenClosed = NO;
     self.normalScheduleWindow.level = NSFloatingWindowLevel;
+    [self.normalScheduleWindow setSharingType:NSWindowSharingNone];
     [self.normalScheduleWindow setAppearance:[NSAppearance appearanceNamed:NSAppearanceNameDarkAqua]];
     self.normalScheduleWindow.contentView = self.normalSchedulePanel;
     [self.normalScheduleWindow makeKeyAndOrderFront:nil];
@@ -2204,6 +2205,7 @@ didRequestDeleteTeamId:(NSString *)teamId {
     self.lobbyWaitingWindow.title = @"Joining Meeting";
     self.lobbyWaitingWindow.releasedWhenClosed = NO;
     self.lobbyWaitingWindow.level = NSFloatingWindowLevel;
+    [self.lobbyWaitingWindow setSharingType:NSWindowSharingNone];
     [self.lobbyWaitingWindow setAppearance:[NSAppearance appearanceNamed:NSAppearanceNameDarkAqua]];
     self.lobbyWaitingWindow.contentView = self.lobbyWaitingView;
     [self.lobbyWaitingWindow makeKeyAndOrderFront:nil];
@@ -2470,6 +2472,7 @@ didRequestDeleteTeamId:(NSString *)teamId {
         self.normalPollWindow.minSize = NSMakeSize(280, 320);
         self.normalPollWindow.releasedWhenClosed = NO;
         self.normalPollWindow.level = NSFloatingWindowLevel;
+        [self.normalPollWindow setSharingType:NSWindowSharingNone];
         [self.normalPollWindow setAppearance:[NSAppearance appearanceNamed:NSAppearanceNameDarkAqua]];
 
         self.normalPollPanel = [[InterPollPanel alloc] initWithFrame:NSMakeRect(0, 0, pollW, pollH)];
@@ -2505,6 +2508,7 @@ didRequestDeleteTeamId:(NSString *)teamId {
         self.normalQAWindow.minSize = NSMakeSize(280, 320);
         self.normalQAWindow.releasedWhenClosed = NO;
         self.normalQAWindow.level = NSFloatingWindowLevel;
+        [self.normalQAWindow setSharingType:NSWindowSharingNone];
         [self.normalQAWindow setAppearance:[NSAppearance appearanceNamed:NSAppearanceNameDarkAqua]];
 
         self.normalQAPanel = [[InterQAPanel alloc] initWithFrame:NSMakeRect(0, 0, qaW, qaH)];
@@ -2531,14 +2535,20 @@ didRequestDeleteTeamId:(NSString *)teamId {
 /// Joiner path: reads from `roomController.active*` properties (set from join response).
 - (void)applyMeetingSettingsAfterLaunch {
     BOOL isHost = self.roomController.isHost;
+    // On a fresh host launch we have pendingMeetingSettings (gathered from the pre-meeting
+    // panel). On host REJOIN — and for every participant — pendingMeetingSettings is nil, so
+    // read the server-returned active* values instead. Keying these off `isHost` alone made
+    // a rejoining host revert meeting name / chat permissions / share-takeover policy to
+    // defaults, because the host branch read from a nil pendingMeetingSettings.
+    InterPreMeetingSettings *pending = self.pendingMeetingSettings;
 
     // NOTE: muteOnJoin and cameraOffOnJoin are applied inside startNormalLocalMediaFlow's
     // prepareWithCompletion: block — after -start — because the capture session must be
     // running before mute/disable calls take effect. Calling them here would be a no-op.
 
     // meetingDisplayName → window title
-    NSString *meetingName = isHost
-        ? (self.pendingMeetingSettings.meetingDisplayName ?: @"")
+    NSString *meetingName = pending
+        ? (pending.meetingDisplayName ?: @"")
         : self.roomController.activeMeetingDisplayName;
     if (meetingName.length > 0) {
         [self.normalCallWindow setTitle:meetingName];
@@ -2547,16 +2557,17 @@ didRequestDeleteTeamId:(NSString *)teamId {
     // allowUnmuting — stored as roomController.activeAllowUnmuting.
     // The moderation controller will consult this when handling raise-hand / unmute requests.
 
-    // Auto-record (host only, pro tier)
-    if (isHost && self.pendingMeetingSettings && self.pendingMeetingSettings.autoRecord) {
+    // Auto-record (host only, pro tier). Guarded on pendingMeetingSettings so it fires only
+    // on the fresh host launch, never on a rejoin (the recording would already be running).
+    if (isHost && pending && pending.autoRecord) {
         [self handleAutoRecordIfNeeded];
     }
 
     // Consume the pending settings — they must not outlive this call window session
     [self _updateChatExportVisibility];
-    // Broadcast co-host local recording permission to all participants.
-    if (isHost && self.pendingMeetingSettings) {
-        BOOL allow = self.pendingMeetingSettings.allowCoHostLocalRecording;
+    // Broadcast co-host local recording permission to all participants (fresh host only).
+    if (isHost && pending) {
+        BOOL allow = pending.allowCoHostLocalRecording;
         self.coHostLocalRecordingAllowed = allow;
         [self.moderationController setCoHostRecordingAllowed:allow];
     }
@@ -2565,21 +2576,24 @@ didRequestDeleteTeamId:(NSString *)teamId {
     // chat input is gated correctly from the very first moment the session opens.
     // applyInitialChatPermissions does NOT broadcast a DataChannel signal —
     // it only sets the local isChatDisabled flag and notifies the delegate.
-    NSString *chatPerms = isHost
-        ? (self.pendingMeetingSettings.chatPermissions ?: @"everyone")
+    NSString *chatPerms = pending
+        ? (pending.chatPermissions ?: @"everyone")
         : (self.roomController.activeChatPermissions ?: @"everyone");
     [self.moderationController applyInitialChatPermissions:chatPerms];
 
-    // Apply the share-conflict policy from settings (host) or server response (joiner).
-    NSString *conflictPolicy = isHost
-        ? (self.pendingMeetingSettings.shareConflictPolicy ?: @"oneattime")
+    // Apply the share-conflict policy from the pre-meeting settings (fresh host) or the
+    // server response (host rejoin / joiner) so the "Share Takeover" menu reflects reality.
+    NSString *conflictPolicy = pending
+        ? (pending.shareConflictPolicy ?: @"oneattime")
         : (self.roomController.activeShareConflictPolicy ?: @"oneattime");
     [self.moderationController applyInitialShareConflictPolicy:conflictPolicy];
 
-    // Remember the host-configured meeting password (plaintext) for this session so the
-    // moderation menu reflects that a password is set and can offer view/copy/change.
+    // Cache the host-configured meeting password (plaintext) for THIS session so the
+    // creating host can View/Copy/Change it. Whether a password is *set* is tracked
+    // server-authoritatively via roomController.activeHasPassword (which also covers the
+    // host-rejoin and co-host cases where the plaintext is not available locally).
     if (isHost) {
-        self.currentMeetingPassword = self.pendingMeetingSettings.meetingPassword ?: @"";
+        self.currentMeetingPassword = pending.meetingPassword ?: @"";
     }
 
     self.pendingMeetingSettings = nil;
@@ -4065,6 +4079,7 @@ didRequestDeleteTeamId:(NSString *)teamId {
         self.normalLobbyWindow.minSize = NSMakeSize(220, 200);
         self.normalLobbyWindow.releasedWhenClosed = NO;
         self.normalLobbyWindow.level = NSFloatingWindowLevel;
+        [self.normalLobbyWindow setSharingType:NSWindowSharingNone];
         [self.normalLobbyWindow setAppearance:[NSAppearance appearanceNamed:NSAppearanceNameDarkAqua]];
         self.normalLobbyWindow.contentView = self.normalLobbyPanel;
 
@@ -4482,9 +4497,16 @@ didRequestDeleteTeamId:(NSString *)teamId {
     // Meeting Password — state-aware (mirrors the pre-meeting setting).
     // When a password is set, the host can view/copy it (to share), change it, or remove it.
     NSMenu *pwSub = [[NSMenu alloc] initWithTitle:@"Meeting Password"];
-    BOOL hasPassword = (self.currentMeetingPassword.length > 0);
+    // "Is a password set?" is server-authoritative (roomController.activeHasPassword), so a
+    // rejoining host or a co-host — who never went through the pre-meeting panel — still see
+    // the correct items. View/Copy is offered only when the plaintext is known locally (the
+    // session that set it): the server stores a bcrypt hash and never returns the plaintext.
+    BOOL hasPlaintext = (self.currentMeetingPassword.length > 0);
+    BOOL hasPassword  = self.roomController.activeHasPassword || hasPlaintext;
     if (hasPassword) {
-        [pwSub addItemWithTitle:@"👁 View / Copy Password" action:@selector(moderationViewPassword) keyEquivalent:@""];
+        if (hasPlaintext) {
+            [pwSub addItemWithTitle:@"👁 View / Copy Password" action:@selector(moderationViewPassword) keyEquivalent:@""];
+        }
         [pwSub addItemWithTitle:@"✏️ Change Password…" action:@selector(moderationSetPassword) keyEquivalent:@""];
         [pwSub addItemWithTitle:@"🗑 Remove Password" action:@selector(moderationRemovePassword) keyEquivalent:@""];
     } else {
@@ -4868,7 +4890,7 @@ didRequestDeleteTeamId:(NSString *)teamId {
 }
 
 - (void)moderationSetPassword {
-    BOOL changing = (self.currentMeetingPassword.length > 0);
+    BOOL changing = self.roomController.activeHasPassword || (self.currentMeetingPassword.length > 0);
     NSAlert *alert = [[NSAlert alloc] init];
     alert.messageText = changing ? @"Change Meeting Password" : @"Set Meeting Password";
     alert.informativeText = changing
@@ -4879,8 +4901,9 @@ didRequestDeleteTeamId:(NSString *)teamId {
 
     NSSecureTextField *passwordField = [[NSSecureTextField alloc] initWithFrame:NSMakeRect(0, 0, 240, 24)];
     passwordField.placeholderString = @"Password";
-    // Prefill with the current password so the host can edit it when changing.
-    if (changing) passwordField.stringValue = self.currentMeetingPassword;
+    // Prefill only when the plaintext is known locally (the session that set it). A
+    // rejoining host / co-host changing a password starts from an empty field.
+    if (self.currentMeetingPassword.length > 0) passwordField.stringValue = self.currentMeetingPassword;
     alert.accessoryView = passwordField;
 
     if ([alert runModal] == NSAlertFirstButtonReturn) {
@@ -4891,6 +4914,8 @@ didRequestDeleteTeamId:(NSString *)teamId {
                 if (success) {
                     // Remember the plaintext for this session so the host can view/copy/change it.
                     weakSelf.currentMeetingPassword = password;
+                    // Keep the server-authoritative "has password" flag in sync.
+                    [weakSelf.roomController updateHasMeetingPassword:YES];
                 } else {
                     NSLog(@"[Phase 9] Set password failed: %@", error.localizedDescription);
                     dispatch_async(dispatch_get_main_queue(), ^{
@@ -4933,6 +4958,8 @@ didRequestDeleteTeamId:(NSString *)teamId {
     [self.moderationController removePasswordWithCompletion:^(BOOL success, NSError *error) {
         if (success) {
             weakSelf.currentMeetingPassword = @"";
+            // Keep the server-authoritative "has password" flag in sync.
+            [weakSelf.roomController updateHasMeetingPassword:NO];
         } else {
             NSLog(@"[Phase 9] Remove password failed: %@", error.localizedDescription);
             dispatch_async(dispatch_get_main_queue(), ^{
@@ -5718,6 +5745,13 @@ didRequestDeleteTeamId:(NSString *)teamId {
     // and notifications all resolve to the same effective name (and so the recent
     // attested-name reconciliation no longer reverts renamed names in chat).
     [self.roomController setSessionDisplayName:newDisplayName forIdentity:identity];
+    // Push a per-session rename OVERRIDE into the roster. The roster is the single source of
+    // truth for video tiles: every presence/track change (e.g. ANY participant toggling
+    // their camera) re-emits a snapshot, and on a fresh camera subscribe the attested
+    // (original) name is re-stamped. The override layer wins over the attested name in the
+    // emitted snapshot, so the rename survives camera toggles — without any server call.
+    // The override is dropped automatically when the participant leaves (per-session).
+    [self.roomController.subscriber.roster setDisplayNameOverride:newDisplayName for:identity];
     // Update the tile label for everyone's view.
     if (self.normalRemoteLayout) {
         [self.normalRemoteLayout registerDisplayName:newDisplayName forParticipant:identity];
@@ -5732,6 +5766,9 @@ didRequestDeleteTeamId:(NSString *)teamId {
         }
         [self.chatController updateLocalDisplayName:newDisplayName];
         [self.moderationController updateLocalDisplayName:newDisplayName];
+        // Set the roster's LOCAL per-session rename override so the unified local self-tile
+        // reflects the new name and survives camera toggles. Client-only, dropped on leave.
+        [self.roomController.subscriber.roster setLocalDisplayNameOverride:newDisplayName];
     }
     // Refresh the DM recipient list so all participants see the updated name
     // in the "To:" picker immediately (DataChannel renames don't update LiveKit
@@ -5944,6 +5981,7 @@ didRequestDeleteTeamId:(NSString *)teamId {
         self.normalRecordingListWindow.minSize = NSMakeSize(280, 260);
         self.normalRecordingListWindow.releasedWhenClosed = NO;
         self.normalRecordingListWindow.level = NSFloatingWindowLevel;
+        [self.normalRecordingListWindow setSharingType:NSWindowSharingNone];
         [self.normalRecordingListWindow setAppearance:[NSAppearance appearanceNamed:NSAppearanceNameDarkAqua]];
         self.normalRecordingListWindow.contentView = self.normalRecordingListPanel;
 

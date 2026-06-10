@@ -75,6 +75,9 @@ import CryptoKit
     /// Whether the server restored this caller as the room host (e.g. the original
     /// host rejoining after leaving). Drives host UI on the client.
     @objc public let isHost: Bool
+    /// Whether the meeting currently has a password set (server-authoritative; presence
+    /// of the bcrypt hash). The plaintext is never returned — only whether one exists.
+    @objc public let hasPassword: Bool
 
     @objc public init(roomName: String,
                       token: String,
@@ -90,7 +93,8 @@ import CryptoKit
                       autoRecord: Bool = false,
                       autoTranscript: Bool = false,
                       shareConflictPolicy: String = "oneattime",
-                      isHost: Bool = false) {
+                      isHost: Bool = false,
+                      hasPassword: Bool = false) {
         self.roomName             = roomName
         self.token                = token
         self.serverURL            = serverURL
@@ -106,6 +110,7 @@ import CryptoKit
         self.autoTranscript       = autoTranscript
         self.shareConflictPolicy  = shareConflictPolicy
         self.isHost               = isHost
+        self.hasPassword          = hasPassword
         super.init()
     }
 }
@@ -1097,6 +1102,7 @@ private struct TokenCacheEntry {
                 let autoTranscript      = json["autoTranscript"] as? Bool ?? false
                 let shareConflictPolicy = json["shareConflictPolicy"] as? String ?? "oneattime"
                 let isHost              = json["isHost"] as? Bool ?? false
+                let hasPassword         = json["hasPassword"] as? Bool ?? false
 
                 let response = InterJoinRoomResponse(
                     roomName: roomName,
@@ -1113,7 +1119,8 @@ private struct TokenCacheEntry {
                     autoRecord: autoRecord,
                     autoTranscript: autoTranscript,
                     shareConflictPolicy: shareConflictPolicy,
-                    isHost: isHost
+                    isHost: isHost,
+                    hasPassword: hasPassword
                 )
                 interLogInfo(InterLog.networking, "Token: room joined (code=***, type=%{public}@)", responseRoomType)
                 self?.completeOnMain { completion(response, nil) }

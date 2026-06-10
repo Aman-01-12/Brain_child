@@ -275,7 +275,7 @@ Skip this and you get **two drifting design systems** — the real risk, and wor
 | Camera/mic two-phase toggles | **Medium** | Must remain core-authoritative; SwiftUI reflects, never drives. See F-C1. |
 | Remote video tiles | Low (deferred) | Tile grid stays AppKit under B. **Local-display-only (never captured/streamed)** → chrome can be made industry-level in pure AppKit at zero capture risk (§6.3). |
 | Screen share (normal) | Low | Policy is signaling-driven, not UI-driven (§8). |
-| **Interview tool share (capture)** | **Medium** | Hosting-view capture fidelity spike required. ImageRenderer fallback exists. |
+| **Interview tool share (capture)** | **Low** | ✅ Capture-fidelity spike PASSED — `cacheDisplayInRect:` is pixel-correct for hosted SwiftUI editor + Canvas; existing pipeline unchanged. ImageRenderer fallback available but unused. |
 | **Code editor** | Medium | New component in the *artifact-bearing* path; invariant + supply chain. |
 | **Whiteboard/canvas** | Medium | New tools; must capture correctly; undo/redo state lifecycle. |
 | Chat / polls / Q&A / lobby | Low | Pure content panels; ideal first migrations. |
@@ -289,15 +289,15 @@ Skip this and you get **two drifting design systems** — the real risk, and wor
 | Invariant | Today | Under Scope B |
 |---|---|---|
 | Window not readable by third-party capture tools | `setSharingType:NSWindowSharingNone` on `NSWindow` (blocks OBS/Zoom/Meet/Bandicam/etc.; native recorder out of scope — Finding S-0) | **Identical** — set on the same AppKit `NSWindow`; SwiftUI content renders into the same backing store, so exclusion is unchanged |
-| Auxiliary windows also non-shareable | (today: few/no extra windows in secure mode) | **New obligation** — SwiftUI popovers/sheets/menus are separate `NSWindow`s; set `NSWindowSharingNone` on them or avoid them in secure mode (S-A6) |
+| Auxiliary windows also non-shareable | **⚠️ GAP FOUND → ✅ FIXED (2026-06-10):** audit found the secure-mode `chatOverlayWindow` (NSPanel, `SecureWindowController.m` `setupChatOverlayWindow`) floated above the secure surface WITHOUT `NSWindowSharingNone` (the main secure window had it, L75). Also found 6 normal-call floating panels (schedule, lobby-waiting, poll, Q&A, lobby, recording-list) unshielded while the call/settings/teams/account windows were shielded. **All 7 now set `NSWindowSharingNone`** (build-verified). | **New obligation** — SwiftUI popovers/sheets/menus are separate `NSWindow`s; set `NSWindowSharingNone` on them or avoid them in secure mode (S-A6). Add a centralized child-window guard at the `createSecureWindow`/kiosk entry point. Login window + pre-meeting/meeting-defaults sheets still unshielded — deferred (pre-call, weaker threat). |
 | Secure window floats above all | `NSScreenSaverWindowLevel` on `NSWindow` | **Identical** |
 | Borderless / non-movable / opaque | `NSWindow` props | **Identical** |
-| Kiosk (dock/menu/⌘-Tab/force-quit disabled) | `applyKioskRestrictions` (AppKit/Carbon) | **Identical**; verify SwiftUI `.keyboardShortcut`/commands don't re-register disabled actions (S-A3) |
+| Kiosk (dock/menu/⌘-Tab/force-quit disabled) | **Audit (2026-06-10):** done entirely via `[NSApp setPresentationOptions:]` in `applyKioskRestrictions` (`AppDelegate.m` ~L6791) — `DisableAppleMenu \| HideDock \| HideMenuBar \| DisableProcessSwitching \| DisableForceQuit \| DisableSessionTermination`. **No** `NSEvent` monitors / `performKeyEquivalent` overrides for shortcut blocking (only idle-timeout monitors). Entry L712, exit restores `PresentationDefault` L6711. | **Identical & low-risk** — app-level presentation options are framework-agnostic; an `NSHostingView` cannot weaken them. Just verify SwiftUI `.keyboardShortcut`/`commands` don't re-register disabled actions (S-A3). |
 | External-display policy (interviewee ≤1 screen) | `NSScreen` monitor in `AppDelegate` | **Identical** |
 | Screen-share permission (`everyone`/`ask`/`none`) | Redis + DataChannel signaling; enforced in moderation/surface controller | **Identical** — not UI-coupled |
 | Capture limited to tool host (never desktop) | `InterViewSnapshotVideoSource(capturedView: toolCaptureHostView)` | **Preserved** — capture an `NSHostingView` that contains *only* the tool; ImageRenderer renders only the tool view |
-| Literal-code integrity (no smart quotes/autocorrect) | NSTextView flags disabled | **Preserved** — custom editor disables them explicitly (S-A4) |
-| Pasteboard restrictions | NSTextView-level | **Must port** — SwiftUI editor must not enable Services/drag-out that leak code (S-A5) |
+| Literal-code integrity (no smart quotes/autocorrect) | **Audit (2026-06-10):** `InterSecureCodeEditorView.m` L101–L120 disables all 13 substitution/autocorrect/detection APIs (richText, importsGraphics, quote/dash/text-replacement/spelling/grammar/data/link/completion). Comment L113 states intent ("captured workspace [must not] lie about what the participant actually typed"). | **Preserved — drives editor choice:** a plain SwiftUI `TextEditor` cannot express all 13 toggles → secure editor stays an `NSViewRepresentable` over `NSTextView` (S-A4). |
+| Pasteboard restrictions | **Audit (2026-06-10):** copy-out and paste-in are **UNRESTRICTED** today (no `-copy:`/`-paste:`/`validRequestorForSendType:` overrides); `importsGraphics=NO` blocks image paste only. Security comes from the substitution-disables, NOT clipboard blocking. Whiteboard has zero pasteboard surface. | **Port the real invariant** (the 13 disables), not clipboard blocking. If tighter exfiltration control is wanted later, that's a NEW decision, not a regression (S-A5). |
 
 ---
 
@@ -326,10 +326,11 @@ Skip this and you get **two drifting design systems** — the real risk, and wor
 - Reimplement as a SwiftUI **`Canvas`** + a small stroke model (`[Stroke]` with tool/color/width), giving shapes, colors, eraser, **undo/redo** (command stack), and text — all rendered locally.
 - **Still streamed as video** through the existing pipeline. **No networking.** Collaborative sync is a separate future spec.
 
-### 9.3 Capture-path spike (BLOCKER before tool migration)
+### 9.3 Capture-path spike (BLOCKER before tool migration) — ✅ RESOLVED GREEN (2026-06-10)
 `InterViewSnapshotVideoSource` captures `toolCaptureHostView` via `cacheDisplayInRect:toBitmapImageRep:`. That API can yield **blank/partial** frames for GPU-backed content (`.drawingGroup()`, certain `Canvas` backings).
 - **Spike:** host the SwiftUI editor + canvas in an `NSHostingView`, run the *existing* snapshot source, confirm frames are pixel-correct at 10fps / ≤1600×900.
 - **Fallback if it fails:** switch the snapshot source to SwiftUI **`ImageRenderer`** (macOS 13+) → renders the SwiftUI view straight to `CGImage`/`CVPixelBuffer`, bypassing `cacheDisplayInRect:`. Keep the same sink/timer/generation guard.
+- **RESULT (`interTests/CaptureFidelitySpikeTests.swift`):** `cacheDisplayInRect:toBitmapImageRep:` (the *exact* API the source uses) reproduces a hosted `NSHostingView` **pixel-correctly for BOTH** the plain-SwiftUI editor case **AND** the GPU-backed `Canvas` whiteboard case — crisp red/blue split + sharp `GraphicsContext`-drawn text, no blank/garbled frames. `ImageRenderer` was exercised head-to-head in the same run and also passes. **Conclusion:** the editor + whiteboard migrations use the **existing snapshot pipeline unchanged**; the `ImageRenderer` fallback is **available but NOT required**. Blocker cleared — tool migration may proceed.
 
 ---
 
@@ -406,7 +407,7 @@ Skip this and you get **two drifting design systems** — the real risk, and wor
 
 ### Adviser 5 — THE EXECUTOR
 1. **Run S-0 verification** — *who:* one engineer — *by:* this week. Record the secure window with ScreenCaptureKit on 15.6; document pass/fail. Gate everything security-related on the result.
-2. **Capture-fidelity spike** — *who:* same — *by:* this week. `NSHostingView` containing a SwiftUI `Canvas` → existing snapshot source → confirm pixels. If fail, swap to `ImageRenderer`.
+2. **Capture-fidelity spike** — *who:* same — *by:* this week. `NSHostingView` containing a SwiftUI `Canvas` → existing snapshot source → confirm pixels. If fail, swap to `ImageRenderer`. ✅ **DONE 2026-06-10 — PASSED** (`interTests/CaptureFidelitySpikeTests.swift`): `cacheDisplayInRect:` is pixel-correct for both editor + Canvas; existing pipeline used unchanged, no fallback needed.
 3. **Migrate ONE throwaway-risk panel** (Q&A or recording-list) to SwiftUI behind `NSHostingController`; codify the `@Observable`-over-KVO adapter as the reference pattern. *By:* next week.
 4. **Defer** the tile grid and `AppDelegate` decomposition indefinitely. No cost to deferring.
 5. **Stop** treating "migrate to SwiftUI" as the goal. The goal is "better editor + canvas + nicer panels." Re-scope tickets to features, not frameworks.

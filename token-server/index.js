@@ -270,6 +270,33 @@ async function checkRateLimit(identity) {
   return count <= RATE_LIMIT_MAX;
 }
 
+/// Per-principal flood limiter for room action endpoints (moderation, lobby, media-lock,
+/// recording control, etc.). These mutate room state and/or call LiveKit (which broadcasts
+/// to every participant), so an un-throttled client could amplify load across the whole
+/// room. Keyed on the authenticated userId when present, else the source IP. Returns an
+/// Express middleware; place it AFTER auth.requireAuth so the userId is available.
+///
+/// Defaults are generous so human-driven moderation (e.g. a host muting many participants
+/// in a burst) never trips the limit, while a scripted flood is capped. Redis errors fail
+/// OPEN (do not block legitimate moderation) — consistent with the auth rate limiters.
+function rateLimitRoomAction(action, max = 60, windowSec = 60) {
+  return async (req, res, next) => {
+    try {
+      const principal = req.user?.userId != null ? `u:${req.user.userId}` : `ip:${req.ip}`;
+      const key = `ratelimit:${action}:${principal}`;
+      const count = await redis.incr(key);
+      if (count === 1) await redis.expire(key, windowSec);
+      if (count > max) {
+        console.log(`[audit] Room action rate-limited: action=${action} principal=${principal}`);
+        return res.status(429).json({ error: 'Too many requests. Please slow down and try again.' });
+      }
+    } catch (redisErr) {
+      console.error(`[room action rate limit] Redis error (action=${action}):`, redisErr.message);
+    }
+    next();
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Room code generation — 6 chars, alphanumeric (excluding confusable chars)
 // 30^6 = 729 million combinations
@@ -2035,6 +2062,17 @@ async function getParticipantRole(code, identity) {
   return 'participant';
 }
 
+/// Sanitize a participant display name: strip ASCII + Unicode control characters
+/// (including newlines, which prevents UI-breaking names and log injection), trim
+/// surrounding whitespace, and cap the length at 50. Mirrors the client-side
+/// `sanitizedDisplayName`. Returns '' when nothing usable remains.
+function sanitizeDisplayName(raw) {
+  if (typeof raw !== 'string') return '';
+  const stripped = raw.replace(/[\u0000-\u001F\u007F-\u009F]/g, '');
+  const trimmed = stripped.trim();
+  return trimmed.length > 50 ? trimmed.slice(0, 50) : trimmed;
+}
+
 /// Validate that the caller has moderator privileges. Returns { valid, role, error }.
 /// When userId is provided, also cross-checks that callerIdentity is bound to that user,
 /// preventing authenticated participants from impersonating the host via body-supplied identity.
@@ -2520,6 +2558,9 @@ app.post('/room/join', async (req, res) => {
       autoTranscript:      roomData.autoTranscript      === 'true',
       // True when the server restored this caller as the room host (original host rejoining).
       isHost:              isReturningHost,
+      // Whether a meeting password is set (presence of the bcrypt hash; the plaintext is
+      // never returned). Lets a rejoining host / co-host render the password menu state.
+      hasPassword:         !!roomData.passwordHash,
     });
   } catch (err) {
     console.error(`[error] Token creation failed for ${identity}:`, err.message);
@@ -2603,7 +2644,7 @@ app.get('/room/info/:code', async (req, res) => {
 // Body: { roomCode, callerIdentity, targetIdentity, newRole }
 // Returns: { success, identity, previousRole, newRole }
 // ---------------------------------------------------------------------------
-app.post('/room/promote', auth.requireAuth, async (req, res) => {
+app.post('/room/promote', auth.requireAuth, rateLimitRoomAction('promote'), async (req, res) => {
   const { roomCode, callerIdentity, targetIdentity, newRole } = req.body;
 
   if (!roomCode || !callerIdentity || !targetIdentity || !newRole) {
@@ -2614,11 +2655,14 @@ app.post('/room/promote', auth.requireAuth, async (req, res) => {
   const roomData = await getRoomData(code);
   if (!roomData) return res.status(404).json({ error: 'Invalid or expired room code' });
 
-  // Validate caller has promote permission
-  const callerRole = await getParticipantRole(code, callerIdentity);
-  if (!isModeratorRole(callerRole)) {
-    return res.status(403).json({ error: 'Insufficient permissions. Moderator role required.' });
-  }
+  // Validate caller has promote permission. Use validateModerator (NOT a raw role
+  // lookup) so the body-supplied callerIdentity is cross-checked against the caller's
+  // authenticated userId. Participant identities are visible to every peer (they key the
+  // tiles), so without this an authenticated participant could pass the host's identity
+  // as callerIdentity and self-promote to co-host. validateModerator rejects that.
+  const validation = await validateModerator(code, callerIdentity, req.user?.userId);
+  if (!validation.valid) return res.status(403).json({ error: validation.error });
+  const callerRole = validation.role;
 
   // Validate the new role is valid
   if (!ROLE_HIERARCHY.hasOwnProperty(newRole)) {
@@ -2669,7 +2713,7 @@ app.post('/room/promote', auth.requireAuth, async (req, res) => {
 // trackSource: "microphone" | "camera"
 // Returns: { success }
 // ---------------------------------------------------------------------------
-app.post('/room/mute', auth.requireAuth, async (req, res) => {
+app.post('/room/mute', auth.requireAuth, rateLimitRoomAction('mute'), async (req, res) => {
   const { roomCode, callerIdentity, targetIdentity, trackSource } = req.body;
 
   if (!roomCode || !callerIdentity || !targetIdentity || !trackSource) {
@@ -2728,7 +2772,7 @@ app.post('/room/mute', auth.requireAuth, async (req, res) => {
 // Body: { roomCode, callerIdentity }
 // Returns: { success, mutedCount }
 // ---------------------------------------------------------------------------
-app.post('/room/mute-all', auth.requireAuth, async (req, res) => {
+app.post('/room/mute-all', auth.requireAuth, rateLimitRoomAction('mute-all'), async (req, res) => {
   const { roomCode, callerIdentity } = req.body;
 
   if (!roomCode || !callerIdentity) {
@@ -2796,7 +2840,7 @@ app.post('/room/mute-all', auth.requireAuth, async (req, res) => {
 // auto-muted. Live participants are unmuted client-side via the requestUnmuteAll
 // DataChannel broadcast.
 // Body: { roomCode, callerIdentity }
-app.post('/room/unmute-all', auth.requireAuth, async (req, res) => {
+app.post('/room/unmute-all', auth.requireAuth, rateLimitRoomAction('unmute-all'), async (req, res) => {
   const { roomCode, callerIdentity } = req.body;
   if (!roomCode || !callerIdentity) {
     return res.status(400).json({ error: 'roomCode and callerIdentity are required' });
@@ -2819,11 +2863,88 @@ app.post('/room/unmute-all', auth.requireAuth, async (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// POST /room/rename — Set a participant's display name (server-authoritative).
+// Body: { roomCode, callerIdentity, targetIdentity, newDisplayName }
+// Returns: { success, displayName }
+//
+// Updates the LiveKit participant name via UpdateParticipant, which the SFU
+// broadcasts to every connected client AND delivers to late joiners natively in
+// ParticipantInfo. The name is also persisted to the room's names hash so a token
+// refresh / reconnect keeps it. This makes the attested name itself authoritative,
+// so a rename survives camera toggles and is seen by participants who join later.
+// ---------------------------------------------------------------------------
+app.post('/room/rename', auth.requireAuth, async (req, res) => {
+  const { roomCode, callerIdentity, targetIdentity, newDisplayName } = req.body;
+  if (!roomCode || !callerIdentity || !targetIdentity || !newDisplayName) {
+    return res.status(400).json({ error: 'roomCode, callerIdentity, targetIdentity, and newDisplayName are required' });
+  }
+
+  const code = roomCode.toUpperCase();
+  const roomData = await getRoomData(code);
+  if (!roomData) return res.status(404).json({ error: 'Invalid or expired room code' });
+
+  // Sanitize server-side too (a hand-crafted request must also be cleaned).
+  const cleanName = sanitizeDisplayName(newDisplayName);
+  if (!cleanName) return res.status(400).json({ error: 'Display name cannot be empty.' });
+
+  // Authorization: a moderator may rename anyone; any other participant may rename
+  // only themselves, and never when they are the interviewee in an interview room
+  // (identity integrity is the point of the interview).
+  const callerRole = await getParticipantRole(code, callerIdentity);
+  const isModerator = isModeratorRole(callerRole);
+  const isSelf = (callerIdentity === targetIdentity);
+  const isInterview = (roomData.roomType === 'interview');
+  if (!isModerator && (!isSelf || isInterview)) {
+    return res.status(403).json({ error: 'You are not allowed to rename this participant.' });
+  }
+
+  // Identity-binding cross-check: an authenticated caller must own the identity it
+  // claims (prevents acting as another participant). Skipped when no binding exists
+  // (guest-hosted room), mirroring validateModerator.
+  if (req.user?.userId != null) {
+    const boundUser = await redis.hget(roomUserBindingKey(code), callerIdentity);
+    if (boundUser !== null && String(boundUser) !== String(req.user.userId)) {
+      console.warn(`[SECURITY] /room/rename identity mismatch: code=${code} claimed=${callerIdentity} userId=${req.user.userId} boundTo=${boundUser}`);
+      return res.status(403).json({ error: 'Identity mismatch: caller does not match authenticated user.' });
+    }
+  }
+
+  // Per-principal flood limiter. Each rename calls LiveKit UpdateParticipant, which
+  // BROADCASTS the new name to every participant (LiveKit warns name/metadata updates
+  // should not exceed roughly once every few seconds). Self-rename means any authenticated
+  // participant can reach this endpoint, so without a cap one client could flood the whole
+  // room. Counted only for authorized requests (placed after the auth checks above) and
+  // before the amplifying LiveKit call. Window 60s, max 10 — generous for fixing a typo,
+  // tight against a flood. Keyed on the authenticated userId, else source IP, scoped to room.
+  const renamePrincipal = req.user?.userId != null ? `u:${req.user.userId}` : `ip:${req.ip}`;
+  const renameRlKey = `ratelimit:rename:${code}:${renamePrincipal}`;
+  const renameCount = await redis.incr(renameRlKey);
+  if (renameCount === 1) await redis.expire(renameRlKey, 60);
+  if (renameCount > 10) {
+    console.log(`[audit] Rename rate-limited: code=${code} principal=${renamePrincipal}`);
+    return res.status(429).json({ error: 'Too many name changes. Please wait a moment and try again.' });
+  }
+
+  // Apply the server-authoritative name on LiveKit, then persist to the names hash
+  // so a token refresh / reconnect keeps it.
+  try {
+    await roomService.updateParticipant(roomData.roomName, targetIdentity, { name: cleanName });
+  } catch (lkErr) {
+    console.error(`[room/rename] LiveKit updateParticipant failed for ${targetIdentity}:`, lkErr.message);
+    return res.status(502).json({ error: 'Could not update the display name. Please try again.' });
+  }
+  await redis.hset(roomNamesKey(code), targetIdentity, cleanName);
+
+  console.log(`[audit] Rename: code=${code} caller=${callerIdentity} target=${targetIdentity}`);
+  res.json({ success: true, displayName: cleanName });
+});
+
+// ---------------------------------------------------------------------------
 // POST /room/remove — Remove a participant from the room
 // Body: { roomCode, callerIdentity, targetIdentity }
 // Returns: { success }
 // ---------------------------------------------------------------------------
-app.post('/room/remove', auth.requireAuth, async (req, res) => {
+app.post('/room/remove', auth.requireAuth, rateLimitRoomAction('remove'), async (req, res) => {
   const { roomCode, callerIdentity, targetIdentity } = req.body;
 
   if (!roomCode || !callerIdentity || !targetIdentity) {
@@ -2871,7 +2992,7 @@ app.post('/room/remove', auth.requireAuth, async (req, res) => {
 // Deletes the LiveKit room (disconnecting all participants with a roomDeleted
 // reason) and clears the room's Redis state. Host-only.
 // ---------------------------------------------------------------------------
-app.post('/room/end', auth.requireAuth, async (req, res) => {
+app.post('/room/end', auth.requireAuth, rateLimitRoomAction('end'), async (req, res) => {
   const { roomCode, callerIdentity } = req.body;
 
   if (!roomCode || !callerIdentity) {
@@ -2886,8 +3007,8 @@ app.post('/room/end', auth.requireAuth, async (req, res) => {
   // can remove individuals but cannot tear down the whole meeting.
   const validation = await validateModerator(code, callerIdentity, req.user?.userId);
   if (!validation.valid) return res.status(403).json({ error: validation.error });
-  if (validation.role !== 'host') {
-    return res.status(403).json({ error: 'Only the host can end the meeting for everyone.' });
+  if (!['host', 'interviewer'].includes(validation.role)) {
+    return res.status(403).json({ error: 'Only the host or interviewer can end the meeting for everyone.' });
   }
 
   try {
@@ -2973,7 +3094,7 @@ app.post('/room/leave', async (req, res) => {
 // Body: { roomCode, callerIdentity }
 // Returns: { success }
 // ---------------------------------------------------------------------------
-app.post('/room/lock', auth.requireAuth, async (req, res) => {
+app.post('/room/lock', auth.requireAuth, rateLimitRoomAction('lock'), async (req, res) => {
   const { roomCode, callerIdentity } = req.body;
 
   if (!roomCode || !callerIdentity) {
@@ -2999,7 +3120,7 @@ app.post('/room/lock', auth.requireAuth, async (req, res) => {
 // Body: { roomCode, callerIdentity }
 // Returns: { success }
 // ---------------------------------------------------------------------------
-app.post('/room/unlock', auth.requireAuth, async (req, res) => {
+app.post('/room/unlock', auth.requireAuth, rateLimitRoomAction('unlock'), async (req, res) => {
   const { roomCode, callerIdentity } = req.body;
 
   if (!roomCode || !callerIdentity) {
@@ -3024,7 +3145,7 @@ app.post('/room/unlock', auth.requireAuth, async (req, res) => {
 // Body: { roomCode, callerIdentity, targetIdentity }
 // Returns: { success }
 // ---------------------------------------------------------------------------
-app.post('/room/suspend', auth.requireAuth, async (req, res) => {
+app.post('/room/suspend', auth.requireAuth, rateLimitRoomAction('suspend'), async (req, res) => {
   const { roomCode, callerIdentity, targetIdentity } = req.body;
 
   if (!roomCode || !callerIdentity || !targetIdentity) {
@@ -3075,7 +3196,7 @@ app.post('/room/suspend', auth.requireAuth, async (req, res) => {
 // Body: { roomCode, callerIdentity, targetIdentity }
 // Returns: { success }
 // ---------------------------------------------------------------------------
-app.post('/room/unsuspend', auth.requireAuth, async (req, res) => {
+app.post('/room/unsuspend', auth.requireAuth, rateLimitRoomAction('unsuspend'), async (req, res) => {
   const { roomCode, callerIdentity, targetIdentity } = req.body;
 
   if (!roomCode || !callerIdentity || !targetIdentity) {
@@ -3100,7 +3221,7 @@ app.post('/room/unsuspend', auth.requireAuth, async (req, res) => {
 // Body: { roomCode, callerIdentity }
 // Returns: { success }
 // ---------------------------------------------------------------------------
-app.post('/room/lobby/enable', auth.requireAuth, async (req, res) => {
+app.post('/room/lobby/enable', auth.requireAuth, rateLimitRoomAction('lobby-enable'), async (req, res) => {
   const { roomCode, callerIdentity } = req.body;
 
   if (!roomCode || !callerIdentity) {
@@ -3125,7 +3246,7 @@ app.post('/room/lobby/enable', auth.requireAuth, async (req, res) => {
 // Body: { roomCode, callerIdentity }
 // Returns: { success }
 // ---------------------------------------------------------------------------
-app.post('/room/lobby/disable', auth.requireAuth, async (req, res) => {
+app.post('/room/lobby/disable', auth.requireAuth, rateLimitRoomAction('lobby-disable'), async (req, res) => {
   const { roomCode, callerIdentity } = req.body;
 
   if (!roomCode || !callerIdentity) {
@@ -3153,7 +3274,7 @@ app.post('/room/lobby/disable', auth.requireAuth, async (req, res) => {
 // Body: { roomCode, callerIdentity, targetIdentity, targetDisplayName }
 // Returns: { token, serverURL }
 // ---------------------------------------------------------------------------
-app.post('/room/admit', auth.requireAuth, async (req, res) => {
+app.post('/room/admit', auth.requireAuth, rateLimitRoomAction('admit'), async (req, res) => {
   const { roomCode, callerIdentity, targetIdentity, targetDisplayName } = req.body;
 
   if (!roomCode || !callerIdentity || !targetIdentity) {
@@ -3202,7 +3323,7 @@ app.post('/room/admit', auth.requireAuth, async (req, res) => {
 // Body: { roomCode, callerIdentity }
 // Returns: { success, admittedCount }
 // ---------------------------------------------------------------------------
-app.post('/room/admit-all', auth.requireAuth, async (req, res) => {
+app.post('/room/admit-all', auth.requireAuth, rateLimitRoomAction('admit-all'), async (req, res) => {
   const { roomCode, callerIdentity } = req.body;
 
   if (!roomCode || !callerIdentity) {
@@ -3227,7 +3348,7 @@ app.post('/room/admit-all', auth.requireAuth, async (req, res) => {
 // Body: { roomCode, callerIdentity, targetIdentity }
 // Returns: { success }
 // ---------------------------------------------------------------------------
-app.post('/room/deny', auth.requireAuth, async (req, res) => {
+app.post('/room/deny', auth.requireAuth, rateLimitRoomAction('deny'), async (req, res) => {
   const { roomCode, callerIdentity, targetIdentity } = req.body;
 
   if (!roomCode || !callerIdentity || !targetIdentity) {
@@ -3346,6 +3467,8 @@ app.get('/room/lobby-status/:code/:identity', async (req, res) => {
       sharingPermissions:  roomData?.sharingPermissions  || 'hostOnly',
       autoRecord:          roomData?.autoRecord          === 'true',
       autoTranscript:      roomData?.autoTranscript      === 'true',
+      // Presence of a meeting password (bcrypt hash only; plaintext never returned).
+      hasPassword:         !!roomData?.passwordHash,
     });
   }
 
@@ -3377,7 +3500,7 @@ app.get('/room/lobby-status/:code/:identity', async (req, res) => {
 // Body: { roomCode, callerIdentity, password } (password = null to remove)
 // Returns: { success }
 // ---------------------------------------------------------------------------
-app.post('/room/password', auth.requireAuth, async (req, res) => {
+app.post('/room/password', auth.requireAuth, rateLimitRoomAction('password'), async (req, res) => {
   const { roomCode, callerIdentity, password } = req.body;
 
   if (!roomCode || !callerIdentity) {
@@ -3465,7 +3588,7 @@ async function checkRecordingQuota(userId, tier) {
 // mid-meeting tier downgrades do not block recording during an active meeting.
 // Returns: { success, egressId, recordingSessionId }
 // ---------------------------------------------------------------------------
-app.post('/room/record/start', auth.requireAuth, async (req, res) => {
+app.post('/room/record/start', auth.requireAuth, rateLimitRoomAction('record-start'), async (req, res) => {
   const { roomCode, callerIdentity, mode, estimatedDurationMinutes } = req.body;
 
   if (!roomCode || !callerIdentity) {
@@ -3729,7 +3852,7 @@ app.post('/room/record/start', auth.requireAuth, async (req, res) => {
 // Requires: auth + host/co-host role
 // Returns: { success, message }
 // ---------------------------------------------------------------------------
-app.post('/room/record/stop', auth.requireAuth, async (req, res) => {
+app.post('/room/record/stop', auth.requireAuth, rateLimitRoomAction('record-stop'), async (req, res) => {
   const { roomCode, callerIdentity, egressId } = req.body;
 
   if (!roomCode || !callerIdentity || !egressId) {
@@ -4306,7 +4429,7 @@ app.get('/room/screenshare-queue', auth.requireAuth, async (req, res) => {
 // Persists the request to Redis ZSET for reconnect resilience.
 // Body: { roomCode, requesterIdentity }
 // ---------------------------------------------------------------------------
-app.post('/room/request-screen-share', auth.requireAuth, async (req, res) => {
+app.post('/room/request-screen-share', auth.requireAuth, rateLimitRoomAction('request-screen-share', 20), async (req, res) => {
   const { roomCode, requesterIdentity } = req.body;
   if (!roomCode || !requesterIdentity) {
     return res.status(400).json({ error: 'roomCode and requesterIdentity are required' });
@@ -4339,7 +4462,7 @@ app.post('/room/request-screen-share', auth.requireAuth, async (req, res) => {
 // POST /room/resolve-screen-share-request — Host resolves a screen share request.
 // Body: { roomCode, callerIdentity, targetIdentity, resolution }
 // ---------------------------------------------------------------------------
-app.post('/room/resolve-screen-share-request', auth.requireAuth, async (req, res) => {
+app.post('/room/resolve-screen-share-request', auth.requireAuth, rateLimitRoomAction('resolve-screen-share'), async (req, res) => {
   const { roomCode, callerIdentity, targetIdentity, resolution } = req.body;
   if (!roomCode || !callerIdentity || !targetIdentity) {
     return res.status(400).json({ error: 'roomCode, callerIdentity, and targetIdentity are required' });
@@ -4366,7 +4489,7 @@ app.post('/room/resolve-screen-share-request', auth.requireAuth, async (req, res
 // POST /room/screen-share-mode — Host changes screen share permission mid-meeting.
 // Body: { roomCode, callerIdentity, mode }  mode: "everyone"|"request"|"hostOnly"
 // ---------------------------------------------------------------------------
-app.post('/room/screen-share-mode', auth.requireAuth, async (req, res) => {
+app.post('/room/screen-share-mode', auth.requireAuth, rateLimitRoomAction('screen-share-mode'), async (req, res) => {
   const { roomCode, callerIdentity, mode } = req.body;
   const VALID_MODES = ['everyone', 'request', 'hostOnly'];
   if (!roomCode || !callerIdentity || !VALID_MODES.includes(mode)) {
@@ -4400,7 +4523,7 @@ app.post('/room/screen-share-mode', auth.requireAuth, async (req, res) => {
 // POST /room/share-conflict-policy — Host changes screen-share takeover policy mid-meeting.
 // Body: { roomCode, callerIdentity, policy }  policy: "oneattime"|"hostCanPreempt"|"anyCanPreempt"
 // ---------------------------------------------------------------------------
-app.post('/room/share-conflict-policy', auth.requireAuth, async (req, res) => {
+app.post('/room/share-conflict-policy', auth.requireAuth, rateLimitRoomAction('share-conflict-policy'), async (req, res) => {
   const { roomCode, callerIdentity, policy } = req.body;
   const VALID_POLICIES = ['oneattime', 'hostCanPreempt', 'anyCanPreempt'];
   if (!roomCode || !callerIdentity || !VALID_POLICIES.includes(policy)) {
@@ -4428,7 +4551,7 @@ app.post('/room/share-conflict-policy', auth.requireAuth, async (req, res) => {
 // POST /room/camera-lock-one — Host locks a specific participant's camera off.
 // Body: { roomCode, callerIdentity, targetIdentity }
 // ---------------------------------------------------------------------------
-app.post('/room/camera-lock-one', auth.requireAuth, async (req, res) => {
+app.post('/room/camera-lock-one', auth.requireAuth, rateLimitRoomAction('camera-lock-one'), async (req, res) => {
   const { roomCode, callerIdentity, targetIdentity } = req.body;
   if (!roomCode || !callerIdentity || !targetIdentity) {
     return res.status(400).json({ error: 'roomCode, callerIdentity, and targetIdentity are required' });
@@ -4459,7 +4582,7 @@ app.post('/room/camera-lock-one', auth.requireAuth, async (req, res) => {
 // POST /room/camera-lock-all — Host locks ALL participants' cameras off.
 // Body: { roomCode, callerIdentity }
 // ---------------------------------------------------------------------------
-app.post('/room/camera-lock-all', auth.requireAuth, async (req, res) => {
+app.post('/room/camera-lock-all', auth.requireAuth, rateLimitRoomAction('camera-lock-all'), async (req, res) => {
   const { roomCode, callerIdentity } = req.body;
   if (!roomCode || !callerIdentity) {
     return res.status(400).json({ error: 'roomCode and callerIdentity are required' });
@@ -4501,7 +4624,7 @@ app.post('/room/camera-lock-all', auth.requireAuth, async (req, res) => {
 // POST /room/camera-lift-one — Host lifts the camera lock for a specific participant.
 // Body: { roomCode, callerIdentity, targetIdentity }
 // ---------------------------------------------------------------------------
-app.post('/room/camera-lift-one', auth.requireAuth, async (req, res) => {
+app.post('/room/camera-lift-one', auth.requireAuth, rateLimitRoomAction('camera-lift-one'), async (req, res) => {
   const { roomCode, callerIdentity, targetIdentity } = req.body;
   if (!roomCode || !callerIdentity || !targetIdentity) {
     return res.status(400).json({ error: 'roomCode, callerIdentity, and targetIdentity are required' });
@@ -4526,7 +4649,7 @@ app.post('/room/camera-lift-one', auth.requireAuth, async (req, res) => {
 // POST /room/camera-lift-all — Host lifts camera lock for ALL participants.
 // Body: { roomCode, callerIdentity }
 // ---------------------------------------------------------------------------
-app.post('/room/camera-lift-all', auth.requireAuth, async (req, res) => {
+app.post('/room/camera-lift-all', auth.requireAuth, rateLimitRoomAction('camera-lift-all'), async (req, res) => {
   const { roomCode, callerIdentity } = req.body;
   if (!roomCode || !callerIdentity) {
     return res.status(400).json({ error: 'roomCode and callerIdentity are required' });
@@ -4564,14 +4687,19 @@ app.get('/room/camera-locked', auth.requireAuth, async (req, res) => {
   try {
     const locked = await redis.smembers(roomCameraLockedKey(code));
     // Moderators receive the full set; participants receive only their own lock state
-    // to avoid leaking which peers are locked.
-    const callerRole = await getParticipantRole(code, callerIdentity);
+    // to avoid leaking which peers are locked. Resolve the caller's role through
+    // validateModerator so the body-supplied callerIdentity is cross-checked against the
+    // authenticated userId — otherwise an authed participant could claim the host's
+    // (peer-visible) identity to read the full locked set. A binding mismatch yields
+    // validation.valid === false, which falls through to the self-only branch below.
+    const validation = await validateModerator(code, callerIdentity, req.user?.userId);
+    const callerRole = validation.role;
     // Evaluate the GLOBAL camera-lock rule for this caller so participants who join
     // after a camera-lock-all are locked too (parity with existing participants).
     const isGlobalLock = roomData.globalCameraLock === 'true';
     const lockingRole = roomData.globalCameraLockRole || 'co-host';
     const selfGloballyLocked = isGlobalLock && roleLevel(callerRole) < roleLevel(lockingRole);
-    if (isModeratorRole(callerRole)) {
+    if (validation.valid) {
       res.json({ locked, globalLock: isGlobalLock });
     } else {
       const selfLocked = locked.includes(callerIdentity) || selfGloballyLocked;
@@ -4587,7 +4715,7 @@ app.get('/room/camera-locked', auth.requireAuth, async (req, res) => {
 // POST /room/mic-lift-one — Host lifts the mic lock for a specific participant.
 // Body: { roomCode, callerIdentity, targetIdentity }
 // ---------------------------------------------------------------------------
-app.post('/room/mic-lift-one', auth.requireAuth, async (req, res) => {
+app.post('/room/mic-lift-one', auth.requireAuth, rateLimitRoomAction('mic-lift-one'), async (req, res) => {
   const { roomCode, callerIdentity, targetIdentity } = req.body;
   if (!roomCode || !callerIdentity || !targetIdentity) {
     return res.status(400).json({ error: 'roomCode, callerIdentity, and targetIdentity are required' });
@@ -4622,13 +4750,19 @@ app.get('/room/mic-locked', auth.requireAuth, async (req, res) => {
   try {
     const locked = await redis.smembers(roomMicLockedKey(code));
     // Moderators receive the full set; participants receive only their own lock state.
-    const callerRole = await getParticipantRole(code, callerIdentity);
+    // Resolve the caller's role through validateModerator so the body-supplied
+    // callerIdentity is cross-checked against the authenticated userId — otherwise an
+    // authed participant could claim the host's (peer-visible) identity to read the full
+    // locked set. A binding mismatch yields validation.valid === false, which falls
+    // through to the self-only branch below.
+    const validation = await validateModerator(code, callerIdentity, req.user?.userId);
+    const callerRole = validation.role;
     // Evaluate the GLOBAL mic-mute rule for this caller so participants who join after
     // a mute-all are muted too (parity with existing participants).
     const isGlobalMute = roomData.globalMicMute === 'true';
     const mutingRole = roomData.globalMicMuteRole || 'co-host';
     const selfGloballyMuted = isGlobalMute && roleLevel(callerRole) < roleLevel(mutingRole);
-    if (isModeratorRole(callerRole)) {
+    if (validation.valid) {
       res.json({ locked, globalMute: isGlobalMute });
     } else {
       const selfLocked = locked.includes(callerIdentity) || selfGloballyMuted;
@@ -5010,12 +5144,17 @@ async function markPhantomMeetingsFailed() {
 //   room:{CODE}:micstate:{identity}  (JSON, TTL 24h)
 //   room:{CODE}:global-mute          (0 or 1, TTL 24h)
 //
-// Events received from clients:
-//   client:join-room          { roomCode, identity } — join the socket room
-//   participant:self-mute     { roomCode, identity } — participant muted themselves
-//   participant:self-unmute   { roomCode, identity } — participant unmuted themselves
-//   participant:raise-hand    { roomCode, identity } — raise hand to speak
-//   participant:lower-hand    { roomCode, identity } — lower hand
+// Authentication: clients authenticate ONCE in the Socket.IO handshake with
+//   io(url, { auth: { roomCode, identity, leaveToken } });
+// the verified identity + room are read from socket.data, so the event payloads
+// below carry no identity (a peer cannot claim another participant's identity).
+//
+// Events received from clients (identity/room come from the handshake):
+//   client:join-room          — join the socket room for live events
+//   participant:self-mute     — participant muted themselves
+//   participant:self-unmute   — participant unmuted themselves
+//   participant:raise-hand    — raise hand to speak
+//   participant:lower-hand    — lower hand
 //
 // Events broadcast to the room:
 //   room:mic-state-update     { participantId, micState } — authoritative state update
@@ -5051,15 +5190,68 @@ function defaultMicState() {
   };
 }
 
+// Constant-time comparison for fixed-length secrets. The leaveToken is 64 hex
+// chars, so comparing lengths first reveals nothing secret.
+function socketTimingSafeEqual(a, b) {
+  const ba = Buffer.from(String(a));
+  const bb = Buffer.from(String(b));
+  if (ba.length !== bb.length) return false;
+  return crypto.timingSafeEqual(ba, bb);
+}
+
+// ---------------------------------------------------------------------------
+// Socket.IO authentication — fail-closed handshake guard.
+//
+// Every participant (guest or authenticated) is issued a 256-bit `leaveToken`
+// at room create/join (roomLeaveTokenKey). We reuse it as the per-connection
+// credential — the same secret already used to authorize chat file upload/
+// download. Clients MUST present it in the Socket.IO handshake auth payload:
+//
+//   io(url, { auth: { roomCode, identity, leaveToken } })
+//
+// The token is verified against Redis with a constant-time compare and the
+// VERIFIED identity + room are bound to socket.data. Handlers below read only
+// socket.data.* — never a client-supplied identity/roomCode — so a peer (LiveKit
+// identities are visible to every participant) cannot claim another's identity to
+// read host-only snapshots or spoof mic/hand state. Connections without a valid
+// token are rejected at the handshake (fail-closed).
+// ---------------------------------------------------------------------------
+io.use(async (socket, next) => {
+  try {
+    const handshakeAuth = socket.handshake.auth || {};
+    const identity = typeof handshakeAuth.identity === 'string' ? handshakeAuth.identity : '';
+    const leaveToken = typeof handshakeAuth.leaveToken === 'string' ? handshakeAuth.leaveToken : '';
+    const code = String(handshakeAuth.roomCode || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+    if (!code || !identity || !leaveToken) {
+      return next(new Error('unauthorized'));
+    }
+    const stored = await redis.get(roomLeaveTokenKey(code, identity)).catch(() => null);
+    if (!stored || !socketTimingSafeEqual(stored, leaveToken)) {
+      console.warn(`[socket] handshake rejected: code=${code} identity=${identity}`);
+      return next(new Error('unauthorized'));
+    }
+    // Bind the verified identity + room; handlers MUST use these, not the body.
+    socket.data.identity = identity;
+    socket.data.roomCode = code;
+    return next();
+  } catch (err) {
+    console.error('[socket] handshake auth error:', err.message);
+    return next(new Error('unauthorized'));
+  }
+});
+
 // ---------------------------------------------------------------------------
 // Socket.IO connection handler
 // ---------------------------------------------------------------------------
 io.on('connection', (socket) => {
-  // client:join-room — participant joins a socket room for live events
-  socket.on('client:join-room', async ({ roomCode, identity }) => {
-    if (!roomCode || !identity) return;
-    const code = String(roomCode).toUpperCase().replace(/[^A-Z0-9]/g, '');
-    if (!code) return;
+  // client:join-room — participant joins the socket room for live events.
+  // identity + roomCode come from the AUTHENTICATED handshake (socket.data),
+  // never the client-supplied event body, so a peer cannot claim another's
+  // identity to read the host-only snapshots emitted below.
+  socket.on('client:join-room', async () => {
+    const code = socket.data.roomCode;
+    const identity = socket.data.identity;
+    if (!code || !identity) return;
 
     // Ban check — prevent banned users from receiving room events even if
     // they somehow acquired a valid LiveKit JWT (e.g. cached token).
@@ -5140,10 +5332,10 @@ io.on('connection', (socket) => {
   // participant:self-mute — participant manually muted their mic
   // Bug 1 fix: when globalMuteActive, revoking speakPermissionGranted here
   // enforces one-time permission — they must raise hand again after re-muting.
-  socket.on('participant:self-mute', async ({ roomCode, identity }) => {
-    if (!roomCode || !identity) return;
-    const code = String(roomCode).toUpperCase().replace(/[^A-Z0-9]/g, '');
-    if (!code) return;
+  socket.on('participant:self-mute', async () => {
+    const code = socket.data.roomCode;
+    const identity = socket.data.identity;
+    if (!code || !identity) return;
 
     try {
       const [stateJson, isGlobalMute] = await Promise.all([
@@ -5170,10 +5362,10 @@ io.on('connection', (socket) => {
   });
 
   // participant:self-unmute — participant manually unmuted their mic
-  socket.on('participant:self-unmute', async ({ roomCode, identity }) => {
-    if (!roomCode || !identity) return;
-    const code = String(roomCode).toUpperCase().replace(/[^A-Z0-9]/g, '');
-    if (!code) return;
+  socket.on('participant:self-unmute', async () => {
+    const code = socket.data.roomCode;
+    const identity = socket.data.identity;
+    if (!code || !identity) return;
 
     try {
       const [stateJson, isGlobalMute] = await Promise.all([
@@ -5199,10 +5391,10 @@ io.on('connection', (socket) => {
   });
 
   // participant:raise-hand — participant raises hand to request speaking permission
-  socket.on('participant:raise-hand', async ({ roomCode, identity }) => {
-    if (!roomCode || !identity) return;
-    const code = String(roomCode).toUpperCase().replace(/[^A-Z0-9]/g, '');
-    if (!code) return;
+  socket.on('participant:raise-hand', async () => {
+    const code = socket.data.roomCode;
+    const identity = socket.data.identity;
+    if (!code || !identity) return;
 
     try {
       const stateJson = await redis.get(micStateKey(code, identity));
@@ -5217,10 +5409,10 @@ io.on('connection', (socket) => {
   });
 
   // participant:lower-hand — participant lowers hand (or host lowered it)
-  socket.on('participant:lower-hand', async ({ roomCode, identity }) => {
-    if (!roomCode || !identity) return;
-    const code = String(roomCode).toUpperCase().replace(/[^A-Z0-9]/g, '');
-    if (!code) return;
+  socket.on('participant:lower-hand', async () => {
+    const code = socket.data.roomCode;
+    const identity = socket.data.identity;
+    if (!code || !identity) return;
 
     try {
       const stateJson = await redis.get(micStateKey(code, identity));

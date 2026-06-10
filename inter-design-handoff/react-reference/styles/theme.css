@@ -1,0 +1,417 @@
+@custom-variant dark (&:is(.dark *));
+
+/* ─────────────────────────────────────────────────────────────
+   LIGHT = "GLITTER" (pale periwinkle #E6E8FA, tuned to level 6 —
+   slightly less bright, more contrast). The single light identity.
+   ───────────────────────────────────────────────────────────── */
+:root {
+  --font-size: 16px;
+  --background: #E2E5F8;
+  --foreground: #201C34;
+  --card: #F5F6FD;
+  --card-foreground: #201C34;
+  --popover: #F5F6FD;
+  --popover-foreground: #201C34;
+  --primary: #7C3AED;
+  --primary-foreground: #FFFFFF;
+  --secondary: #CED2F3;
+  --secondary-foreground: #201C34;
+  --muted: #D4D7F4;
+  --muted-foreground: #635F89;
+  --accent: #C2C6F0;
+  --accent-foreground: #201C34;
+  --destructive: #d4183d;
+  --destructive-foreground: #ffffff;
+  --border: rgba(45,40,110,0.108);
+  --input: transparent;
+  --input-background: #D4D7F4;
+  --switch-background: #B7BBE4;
+  --font-weight-medium: 500;
+  --font-weight-normal: 400;
+  --ring: #7C3AED;
+  --chart-1: oklch(0.646 0.222 41.116);
+  --chart-2: oklch(0.6 0.118 184.704);
+  --chart-3: oklch(0.398 0.07 227.392);
+  --chart-4: oklch(0.828 0.189 84.429);
+  --chart-5: oklch(0.769 0.188 70.08);
+  --radius: 0.625rem;
+  --sidebar: #DADDF6;
+  --sidebar-foreground: #201C34;
+  --sidebar-primary: #7C3AED;
+  --sidebar-primary-foreground: #FFFFFF;
+  --sidebar-accent: #CACEF2;
+  --sidebar-accent-foreground: #201C34;
+  --sidebar-border: rgba(45,40,110,0.087);
+  --sidebar-ring: #7C3AED;
+}
+
+/* ─────────────────────────────────────────────────────────────
+   DARK — unchanged
+   ───────────────────────────────────────────────────────────── */
+.dark {
+  --background: oklch(0.145 0 0);
+  --foreground: oklch(0.985 0 0);
+  --card: oklch(0.145 0 0);
+  --card-foreground: oklch(0.985 0 0);
+  --popover: oklch(0.145 0 0);
+  --popover-foreground: oklch(0.985 0 0);
+  --primary: #8B5CF6;
+  --primary-foreground: #FFFFFF;
+  --secondary: oklch(0.269 0 0);
+  --secondary-foreground: oklch(0.985 0 0);
+  --muted: oklch(0.269 0 0);
+  --muted-foreground: oklch(0.708 0 0);
+  --accent: oklch(0.269 0 0);
+  --accent-foreground: oklch(0.985 0 0);
+  --destructive: oklch(0.396 0.141 25.723);
+  --destructive-foreground: oklch(0.637 0.237 25.331);
+  --border: oklch(0.269 0 0);
+  --input: oklch(0.269 0 0);
+  --input-background: oklch(0.2 0 0);
+  --ring: #8B5CF6;
+  --font-weight-medium: 500;
+  --font-weight-normal: 400;
+  --chart-1: oklch(0.488 0.243 264.376);
+  --chart-2: oklch(0.696 0.17 162.48);
+  --chart-3: oklch(0.769 0.188 70.08);
+  --chart-4: oklch(0.627 0.265 303.9);
+  --chart-5: oklch(0.645 0.246 16.445);
+  --sidebar: oklch(0.205 0 0);
+  --sidebar-foreground: oklch(0.985 0 0);
+  --sidebar-primary: #8B5CF6;
+  --sidebar-primary-foreground: oklch(0.985 0 0);
+  --sidebar-accent: oklch(0.269 0 0);
+  --sidebar-accent-foreground: oklch(0.985 0 0);
+  --sidebar-border: oklch(0.269 0 0);
+  --sidebar-ring: #8B5CF6;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-input-background: var(--input-background);
+  --color-switch-background: var(--switch-background);
+  --color-ring: var(--ring);
+  --color-chart-1: var(--chart-1);
+  --color-chart-2: var(--chart-2);
+  --color-chart-3: var(--chart-3);
+  --color-chart-4: var(--chart-4);
+  --color-chart-5: var(--chart-5);
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-ring: var(--sidebar-ring);
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  body {
+    @apply bg-background text-foreground;
+  }
+  html { font-size: var(--font-size); }
+  h1 { font-size: var(--text-2xl); font-weight: var(--font-weight-medium); line-height: 1.5; }
+  h2 { font-size: var(--text-xl);  font-weight: var(--font-weight-medium); line-height: 1.5; }
+  h3 { font-size: var(--text-lg);  font-weight: var(--font-weight-medium); line-height: 1.5; }
+  h4 { font-size: var(--text-base);font-weight: var(--font-weight-medium); line-height: 1.5; }
+  label  { font-size: var(--text-base); font-weight: var(--font-weight-medium); line-height: 1.5; }
+  button { font-size: var(--text-base); font-weight: var(--font-weight-medium); line-height: 1.5; }
+  input  { font-size: var(--text-base); font-weight: var(--font-weight-normal); line-height: 1.5; }
+}
+
+
+:root {
+  --font-size: 16px;
+  --background: #E2E5F8;
+  --foreground: #201C34;
+  --card: #F5F6FD;
+  --card-foreground: #201C34;
+  --popover: #F5F6FD;
+  --popover-foreground: #201C34;
+  --primary: #7C3AED;
+  --primary-foreground: #FFFFFF;
+  --secondary: #CED2F3;
+  --secondary-foreground: #201C34;
+  --muted: #D4D7F4;
+  --muted-foreground: #635F89;
+  --accent: #C2C6F0;
+  --accent-foreground: #201C34;
+  --destructive: #d4183d;
+  --destructive-foreground: #ffffff;
+  --border: rgba(45,40,110,0.108);
+  --input: transparent;
+  --input-background: #D4D7F4;
+  --switch-background: #B7BBE4;
+  --font-weight-medium: 500;
+  --font-weight-normal: 400;
+  --ring: #7C3AED;
+  --chart-1: oklch(0.646 0.222 41.116);
+  --chart-2: oklch(0.6 0.118 184.704);
+  --chart-3: oklch(0.398 0.07 227.392);
+  --chart-4: oklch(0.828 0.189 84.429);
+  --chart-5: oklch(0.769 0.188 70.08);
+  --radius: 0.625rem;
+  --sidebar: #DADDF6;
+  --sidebar-foreground: #201C34;
+  --sidebar-primary: #7C3AED;
+  --sidebar-primary-foreground: #FFFFFF;
+  --sidebar-accent: #CACEF2;
+  --sidebar-accent-foreground: #201C34;
+  --sidebar-border: rgba(45,40,110,0.087);
+  --sidebar-ring: #7C3AED;
+}
+
+.dark {
+  --background: oklch(0.145 0 0);
+  --foreground: oklch(0.985 0 0);
+  --card: oklch(0.145 0 0);
+  --card-foreground: oklch(0.985 0 0);
+  --popover: oklch(0.145 0 0);
+  --popover-foreground: oklch(0.985 0 0);
+  --primary: #8B5CF6;
+  --primary-foreground: #FFFFFF;
+  --secondary: oklch(0.269 0 0);
+  --secondary-foreground: oklch(0.985 0 0);
+  --muted: oklch(0.269 0 0);
+  --muted-foreground: oklch(0.708 0 0);
+  --accent: oklch(0.269 0 0);
+  --accent-foreground: oklch(0.985 0 0);
+  --destructive: oklch(0.396 0.141 25.723);
+  --destructive-foreground: oklch(0.637 0.237 25.331);
+  --border: oklch(0.269 0 0);
+  --input: oklch(0.269 0 0);
+  --ring: #8B5CF6;
+  --font-weight-medium: 500;
+  --font-weight-normal: 400;
+  --chart-1: oklch(0.488 0.243 264.376);
+  --chart-2: oklch(0.696 0.17 162.48);
+  --chart-3: oklch(0.769 0.188 70.08);
+  --chart-4: oklch(0.627 0.265 303.9);
+  --chart-5: oklch(0.645 0.246 16.439);
+  --sidebar: oklch(0.205 0 0);
+  --sidebar-foreground: oklch(0.985 0 0);
+  --sidebar-primary: #8B5CF6;
+  --sidebar-primary-foreground: oklch(0.985 0 0);
+  --sidebar-accent: oklch(0.269 0 0);
+  --sidebar-accent-foreground: oklch(0.985 0 0);
+  --sidebar-border: oklch(0.269 0 0);
+  --sidebar-ring: #8B5CF6;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-input-background: var(--input-background);
+  --color-switch-background: var(--switch-background);
+  --color-ring: var(--ring);
+  --color-chart-1: var(--chart-1);
+  --color-chart-2: var(--chart-2);
+  --color-chart-3: var(--chart-3);
+  --color-chart-4: var(--chart-4);
+  --color-chart-5: var(--chart-5);
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-ring: var(--sidebar-ring);
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+
+  body {
+    @apply bg-background text-foreground;
+  }
+
+  /**
+  * Default typography styles for HTML elements (h1-h4, p, label, button, input).
+  * These are in @layer base, so Tailwind utility classes (like text-sm, text-lg) automatically override them.
+  */
+
+  html {
+    font-size: var(--font-size);
+  }
+
+  h1 {
+    font-size: var(--text-2xl);
+    font-weight: var(--font-weight-medium);
+    line-height: 1.5;
+  }
+
+  h2 {
+    font-size: var(--text-xl);
+    font-weight: var(--font-weight-medium);
+    line-height: 1.5;
+  }
+
+  h3 {
+    font-size: var(--text-lg);
+    font-weight: var(--font-weight-medium);
+    line-height: 1.5;
+  }
+
+  h4 {
+    font-size: var(--text-base);
+    font-weight: var(--font-weight-medium);
+    line-height: 1.5;
+  }
+
+  label {
+    font-size: var(--text-base);
+    font-weight: var(--font-weight-medium);
+    line-height: 1.5;
+  }
+
+  button {
+    font-size: var(--text-base);
+    font-weight: var(--font-weight-medium);
+    line-height: 1.5;
+  }
+
+  input {
+    font-size: var(--text-base);
+    font-weight: var(--font-weight-normal);
+    line-height: 1.5;
+  }
+}
+
+/* ───────────────────────────────────────────────────────────────
+   DARK MODE = "Deep Obsidian Ink" canvas + slate structure.
+   60% obsidian canvas #0B0F19, 30% slate structure #1E293B, 10%
+   Inter Violet spotlight. Uses html.dark (specificity 0,1,1) to
+   override the two stacked `.dark` blocks above, and deliberately
+   omits --primary/--ring so the violet accent (#8B5CF6) is preserved.
+   Re-points the hardcoded dark neutral ramp so in-call screens go
+   obsidian too.
+   ─────────────────────────────────────────────────────────────── */
+html.dark {
+  /* Obsidian Ink canvas (60%) + Slate structure (30%) */
+  --background:         #0B0F19;
+  --foreground:         #F1F5F9;
+  --card:               #11161F;
+  --card-foreground:    #F1F5F9;
+  --popover:            #11161F;
+  --popover-foreground: #F1F5F9;
+  --secondary:          #1E293B;
+  --secondary-foreground: #F1F5F9;
+  --muted:              #1E293B;
+  --muted-foreground:   #94A3B8;
+  --accent:             #1E293B;
+  --accent-foreground:  #F1F5F9;
+  --border:             rgba(148,163,184,0.14);
+  --input:              #1E293B;
+  --input-background:    #1E293B;
+  --sidebar:            #0B0F19;
+  --sidebar-foreground: #F1F5F9;
+  --sidebar-accent:     #1E293B;
+  --sidebar-accent-foreground: #F1F5F9;
+  --sidebar-border:     rgba(148,163,184,0.12);
+
+  /* Hardcoded dark surfaces → obsidian/slate ramp */
+  --color-neutral-950: #0B0F19;
+  --color-neutral-900: #11161F;
+  --color-neutral-800: #1E293B;
+}
+
+/* ───────────────────────────────────────────────────────────────
+   VIDEO "STAGE" SURFACES — intentionally dark in BOTH light & dark
+   modes (a live call window reads as dark like Zoom/Teams, even when
+   the surrounding app is in light mode). Defined once on :root so the
+   value is identical in every theme. Use via bg-[var(--stage*)].
+     --stage          → deepest chrome (footers, side rails)
+     --stage-surface  → main video canvas / panels
+     --stage-elevated → menus, popovers, modals floating on the stage
+   ─────────────────────────────────────────────────────────────── */
+:root {
+  --stage:          #101012;
+  --stage-surface:  #18181b;
+  --stage-elevated: #27272a;
+}
+
+/* ───────────────────────────────────────────────────────────────
+   TYPOGRAPHY SYSTEM — "General Sans" as the single brand typeface.
+   Applied authoritatively here (last in source) so it cascades to
+   every screen. Sets industry-standard rendering: grayscale font
+   smoothing, optimized legibility, a 1.5 base line-height for UI
+   text / 1.6 for paragraphs, and a slight optical tracking on
+   display headings (geometric sans look best with negative tracking).
+   ─────────────────────────────────────────────────────────────── */
+:root {
+  --font-sans: "General Sans", ui-sans-serif, system-ui, -apple-system,
+    "Segoe UI", Roboto, Helvetica, Arial, "Apple Color Emoji",
+    "Segoe UI Emoji", sans-serif;
+}
+
+@theme inline {
+  --font-sans: var(--font-sans);
+}
+
+@layer base {
+  html {
+    font-family: var(--font-sans);
+  }
+  body {
+    font-family: var(--font-sans);
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
+    line-height: 1.5;
+    letter-spacing: -0.006em;
+  }
+  h1, h2, h3, h4 {
+    letter-spacing: -0.018em;
+  }
+  p {
+    line-height: 1.6;
+  }
+}

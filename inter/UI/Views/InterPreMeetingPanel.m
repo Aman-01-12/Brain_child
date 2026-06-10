@@ -808,6 +808,12 @@ static const CGFloat kControlW   = 140.0; // width of popup/button controls
             return;
         }
     }
+    if (_passwordToggle.state == NSControlStateValueOn &&
+        _passwordField.stringValue.length == 0) {
+        [self.window makeFirstResponder:_passwordField];
+        NSBeep();
+        return;
+    }
     InterPreMeetingSettings *s = [self _collectSettings];
     [s saveToUserDefaults];
     if (_defaultsEditorMode) {
