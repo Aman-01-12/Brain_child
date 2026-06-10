@@ -47,4 +47,39 @@ final class InterDesignTokensTests: XCTestCase {
         XCTAssertEqual(InterDesignTokens.tileCornerRadius, InterRadius.lg)
         XCTAssertNotEqual(InterDesignTokens.tileGradientTop, InterDesignTokens.tileGradientBottom)
     }
+
+    // MARK: - Foundation gate (Task 0): font + appearance
+
+    /// General Sans must register from the bundle, not silently fall back to SF.
+    func testGeneralSansResolvesNotSFFallback() {
+        InterDesignTokens.registerFonts() // idempotent; self-contained
+        let f = NSFont(name: "General Sans", size: 24)
+        XCTAssertNotNil(f, "General Sans is not registered/bundled")
+        XCTAssertEqual(f?.familyName, "General Sans",
+                       "Font fell back to \(f?.familyName ?? "nil") — registration failed")
+    }
+
+    /// Stage colours are FIXED DARK — identical under both appearances.
+    func testStageColorsAreAppearanceIndependent() {
+        let d = resolve(InterColor.stageSurface, .darkAqua)
+        let l = resolve(InterColor.stageSurface, .aqua)
+        XCTAssertEqual(d, l, "stage-surface must not change with appearance")
+    }
+
+    /// Theme colours ARE appearance-aware — they must differ between light and dark.
+    func testThemeColorsDoChangeWithAppearance() {
+        let d = resolve(InterColor.background, .darkAqua)
+        let l = resolve(InterColor.background, .aqua)
+        XCTAssertNotEqual(d, l, "theme background must differ by appearance")
+    }
+
+    /// Resolve a (possibly dynamic) NSColor to concrete sRGB components under `name`.
+    private func resolve(_ color: NSColor, _ name: NSAppearance.Name) -> NSColor? {
+        guard let appearance = NSAppearance(named: name) else { return nil }
+        var out: NSColor?
+        appearance.performAsCurrentDrawingAppearance {
+            out = color.usingColorSpace(.sRGB)
+        }
+        return out
+    }
 }

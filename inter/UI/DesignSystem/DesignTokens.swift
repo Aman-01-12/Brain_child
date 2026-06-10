@@ -186,8 +186,14 @@ public enum InterFont {
     /// Register every General Sans face shipped in the app bundle's `Fonts/` folder.
     /// Alternatively add the `ATSApplicationFontsPath` key to Info.plist (see md).
     public static func registerBundledFonts() {
-        guard let urls = Bundle.main.urls(forResourcesWithExtension: "otf", subdirectory: "Fonts")
-            ?? Bundle.main.urls(forResourcesWithExtension: "ttf", subdirectory: "Fonts") else { return }
+        // Be robust to bundle layout: file-system-synchronized targets flatten the
+        // `Fonts/` group straight into Resources/, so try the subdirectory first and
+        // then fall back to the Resources root. Registration is idempotent.
+        var urls: [URL] = []
+        for ext in ["otf", "ttf"] {
+            if let u = Bundle.main.urls(forResourcesWithExtension: ext, subdirectory: "Fonts") { urls += u }
+            if let u = Bundle.main.urls(forResourcesWithExtension: ext, subdirectory: nil) { urls += u }
+        }
         for url in urls {
             CTFontManagerRegisterFontsForURL(url as CFURL, .process, nil)
         }

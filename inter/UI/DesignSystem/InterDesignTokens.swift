@@ -72,4 +72,11 @@ import AppKit
     @objc public static let allSymbolNames: [String] = [
         symbolHandRaised, symbolMicMuted, symbolCoHost, symbolCameraLocked, symbolModerationMenu
     ]
+
+    /// Register the bundled General Sans faces so `NSFont(name:"General Sans",…)` resolves.
+    /// ObjC entry point (call once at launch from `AppDelegate`); forwards to the canonical
+    /// `InterFont.registerBundledFonts()`. Idempotent.
+    @objc public static func registerFonts() {
+        InterFont.registerBundledFonts()
+    }
 }

@@ -240,6 +240,14 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
 }
 
 - (void)applicationDidFinishLaunching:(NSNotification *)aNotification {
+    // Register the bundled General Sans faces before any UI mounts so the design-system
+    // typography resolves (NSFont(name:"General Sans",…)) instead of falling back to SF.
+    [InterDesignTokens registerFonts];
+
+    // Debug-only: open the SwiftUI component gallery when launched with
+    // `--component-gallery` (or INTER_COMPONENT_GALLERY=1). No-op in normal runs.
+    [ComponentGallery presentIfLaunchFlagPresent];
+
     // [Finding 11] Register InterAudioEngineAccess as the head of LiveKit's engine-observer
     // chain BEFORE any room connects so engineWillStart fires and the engine ref is captured.
     [InterAudioEngineAccess register];
