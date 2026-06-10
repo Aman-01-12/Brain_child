@@ -563,18 +563,62 @@ static void *InterWiringParticipantCountContext = &InterWiringParticipantCountCo
 }
 
 - (void)applyRemoteMicUnmute {
-    self.micUnlockApproved = NO;
     self.micUnlockRequestPending = NO;
-    self.micWasUnmutedWhileApproved = NO;
     [self invalidateMicUnlockRequestTimer];
     InterRoomController *rc = self.roomController;
     BOOL isConnected = rc && rc.connectionState == InterRoomConnectionStateConnected;
     if (!isConnected) return;
 
-    // Host explicitly lifted the per-tile mute restriction.
-    // Clear hostMuted and force-unmute the track so mic is immediately active.
+    // Host explicitly lifted this participant's per-tile mute.
     self.hostMuted = NO;
 
+    // P4 reconciliation: if a global Mute All is still active (e.g. a per-tile unmute
+    // raced a concurrent Mute All, so the host's isAllMuted was NO when they clicked but
+    // this client already has globalMuteActive=YES), DO NOT force-blast the mic on into a
+    // room that is supposed to be muted. Instead grant a one-time speak slot — identical
+    // to approveMicUnlock — so the participant turns their own mic on. The button then
+    // shows "Turn Mic On" (approved, mic still off), never "Ask to Unmute" over a live
+    // mic, which is the contradiction this guards against.
+    if (self.globalMuteActive) {
+        self.micUnlockApproved = YES;
+        self.micWasUnmutedWhileApproved = NO;
+        self.stateSequenceNumber++;
+        [self deriveParticipantMicButton];
+        NSString *summary = self.mediaStateSummaryBlock ? self.mediaStateSummaryBlock() : nil;
+        if (summary) {
+            [self.controlPanel setMediaStatusText:summary];
+        }
+        return;
+    }
+
+    // No global mute. Consent-first: in NORMAL mode a per-tile unmute is LIFT-ONLY —
+    // clearing hostMuted re-enables the participant's own mic button, but we do NOT force
+    // the track on; the participant taps to unmute (the host's "Remove Mute & Ask" sends a
+    // separate consent prompt). In INTERVIEW mode the host may force-activate, so we
+    // force-unmute the track. (Increment 2 adds the participant-facing "host enabled your
+    // mic" indicator for the interview force path.)
+    self.micUnlockApproved = NO;
+    self.micWasUnmutedWhileApproved = NO;
+
+    BOOL interview = [rc.roomType isEqualToString:@"interview"];
+    if (!interview) {
+        // Lift-only: the restriction is gone (hostMuted=NO); deriveParticipantMicButton
+        // now shows the normal enabled mic toggle. The mic stays off until they tap.
+        self.stateSequenceNumber++;
+        [self deriveParticipantMicButton];
+        NSString *summary = self.mediaStateSummaryBlock ? self.mediaStateSummaryBlock() : nil;
+        if (summary) {
+            [self.controlPanel setMediaStatusText:summary];
+        }
+        return;
+    }
+
+    // Interview mode — force the mic on immediately.
+    // TODO [Increment 2 — interview "host enabled" indicator]: when interview mode
+    // force-activates the mic here, the participant MUST see a persistent "Host turned on
+    // your microphone" indicator (spec §5, Finding B) — activation is never silent. No such
+    // indicator is shown yet; add it on this force path (and mirror it on the camera force
+    // path in PR #2). The force itself is correct; only the participant-facing notice is missing.
     if (self.isMicNetworkMuted) {
         __weak typeof(self) weakSelf = self;
         [rc.publisher forceUnmuteMicrophoneTrackWithCompletion:^{

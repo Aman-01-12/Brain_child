@@ -1522,7 +1522,7 @@ didRequestDeleteTeamId:(NSString *)teamId {
     }
 
     self.loginWindow =
-    [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 420, 500)
+    [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 460, 680)
                                 styleMask:(NSWindowStyleMaskTitled |
                                            NSWindowStyleMaskClosable)
                                   backing:NSBackingStoreBuffered
@@ -1531,19 +1531,16 @@ didRequestDeleteTeamId:(NSString *)teamId {
     [self.loginWindow setTitle:@"Inter — Sign In"];
     [self.loginWindow setBackgroundColor:[NSColor colorWithWhite:0.1 alpha:1.0]];
     [self.loginWindow setDelegate:self];
-    [self.loginWindow setMinSize:NSMakeSize(420.0, 500.0)];
+    [self.loginWindow setMinSize:NSMakeSize(460.0, 560.0)];
 
     NSView *contentView = self.loginWindow.contentView;
     contentView.wantsLayer = YES;
     contentView.layer.backgroundColor = [NSColor colorWithWhite:0.1 alpha:1.0].CGColor;
 
-    CGFloat panelW = 380.0;
-    CGFloat panelH = 460.0;
-    CGFloat panelX = (contentView.bounds.size.width - panelW) / 2.0;
-    CGFloat panelY = (contentView.bounds.size.height - panelH) / 2.0;
-
-    self.loginPanel = [[InterLoginPanel alloc] initWithFrame:NSMakeRect(panelX, panelY, panelW, panelH)];
-    self.loginPanel.autoresizingMask = NSViewMinXMargin | NSViewMaxXMargin | NSViewMinYMargin | NSViewMaxYMargin;
+    // The auth panel now hosts SwiftUI (`AuthView`), which draws its own themed background
+    // and a centred card — so it fills the whole content view rather than being a fixed box.
+    self.loginPanel = [[InterLoginPanel alloc] initWithFrame:contentView.bounds];
+    self.loginPanel.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
     self.loginPanel.delegate = self;
     [contentView addSubview:self.loginPanel];
 
@@ -1639,6 +1636,34 @@ didRequestDeleteTeamId:(NSString *)teamId {
     didRequestOAuthWithProvider:(NSString *)provider {
 #pragma unused(panel)
     [self startOAuthSignInWithProvider:provider];
+}
+
+- (void)loginPanel:(InterLoginPanel *)panel
+    didRequestPasswordResetForEmail:(NSString *)email {
+    [panel clearError];
+
+    NSString *tokenServerURL = [[NSUserDefaults standardUserDefaults]
+        stringForKey:@"InterDefaultTokenServerURL"];
+    if (!tokenServerURL.length) {
+        tokenServerURL = @"http://localhost:3000";
+    }
+
+    // No global loading state here — that drives the primary CTA's "Signing in…" label,
+    // which would be misleading for a reset request. The info/error banner is the feedback.
+    [self.roomController.tokenService requestPasswordResetWithEmail:email
+                                                          serverURL:tokenServerURL
+                                                         completion:^(NSError *error) {
+        if (error) {
+            NSString *msg = (error.code == 1005)
+                ? @"Couldn't reach the server. Check your connection and try again."
+                : error.localizedDescription;
+            [panel showError:msg];
+            return;
+        }
+        // Server always responds generically (anti-enumeration) — never confirm the email
+        // exists. The reset is finished via the emailed deep link.
+        [panel showInfo:@"If that email is registered, you'll receive a reset link shortly. Check your inbox."];
+    }];
 }
 
 #pragma mark - InterAuthSessionDelegate [Phase B.4d]
@@ -2364,6 +2389,10 @@ didRequestDeleteTeamId:(NSString *)teamId {
         self.normalRemoteLayout.localUserCanAssignCoHost =
             (self.moderationController.localRole == InterParticipantRoleHost);
     }
+    // Interview rooms let the host force-activate, so the cause-derived mic menu reads a
+    // direct "Unmute" there. Constant for the session — set once at layout creation.
+    self.normalRemoteLayout.interviewMode =
+        [self.roomController.roomType isEqualToString:@"interview"];
     __weak typeof(self) weakModSelf = self;
     self.normalRemoteLayout.moderationActionHandler = ^(NSString *participantIdentity, NSString *actionType) {
         [weakModSelf handleTileModerationAction:actionType forParticipant:participantIdentity];
@@ -4568,16 +4597,13 @@ didRequestDeleteTeamId:(NSString *)teamId {
             NSLog(@"[Phase 9] Muted %ld participants", (long)count);
             // Show "Allow" buttons in the speaker queue for raised hands
             self.normalSpeakerQueuePanel.showAllowActions = YES;
-            // Mark every remote tile as host-muted so the three-dot menu shows
-            // "Unmute Mic" for all participants, reflecting the host's action.
-            NSArray<NSDictionary<NSString *, NSString *> *> *participants =
-                [self.roomController remoteParticipantList];
-            for (NSDictionary<NSString *, NSString *> *p in participants) {
-                NSString *identity = p[@"identity"];
-                if (identity.length > 0) {
-                    [self.normalRemoteLayout setHostMuted:YES forParticipant:identity];
-                }
-            }
+            // Mute-All is a ROOM-WIDE cause, distinct from a per-tile host block. Set the
+            // layout's globalMuteActive so the cause-derived menu shows "Allow to Speak" on
+            // mute-all'd participants (NOT "Remove Mute & Ask"). We must NOT stamp
+            // isHostMuted on every tile — that would mislabel everyone as individually
+            // blocked. Individually-blocked tiles keep their own isHostMuted (block wins
+            // over mute-all in the precedence), so their menu stays correct too.
+            self.normalRemoteLayout.globalMuteActive = YES;
         } else {
             NSLog(@"[Phase 9] Mute all failed: %@", error.localizedDescription);
         }
@@ -4694,7 +4720,9 @@ didRequestDeleteTeamId:(NSString *)teamId {
 - (void)handleTileModerationAction:(NSString *)actionType forParticipant:(NSString *)participantIdentity {
     if (!self.moderationController || participantIdentity.length == 0) return;
 
-    if ([actionType isEqualToString:@"muteMic"]) {
+    if ([actionType isEqualToString:@"muteMic"] || [actionType isEqualToString:@"blockMic"]) {
+        // "Mute Mic" (live participant) and "Block mic" (enforce-mute someone already
+        // self/globally muted) are the same host action: apply a per-tile block.
         __weak typeof(self) weakSelf = self;
         [self.moderationController muteParticipantWithIdentity:participantIdentity
                                                    trackSource:@"microphone"
@@ -4712,28 +4740,47 @@ didRequestDeleteTeamId:(NSString *)teamId {
             if (weakSelf.micUnlockQueue.count == 0) [weakSelf.normalMicUnlockQueuePanel hidePanel];
         }];
 
-    } else if ([actionType isEqualToString:@"unmuteMic"]) {
-        if (self.moderationController.isAllMuted) {
-            // Mute All is active — grant this participant a mic unlock slot via
-            // the new approval flow. approveMicUnlock sends the signal; on the
-            // participant side applyMicUnlockApproved takes the global-mute path
-            // (one-time slot with revoke detection). Lower their raised hand if
-            // one is pending.
-            [self.moderationController approveMicUnlockWithIdentity:participantIdentity];
-            [self.chatController lowerHandForParticipant:participantIdentity];
-            [self.speakerQueue removeHandFor:participantIdentity];
-            [self.normalSpeakerQueuePanel setEntries:self.speakerQueue.entries];
-            [self.normalRemoteLayout setHandRaised:NO forParticipant:participantIdentity];
-            // Flip tile to "Mute Mic" so host can silence them if needed.
-            [self.normalRemoteLayout setHostMuted:NO forParticipant:participantIdentity];
-        } else {
-            // No Mute All active — directly unmute; participant's mic turns on immediately
-            // and they can toggle freely afterward.
+    } else if ([actionType isEqualToString:@"allowToSpeak"]) {
+        // Mute-All cause: grant this participant a one-time speak slot (existing approve
+        // flow). approveMicUnlock sends the signal; the participant takes the global-mute
+        // path (one-time slot with revoke detection). Lower their raised hand if pending.
+        [self.moderationController approveMicUnlockWithIdentity:participantIdentity];
+        [self.chatController lowerHandForParticipant:participantIdentity];
+        [self.speakerQueue removeHandFor:participantIdentity];
+        [self.normalSpeakerQueuePanel setEntries:self.speakerQueue.entries];
+        [self.normalRemoteLayout setHandRaised:NO forParticipant:participantIdentity];
+
+    } else if ([actionType isEqualToString:@"askToUnmute"]) {
+        // Self-muted participant (no host block). Consent-first: in NORMAL mode send a
+        // request — the participant taps their own mic (no force). In INTERVIEW mode the
+        // host may force-activate, so directly unmute (requestUnmuteOne; the interviewee
+        // side force-turns on and shows the "host enabled" indicator).
+        //
+        // TODO [Increment 2 — host "Asked ✓" + cooldown + pending]: after sending the ask
+        // in normal mode, give the host feedback (a transient "Asked ✓" on the menu item /
+        // a short per-(tile,host) cooldown so repeated clicks don't spam the participant),
+        // and set the per-tile micAskPending flag (see InterRemoteVideoLayoutManager menu
+        // TODO) so the caption reads "Asked to unmute". Clear it when the participant
+        // unmutes (isMicMuted→NO) or on re-block / Mute-All. No host UI feedback exists yet.
+        if ([self.roomController.roomType isEqualToString:@"interview"]) {
             [self.moderationController unmuteParticipantWithIdentity:participantIdentity];
-            // Flip tile menu back to "Mute Mic" and remove from host-muted set
-            [self.normalRemoteLayout setHostMuted:NO forParticipant:participantIdentity];
-            [self.hostMutedParticipants removeObject:participantIdentity];
-            self.normalSpeakerQueuePanel.hostMutedIdentities = [self.hostMutedParticipants copy];
+        } else {
+            [self.moderationController askToUnmuteWithIdentity:participantIdentity];
+        }
+
+    } else if ([actionType isEqualToString:@"removeMuteAndAsk"]) {
+        // Host-muted participant. One click: lift the host block, then invite. The lift
+        // (requestUnmuteOne) is lift-only in normal mode (participant taps to turn on) and
+        // force-on in interview mode. Keep the hostMutedParticipants set in sync (P3).
+        BOOL interview = [self.roomController.roomType isEqualToString:@"interview"];
+        [self.moderationController unmuteParticipantWithIdentity:participantIdentity];
+        [self.normalRemoteLayout setHostMuted:NO forParticipant:participantIdentity];
+        [self.hostMutedParticipants removeObject:participantIdentity];
+        self.normalSpeakerQueuePanel.hostMutedIdentities = [self.hostMutedParticipants copy];
+        if (!interview) {
+            // Normal mode: the lift only re-enables their button; send the consent ask so
+            // they know to turn their mic on. Interview mode already force-turned it on.
+            [self.moderationController askToUnmuteWithIdentity:participantIdentity];
         }
 
     } else if ([actionType isEqualToString:@"lockCamera"]) {
@@ -4830,27 +4877,14 @@ didRequestDeleteTeamId:(NSString *)teamId {
             NSLog(@"[Phase 9] Broadcast unmute-all request to participants");
             // Global mute session is over — hide the raise-hand gate in the queue.
             self.normalSpeakerQueuePanel.showAllowActions = NO;
+            // Clear the room-wide mute-all cause so the menu stops showing "Allow to Speak".
+            // Individually-blocked tiles keep their isHostMuted (per-tile mute persists, §8.1),
+            // so their menu correctly stays "Remove Mute & Ask".
+            self.normalRemoteLayout.globalMuteActive = NO;
             // Individual per-tile mutes persist after UnmuteAll (§8.1).
             // hostMutedParticipants retains those identities; update the queue
             // panel so it still shows Allow actions for their hand-raises.
             self.normalSpeakerQueuePanel.hostMutedIdentities = [self.hostMutedParticipants copy];
-            // Unmute All is DataChannel-only — no LiveKit server-side unmute
-            // event fires, so tiles stuck at "Unmute Mic" must be reset explicitly.
-            // Skip individually tile-muted participants — their track stays muted
-            // and their tile should keep the host-muted indicators (Bug B fix).
-            NSArray<NSDictionary<NSString *, NSString *> *> *participants =
-                [self.roomController remoteParticipantList];
-            for (NSDictionary<NSString *, NSString *> *p in participants) {
-                NSString *identity = p[@"identity"];
-                if (identity.length == 0) continue;
-                if ([self.hostMutedParticipants containsObject:identity]) {
-                    // This participant was individually tile-muted — skip the
-                    // tile reset so it keeps showing "Unmute Mic" on the host.
-                    continue;
-                }
-                [self.normalRemoteLayout setMicMuted:NO forParticipant:identity];
-                [self.normalRemoteLayout setHostMuted:NO forParticipant:identity];
-            }
         } else {
             NSLog(@"[Phase 9] Unmute all failed: %@", error.localizedDescription);
         }
@@ -5016,6 +5050,14 @@ didRequestDeleteTeamId:(NSString *)teamId {
 
 - (void)moderationController:(InterModerationController *)controller receivedUnmuteRequest:(NSString *)fromIdentity displayName:(NSString *)displayName {
 #pragma unused(controller)
+    // TODO [Increment 2 — persistent affordance]: the spec (§4.3) calls for a NON-modal,
+    // PERSISTENT affordance instead of this blocking NSAlert: the participant's OWN mic
+    // button pulses + a small "Host asked you to unmute" chip stays until they act, tap
+    // their own mic, or dismiss it (dismiss is local-only, no "declined" signal). The
+    // modal below is the interim consent prompt — it is non-silent (so it satisfies "never
+    // force, always ask") but it interrupts and conflates "declined" with "never saw it".
+    // Replace with the persistent chip during the UI redesign; keep "participant makes the
+    // final tap" (do NOT auto-unmute beyond their own action).
     NSAlert *alert = [[NSAlert alloc] init];
     alert.messageText = @"Unmute Request";
     alert.informativeText = [NSString stringWithFormat:@"%@ is asking you to unmute your microphone.", displayName];
@@ -5051,15 +5093,8 @@ didRequestDeleteTeamId:(NSString *)teamId {
         self.normalSpeakerQueuePanel.showAllowActions = NO;
         // Preserve individual tile-mutes — same §8.1 rule as moderationUnmuteAll.
         self.normalSpeakerQueuePanel.hostMutedIdentities = [self.hostMutedParticipants copy];
-        NSArray<NSDictionary<NSString *, NSString *> *> *participants =
-            [self.roomController remoteParticipantList];
-        for (NSDictionary<NSString *, NSString *> *p in participants) {
-            NSString *identity = p[@"identity"];
-            if (identity.length == 0) continue;
-            if ([self.hostMutedParticipants containsObject:identity]) continue;
-            [self.normalRemoteLayout setMicMuted:NO forParticipant:identity];
-            [self.normalRemoteLayout setHostMuted:NO forParticipant:identity];
-        }
+        // Clear the room-wide mute-all cause; individually-blocked tiles keep isHostMuted.
+        self.normalRemoteLayout.globalMuteActive = NO;
     }
 }
 
@@ -5077,14 +5112,8 @@ didRequestDeleteTeamId:(NSString *)teamId {
     if (self.roomController.isHost) {
         [self.moderationController applyExternalGlobalMuteChanged:YES];
         self.normalSpeakerQueuePanel.showAllowActions = YES;
-        NSArray<NSDictionary<NSString *, NSString *> *> *participants =
-            [self.roomController remoteParticipantList];
-        for (NSDictionary<NSString *, NSString *> *p in participants) {
-            NSString *identity = p[@"identity"];
-            if (identity.length > 0) {
-                [self.normalRemoteLayout setHostMuted:YES forParticipant:identity];
-            }
-        }
+        // Room-wide mute-all cause — the cause-derived menu shows "Allow to Speak".
+        self.normalRemoteLayout.globalMuteActive = YES;
     }
 }
 

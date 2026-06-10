@@ -23,6 +23,11 @@ NS_ASSUME_NONNULL_BEGIN
 - (void)loginPanel:(InterLoginPanel *)panel
     didRequestOAuthWithProvider:(NSString *)provider;
 
+/// User tapped "Forgot password?" with an email entered. The delegate should request a
+/// reset link (`POST /auth/forgot-password`) and report back via `showInfo:`/`showError:`.
+- (void)loginPanel:(InterLoginPanel *)panel
+    didRequestPasswordResetForEmail:(NSString *)email;
+
 @end
 
 /// Self-contained login/register panel.
@@ -35,6 +40,9 @@ NS_ASSUME_NONNULL_BEGIN
 
 /// Show an error message below the form (e.g. "Invalid credentials").
 - (void)showError:(NSString *)message;
+
+/// Show a non-error confirmation message (e.g. "reset link sent").
+- (void)showInfo:(NSString *)message;
 
 /// Clear any displayed error.
 - (void)clearError;

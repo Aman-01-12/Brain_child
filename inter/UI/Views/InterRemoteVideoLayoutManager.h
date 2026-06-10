@@ -234,6 +234,15 @@ typedef NS_ENUM(NSUInteger, InterRemoteVideoLayoutMode) {
 /// Propagated to all existing and newly created tiles automatically.
 @property (nonatomic, assign) BOOL localUserCanAssignCoHost;
 
+/// Room-wide: whether a global Mute-All is currently active. Fed into the cause-derived
+/// per-tile mic menu so the action reflects mute-all. Propagated to all tiles automatically.
+@property (nonatomic, assign) BOOL globalMuteActive;
+
+/// Room-wide: whether this is an interview room. In interview mode the host may
+/// force-activate, so the mic primary action reads a direct "Unmute". Set once per session.
+/// Propagated to all existing and newly created tiles automatically.
+@property (nonatomic, assign) BOOL interviewMode;
+
 /// Invoked on the main queue when the local host selects a moderation action
 /// from a participant tile's three-dot hover menu.
 ///

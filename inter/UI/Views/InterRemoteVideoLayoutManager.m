@@ -47,6 +47,17 @@ static NSString *const kInterPreferGridLayoutKey = @"InterPreferGridLayout";
 /// Drives the tile three-dot menu label ("Mute Mic" vs "Unmute Mic"),
 /// independent of the participant's self-mute state.
 @property (nonatomic, assign) BOOL isHostMuted;
+/// Room-wide: whether a global Mute-All is active. Fed into the cause-derived menu
+/// (InterModerationTileState.deriveMic) so the mic action reflects mute-all correctly.
+@property (nonatomic, assign) BOOL globalMuteActive;
+/// Room-wide: whether this is an interview room. In interview mode the host may
+/// force-activate, so the primary action reads a direct "Unmute".
+@property (nonatomic, assign) BOOL interviewMode;
+/// Host-only glanceable caption showing WHY this participant is muted (self / by-host /
+/// mute-all), derived from the same cause as the menu action (InterModerationTileState).
+/// Always visible (no menu open needed); hidden for non-hosts, the host's own tile, and
+/// when the mic is live. Updated by -updateMicCaption.
+@property (nonatomic, strong) NSTextField *micCaptionLabel;
 /// Whether this participant's camera is currently muted (updated by track events).
 @property (nonatomic, assign) BOOL isCameraMuted;
 /// When YES this tile is the current host-forced spotlight. The three-dot menu
@@ -161,11 +172,22 @@ static NSString *const kInterPreferGridLayoutKey = @"InterPreferGridLayout";
     self.nameLabel.maximumNumberOfLines = 1;
     [self addSubview:self.nameLabel];
 
-    // Hand-raise badge — SF Symbol via shared design tokens (spec §6.3)
-    self.handRaiseBadge = [[InterTileBadge alloc] initWithSymbolName:[InterDesignTokens symbolHandRaised]
-                                                                tint:[InterDesignTokens accentGold]];
-    self.handRaiseBadge.hidden = YES;
-    [self addSubview:self.handRaiseBadge];
+    // Host-only mic cause caption — a small dark chip just above the name showing
+    // "Self-muted" / "Muted by you" / "Muted (mute-all)". Driven by -updateMicCaption
+    // from the SAME deriveMic cause as the menu action, so caption and menu never
+    // disagree. Self-sizing pill; frame computed in -layout. Hidden by default.
+    self.micCaptionLabel = [NSTextField labelWithString:@""];
+    self.micCaptionLabel.font = [NSFont systemFontOfSize:9 weight:NSFontWeightSemibold];
+    self.micCaptionLabel.textColor = [NSColor whiteColor];
+    self.micCaptionLabel.alignment = NSTextAlignmentCenter;
+    self.micCaptionLabel.lineBreakMode = NSLineBreakByTruncatingTail;
+    self.micCaptionLabel.maximumNumberOfLines = 1;
+    self.micCaptionLabel.drawsBackground = NO;
+    self.micCaptionLabel.wantsLayer = YES;
+    self.micCaptionLabel.layer.backgroundColor = [NSColor colorWithWhite:0.0 alpha:0.6].CGColor;
+    self.micCaptionLabel.layer.cornerRadius = 4.0;
+    self.micCaptionLabel.hidden = YES;
+    [self addSubview:self.micCaptionLabel];
 
     // Mic-muted indicator — bottom-right corner, shown when the participant's
     // microphone track is muted. Secondary indicator; does not affect host
@@ -244,6 +266,59 @@ static NSString *const kInterPreferGridLayoutKey = @"InterPreferGridLayout";
     if (_isMicMuted == isMicMuted) return;
     _isMicMuted = isMicMuted;
     [self setBadge:self.micMutedBadge visible:isMicMuted];
+    [self updateMicCaption];
+}
+
+// The mic caption + the menu action are both pure functions of (isMicMuted, isHostMuted,
+// globalMuteActive) via InterModerationTileState.deriveMic, so any change to those inputs
+// — or to whether this tile is host-moderatable — must recompute the caption.
+- (void)setIsHostMuted:(BOOL)isHostMuted {
+    if (_isHostMuted == isHostMuted) return;
+    _isHostMuted = isHostMuted;
+    [self updateMicCaption];
+}
+
+- (void)setGlobalMuteActive:(BOOL)globalMuteActive {
+    if (_globalMuteActive == globalMuteActive) return;
+    _globalMuteActive = globalMuteActive;
+    [self updateMicCaption];
+}
+
+- (void)setShowsModerationMenu:(BOOL)showsModerationMenu {
+    if (_showsModerationMenu == showsModerationMenu) return;
+    _showsModerationMenu = showsModerationMenu;
+    [self updateMicCaption];
+}
+
+- (void)setIsHostParticipant:(BOOL)isHostParticipant {
+    if (_isHostParticipant == isHostParticipant) return;
+    _isHostParticipant = isHostParticipant;
+    [self updateMicCaption];
+}
+
+/// Recompute the host-only mic cause caption from deriveMic. Shown only to hosts
+/// (showsModerationMenu) for moderatable tiles (not the host's own tile) and only when
+/// the mic is actually muted — a live mic gets no caption (no clutter on normal state).
+- (void)updateMicCaption {
+    BOOL eligible = self.showsModerationMenu && !self.isHostParticipant;
+    if (!eligible) {
+        if (!self.micCaptionLabel.hidden) { self.micCaptionLabel.hidden = YES; [self setNeedsLayout:YES]; }
+        return;
+    }
+    InterMicTileState *st =
+        [InterModerationTileState deriveMicWithReallyMuted:self.isMicMuted
+                                              hostBlocked:self.isHostMuted
+                                               globalMute:self.globalMuteActive
+                                        pendingSelfAction:NO
+                                               askPending:NO
+                                          isInterviewMode:self.interviewMode];
+    if (st.cause == InterMicCauseMicOn) {
+        if (!self.micCaptionLabel.hidden) { self.micCaptionLabel.hidden = YES; [self setNeedsLayout:YES]; }
+        return;
+    }
+    self.micCaptionLabel.stringValue = st.captionText;
+    self.micCaptionLabel.hidden = NO;
+    [self setNeedsLayout:YES];
 }
 
 - (void)setIsCoHost:(BOOL)isCoHost {
@@ -330,6 +405,13 @@ static NSString *const kInterPreferGridLayoutKey = @"InterPreferGridLayout";
     // Name label at bottom, 22px tall
     CGFloat labelH = 22.0;
     self.nameLabel.frame = NSMakeRect(0, 0, b.size.width, labelH);
+    // Host-only mic cause caption: self-sizing dark chip centred just above the name,
+    // kept clear of the bottom-right mic/camera badges.
+    if (!self.micCaptionLabel.hidden) {
+        CGFloat capW = MIN(self.micCaptionLabel.intrinsicContentSize.width + 12.0, b.size.width - 12.0);
+        capW = MAX(capW, 0.0);
+        self.micCaptionLabel.frame = NSMakeRect((b.size.width - capW) / 2.0, labelH + 3.0, capW, 15.0);
+    }
     // Hand raise badge at top-left
     self.handRaiseBadge.frame = NSMakeRect(4, b.size.height - 28, 24, 24);
     // Mic-muted badge at bottom-right, just above the name label
@@ -445,16 +527,46 @@ static NSString *const kInterPreferGridLayoutKey = @"InterPreferGridLayout";
         return;
     }
 
-    // Mic — label reflects HOST's mute intent, not participant's self-mute state.
-    // isMicMuted drives the visual mic indicator; isHostMuted drives the menu label
-    // so the host sees "Unmute Mic" only when THEY explicitly muted this participant.
-    if (self.isHostMuted) {
-        addItem(@"Unmute Mic", @"unmuteMic");
-    } else {
-        addItem(@"Mute Mic", @"muteMic");
+    // Mic — single cause-derived action (+ optional secondary). The caption and the
+    // action come from ONE cause (InterModerationTileState.deriveMic), so a "Mute"
+    // action can never sit beside a "muted" state. isMicMuted = the participant's REAL
+    // LiveKit state; isHostMuted = the host's per-tile block intent.
+    //
+    // TODO [Increment 2 — micPendingSelfAction]: pendingSelfAction/askPending are hard-coded
+    // NO here (and in -updateMicCaption). To light up the "Off — can unmute" / "Asked to
+    // unmute" captions (spec §3, Finding A), add a per-tile BOOL (e.g. tile.micAskPending)
+    // that AppDelegate sets when it sends askToUnmute / removeMuteAndAsk against an off mic
+    // (see handleTileModerationAction:), and clears when isMicMuted flips to NO or on
+    // re-block / Mute-All. Then pass it here as pendingSelfAction: and askPending:.
+    InterMicTileState *micState =
+        [InterModerationTileState deriveMicWithReallyMuted:self.isMicMuted
+                                              hostBlocked:self.isHostMuted
+                                               globalMute:self.globalMuteActive
+                                        pendingSelfAction:NO
+                                               askPending:NO
+                                          isInterviewMode:self.interviewMode];
+    NSString *micActionKey;
+    switch (micState.primaryAction) {
+        case InterMicPrimaryActionMute:             micActionKey = @"muteMic";          break;
+        case InterMicPrimaryActionAskToUnmute:      micActionKey = @"askToUnmute";      break;
+        case InterMicPrimaryActionRemoveMuteAndAsk: micActionKey = @"removeMuteAndAsk"; break;
+        case InterMicPrimaryActionAllowToSpeak:     micActionKey = @"allowToSpeak";     break;
+    }
+    addItem(micState.primaryActionTitle, micActionKey);
+    if (micState.secondaryAction == InterMicSecondaryActionBlockMic) {
+        // Enforce-block someone already (self/globally) muted, so they cannot self-unmute.
+        addItem(micState.secondaryActionTitle, @"blockMic");
     }
 
     // Camera lock — unified "Mute Camera" (locks camera) / "Lift Camera Lock"
+    //
+    // TODO [PR #2 — camera cause-derived model]: port this to the same pattern as mic above.
+    // Add a camera half to InterModerationTileState (deriveCamera → cause + primary/secondary:
+    // "Stop Video" / "Ask to Turn On Camera" / "Remove Lock & Ask" / "Allow Camera" + "Lock
+    // camera" secondary), feed it cameraOff (real LiveKit state) + isHostCameraLocked +
+    // globalCameraLock + interviewMode, and add a camera cause caption (mirror -updateMicCaption).
+    // Then change the camera unlock semantics to lift-only (normal) / restore + indicator
+    // (interview), mirroring applyRemoteMicUnmute. See spec §4.2/§5/§7 PR #2.
     if (self.isHostCameraLocked) {
         addItem(@"Unmute Camera", @"liftCameraLock");
     } else {
@@ -819,6 +931,20 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
     _localUserCanAssignCoHost = canAssign;
     for (NSString *key in self.tileViews) {
         self.tileViews[key].localUserCanAssignCoHost = canAssign;
+    }
+}
+
+- (void)setGlobalMuteActive:(BOOL)globalMuteActive {
+    _globalMuteActive = globalMuteActive;
+    for (NSString *key in self.tileViews) {
+        self.tileViews[key].globalMuteActive = globalMuteActive;
+    }
+}
+
+- (void)setInterviewMode:(BOOL)interviewMode {
+    _interviewMode = interviewMode;
+    for (NSString *key in self.tileViews) {
+        self.tileViews[key].interviewMode = interviewMode;
     }
 }
 
@@ -1218,6 +1344,9 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
         NSNumber *isHost = self.hostParticipantStates[key];
         if (isHost) tile.isHostParticipant = isHost.boolValue;
         tile.localUserCanAssignCoHost = _localUserCanAssignCoHost;
+        // Room-wide moderation facts feed the cause-derived mic menu on this tile.
+        tile.globalMuteActive = _globalMuteActive;
+        tile.interviewMode = _interviewMode;
         // Restore camera-off (avatar placeholder) state so it survives tile recreation.
         // Default to YES (avatar) when the state is unknown — NEVER NO. A camera tile
         // whose state is not yet known must show the avatar, not an empty video view:

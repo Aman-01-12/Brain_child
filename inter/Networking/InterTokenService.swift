@@ -1514,6 +1514,47 @@ private struct TokenCacheEntry {
         }
     }
 
+    /// Request a password-reset link for `email` via `POST /auth/forgot-password`.
+    ///
+    /// The server ALWAYS returns 200 with a generic message (anti-enumeration), so a
+    /// `nil` error means "request accepted" — it does NOT confirm the email exists. The
+    /// reset itself is completed later via the `com-inter-app://reset-password?token=…`
+    /// deep link (handled in `AppDelegate`). A non-nil error is a transport/rate-limit
+    /// failure the caller should surface (e.g. "couldn't reach the server", or 429).
+    @objc public func requestPasswordReset(email: String,
+                                           serverURL: String,
+                                           completion: @escaping (NSError?) -> Void) {
+        let body: [String: Any] = ["email": email]
+
+        interLogInfo(InterLog.networking, "Auth: requesting password reset (email=%{private}@)", email)
+
+        performAuthHTTPRequest(url: "\(serverURL)/auth/forgot-password", method: "POST",
+                               body: body, bearerToken: nil, retryCount: 0) { [weak self] data, httpResponse, error in
+            guard let self = self else { return }
+
+            if let error = error {
+                self.completeOnMain { completion(error) }
+                return
+            }
+
+            guard let httpResponse = httpResponse else {
+                self.completeOnMain { completion(InterNetworkErrorCode.authFailed.error(message: "No response")) }
+                return
+            }
+
+            if httpResponse.statusCode == 200 {
+                interLogInfo(InterLog.networking, "Auth: password-reset request accepted")
+                self.completeOnMain { completion(nil) }
+            } else {
+                let parsed = self.parseJSON(data ?? Data())
+                let message = parsed?["error"] as? String
+                    ?? "Couldn't request a reset link (\(httpResponse.statusCode))."
+                interLogError(InterLog.networking, "Auth: password-reset request failed (%{public}d)", httpResponse.statusCode)
+                self.completeOnMain { completion(InterNetworkErrorCode.authFailed.error(message: message)) }
+            }
+        }
+    }
+
     /// Exchange an OAuth handoff code for auth tokens.
     ///
     /// Called after `ASWebAuthenticationSession` completes. The one-time code
