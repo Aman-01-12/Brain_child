@@ -24,7 +24,6 @@ public struct AuthView: View {
 
     @ObservedObject var viewModel: AuthViewModel
     @Environment(\.colorScheme) private var colorScheme
-    @State private var ctaHovering = false
 
     public init(viewModel: AuthViewModel) {
         self.viewModel = viewModel
@@ -108,10 +107,10 @@ public struct AuthView: View {
             oauthColumn
             emailDivider
             if let info = viewModel.infoMessage, !info.isEmpty {
-                infoBanner(info)
+                InterBanner(info, variant: .success, systemImage: "envelope.badge.fill")
             }
             if let error = viewModel.formError, !error.isEmpty {
-                errorBanner(error)
+                InterBanner(error, variant: .error, tinted: false)
             }
             form
             submitButton
@@ -125,12 +124,16 @@ public struct AuthView: View {
 
     private var oauthColumn: some View {
         VStack(spacing: InterSpacing.x3) {
-            OAuthButton(label: "Continue with Google",
+            InterButton("Continue with Google", variant: .secondary, fullWidth: true,
                         enabled: viewModel.controlsEnabled,
-                        action: { viewModel.tapOAuth("google") }) { GoogleIcon() }
-            OAuthButton(label: "Continue with Microsoft",
+                        action: { viewModel.tapOAuth("google") }) {
+                GoogleIcon().frame(width: 18, height: 18)
+            }
+            InterButton("Continue with Microsoft", variant: .secondary, fullWidth: true,
                         enabled: viewModel.controlsEnabled,
-                        action: { viewModel.tapOAuth("microsoft") }) { MicrosoftIcon() }
+                        action: { viewModel.tapOAuth("microsoft") }) {
+                MicrosoftIcon().frame(width: 18, height: 18)
+            }
         }
     }
 
@@ -143,37 +146,6 @@ public struct AuthView: View {
                 .fixedSize()
             Rectangle().fill(Color(nsColor: InterColor.muted)).frame(height: 1)
         }
-    }
-
-    private func errorBanner(_ message: String) -> some View {
-        (Text(Image(systemName: "exclamationmark.circle.fill")) + Text("  ") + Text(message))
-            .font(InterFont.swiftUI(InterFont.Size.secondary))
-            .multilineTextAlignment(.center)
-            .foregroundStyle(Color(nsColor: InterStatus.danger))
-            .frame(maxWidth: .infinity, alignment: .center)
-            .padding(.horizontal, InterSpacing.x3)
-            .padding(.vertical, InterSpacing.x2)
-            .overlay(
-                RoundedRectangle(cornerRadius: InterRadius.lg, style: .continuous)
-                    .stroke(Color(nsColor: InterStatus.danger).opacity(0.3), lineWidth: 1)
-            )
-            .clipShape(RoundedRectangle(cornerRadius: InterRadius.lg, style: .continuous))
-    }
-
-    private func infoBanner(_ message: String) -> some View {
-        (Text(Image(systemName: "envelope.badge.fill")) + Text("  ") + Text(message))
-            .font(InterFont.swiftUI(InterFont.Size.secondary))
-            .multilineTextAlignment(.center)
-            .foregroundStyle(Color(nsColor: InterStatus.success))
-            .frame(maxWidth: .infinity, alignment: .center)
-            .padding(.horizontal, InterSpacing.x3)
-            .padding(.vertical, InterSpacing.x2)
-            .background(Color(nsColor: InterStatus.success).opacity(0.12))
-            .overlay(
-                RoundedRectangle(cornerRadius: InterRadius.lg, style: .continuous)
-                    .stroke(Color(nsColor: InterStatus.success).opacity(0.3), lineWidth: 1)
-            )
-            .clipShape(RoundedRectangle(cornerRadius: InterRadius.lg, style: .continuous))
     }
 
     // MARK: Form
@@ -210,7 +182,7 @@ public struct AuthView: View {
                     .foregroundStyle(Color(nsColor: InterColor.foreground))
                 Spacer()
                 if viewModel.mode == .signIn {
-                    TextLink(title: "Forgot password?") { viewModel.tapForgotPassword() }
+                    InterTextLink("Forgot password?") { viewModel.tapForgotPassword() }
                 }
             }
             InterSecureInputField(placeholder: "Minimum 8 characters",
@@ -258,28 +230,13 @@ public struct AuthView: View {
     }
 
     private var submitButton: some View {
-        Button(action: { viewModel.submit() }) {
-            HStack(spacing: InterSpacing.x2) {
-                if viewModel.isLoading {
-                    ProgressView()
-                        .controlSize(.small)
-                        .tint(invertedForeground)
-                    Text("Signing in…")
-                } else {
-                    Text(viewModel.mode == .signIn ? "Log In" : "Create Account")
-                }
-            }
-            .font(InterFont.swiftUI(InterFont.Size.secondary, .medium))
-            .foregroundStyle(invertedForeground)
-            .frame(maxWidth: .infinity)
-            .frame(height: InterControl.primaryHeight)
-            .background(invertedBackground(hovering: ctaHovering))
-            .clipShape(RoundedRectangle(cornerRadius: InterRadius.lg, style: .continuous))
-        }
-        .buttonStyle(.plain)
-        .handCursor()
-        .onHover { ctaHovering = $0 }
-        .disabled(viewModel.isLoading || !viewModel.controlsEnabled)
+        InterButton(viewModel.mode == .signIn ? "Log In" : "Create Account",
+                    variant: .neutral,
+                    fullWidth: true,
+                    isLoading: viewModel.isLoading,
+                    loadingTitle: "Signing in…",
+                    enabled: viewModel.controlsEnabled,
+                    action: { viewModel.submit() })
     }
 
     private var footer: some View {
@@ -287,7 +244,7 @@ public struct AuthView: View {
             Text(viewModel.mode == .signIn ? "No account yet?" : "Already have an account?")
                 .font(InterFont.swiftUI(InterFont.Size.caption))
                 .foregroundStyle(Color(nsColor: InterColor.mutedForeground))
-            TextLink(title: viewModel.mode == .signIn ? "Create Account" : "Back to Login") {
+            InterTextLink(viewModel.mode == .signIn ? "Create Account" : "Back to Login") {
                 viewModel.toggleMode()
             }
             .disabled(!viewModel.controlsEnabled)
@@ -353,59 +310,6 @@ public struct AuthView: View {
     }
     private var invertedForeground: Color {
         colorScheme == .dark ? Color(nsColor: NSColor(hex: 0x171717)) : .white
-    }
-}
-
-// MARK: - OAuth button (full-width, hover state + hand cursor)
-
-private struct OAuthButton<Icon: View>: View {
-    let label: String
-    let enabled: Bool
-    let action: () -> Void
-    @ViewBuilder let icon: () -> Icon
-    @State private var hovering = false
-
-    var body: some View {
-        Button(action: action) {
-            HStack(spacing: InterSpacing.x2) {
-                icon().frame(width: 18, height: 18)
-                Text(label)
-                    .font(InterFont.swiftUI(InterFont.Size.secondary, .medium))
-                    .foregroundStyle(Color(nsColor: InterColor.foreground))
-            }
-            .frame(maxWidth: .infinity)
-            .frame(height: InterControl.primaryHeight)
-            .background(Color(nsColor: hovering ? InterColor.muted : InterColor.card))
-            .overlay(
-                RoundedRectangle(cornerRadius: InterRadius.lg, style: .continuous)
-                    .stroke(Color(nsColor: InterColor.border), lineWidth: 1)
-            )
-            .clipShape(RoundedRectangle(cornerRadius: InterRadius.lg, style: .continuous))
-        }
-        .buttonStyle(.plain)
-        .handCursor()
-        .onHover { hovering = $0 }
-        .disabled(!enabled)
-    }
-}
-
-// MARK: - Text link (hover underline + hand cursor)
-
-private struct TextLink: View {
-    let title: String
-    let action: () -> Void
-    @State private var hovering = false
-
-    var body: some View {
-        Button(action: action) {
-            Text(title)
-                .font(InterFont.swiftUI(InterFont.Size.caption, .medium))
-                .foregroundStyle(Color(nsColor: InterColor.primary))
-                .underline(hovering)
-        }
-        .buttonStyle(.plain)
-        .handCursor()
-        .onHover { hovering = $0 }
     }
 }
 

@@ -77,6 +77,12 @@ import LiveKit
                                              lobbyParticipantJoined identity: String,
                                              displayName: String)
 
+    /// A participant is no longer waiting in the lobby — they left on their own, or were
+    /// admitted/denied out-of-band (e.g. by another moderator, or admit-all elsewhere).
+    /// The host UI should remove their row. Detected by reconciling the polled server list.
+    @objc optional func moderationController(_ controller: InterModerationController,
+                                             lobbyParticipantLeft identity: String)
+
     /// Host has requested all participants to unmute their microphones.
     @objc optional func moderationControllerReceivedUnmuteAllRequest(_ controller: InterModerationController)
 
@@ -1218,7 +1224,9 @@ import LiveKit
                 let serverIdentities = Set(updated.compactMap { $0["identity"] })
                 for known in self.lobbyWaitingParticipants {
                     if let ident = known["identity"], !serverIdentities.contains(ident) {
-                        // Participant no longer in lobby — was admitted/denied outside our UI
+                        // No longer in the server's lobby — they left, or were admitted/denied
+                        // out-of-band. Tell the host UI to drop the row so it converges.
+                        self.delegate?.moderationController?(self, lobbyParticipantLeft: ident)
                     }
                 }
 

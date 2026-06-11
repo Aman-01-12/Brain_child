@@ -506,10 +506,19 @@ extension InterLiveKitSubscriber: RoomDelegate {
             }
         }
 
-        // Audio tracks: no custom work needed. LiveKit handles playback automatically.
-        // Just log for diagnostics.
+        // Audio tracks: LiveKit handles playback automatically, but we MUST seed the
+        // roster's mic-muted state from the publication here (F1). The roster defaults
+        // micMuted=true ("assume muted until a live audio track proves otherwise", F2),
+        // so a normal (unmuted) joiner only shows as live once this subscribe seeds the
+        // real publication.isMuted. Without this, a late joiner would stay stuck showing
+        // "muted" on the host. (Mirrors the camera branch's roster.cameraMuted seed.)
+        // A mute-on-join participant publishes NO audio track, so this never fires for
+        // them and they correctly remain muted — which is exactly the headline fix.
         if track is RemoteAudioTrack {
-            interLogInfo(InterLog.media, "Subscriber: remote audio track subscribed (automatic playback)")
+            roster.participantJoined(participantId, displayName: participantName)
+            roster.micMuted(participantId, muted: publication.isMuted)
+            interLogInfo(InterLog.media, "Subscriber: remote audio subscribed, seeded micMuted=%d for %{public}@",
+                         publication.isMuted ? 1 : 0, participantId)
         }
     }
 

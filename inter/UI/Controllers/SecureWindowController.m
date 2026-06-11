@@ -1,4 +1,5 @@
 #import "SecureWindowController.h"
+#import "InterWindowSecurity.h"
 #import "InterLocalCallControlPanel.h"
 #import "InterLocalMediaController.h"
 #import "InterMediaWiringController.h"
@@ -72,7 +73,7 @@ static const CGFloat InterSecureBottomWorkspaceMargin = 100.0;
     [self.secureWindow setLevel:NSScreenSaverWindowLevel];
     [self.secureWindow setOpaque:YES];
     [self.secureWindow setBackgroundColor:[NSColor blackColor]];
-    [self.secureWindow setSharingType:NSWindowSharingNone];
+    [self.secureWindow setSharingType:InterWindowSharingType()];
     [self.secureWindow setMovable:NO];
     [self.secureWindow setReleasedWhenClosed:NO];
     [self.secureWindow setHidesOnDeactivate:NO];
@@ -166,7 +167,7 @@ static const CGFloat InterSecureBottomWorkspaceMargin = 100.0;
     // secure window itself is shielded (createSecureWindow). The panel floats above
     // the secure surface during a live interview; without this it would be the one
     // unshielded surface a capture tool could read while everything else is black.
-    [self.chatOverlayWindow setSharingType:NSWindowSharingNone];
+    [self.chatOverlayWindow setSharingType:InterWindowSharingType()];
 
     // InterChatPanel fills the window's content view (always expanded in overlay mode)
     NSView *contentView = self.chatOverlayWindow.contentView;

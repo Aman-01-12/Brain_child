@@ -37,7 +37,12 @@ import os.log
         var subscribed: Bool = false
         var cameraMuted: Bool = true     // assume off until proven on
         var firstFrameSeen: Bool = false
-        var micMuted: Bool = false
+        // Assume MUTED until a live audio track proves otherwise (F2), symmetric with
+        // cameraMuted above. A mute-on-join participant publishes no audio track and so
+        // never emits a mute event — defaulting to false (live) made the host miss the
+        // mic-off badge and show "Mute Mic"/no caption. didSubscribeTrack's audio branch
+        // (F1) seeds the real publication.isMuted for normal joiners, who flip to live.
+        var micMuted: Bool = true
         var handRaised: Bool = false
         var isScreenSharing: Bool = false
         /// Effective name shown in the snapshot: the override if present, else attested.

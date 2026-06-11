@@ -24,8 +24,38 @@ import SwiftUI
     @objc public static func presentIfLaunchFlagPresent() {
         let args = ProcessInfo.processInfo.arguments
         let env = ProcessInfo.processInfo.environment
+        if args.contains("--gallery-lobby") || env["INTER_GALLERY_LOBBY"] == "1" {
+            presentLobbyPreviews()
+            return
+        }
         guard args.contains("--component-gallery") || env["INTER_COMPONENT_GALLERY"] == "1" else { return }
         presentDefaultGallery()
+    }
+
+    /// Open both lobby views with sample data for screenshotting (they're otherwise only
+    /// reachable mid-call). Host panel + a participant view with a 5-state picker.
+    /// Mirrors the REAL app windows: pinned dark appearance + themed title bar (and no
+    /// window buttons on the participant preview, matching the blocking waiting room).
+    @objc public static func presentLobbyPreviews() {
+        let hostVM = LobbyHostViewModel()
+        hostVM.lobbyEnabled = true
+        hostVM.add(identity: "u1", displayName: "Alice Chen")
+        hostVM.add(identity: "u2", displayName: "Bob Smith")
+        hostVM.add(identity: "u3", displayName: "Diana Prince")
+        let hostWindow = makeWindow(title: "Lobby — Host", size: CGSize(width: 460, height: 520))
+        hostWindow.appearance = NSAppearance(named: .darkAqua)
+        hostWindow.contentViewController = InterHostingController(mode: .dark, rootView: LobbyHostView(viewModel: hostVM))
+        InterWindowChrome.applyPanelChrome(to: hostWindow)
+        hostWindow.setFrameOrigin(NSPoint(x: 120, y: 240))
+        hostWindow.makeKeyAndOrderFront(nil)
+
+        let waitWindow = makeWindow(title: "Lobby — Participant", size: CGSize(width: 420, height: 420))
+        waitWindow.appearance = NSAppearance(named: .darkAqua)
+        waitWindow.contentViewController = InterHostingController(mode: .dark, rootView: LobbyWaitingPreview())
+        InterWindowChrome.applyPanelChrome(to: waitWindow)
+        InterWindowChrome.hideStandardButtons(waitWindow)
+        waitWindow.setFrameOrigin(NSPoint(x: 620, y: 290))
+        waitWindow.makeKeyAndOrderFront(nil)
     }
 
     /// Open the token sanity board.
@@ -145,3 +175,41 @@ private struct ComponentGalleryView: View {
         .foregroundStyle(Color(nsColor: InterColor.foreground))
     }
 }
+
+// MARK: - Lobby participant preview (gallery-only: 5-state picker, mirrors the mock's demo)
+
+private struct LobbyWaitingPreview: View {
+    @StateObject private var vm = LobbyWaitingViewModel()
+    private let states: [(String, LobbyWaitingState)] = [
+        ("joining", .joining), ("waiting", .waiting), ("denied", .denied), ("admitted", .admitted),
+    ]
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 6) {
+                Text("State:")
+                    .font(InterFont.swiftUI(InterFont.Size.caption, .semibold))
+                    .foregroundStyle(Color(nsColor: InterColor.mutedForeground))
+                ForEach(states, id: \.0) { label, state in
+                    Button(label) {
+                        vm.state = state
+                        vm.position = (state == .waiting) ? 2 : 0
+                    }
+                    .buttonStyle(.plain)
+                    .font(InterFont.swiftUI(InterFont.Size.dense10, .semibold))
+                    .foregroundStyle(vm.state == state ? .white : Color(nsColor: InterColor.mutedForeground))
+                    .padding(.horizontal, 8).padding(.vertical, 4)
+                    .background(vm.state == state ? Color(nsColor: InterColor.primary) : Color(nsColor: InterColor.secondary))
+                    .clipShape(RoundedRectangle(cornerRadius: InterRadius.md, style: .continuous))
+                }
+                Spacer()
+            }
+            .padding(.horizontal, InterSpacing.x4)
+            .padding(.vertical, InterSpacing.x2_5)
+            .background(Color(nsColor: InterColor.muted))
+
+            LobbyWaitingView(viewModel: vm)
+        }
+    }
+}
+

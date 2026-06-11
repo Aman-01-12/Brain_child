@@ -9,6 +9,7 @@
 #import "InterWindowPickerPanel.h"
 #import "MetalSurfaceView.h"
 #import "SecureWindowController.h"
+#import "InterWindowSecurity.h"
 #import "InterConnectionSetupPanel.h"
 #import "InterLoginPanel.h"
 #import "InterRemoteVideoLayoutManager.h"
@@ -756,7 +757,7 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
 
     [self.setupWindow center];
     [self.setupWindow setTitle:@"Secure Call Setup"];
-    [self.setupWindow setSharingType:NSWindowSharingNone];
+    [self.setupWindow setSharingType:InterWindowSharingType()];
     [self.setupWindow setDelegate:self];
     [self.setupWindow setBackgroundColor:[NSColor blackColor]];
     [self.setupWindow setMinSize:NSMakeSize(660.0, 600.0)];
@@ -1016,7 +1017,7 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
     self.normalScheduleWindow.minSize = NSMakeSize(680, 560);
     self.normalScheduleWindow.releasedWhenClosed = NO;
     self.normalScheduleWindow.level = NSFloatingWindowLevel;
-    [self.normalScheduleWindow setSharingType:NSWindowSharingNone];
+    [self.normalScheduleWindow setSharingType:InterWindowSharingType()];
     [self.normalScheduleWindow setAppearance:[NSAppearance appearanceNamed:NSAppearanceNameDarkAqua]];
     self.normalScheduleWindow.contentView = self.normalSchedulePanel;
     [self.normalScheduleWindow makeKeyAndOrderFront:nil];
@@ -1529,9 +1530,13 @@ didRequestDeleteTeamId:(NSString *)teamId {
                                     defer:NO];
     [self.loginWindow center];
     [self.loginWindow setTitle:@"Inter — Sign In"];
-    [self.loginWindow setBackgroundColor:[NSColor colorWithWhite:0.1 alpha:1.0]];
     [self.loginWindow setDelegate:self];
     [self.loginWindow setMinSize:NSMakeSize(460.0, 560.0)];
+    // Theme the title bar to the app surface so it matches the SwiftUI content in BOTH
+    // appearances. The card token is dynamic, so when the in-screen light/dark toggle
+    // updates the window's appearance, the title bar re-resolves with it. (Keeps the
+    // visible title + close button — unlike utility panels which hide them.)
+    [InterWindowChrome applyWindowTitlebarThemeTo:self.loginWindow];
 
     NSView *contentView = self.loginWindow.contentView;
     contentView.wantsLayer = YES;
@@ -2231,16 +2236,20 @@ didRequestDeleteTeamId:(NSString *)teamId {
     [self.lobbyWaitingView showJoining]; // "Joining Meeting..." state
 
     self.lobbyWaitingWindow = [[NSWindow alloc] initWithContentRect:NSMakeRect(x, y, w, h)
-                                                          styleMask:(NSWindowStyleMaskTitled |
-                                                                     NSWindowStyleMaskClosable)
+                                                          styleMask:(NSWindowStyleMaskTitled)
                                                             backing:NSBackingStoreBuffered
                                                               defer:NO];
     self.lobbyWaitingWindow.title = @"Joining Meeting";
     self.lobbyWaitingWindow.releasedWhenClosed = NO;
     self.lobbyWaitingWindow.level = NSFloatingWindowLevel;
-    [self.lobbyWaitingWindow setSharingType:NSWindowSharingNone];
+    [self.lobbyWaitingWindow setSharingType:InterWindowSharingType()];
     [self.lobbyWaitingWindow setAppearance:[NSAppearance appearanceNamed:NSAppearanceNameDarkAqua]];
     self.lobbyWaitingWindow.contentView = self.lobbyWaitingView;
+    // Theme the title bar to the app surface, and remove the window buttons: the waiting
+    // room is a blocking flow — the ONLY way out is the in-content "Leave" button, which
+    // tells the server so the host's lobby list updates. (No stray red close button.)
+    [InterWindowChrome applyPanelChromeTo:self.lobbyWaitingWindow];
+    [InterWindowChrome hideStandardButtons:self.lobbyWaitingWindow];
     [self.lobbyWaitingWindow makeKeyAndOrderFront:nil];
 }
 
@@ -2353,7 +2362,7 @@ didRequestDeleteTeamId:(NSString *)teamId {
 
     [self.normalCallWindow center];
     [self.normalCallWindow setTitle:title];
-    [self.normalCallWindow setSharingType:NSWindowSharingNone];
+    [self.normalCallWindow setSharingType:InterWindowSharingType()];
     [self.normalCallWindow setDelegate:self];
 
     NSView *view = self.normalCallWindow.contentView;
@@ -2509,7 +2518,7 @@ didRequestDeleteTeamId:(NSString *)teamId {
         self.normalPollWindow.minSize = NSMakeSize(280, 320);
         self.normalPollWindow.releasedWhenClosed = NO;
         self.normalPollWindow.level = NSFloatingWindowLevel;
-        [self.normalPollWindow setSharingType:NSWindowSharingNone];
+        [self.normalPollWindow setSharingType:InterWindowSharingType()];
         [self.normalPollWindow setAppearance:[NSAppearance appearanceNamed:NSAppearanceNameDarkAqua]];
 
         self.normalPollPanel = [[InterPollPanel alloc] initWithFrame:NSMakeRect(0, 0, pollW, pollH)];
@@ -2545,7 +2554,7 @@ didRequestDeleteTeamId:(NSString *)teamId {
         self.normalQAWindow.minSize = NSMakeSize(280, 320);
         self.normalQAWindow.releasedWhenClosed = NO;
         self.normalQAWindow.level = NSFloatingWindowLevel;
-        [self.normalQAWindow setSharingType:NSWindowSharingNone];
+        [self.normalQAWindow setSharingType:InterWindowSharingType()];
         [self.normalQAWindow setAppearance:[NSAppearance appearanceNamed:NSAppearanceNameDarkAqua]];
 
         self.normalQAPanel = [[InterQAPanel alloc] initWithFrame:NSMakeRect(0, 0, qaW, qaH)];
@@ -3041,11 +3050,17 @@ didRequestDeleteTeamId:(NSString *)teamId {
 
 - (NSString *)normalMediaStateSummary {
     BOOL cameraOn = self.normalMediaController.isCameraEnabled;
-    // When connected the mic toggle only mutes the LiveKit track and
-    // does NOT touch InterLocalMediaController, so isMicrophoneEnabled
-    // stays YES. Use the wiring controller's network mute flag instead.
-    BOOL microphoneOn = self.normalMediaController.isMicrophoneEnabled
-                        && !self.normalMediaWiring.isMicNetworkMuted;
+    // Mic truth depends on connection state (F3 — single source of truth):
+    //   • Connected: the LiveKit track IS the mic. isMicNetworkMuted is the only
+    //     authority. We must NOT AND-in isMicrophoneEnabled (the AVCaptureSession audio
+    //     input, which feeds recording/share, not the call). mute-on-join disables that
+    //     input at join, so the old `isMicrophoneEnabled && !isMicNetworkMuted` reported
+    //     "Mic off" even after the participant unmuted and the LiveKit track went live.
+    //   • Offline/pre-connect: no LiveKit track yet, so isMicrophoneEnabled is the truth.
+    BOOL connected = (self.roomController.connectionState == InterRoomConnectionStateConnected);
+    BOOL microphoneOn = connected
+        ? !self.normalMediaWiring.isMicNetworkMuted
+        : self.normalMediaController.isMicrophoneEnabled;
     return [NSString stringWithFormat:@"Camera %@, Mic %@.",
             cameraOn ? @"on" : @"off",
             microphoneOn ? @"on" : @"off"];
@@ -4091,9 +4106,11 @@ didRequestDeleteTeamId:(NSString *)teamId {
 
 - (void)toggleNormalLobbyPanel {
     if (!self.normalLobbyWindow) {
-        // Create lobby panel next to the control bar
-        CGFloat panelWidth = 280;
-        CGFloat panelHeight = 320;
+        // Create lobby panel next to the control bar. Sized to comfortably fit the SwiftUI
+        // content (header actions + rows) so labels don't truncate/wrap; minSize keeps it
+        // usable when the host resizes it down.
+        CGFloat panelWidth = 400;
+        CGFloat panelHeight = 480;
         NSRect windowFrame = self.normalCallWindow.frame;
         CGFloat x = NSMaxX(windowFrame) - panelWidth - 12;
         CGFloat y = windowFrame.origin.y + 100;
@@ -4113,12 +4130,15 @@ didRequestDeleteTeamId:(NSString *)teamId {
                                                                backing:NSBackingStoreBuffered
                                                                  defer:NO];
         self.normalLobbyWindow.title = @"Waiting Room";
-        self.normalLobbyWindow.minSize = NSMakeSize(220, 200);
+        self.normalLobbyWindow.minSize = NSMakeSize(360, 300);
         self.normalLobbyWindow.releasedWhenClosed = NO;
         self.normalLobbyWindow.level = NSFloatingWindowLevel;
-        [self.normalLobbyWindow setSharingType:NSWindowSharingNone];
+        [self.normalLobbyWindow setSharingType:InterWindowSharingType()];
         [self.normalLobbyWindow setAppearance:[NSAppearance appearanceNamed:NSAppearanceNameDarkAqua]];
         self.normalLobbyWindow.contentView = self.normalLobbyPanel;
+        // Theme the title bar to the app surface (transparent bar + surface fill) so it
+        // matches the panel content instead of the default system gray.
+        [InterWindowChrome applyPanelChromeTo:self.normalLobbyWindow];
 
         // Populate with any participants who joined the lobby before the panel was opened
         NSArray<NSDictionary<NSString *, NSString *> *> *waiting = self.moderationController.lobbyWaitingParticipants;
@@ -4386,7 +4406,37 @@ didRequestDeleteTeamId:(NSString *)teamId {
 
 - (void)lobbyWaitingViewDidCancel:(InterLobbyWaitingView *)view {
 #pragma unused(view)
+    // Tell the server we're withdrawing so the host's lobby list drops us (best-effort,
+    // fire-and-forget — the window closes immediately regardless of the network result).
+    // Only meaningful once we're actually queued (waiting state has a pollToken); in the
+    // pre-queue "joining" state there's nothing to leave server-side.
+    [self _leaveLobbyOnServerBestEffort];
     [self _dismissJoiningOverlay];
+}
+
+/// POST /room/lobby/leave with our per-join pollToken. Mirrors the participant-side
+/// lobby-status poll (raw URLSession + x-poll-token header; the waiter may be anonymous).
+- (void)_leaveLobbyOnServerBestEffort {
+    NSString *code      = self.lobbyRoomCode;
+    NSString *identity  = self.lobbyIdentity;
+    NSString *pollToken = self.lobbyPollToken;
+    NSString *tokenURL  = self.lobbyTokenServerURL;
+    if (!code || !identity || !pollToken || !tokenURL) return; // not queued yet → nothing to leave
+
+    NSURL *url = [NSURL URLWithString:[NSString stringWithFormat:@"%@/room/lobby/leave", tokenURL]];
+    if (!url) return;
+    NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:url];
+    request.HTTPMethod = @"POST";
+    [request setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
+    [request setValue:pollToken forHTTPHeaderField:@"x-poll-token"];
+    [request setTimeoutInterval:10.0];
+    NSDictionary *body = @{ @"roomCode": code, @"identity": identity };
+    request.HTTPBody = [NSJSONSerialization dataWithJSONObject:body options:0 error:nil];
+
+    [[[NSURLSession sharedSession] dataTaskWithRequest:request
+                                     completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
+        if (e) NSLog(@"[Lobby] leave best-effort failed: %@", e.localizedDescription);
+    }] resume];
 }
 
 // MARK: - Phase 9 — Host-Side Lobby Polling
@@ -4622,16 +4672,14 @@ didRequestDeleteTeamId:(NSString *)teamId {
         }
         dispatch_async(dispatch_get_main_queue(), ^{
             [weakSelf.moderationController muteCameraAll];
-            // The DataChannel signal is filtered on own-send, so update every remote
-            // tile's lock badge directly (same reasoning as the per-tile lockCamera).
-            NSArray<NSDictionary<NSString *, NSString *> *> *participants =
-                [weakSelf.roomController remoteParticipantList];
-            for (NSDictionary<NSString *, NSString *> *p in participants) {
-                NSString *identity = p[@"identity"];
-                if (identity.length > 0) {
-                    [weakSelf.normalRemoteLayout setIsHostCameraLocked:YES forParticipant:identity];
-                }
-            }
+            // Lock-All is a ROOM-WIDE cause, distinct from a per-tile camera lock. Set the
+            // layout's globalCameraLockActive so the cause-derived camera menu shows
+            // "Allow Camera" on lock-all'd participants (NOT "Remove Lock"). Do NOT stamp
+            // isHostCameraLocked on every tile — that would mislabel everyone as individually
+            // locked. Individually-locked tiles keep their own isHostCameraLocked (lock wins
+            // over lock-all in the precedence), so their menu stays correct. (Mirror of the
+            // mic moderationMuteAll fix.)
+            weakSelf.normalRemoteLayout.globalCameraLockActive = YES;
             // Any pending camera-unlock requests are moot now that all cameras are locked.
             [weakSelf.cameraUnlockQueue reset];
             [weakSelf.normalCameraUnlockQueuePanel setEntries:weakSelf.cameraUnlockQueue.entries];
@@ -4650,14 +4698,9 @@ didRequestDeleteTeamId:(NSString *)teamId {
         }
         dispatch_async(dispatch_get_main_queue(), ^{
             [weakSelf.moderationController liftCameraLockAll];
-            NSArray<NSDictionary<NSString *, NSString *> *> *participants =
-                [weakSelf.roomController remoteParticipantList];
-            for (NSDictionary<NSString *, NSString *> *p in participants) {
-                NSString *identity = p[@"identity"];
-                if (identity.length > 0) {
-                    [weakSelf.normalRemoteLayout setIsHostCameraLocked:NO forParticipant:identity];
-                }
-            }
+            // Clear the room-wide lock-all cause; individually-locked tiles keep their own
+            // isHostCameraLocked (per-tile lock persists). Mirror of moderationUnmuteAll.
+            weakSelf.normalRemoteLayout.globalCameraLockActive = NO;
         });
     }];
 }
@@ -4768,20 +4811,17 @@ didRequestDeleteTeamId:(NSString *)teamId {
             [self.moderationController askToUnmuteWithIdentity:participantIdentity];
         }
 
-    } else if ([actionType isEqualToString:@"removeMuteAndAsk"]) {
-        // Host-muted participant. One click: lift the host block, then invite. The lift
-        // (requestUnmuteOne) is lift-only in normal mode (participant taps to turn on) and
-        // force-on in interview mode. Keep the hostMutedParticipants set in sync (P3).
-        BOOL interview = [self.roomController.roomType isEqualToString:@"interview"];
+    } else if ([actionType isEqualToString:@"removeMute"]) {
+        // Host-muted participant. Lift the host block ONLY (requestUnmuteOne): lift-only in
+        // normal mode (participant's button re-enables; they tap to turn on) and force-on in
+        // interview mode. We deliberately do NOT auto-send a consent request — removing the
+        // block already gives them the ability, and an unsolicited nudge is poor UX. If the
+        // host wants to nudge, the cause is now self-muted so the menu offers "Ask to Unmute"
+        // as a separate step. Keep the hostMutedParticipants set in sync (P3).
         [self.moderationController unmuteParticipantWithIdentity:participantIdentity];
         [self.normalRemoteLayout setHostMuted:NO forParticipant:participantIdentity];
         [self.hostMutedParticipants removeObject:participantIdentity];
         self.normalSpeakerQueuePanel.hostMutedIdentities = [self.hostMutedParticipants copy];
-        if (!interview) {
-            // Normal mode: the lift only re-enables their button; send the consent ask so
-            // they know to turn their mic on. Interview mode already force-turned it on.
-            [self.moderationController askToUnmuteWithIdentity:participantIdentity];
-        }
 
     } else if ([actionType isEqualToString:@"lockCamera"]) {
         // "Mute Camera" — persist lock to Redis FIRST for durability, then send DataChannel signal.
@@ -5826,6 +5866,15 @@ didRequestDeleteTeamId:(NSString *)teamId {
     }
 }
 
+- (void)moderationController:(InterModerationController *)controller lobbyParticipantLeft:(NSString *)identity {
+#pragma unused(controller)
+    // A waiter withdrew (or was admitted/denied out-of-band) — drop their row so the host's
+    // panel converges with the server. Safe if the row is already gone (no-op).
+    if (self.normalLobbyPanel) {
+        [self.normalLobbyPanel removeWaitingParticipant:identity];
+    }
+}
+
 #pragma mark - Recording (Phase 10)
 
 - (void)handleRecordToggle {
@@ -6018,7 +6067,7 @@ didRequestDeleteTeamId:(NSString *)teamId {
         self.normalRecordingListWindow.minSize = NSMakeSize(280, 260);
         self.normalRecordingListWindow.releasedWhenClosed = NO;
         self.normalRecordingListWindow.level = NSFloatingWindowLevel;
-        [self.normalRecordingListWindow setSharingType:NSWindowSharingNone];
+        [self.normalRecordingListWindow setSharingType:InterWindowSharingType()];
         [self.normalRecordingListWindow setAppearance:[NSAppearance appearanceNamed:NSAppearanceNameDarkAqua]];
         self.normalRecordingListWindow.contentView = self.normalRecordingListPanel;
 
@@ -6165,7 +6214,7 @@ didRequestDeleteTeamId:(NSString *)teamId {
                                       backing:NSBackingStoreBuffered
                                         defer:NO];
     [self.settingsWindow setTitle:@"Settings"];
-    [self.settingsWindow setSharingType:NSWindowSharingNone];
+    [self.settingsWindow setSharingType:InterWindowSharingType()];
     [self.settingsWindow setReleasedWhenClosed:NO];
 
     NSView *cv = self.settingsWindow.contentView;
@@ -6387,7 +6436,7 @@ didRequestDeleteTeamId:(NSString *)teamId {
                                                           backing:NSBackingStoreBuffered
                                                             defer:NO];
         [self.teamsWindow setTitle:@"Teams"];
-        [self.teamsWindow setSharingType:NSWindowSharingNone];
+        [self.teamsWindow setSharingType:InterWindowSharingType()];
         [self.teamsWindow setReleasedWhenClosed:NO];
         [self.teamsWindow setContentView:self.teamsPanel];
         [self.teamsWindow setDelegate:self];
@@ -6433,7 +6482,7 @@ didRequestDeleteTeamId:(NSString *)teamId {
                                                             backing:NSBackingStoreBuffered
                                                               defer:NO];
         [self.accountWindow setTitle:@"Account Settings"];
-        [self.accountWindow setSharingType:NSWindowSharingNone];
+        [self.accountWindow setSharingType:InterWindowSharingType()];
         [self.accountWindow setReleasedWhenClosed:NO];
         [self.accountWindow setContentView:self.accountPanel];
         [self.accountWindow setDelegate:self];

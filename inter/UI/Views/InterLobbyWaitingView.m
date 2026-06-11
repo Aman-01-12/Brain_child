@@ -2,194 +2,62 @@
 // InterLobbyWaitingView.m
 // inter
 //
-// Participant-side waiting room view — shown when lobby is enabled.
-// Displays a spinner, position, status message, and cancel button.
+// Participant-side waiting room — now SwiftUI (`LobbyWaitingView`), hosted via the Swift
+// `InterLobbyWaitingBridgeView`. This is a thin Obj-C shell preserving the original public
+// API + `InterLobbyWaitingViewDelegate` so `AppDelegate`'s polling/admission flow is unchanged.
 //
-// ISOLATION INVARIANT [G8]:
-// This view has NO side effects on networking or media.
-// All actions are reported via the delegate protocol.
+// ISOLATION INVARIANT [G8]: still has NO side effects on networking or media — all actions
+// are reported via the delegate protocol (cancel).
 // ============================================================================
 
 #import "InterLobbyWaitingView.h"
 
+#if __has_include("inter-Swift.h")
+#import "inter-Swift.h"
+#endif
+
 @interface InterLobbyWaitingView ()
-@property (nonatomic, strong) NSProgressIndicator *spinner;
-@property (nonatomic, strong) NSTextField *titleLabel;
-@property (nonatomic, strong) NSTextField *statusLabel;
-@property (nonatomic, strong) NSTextField *positionLabel;
-@property (nonatomic, strong) NSButton    *cancelButton;
-@property (nonatomic, strong) NSImageView *iconView;
+@property (nonatomic, strong) InterLobbyWaitingBridgeView *bridge;
 @end
 
 @implementation InterLobbyWaitingView
 
 - (instancetype)initWithFrame:(NSRect)frameRect {
     self = [super initWithFrame:frameRect];
-    if (self) {
-        [self _setupUI];
-    }
+    if (!self) return nil;
+    [self buildBridge];
     return self;
 }
 
-- (void)_setupUI {
-    self.wantsLayer = YES;
-    self.layer.backgroundColor = [[NSColor colorWithWhite:0.10 alpha:1.0] CGColor];
+- (void)buildBridge {
+    self.bridge = [[InterLobbyWaitingBridgeView alloc] initWithFrame:self.bounds];
+    self.bridge.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
 
-    // Icon — lock/waiting indicator
-    NSImage *lockImage = [NSImage imageWithSystemSymbolName:@"person.badge.clock"
-                                  accessibilityDescription:@"Waiting"];
-    _iconView = [NSImageView imageViewWithImage:lockImage ?: [NSImage imageNamed:NSImageNameCaution]];
-    _iconView.translatesAutoresizingMaskIntoConstraints = NO;
-    _iconView.contentTintColor = [NSColor systemBlueColor];
-    _iconView.symbolConfiguration = [NSImageSymbolConfiguration configurationWithPointSize:48 weight:NSFontWeightLight];
-    [self addSubview:_iconView];
+    __weak typeof(self) weakSelf = self;
+    self.bridge.onCancel = ^{
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf) return;
+        if ([strongSelf.delegate respondsToSelector:@selector(lobbyWaitingViewDidCancel:)]) {
+            [strongSelf.delegate lobbyWaitingViewDidCancel:strongSelf];
+        }
+    };
 
-    // Title
-    _titleLabel = [NSTextField labelWithString:@"Waiting Room"];
-    _titleLabel.font = [NSFont boldSystemFontOfSize:22];
-    _titleLabel.textColor = [NSColor whiteColor];
-    _titleLabel.alignment = NSTextAlignmentCenter;
-    _titleLabel.translatesAutoresizingMaskIntoConstraints = NO;
-    [self addSubview:_titleLabel];
-
-    // Status message
-    _statusLabel = [NSTextField labelWithString:@"Please wait, the host will let you in shortly."];
-    _statusLabel.font = [NSFont systemFontOfSize:14];
-    _statusLabel.textColor = [NSColor secondaryLabelColor];
-    _statusLabel.alignment = NSTextAlignmentCenter;
-    _statusLabel.lineBreakMode = NSLineBreakByWordWrapping;
-    _statusLabel.maximumNumberOfLines = 3;
-    _statusLabel.preferredMaxLayoutWidth = 300;
-    _statusLabel.translatesAutoresizingMaskIntoConstraints = NO;
-    [self addSubview:_statusLabel];
-
-    // Position label
-    _positionLabel = [NSTextField labelWithString:@""];
-    _positionLabel.font = [NSFont monospacedDigitSystemFontOfSize:13 weight:NSFontWeightMedium];
-    _positionLabel.textColor = [NSColor tertiaryLabelColor];
-    _positionLabel.alignment = NSTextAlignmentCenter;
-    _positionLabel.translatesAutoresizingMaskIntoConstraints = NO;
-    _positionLabel.hidden = YES;
-    [self addSubview:_positionLabel];
-
-    // Spinner
-    _spinner = [[NSProgressIndicator alloc] init];
-    _spinner.style = NSProgressIndicatorStyleSpinning;
-    _spinner.controlSize = NSControlSizeRegular;
-    _spinner.translatesAutoresizingMaskIntoConstraints = NO;
-    [_spinner startAnimation:nil];
-    [self addSubview:_spinner];
-
-    // Cancel button
-    _cancelButton = [NSButton buttonWithTitle:@"Leave" target:self action:@selector(_cancelClicked:)];
-    _cancelButton.translatesAutoresizingMaskIntoConstraints = NO;
-    _cancelButton.bezelStyle = NSBezelStyleRounded;
-    _cancelButton.controlSize = NSControlSizeRegular;
-    _cancelButton.contentTintColor = [NSColor systemRedColor];
-    [self addSubview:_cancelButton];
-
-    // Layout — centered vertically
-    [NSLayoutConstraint activateConstraints:@[
-        [_iconView.centerXAnchor constraintEqualToAnchor:self.centerXAnchor],
-        [_iconView.bottomAnchor constraintEqualToAnchor:_titleLabel.topAnchor constant:-16],
-        [_iconView.widthAnchor constraintEqualToConstant:56],
-        [_iconView.heightAnchor constraintEqualToConstant:56],
-
-        [_titleLabel.centerXAnchor constraintEqualToAnchor:self.centerXAnchor],
-        [_titleLabel.centerYAnchor constraintEqualToAnchor:self.centerYAnchor constant:-40],
-
-        [_statusLabel.centerXAnchor constraintEqualToAnchor:self.centerXAnchor],
-        [_statusLabel.topAnchor constraintEqualToAnchor:_titleLabel.bottomAnchor constant:10],
-        [_statusLabel.widthAnchor constraintLessThanOrEqualToConstant:320],
-
-        [_positionLabel.centerXAnchor constraintEqualToAnchor:self.centerXAnchor],
-        [_positionLabel.topAnchor constraintEqualToAnchor:_statusLabel.bottomAnchor constant:8],
-
-        [_spinner.centerXAnchor constraintEqualToAnchor:self.centerXAnchor],
-        [_spinner.topAnchor constraintEqualToAnchor:_positionLabel.bottomAnchor constant:16],
-
-        [_cancelButton.centerXAnchor constraintEqualToAnchor:self.centerXAnchor],
-        [_cancelButton.topAnchor constraintEqualToAnchor:_spinner.bottomAnchor constant:24],
-        [_cancelButton.widthAnchor constraintGreaterThanOrEqualToConstant:100],
-    ]];
+    [self addSubview:self.bridge];
 }
 
-// ---------------------------------------------------------------------------
-// MARK: - Public API
-// ---------------------------------------------------------------------------
+// MARK: - Public API (forwarded to the SwiftUI bridge)
 
-- (void)showJoining {
-    self.titleLabel.stringValue = @"Joining Meeting";
-    self.titleLabel.textColor   = [NSColor whiteColor];
-    self.statusLabel.stringValue = @"Connecting to the meeting\u2026";
-    self.positionLabel.hidden   = YES;
-    NSImage *img = [NSImage imageWithSystemSymbolName:@"video.fill"
-                               accessibilityDescription:@"Joining"];
-    if (img) self.iconView.image = img;
-    self.iconView.contentTintColor = [NSColor systemBlueColor];
-    [self.spinner startAnimation:nil];
-    self.spinner.hidden      = NO;
-    self.cancelButton.hidden = NO;
-    [self.cancelButton setTitle:@"Cancel"];
-}
-
-- (void)showWaiting {
-    self.titleLabel.stringValue  = @"Waiting Room";
-    self.titleLabel.textColor    = [NSColor whiteColor];
-    self.statusLabel.stringValue = @"Please wait, the host will let you in shortly.";
-    NSImage *img = [NSImage imageWithSystemSymbolName:@"person.badge.clock"
-                               accessibilityDescription:@"Waiting"];
-    if (img) self.iconView.image = img;
-    self.iconView.contentTintColor = [NSColor systemBlueColor];
-    [self.spinner startAnimation:nil];
-    self.spinner.hidden      = NO;
-    self.cancelButton.hidden = NO;
-    [self.cancelButton setTitle:@"Leave"];
-}
+- (void)showJoining { [self.bridge showJoining]; }
+- (void)showWaiting { [self.bridge showWaiting]; }
+- (void)showDenied  { [self.bridge showDenied]; }
+- (void)showAdmitted { [self.bridge showAdmitted]; }
 
 - (void)setPosition:(NSInteger)position {
-    if (position > 0) {
-        self.positionLabel.hidden = NO;
-        self.positionLabel.stringValue = [NSString stringWithFormat:@"Your position in queue: %ld", (long)position];
-    } else {
-        self.positionLabel.hidden = YES;
-    }
+    [self.bridge setPosition:position];
 }
 
 - (void)setStatusMessage:(NSString *)message {
-    self.statusLabel.stringValue = message ?: @"";
-}
-
-- (void)showDenied {
-    [self.spinner stopAnimation:nil];
-    self.spinner.hidden = YES;
-    self.titleLabel.stringValue = @"Access Denied";
-    self.titleLabel.textColor = [NSColor systemRedColor];
-    self.statusLabel.stringValue = @"The host has denied your request to join this meeting.";
-    self.positionLabel.hidden = YES;
-    self.iconView.contentTintColor = [NSColor systemRedColor];
-    [self.cancelButton setTitle:@"OK"];
-}
-
-- (void)showAdmitted {
-    [self.spinner stopAnimation:nil];
-    self.spinner.hidden = YES;
-    self.titleLabel.stringValue = @"You're In!";
-    self.titleLabel.textColor = [NSColor systemGreenColor];
-    self.statusLabel.stringValue = @"The host has admitted you. Connecting…";
-    self.positionLabel.hidden = YES;
-    self.iconView.contentTintColor = [NSColor systemGreenColor];
-    self.cancelButton.hidden = YES;
-}
-
-// ---------------------------------------------------------------------------
-// MARK: - Actions
-// ---------------------------------------------------------------------------
-
-- (void)_cancelClicked:(id)sender {
-    if ([self.delegate respondsToSelector:@selector(lobbyWaitingViewDidCancel:)]) {
-        [self.delegate lobbyWaitingViewDidCancel:self];
-    }
+    [self.bridge setStatusMessage:message ?: @""];
 }
 
 @end

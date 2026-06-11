@@ -50,6 +50,10 @@ static NSString *const kInterPreferGridLayoutKey = @"InterPreferGridLayout";
 /// Room-wide: whether a global Mute-All is active. Fed into the cause-derived menu
 /// (InterModerationTileState.deriveMic) so the mic action reflects mute-all correctly.
 @property (nonatomic, assign) BOOL globalMuteActive;
+/// Room-wide: whether a global camera Lock-All is active. Fed into the cause-derived camera
+/// menu (deriveCamera) so the camera action reflects lock-all (PR #2). Distinct from the
+/// per-tile isHostCameraLocked, exactly as globalMuteActive is distinct from isHostMuted.
+@property (nonatomic, assign) BOOL globalCameraLockActive;
 /// Room-wide: whether this is an interview room. In interview mode the host may
 /// force-activate, so the primary action reads a direct "Unmute".
 @property (nonatomic, assign) BOOL interviewMode;
@@ -58,6 +62,10 @@ static NSString *const kInterPreferGridLayoutKey = @"InterPreferGridLayout";
 /// Always visible (no menu open needed); hidden for non-hosts, the host's own tile, and
 /// when the mic is live. Updated by -updateMicCaption.
 @property (nonatomic, strong) NSTextField *micCaptionLabel;
+/// Host-only glanceable caption showing WHY this participant's camera is off (self /
+/// locked-by-host / lock-all), the camera mirror of micCaptionLabel (PR #2). Stacked just
+/// above the mic caption. Hidden for non-hosts, the host's own tile, and when camera is on.
+@property (nonatomic, strong) NSTextField *camCaptionLabel;
 /// Whether this participant's camera is currently muted (updated by track events).
 @property (nonatomic, assign) BOOL isCameraMuted;
 /// When YES this tile is the current host-forced spotlight. The three-dot menu
@@ -189,6 +197,22 @@ static NSString *const kInterPreferGridLayoutKey = @"InterPreferGridLayout";
     self.micCaptionLabel.hidden = YES;
     [self addSubview:self.micCaptionLabel];
 
+    // Host-only camera cause caption — mirror of micCaptionLabel (PR #2), stacked just
+    // above it. Shows "Camera off" / "Locked by you" / "Locked (lock-all)" from the same
+    // deriveCamera cause as the camera menu action. Hidden by default.
+    self.camCaptionLabel = [NSTextField labelWithString:@""];
+    self.camCaptionLabel.font = [NSFont systemFontOfSize:9 weight:NSFontWeightSemibold];
+    self.camCaptionLabel.textColor = [NSColor whiteColor];
+    self.camCaptionLabel.alignment = NSTextAlignmentCenter;
+    self.camCaptionLabel.lineBreakMode = NSLineBreakByTruncatingTail;
+    self.camCaptionLabel.maximumNumberOfLines = 1;
+    self.camCaptionLabel.drawsBackground = NO;
+    self.camCaptionLabel.wantsLayer = YES;
+    self.camCaptionLabel.layer.backgroundColor = [NSColor colorWithWhite:0.0 alpha:0.6].CGColor;
+    self.camCaptionLabel.layer.cornerRadius = 4.0;
+    self.camCaptionLabel.hidden = YES;
+    [self addSubview:self.camCaptionLabel];
+
     // Mic-muted indicator — bottom-right corner, shown when the participant's
     // microphone track is muted. Secondary indicator; does not affect host
     // controls (the three-dot menu label uses isHostMuted exclusively).
@@ -288,12 +312,14 @@ static NSString *const kInterPreferGridLayoutKey = @"InterPreferGridLayout";
     if (_showsModerationMenu == showsModerationMenu) return;
     _showsModerationMenu = showsModerationMenu;
     [self updateMicCaption];
+    [self updateCamCaption];
 }
 
 - (void)setIsHostParticipant:(BOOL)isHostParticipant {
     if (_isHostParticipant == isHostParticipant) return;
     _isHostParticipant = isHostParticipant;
     [self updateMicCaption];
+    [self updateCamCaption];
 }
 
 /// Recompute the host-only mic cause caption from deriveMic. Shown only to hosts
@@ -321,6 +347,40 @@ static NSString *const kInterPreferGridLayoutKey = @"InterPreferGridLayout";
     [self setNeedsLayout:YES];
 }
 
+// The camera caption + camera menu action are both pure functions of (cameraOff,
+// isHostCameraLocked, globalCameraLockActive) via deriveCamera (PR #2), so any change to
+// those inputs recomputes the caption.
+- (void)setGlobalCameraLockActive:(BOOL)globalCameraLockActive {
+    if (_globalCameraLockActive == globalCameraLockActive) return;
+    _globalCameraLockActive = globalCameraLockActive;
+    [self updateCamCaption];
+}
+
+/// Recompute the host-only camera cause caption from deriveCamera. Shown only to hosts
+/// for moderatable tiles, and only when the camera is actually off — a live camera gets
+/// no caption. Mirrors -updateMicCaption.
+- (void)updateCamCaption {
+    BOOL eligible = self.showsModerationMenu && !self.isHostParticipant;
+    if (!eligible) {
+        if (!self.camCaptionLabel.hidden) { self.camCaptionLabel.hidden = YES; [self setNeedsLayout:YES]; }
+        return;
+    }
+    InterCamTileState *st =
+        [InterModerationTileState deriveCameraWithCameraReallyOff:self.cameraOff
+                                                       hostLocked:self.isHostCameraLocked
+                                                       globalLock:self.globalCameraLockActive
+                                                pendingSelfAction:NO
+                                                       askPending:NO
+                                                  isInterviewMode:self.interviewMode];
+    if (st.cause == InterCamCauseCamOn) {
+        if (!self.camCaptionLabel.hidden) { self.camCaptionLabel.hidden = YES; [self setNeedsLayout:YES]; }
+        return;
+    }
+    self.camCaptionLabel.stringValue = st.captionText;
+    self.camCaptionLabel.hidden = NO;
+    [self setNeedsLayout:YES];
+}
+
 - (void)setIsCoHost:(BOOL)isCoHost {
     if (_isCoHost == isCoHost) return;
     _isCoHost = isCoHost;
@@ -331,6 +391,7 @@ static NSString *const kInterPreferGridLayoutKey = @"InterPreferGridLayout";
     if (_isHostCameraLocked == isHostCameraLocked) return;
     _isHostCameraLocked = isHostCameraLocked;
     [self setBadge:self.cameraLockedBadge visible:isHostCameraLocked];
+    [self updateCamCaption];
 }
 
 /// Show/hide the avatar placeholder. When YES, the video view is hidden and the
@@ -338,6 +399,8 @@ static NSString *const kInterPreferGridLayoutKey = @"InterPreferGridLayout";
 - (void)setCameraOff:(BOOL)cameraOff {
     if (_cameraOff == cameraOff) return;
     _cameraOff = cameraOff;
+    // cameraOff is the participant's REAL camera state — recompute the host cause caption.
+    [self updateCamCaption];
 
     if (!cameraOff) {
         // Revealing video: prepare the display layer for new frames first.
@@ -411,6 +474,14 @@ static NSString *const kInterPreferGridLayoutKey = @"InterPreferGridLayout";
         CGFloat capW = MIN(self.micCaptionLabel.intrinsicContentSize.width + 12.0, b.size.width - 12.0);
         capW = MAX(capW, 0.0);
         self.micCaptionLabel.frame = NSMakeRect((b.size.width - capW) / 2.0, labelH + 3.0, capW, 15.0);
+    }
+    // Host-only camera cause caption: stacked just above the mic caption (or in its place
+    // when the mic caption is hidden), so the two never overlap.
+    if (!self.camCaptionLabel.hidden) {
+        CGFloat camCapW = MIN(self.camCaptionLabel.intrinsicContentSize.width + 12.0, b.size.width - 12.0);
+        camCapW = MAX(camCapW, 0.0);
+        CGFloat camCapY = self.micCaptionLabel.hidden ? (labelH + 3.0) : (labelH + 3.0 + 17.0);
+        self.camCaptionLabel.frame = NSMakeRect((b.size.width - camCapW) / 2.0, camCapY, camCapW, 15.0);
     }
     // Hand raise badge at top-left
     self.handRaiseBadge.frame = NSMakeRect(4, b.size.height - 28, 24, 24);
@@ -535,7 +606,7 @@ static NSString *const kInterPreferGridLayoutKey = @"InterPreferGridLayout";
     // TODO [Increment 2 — micPendingSelfAction]: pendingSelfAction/askPending are hard-coded
     // NO here (and in -updateMicCaption). To light up the "Off — can unmute" / "Asked to
     // unmute" captions (spec §3, Finding A), add a per-tile BOOL (e.g. tile.micAskPending)
-    // that AppDelegate sets when it sends askToUnmute / removeMuteAndAsk against an off mic
+    // that AppDelegate sets when it sends askToUnmute / removeMute against an off mic
     // (see handleTileModerationAction:), and clears when isMicMuted flips to NO or on
     // re-block / Mute-All. Then pass it here as pendingSelfAction: and askPending:.
     InterMicTileState *micState =
@@ -549,7 +620,7 @@ static NSString *const kInterPreferGridLayoutKey = @"InterPreferGridLayout";
     switch (micState.primaryAction) {
         case InterMicPrimaryActionMute:             micActionKey = @"muteMic";          break;
         case InterMicPrimaryActionAskToUnmute:      micActionKey = @"askToUnmute";      break;
-        case InterMicPrimaryActionRemoveMuteAndAsk: micActionKey = @"removeMuteAndAsk"; break;
+        case InterMicPrimaryActionRemoveMute:      micActionKey = @"removeMute";       break;
         case InterMicPrimaryActionAllowToSpeak:     micActionKey = @"allowToSpeak";     break;
     }
     addItem(micState.primaryActionTitle, micActionKey);
@@ -558,19 +629,30 @@ static NSString *const kInterPreferGridLayoutKey = @"InterPreferGridLayout";
         addItem(micState.secondaryActionTitle, @"blockMic");
     }
 
-    // Camera lock — unified "Mute Camera" (locks camera) / "Lift Camera Lock"
-    //
-    // TODO [PR #2 — camera cause-derived model]: port this to the same pattern as mic above.
-    // Add a camera half to InterModerationTileState (deriveCamera → cause + primary/secondary:
-    // "Stop Video" / "Ask to Turn On Camera" / "Remove Lock & Ask" / "Allow Camera" + "Lock
-    // camera" secondary), feed it cameraOff (real LiveKit state) + isHostCameraLocked +
-    // globalCameraLock + interviewMode, and add a camera cause caption (mirror -updateMicCaption).
-    // Then change the camera unlock semantics to lift-only (normal) / restore + indicator
-    // (interview), mirroring applyRemoteMicUnmute. See spec §4.2/§5/§7 PR #2.
-    if (self.isHostCameraLocked) {
-        addItem(@"Unmute Camera", @"liftCameraLock");
-    } else {
-        addItem(@"Mute Camera", @"lockCamera");
+    // Camera — single cause-derived action (+ optional secondary), mirror of mic (PR #2).
+    // cameraOff = the participant's REAL camera state (roster snapshot); isHostCameraLocked
+    // = the host's per-tile lock intent; globalCameraLockActive = a room-wide Lock-All.
+    // So "Stop Video" only ever appears when the camera is actually on, never beside a
+    // locked/off caption. (pendingSelfAction/askPending hard-coded NO here for now — same
+    // deferred per-tile flag as the mic side; see the mic TODO above.)
+    InterCamTileState *camState =
+        [InterModerationTileState deriveCameraWithCameraReallyOff:self.cameraOff
+                                                       hostLocked:self.isHostCameraLocked
+                                                       globalLock:self.globalCameraLockActive
+                                                pendingSelfAction:NO
+                                                       askPending:NO
+                                                  isInterviewMode:self.interviewMode];
+    NSString *camActionKey;
+    switch (camState.primaryAction) {
+        case InterCamPrimaryActionStopVideo:   camActionKey = @"stopCamera";  break;
+        case InterCamPrimaryActionAskToTurnOn: camActionKey = @"askToTurnOnCamera"; break;
+        case InterCamPrimaryActionRemoveLock:  camActionKey = @"removeCameraLock"; break;
+        case InterCamPrimaryActionAllowCamera: camActionKey = @"allowCamera"; break;
+    }
+    addItem(camState.primaryActionTitle, camActionKey);
+    if (camState.secondaryAction == InterCamSecondaryActionLockCamera) {
+        // Enforce-lock a camera already (self/globally) off, so they cannot self-enable.
+        addItem(camState.secondaryActionTitle, @"lockCamera");
     }
     [menu addItem:[NSMenuItem separatorItem]];
     // Pin/Unpin toggles.
@@ -938,6 +1020,13 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
     _globalMuteActive = globalMuteActive;
     for (NSString *key in self.tileViews) {
         self.tileViews[key].globalMuteActive = globalMuteActive;
+    }
+}
+
+- (void)setGlobalCameraLockActive:(BOOL)globalCameraLockActive {
+    _globalCameraLockActive = globalCameraLockActive;
+    for (NSString *key in self.tileViews) {
+        self.tileViews[key].globalCameraLockActive = globalCameraLockActive;
     }
 }
 
@@ -1346,6 +1435,7 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
         tile.localUserCanAssignCoHost = _localUserCanAssignCoHost;
         // Room-wide moderation facts feed the cause-derived mic menu on this tile.
         tile.globalMuteActive = _globalMuteActive;
+        tile.globalCameraLockActive = _globalCameraLockActive;
         tile.interviewMode = _interviewMode;
         // Restore camera-off (avatar placeholder) state so it survives tile recreation.
         // Default to YES (avatar) when the state is unknown — NEVER NO. A camera tile

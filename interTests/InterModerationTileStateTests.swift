@@ -64,11 +64,12 @@ final class InterModerationTileStateTests: XCTestCase {
 
     // MARK: - Host block
 
-    func test_hostMuted_offersRemoveMuteAndAsk() {
+    func test_hostMuted_offersRemoveMute() {
         let s = derive(reallyMuted: true, hostBlocked: true, globalMute: false)
         XCTAssertEqual(s.cause, .mutedByHost)
         XCTAssertEqual(s.captionText, "Muted by you")
-        XCTAssertEqual(s.primaryAction, .removeMuteAndAsk)
+        XCTAssertEqual(s.primaryAction, .removeMute)
+        XCTAssertEqual(s.primaryActionTitle, "Remove Mute")
         XCTAssertEqual(s.secondaryAction, .none)
     }
 
@@ -94,7 +95,7 @@ final class InterModerationTileStateTests: XCTestCase {
         let s = derive(reallyMuted: true, hostBlocked: true, globalMute: true)
         XCTAssertEqual(s.cause, .mutedByHost, "host block must win over mute-all")
         XCTAssertEqual(s.captionText, "Muted by you")
-        XCTAssertEqual(s.primaryAction, .removeMuteAndAsk)
+        XCTAssertEqual(s.primaryAction, .removeMute)
     }
 
     // MARK: - Enforce-block secondary availability
@@ -116,7 +117,7 @@ final class InterModerationTileStateTests: XCTestCase {
         XCTAssertEqual(self_.primaryAction, .askToUnmute)
         XCTAssertTrue(self_.activationForcesDevice)
 
-        // Host-muted: removeMuteAndAsk is an activation → forces in interview.
+        // Host-muted: removeMute is an activation → forces in interview.
         let hostMuted = derive(reallyMuted: true, hostBlocked: true, globalMute: false, interview: true)
         XCTAssertTrue(hostMuted.activationForcesDevice)
 
@@ -200,6 +201,111 @@ final class InterModerationTileStateTests: XCTestCase {
                                     XCTAssertEqual(s.primaryAction, .mute)
                                 }
                                 // Force only ever applies to activation actions, only in interview.
+                                if s.activationForcesDevice {
+                                    XCTAssertTrue(interview)
+                                    XCTAssertTrue(s.primaryAction.isActivation)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // MARK: - Camera (PR #2 — mirror of the mic matrix)
+
+    private func deriveCam(cameraReallyOff: Bool,
+                           hostLocked: Bool,
+                           globalLock: Bool,
+                           pendingSelfAction: Bool = false,
+                           askPending: Bool = false,
+                           interview: Bool = false) -> InterCamTileState {
+        InterModerationTileState.deriveCamera(cameraReallyOff: cameraReallyOff,
+                                              hostLocked: hostLocked,
+                                              globalLock: globalLock,
+                                              pendingSelfAction: pendingSelfAction,
+                                              askPending: askPending,
+                                              isInterviewMode: interview)
+    }
+
+    func test_cam_on_offersStopVideoOnly() {
+        let s = deriveCam(cameraReallyOff: false, hostLocked: false, globalLock: false)
+        XCTAssertEqual(s.cause, .camOn)
+        XCTAssertEqual(s.captionText, "Camera on")
+        XCTAssertEqual(s.primaryAction, .stopVideo)
+        XCTAssertEqual(s.secondaryAction, .none)
+    }
+
+    func test_cam_selfOff_offersAskToTurnOn_withLockSecondary() {
+        let s = deriveCam(cameraReallyOff: true, hostLocked: false, globalLock: false)
+        XCTAssertEqual(s.cause, .selfOff)
+        XCTAssertEqual(s.captionText, "Camera off")
+        XCTAssertEqual(s.primaryAction, .askToTurnOn)
+        XCTAssertEqual(s.secondaryAction, .lockCamera)
+    }
+
+    func test_cam_lockLifted_isOffCanTurnOn_notSelfOff() {
+        let s = deriveCam(cameraReallyOff: true, hostLocked: false, globalLock: false,
+                          pendingSelfAction: true)
+        XCTAssertEqual(s.cause, .offCanTurnOn)
+        XCTAssertEqual(s.captionText, "Off — can turn on")
+        XCTAssertEqual(s.primaryAction, .askToTurnOn)
+    }
+
+    func test_cam_lockedByHost_offersRemoveLock_noAsk() {
+        let s = deriveCam(cameraReallyOff: true, hostLocked: true, globalLock: false)
+        XCTAssertEqual(s.cause, .lockedByHost)
+        XCTAssertEqual(s.captionText, "Locked by you")
+        XCTAssertEqual(s.primaryAction, .removeLock)
+        XCTAssertEqual(s.primaryActionTitle, "Remove Lock")
+        XCTAssertEqual(s.secondaryAction, .none)
+    }
+
+    func test_cam_lockAll_offersAllowCamera_neverStopVideo() {
+        let s = deriveCam(cameraReallyOff: true, hostLocked: false, globalLock: true)
+        XCTAssertEqual(s.cause, .lockedByLockAll)
+        XCTAssertEqual(s.captionText, "Locked (lock-all)")
+        XCTAssertEqual(s.primaryAction, .allowCamera)
+        XCTAssertNotEqual(s.primaryAction, .stopVideo)
+        XCTAssertEqual(s.secondaryAction, .lockCamera)
+    }
+
+    func test_cam_precedence_hostLockWinsOverLockAll() {
+        let s = deriveCam(cameraReallyOff: true, hostLocked: true, globalLock: true)
+        XCTAssertEqual(s.cause, .lockedByHost)
+        XCTAssertEqual(s.primaryAction, .removeLock)
+    }
+
+    func test_cam_interviewMode_directTurnOnLabel_keepsLockSecondary() {
+        // Self-off interviewee in interview mode: activation force-restores → direct label.
+        let selfOff = deriveCam(cameraReallyOff: true, hostLocked: false, globalLock: false, interview: true)
+        XCTAssertTrue(selfOff.activationForcesDevice)
+        XCTAssertEqual(selfOff.primaryActionTitle, "Turn On Camera")
+        XCTAssertEqual(selfOff.secondaryAction, .lockCamera)
+        // Camera-on interviewee: Stop Video is a restriction, never a forced activation.
+        let live = deriveCam(cameraReallyOff: false, hostLocked: false, globalLock: false, interview: true)
+        XCTAssertEqual(live.primaryAction, .stopVideo)
+        XCTAssertFalse(live.activationForcesDevice)
+    }
+
+    func test_cam_invariant_stopVideoOnlyWhenLive_acrossAllInputs() {
+        for reallyOff in [true, false] {
+            for hostLocked in [true, false] {
+                for globalLock in [true, false] {
+                    for pending in [true, false] {
+                        for askPending in [true, false] {
+                            for interview in [true, false] {
+                                let s = deriveCam(cameraReallyOff: reallyOff, hostLocked: hostLocked,
+                                                  globalLock: globalLock, pendingSelfAction: pending,
+                                                  askPending: askPending, interview: interview)
+                                if s.primaryAction == .stopVideo {
+                                    XCTAssertEqual(s.cause, .camOn)
+                                    XCTAssertFalse(s.cause.isOff)
+                                }
+                                if s.cause == .camOn {
+                                    XCTAssertEqual(s.primaryAction, .stopVideo)
+                                }
                                 if s.activationForcesDevice {
                                     XCTAssertTrue(interview)
                                     XCTAssertTrue(s.primaryAction.isActivation)

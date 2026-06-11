@@ -79,10 +79,13 @@ import Foundation
     /// Send the consent affordance (no force-on). Used when the participant is
     /// self-muted / off-can-unmute.
     case askToUnmute = 1
-    /// Host-muted case only: one click lifts the host's block AND sends the consent
-    /// affordance. Still does not force the mic on (normal mode) — a deliberate,
-    /// scoped coupling of lift+ask justified because the host muted them.
-    case removeMuteAndAsk = 2
+    /// Host-muted case: lift the host's block ONLY. The participant can then toggle their
+    /// own mic if they want — we deliberately do NOT auto-send a request (that would be a
+    /// presumptuous nudge when the host may simply be restoring the ability). If the host
+    /// does want to nudge, the cause becomes self-muted after the lift and the menu then
+    /// offers "Ask to Unmute" as a separate step (keeps lift ≠ ask). In interview mode the
+    /// lift force-restores the mic (activation) per the ratified interview exception.
+    case removeMute = 2
     /// Mute-All case: grant a one-time speak slot (existing approve flow).
     case allowToSpeak = 3
 
@@ -91,17 +94,18 @@ import Foundation
         switch self {
         case .mute:             return "Mute Mic"
         case .askToUnmute:      return "Ask to Unmute"
-        case .removeMuteAndAsk: return "Remove Mute & Ask"
+        case .removeMute:       return "Remove Mute"
         case .allowToSpeak:     return "Allow to Speak"
         }
     }
 
     /// True for actions that aim to ACTIVATE the participant's mic (vs restrict it).
     /// Only these are force-executed in interview mode. `mute` is a restriction and
-    /// is never a forced activation.
+    /// is never a forced activation. `removeMute` lifts the block (no force in normal mode)
+    /// but force-restores in interview mode, so it counts as an activation.
     public var isActivation: Bool {
         switch self {
-        case .askToUnmute, .removeMuteAndAsk, .allowToSpeak: return true
+        case .askToUnmute, .removeMute, .allowToSpeak: return true
         case .mute: return false
         }
     }
@@ -144,8 +148,8 @@ import Foundation
 
     /// The primary button title. In interview mode an activation action force-turns the
     /// mic on, so it reads a direct **"Unmute"** rather than the consent-flow wording
-    /// ("Ask to Unmute" / "Remove Mute & Ask" / "Allow to Speak"). `mute` and all
-    /// normal-mode actions keep their own titles. (`activationForcesDevice` is exactly
+    /// ("Ask to Unmute" / "Remove Mute" / "Allow to Speak"). `mute` and all normal-mode
+    /// actions keep their own titles. (`activationForcesDevice` is exactly
     /// `interview && primaryAction.isActivation`.)
     @objc public var primaryActionTitle: String {
         activationForcesDevice ? "Unmute" : primaryAction.title
@@ -159,6 +163,135 @@ import Foundation
     init(cause: InterMicCause,
          primaryAction: InterMicPrimaryAction,
          secondaryAction: InterMicSecondaryAction,
+         activationForcesDevice: Bool) {
+        self.cause = cause
+        self.primaryAction = primaryAction
+        self.secondaryAction = secondaryAction
+        self.activationForcesDevice = activationForcesDevice
+        super.init()
+    }
+}
+
+// MARK: - Camera Cause (drives the caption) — PR #2, mirror of the mic half
+
+/// The single authoritative reason a participant's camera is in its current state,
+/// as seen by the host. Caption and primary action are both derived from this, so they
+/// can never contradict. Precedence (highest first): host lock → global lock-all → live
+/// → pending → self-off.
+@objc public enum InterCamCause: Int, CaseIterable {
+    /// Camera is live. The ONLY cause from which the primary action is "Stop Video".
+    case camOn = 0
+    /// The participant turned their own camera off and is not otherwise restricted.
+    case selfOff = 1
+    /// The host applied a per-tile camera lock to this participant.
+    case lockedByHost = 2
+    /// A global camera Lock-All is in effect (no individual host lock on this participant).
+    case lockedByLockAll = 3
+    /// The host lifted their lock (or the participant was invited) and the camera is still
+    /// off, awaiting the participant's own tap. NOT a self-off — labeling it "Camera off"
+    /// would lose the "permitted, hasn't acted" nuance (camera analogue of Finding A).
+    case offCanTurnOn = 4
+    /// Same as `offCanTurnOn`, but an "Ask to Turn On Camera" is currently pending.
+    case askedToTurnOn = 5
+
+    /// Host-facing caption. Default copy; final word-smithing is a UI-layer concern (spec §8).
+    public var captionText: String {
+        switch self {
+        case .camOn:          return "Camera on"
+        case .selfOff:        return "Camera off"
+        case .lockedByHost:   return "Locked by you"
+        case .lockedByLockAll: return "Locked (lock-all)"
+        case .offCanTurnOn:   return "Off — can turn on"
+        case .askedToTurnOn:  return "Asked to turn on"
+        }
+    }
+
+    /// Whether the camera is actually off in this cause. (`camOn` is the only live cause.)
+    public var isOff: Bool { self != .camOn }
+}
+
+// MARK: - Camera Primary Action
+
+/// The single primary camera action the host can take, derived from the same cause as the
+/// caption. No host action force-activates a camera in normal mode — see
+/// `activationForcesDevice` for the interview-mode exception.
+@objc public enum InterCamPrimaryAction: Int, CaseIterable {
+    /// Lock/turn off the camera. Reachable ONLY from `camOn`, so it never contradicts a
+    /// "Locked (…)" / "off" caption.
+    case stopVideo = 0
+    /// Send the consent affordance (no force-on). Used when the camera is self-off.
+    case askToTurnOn = 1
+    /// Host-locked case: lift the lock ONLY. The participant can then turn their own camera
+    /// on if they want — we deliberately do NOT auto-send a request (poor UX when not
+    /// needed). If the host wants to nudge, the cause becomes self-off after the lift and
+    /// the menu then offers "Ask to Turn On Camera" separately. In interview mode the lift
+    /// force-restores the camera per the ratified interview exception.
+    case removeLock = 2
+    /// Lock-All case: grant a one-time camera slot (existing approve flow).
+    case allowCamera = 3
+
+    /// Default button title. Final word-smithing is a UI-layer concern (spec §8).
+    public var title: String {
+        switch self {
+        case .stopVideo:    return "Stop Video"
+        case .askToTurnOn:  return "Ask to Turn On Camera"
+        case .removeLock:   return "Remove Lock"
+        case .allowCamera:  return "Allow Camera"
+        }
+    }
+
+    /// True for actions that aim to ACTIVATE the camera (vs restrict it). Only these are
+    /// force-executed in interview mode. `stopVideo` is a restriction.
+    public var isActivation: Bool {
+        switch self {
+        case .askToTurnOn, .removeLock, .allowCamera: return true
+        case .stopVideo: return false
+        }
+    }
+}
+
+// MARK: - Camera Secondary Action
+
+/// An optional secondary camera menu item, shown only where the primary action would
+/// otherwise drop a real capability.
+@objc public enum InterCamSecondaryAction: Int, CaseIterable {
+    case none = 0
+    /// Enforce-lock a camera that is already self/globally off, so they cannot self-enable.
+    case lockCamera = 1
+
+    public var title: String? {
+        switch self {
+        case .none:       return nil
+        case .lockCamera: return "Lock camera"
+        }
+    }
+}
+
+// MARK: - Derived Camera Tile State
+
+@objc public final class InterCamTileState: NSObject {
+    @objc public let cause: InterCamCause
+    @objc public let primaryAction: InterCamPrimaryAction
+    @objc public let secondaryAction: InterCamSecondaryAction
+    /// True when the primary action will FORCE the camera on (interview mode + activation),
+    /// so the participant must see a "host enabled your camera" indicator. Also flips the
+    /// primary label to a direct "Turn On Camera".
+    @objc public let activationForcesDevice: Bool
+
+    @objc public var captionText: String { cause.captionText }
+
+    /// In interview mode an activation force-turns the camera on, so it reads a direct
+    /// **"Turn On Camera"** rather than the consent-flow wording.
+    @objc public var primaryActionTitle: String {
+        activationForcesDevice ? "Turn On Camera" : primaryAction.title
+    }
+
+    /// "Lock camera" secondary remains available in interview mode (superset of control).
+    @objc public var secondaryActionTitle: String? { secondaryAction.title }
+
+    init(cause: InterCamCause,
+         primaryAction: InterCamPrimaryAction,
+         secondaryAction: InterCamSecondaryAction,
          activationForcesDevice: Bool) {
         self.cause = cause
         self.primaryAction = primaryAction
@@ -206,7 +339,7 @@ import Foundation
         // beside a muted caption — this is the structural fix for the old mismatch.
         if hostBlocked {
             cause = .mutedByHost
-            primary = .removeMuteAndAsk      // one click: lift my block + invite
+            primary = .removeMute            // lift my block only; they toggle their own mic
             secondary = .none
         } else if globalMute {
             cause = .mutedByMuteAll
@@ -228,6 +361,54 @@ import Foundation
 
         let forces = isInterviewMode && primary.isActivation
         return InterMicTileState(cause: cause,
+                                 primaryAction: primary,
+                                 secondaryAction: secondary,
+                                 activationForcesDevice: forces)
+    }
+
+    /// Single source of truth for the host's per-tile CAMERA view. Pure — no side effects.
+    /// Exact mirror of `deriveMic` (PR #2). `cameraReallyOff` is the participant's ACTUAL
+    /// camera state from LiveKit (true == off). `hostLocked` is the host's per-tile lock,
+    /// `globalLock` a camera Lock-All. `pendingSelfAction` marks the lift-lifted-awaiting-tap
+    /// window; `askPending` refines its caption. Interview mode flips `activationForcesDevice`
+    /// (force-restore + "Turn On Camera" label) without changing cause or which action shows.
+    @objc public static func deriveCamera(cameraReallyOff: Bool,
+                                          hostLocked: Bool,
+                                          globalLock: Bool,
+                                          pendingSelfAction: Bool,
+                                          askPending: Bool,
+                                          isInterviewMode: Bool) -> InterCamTileState {
+        let cause: InterCamCause
+        let primary: InterCamPrimaryAction
+        let secondary: InterCamSecondaryAction
+
+        // Precedence: host lock → global lock-all → live → pending → self-off.
+        // `stopVideo` is reachable ONLY from the live branch, so it can never sit beside a
+        // locked/off caption — the structural fix mirroring the mic mismatch fix.
+        if hostLocked {
+            cause = .lockedByHost
+            primary = .removeLock            // lift my lock only; they toggle their own camera
+            secondary = .none
+        } else if globalLock {
+            cause = .lockedByLockAll
+            primary = .allowCamera           // grant a one-time camera slot
+            secondary = .lockCamera          // may also enforce an individual lock
+        } else if !cameraReallyOff {
+            cause = .camOn
+            primary = .stopVideo             // the ONLY state where Stop Video is offered
+            secondary = .none
+        } else if pendingSelfAction {
+            cause = askPending ? .askedToTurnOn : .offCanTurnOn
+            primary = .askToTurnOn
+            secondary = .lockCamera
+        } else {
+            cause = .selfOff
+            primary = .askToTurnOn
+            secondary = .lockCamera
+        }
+
+        let forces = isInterviewMode && primary.isActivation
+        return InterCamTileState(cause: cause,
                                  primaryAction: primary,
                                  secondaryAction: secondary,
                                  activationForcesDevice: forces)
