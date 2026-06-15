@@ -23,6 +23,29 @@ static os_log_t InterComposedRendererLog(void) {
 static const NSInteger kPoolBufferCount = 3;   // Triple buffering.
 static const CGFloat kPiPWidthRatio = 0.20;    // PiP is 20% of output width.
 static const CGFloat kPiPPadding = 16.0;       // Padding from bottom-right edge.
+// [B4] Grace window during which the active/host camera is still treated as
+// "present" after its last non-NULL frame, so a single dropped frame between
+// frames does not collapse ScreenSharePiP → ScreenShareOnly → ScreenSharePiP.
+static const CFAbsoluteTime kLayoutCameraGrace = 0.75;
+
+// ---------------------------------------------------------------------------
+// MARK: - Pure Layout Selection
+// ---------------------------------------------------------------------------
+
+/// Pure: no ivars, no side effects. Mirrors the documented layout decision table.
+/// Centralizes the selection so it is unit-testable without standing up Metal.
+static InterComposedLayout InterComposedSelectLayout(BOOL hasScreen,
+                                                     NSUInteger gridCount,
+                                                     BOOL hasPrimaryCamera,
+                                                     BOOL hasSecondaryCamera) {
+    if (hasScreen && gridCount > 0) return InterComposedLayoutScreenShareFilmstrip;  // grid+share (preserved)
+    if (hasScreen && hasPrimaryCamera) return InterComposedLayoutScreenSharePiP;      // [B4] new: host PiP during non-grid share
+    if (hasScreen) return InterComposedLayoutScreenShareOnly;                         // share, no camera (preserved)
+    if (gridCount >= 3) return InterComposedLayoutGrid;
+    if (hasPrimaryCamera && hasSecondaryCamera) return InterComposedLayoutCameraSideBySide;
+    if (hasPrimaryCamera) return InterComposedLayoutCameraOnlyFull;
+    return InterComposedLayoutIdle;
+}
 
 // ---------------------------------------------------------------------------
 // MARK: - Metal Shader Source
@@ -108,6 +131,8 @@ typedef struct {
     CVPixelBufferRef _secondarySpeakerPixelBuffer;
     NSString *_secondarySpeakerIdentity;
     InterComposedLayout _currentLayout;
+    // [B4] Timestamp of the last non-NULL active-speaker frame, for layout hysteresis.
+    CFAbsoluteTime _lastActiveSpeakerFrameAt;
 
     // Grid participant state — guarded by _frameLock.
     // Maps participant identity → CVPixelBufferRef (retained via __bridge_retained id).
@@ -316,6 +341,9 @@ typedef struct {
     if (_activeSpeakerPixelBuffer) CVBufferRelease(_activeSpeakerPixelBuffer);
     _activeSpeakerPixelBuffer = pixelBuffer ? CVBufferRetain(pixelBuffer) : NULL;
     _activeSpeakerIdentity = [identity copy];
+    // [B4] Record when a live frame arrived so the layout selector can apply a
+    // grace window and avoid PiP↔ScreenShareOnly flicker on dropped frames.
+    if (pixelBuffer) _lastActiveSpeakerFrameAt = CFAbsoluteTimeGetCurrent();
     [self _recalculateLayoutLocked];
     os_unfair_lock_unlock(&_frameLock);
 }
@@ -375,31 +403,13 @@ typedef struct {
     InterComposedLayout oldLayout = _currentLayout;
 
     BOOL hasScreen = (_screenSharePixelBuffer != NULL);
-    // Count grid participants that have a frame (or will get a placeholder).
     NSUInteger gridCount = _gridParticipantOrder.count;
-
-    if (hasScreen && gridCount > 0) {
-        // Screen share + participants → filmstrip sidebar layout.
-        _currentLayout = InterComposedLayoutScreenShareFilmstrip;
-    } else if (hasScreen) {
-        // Screen share only — no camera participants available.
-        _currentLayout = InterComposedLayoutScreenShareOnly;
-    } else if (gridCount >= 3) {
-        // 3+ cameras — NxM grid.
-        _currentLayout = InterComposedLayoutGrid;
-    } else {
-        // 0–2 cameras — use legacy active/secondary speaker logic.
-        BOOL hasPrimary = (_activeSpeakerPixelBuffer != NULL);
-        BOOL hasSecondary = (_secondarySpeakerPixelBuffer != NULL);
-
-        if (hasPrimary && hasSecondary) {
-            _currentLayout = InterComposedLayoutCameraSideBySide;
-        } else if (hasPrimary) {
-            _currentLayout = InterComposedLayoutCameraOnlyFull;
-        } else {
-            _currentLayout = InterComposedLayoutIdle;
-        }
-    }
+    // [B4] Hysteresis: treat the host/active camera as present for a short grace window
+    // after the last non-NULL frame so a single dropped frame doesn't collapse PiP→Only→PiP.
+    BOOL hasPrimaryCamera = (_activeSpeakerPixelBuffer != NULL) ||
+                            (CFAbsoluteTimeGetCurrent() - _lastActiveSpeakerFrameAt < kLayoutCameraGrace);
+    BOOL hasSecondaryCamera = (_secondarySpeakerPixelBuffer != NULL);
+    _currentLayout = InterComposedSelectLayout(hasScreen, gridCount, hasPrimaryCamera, hasSecondaryCamera);
 
     if (_currentLayout != oldLayout) {
         os_log_info(InterComposedRendererLog(),

@@ -64,6 +64,52 @@ import LiveKit
     @objc optional func recordingLayoutDidChange(_ layout: InterComposedLayout)
 }
 
+// MARK: - Recording Layout Preference
+
+/// Host-selectable layout for the local composed recording.
+/// `auto` mirrors a gallery-style view (grid for 3+, side-by-side for 2, full for 1);
+/// `speaker` keeps the active remote speaker prominent alongside the local self-view.
+@objc public enum InterRecordingLayoutPreference: Int {
+    case auto = 0
+    case speaker = 1
+}
+
+// MARK: - Recording Layout Logic (pure, unit-testable)
+
+/// Side-effect-free layout decisions for the recording composer. Extracted so the
+/// freeze-prevention invariants can be unit-tested without standing up the Metal /
+/// AVAssetWriter pipeline. Every function here is a pure function of its inputs.
+enum InterRecordingLayoutLogic {
+    /// Which 2-slot position the LOCAL participant occupies.
+    enum Slot: Equatable { case primary, secondary }
+
+    /// Grid (gallery) engages for 3+ participants in `auto`; never in `speaker`.
+    static func useGrid(participantCount: Int, preference: InterRecordingLayoutPreference) -> Bool {
+        if preference == .speaker { return false }
+        return participantCount >= 3
+    }
+
+    /// The local participant is NEVER subject to active-speaker selection. It takes the
+    /// secondary slot when a remote holds the primary, and the primary slot when it is
+    /// the only camera. This guarantees the host is always rendered (the freeze fix) and
+    /// avoids the renderer's "secondary-only ⇒ Idle/black" edge.
+    static func localSlot(hasRemoteActiveSpeaker: Bool) -> Slot {
+        return hasRemoteActiveSpeaker ? .secondary : .primary
+    }
+
+    /// A slot showing `identity` must use an avatar placeholder when no live camera
+    /// frame has been delivered for it — preventing a stale frozen frame from persisting.
+    static func needsPlaceholder(identity: String, identitiesWithLiveFrame: Set<String>) -> Bool {
+        return !identitiesWithLiveFrame.contains(identity)
+    }
+
+    /// A remote participant "holds the primary slot" exactly when some non-local identity
+    /// has delivered a live camera frame. Pure → unit-testable.
+    static func hasRemoteActiveSpeaker(localId: String?, identitiesWithLiveFrame: Set<String>) -> Bool {
+        return identitiesWithLiveFrame.contains { $0 != localId }
+    }
+}
+
 // MARK: - InterRecordingCoordinator
 
 @objc public class InterRecordingCoordinator: NSObject {
@@ -82,6 +128,22 @@ import LiveKit
 
     /// Delegate for state, duration, and completion callbacks.
     @objc public weak var delegate: InterRecordingCoordinatorDelegate?
+
+    /// Host-selectable recording layout. Set BEFORE `startLocalRecording`; snapshotted
+    /// at recording start. Thread-safe via `_stateLock`. Defaults to `.auto`.
+    @objc public var preferredLayout: InterRecordingLayoutPreference {
+        get {
+            os_unfair_lock_lock(&_stateLock)
+            let v = _preferredLayoutStorage
+            os_unfair_lock_unlock(&_stateLock)
+            return v
+        }
+        set {
+            os_unfair_lock_lock(&_stateLock)
+            _preferredLayoutStorage = newValue
+            os_unfair_lock_unlock(&_stateLock)
+        }
+    }
 
     /// Maximum recording duration before issuing a warning notification (seconds).
     private static let oneHourWarningThreshold: TimeInterval = 3600
@@ -151,6 +213,18 @@ import LiveKit
     /// When true, frames are routed to composedRenderer.updateParticipantFrame
     /// instead of the active/secondary speaker pair.
     private var _useGridLayout: Bool = false
+
+    /// Identities that have delivered a live camera frame (and not since gone
+    /// camera-off / left). Drives the frame-vs-placeholder slot decision so an
+    /// audio-only or camera-off participant never strands a stale frozen frame.
+    /// coordinatorQueue-confined.
+    private var _identitiesWithLiveFrame: Set<String> = []
+
+    /// Layout preference snapshot taken at recording start (coordinatorQueue-confined).
+    private var _layoutPref: InterRecordingLayoutPreference = .auto
+
+    /// Backing storage for `preferredLayout`, guarded by `_stateLock`.
+    private var _preferredLayoutStorage: InterRecordingLayoutPreference = .auto
     /// Host participant identity for screen share priority.
     /// When multiple participants screen share, the host's share takes precedence.
     private var _hostIdentity: String?
@@ -555,60 +629,45 @@ import LiveKit
         // calling any renderer methods. The sync block does only value copies —
         // no I/O, no locks — so it completes in microseconds. Renderer calls
         // happen outside the sync so the queue is never held during rendering.
-        let snapshot: (renderer: InterComposedRenderer, activeId: String?, secondaryId: String?, useGrid: Bool)?
+        let snapshot: (renderer: InterComposedRenderer, hasRemoteLiveFrame: Bool, localId: String?, useGrid: Bool)?
         snapshot = coordinatorQueue.sync {
             guard _state == .recording || _state == .paused,
                   let renderer = composedRenderer else { return nil }
-            let activeId = _activeSpeakerId
-            let secondaryId: String? = _recentSpeakers.count >= 2
-                ? _recentSpeakers.first(where: { $0 != activeId })
-                : nil
-            return (renderer, activeId, secondaryId, _useGridLayout)
+            // [B3] Insert the just-arrived sender INSIDE the snapshot so the
+            // "remote has a live frame" predicate sees it immediately (covers both
+            // the remote-already-present and remote-joins-after-start timings).
+            _identitiesWithLiveFrame.insert(participantId)
+            os_unfair_lock_lock(&_stateLock)
+            let localId = _localParticipantIdentity
+            os_unfair_lock_unlock(&_stateLock)
+            let hasRemoteLiveFrame = InterRecordingLayoutLogic.hasRemoteActiveSpeaker(
+                localId: localId, identitiesWithLiveFrame: _identitiesWithLiveFrame)
+            return (renderer, hasRemoteLiveFrame, localId, _useGridLayout)
         }
-        guard let (renderer, activeId, secondaryId, useGrid) = snapshot else { return }
+        guard let (renderer, hasRemoteLiveFrame, localId, useGrid) = snapshot else { return }
 
         if useGrid {
-            // Grid mode: route all frames to grid participant storage.
+            // Grid mode: route all frames to grid participant storage (keyed by identity).
+            // The local participant is part of the grid order, so the host always renders.
             renderer.updateParticipantFrame(pixelBuffer, identity: participantId)
         } else {
-            // Active/secondary speaker mode.
-            //
-            // Late-bootstrap guard: if _activeSpeakerId is still nil when the first
-            // frame arrives (e.g. activeSpeakerDidChange hasn't fired yet), accept
-            // the frame unconditionally and self-promote the sender. This is a
-            // belt-and-suspenders fallback; the primary seeding happens in
-            // _startLocalRecording. Without this, a race at recording start would
-            // cause frames to be dropped until the next speaker event.
-            if activeId == nil || participantId == activeId {
+            // Non-grid (≤2 participants). The LOCAL participant is never an active
+            // speaker: it renders in the secondary slot when a remote holds the primary,
+            // and in the primary slot when it is the only camera. This guarantees the
+            // host is always rendered (the freeze fix). The single remote (if any)
+            // always renders in the primary slot.
+            let isLocal = (localId != nil && participantId == localId)
+            if isLocal {
+                switch InterRecordingLayoutLogic.localSlot(hasRemoteActiveSpeaker: hasRemoteLiveFrame) {
+                case .primary:
+                    renderer.updateActiveSpeakerFrame(pixelBuffer, identity: participantId)
+                case .secondary:
+                    renderer.updateSecondarySpeakerFrame(pixelBuffer, identity: participantId)
+                }
+            } else {
+                // Remote camera frame → primary (active) slot.
                 renderer.updateActiveSpeakerFrame(pixelBuffer, identity: participantId)
-                if activeId == nil {
-                    coordinatorQueue.async { [weak self] in
-                        guard let self = self, self._activeSpeakerId == nil else { return }
-                        self._activeSpeakerId = participantId
-                        if !self._recentSpeakers.contains(participantId) {
-                            self._recentSpeakers.insert(participantId, at: 0)
-                        }
-                        self._activeSpeakerHoldUntil = CFAbsoluteTimeGetCurrent() + 2.0
-                    }
-                }
-            } else if let secId = secondaryId, participantId == secId {
-                renderer.updateSecondarySpeakerFrame(pixelBuffer, identity: participantId)
-            } else if secondaryId == nil {
-                // No designated secondary yet — auto-promote this participant
-                // so their camera is visible immediately in a 2-person call.
-                // Without this, frames from newly-joined participants are
-                // silently dropped until activeSpeakerDidChange fires.
-                renderer.updateSecondarySpeakerFrame(pixelBuffer, identity: participantId)
-                coordinatorQueue.async { [weak self] in
-                    guard let self = self else { return }
-                    if !self._recentSpeakers.contains(participantId) {
-                        self._recentSpeakers.append(participantId)
-                    }
-                }
             }
-            // else: participant is neither active nor secondary — frame dropped.
-            // This only happens in 3+ non-grid mode which shouldn't occur
-            // since grid kicks in at 3 participants.
         }
     }
 
@@ -623,8 +682,10 @@ import LiveKit
         guard let renderer = composedRenderer else { return }
 
         let previousGridMode = _useGridLayout
-        // Switch to grid when 3+ participants are in the call.
-        _useGridLayout = _allParticipants.count >= 3
+        // Switch to grid when 3+ participants are in the call (auto), honoring the
+        // host's layout preference (speaker view never grids).
+        _useGridLayout = InterRecordingLayoutLogic.useGrid(participantCount: _allParticipants.count,
+                                                           preference: _layoutPref)
 
         if _useGridLayout != previousGridMode {
             if _useGridLayout {
@@ -831,7 +892,11 @@ import LiveKit
             }
         }
         // Evaluate whether grid mode is needed from the start.
-        _useGridLayout = _allParticipants.count >= 3
+        os_unfair_lock_lock(&_stateLock)
+        _layoutPref = _preferredLayoutStorage
+        os_unfair_lock_unlock(&_stateLock)
+        _useGridLayout = InterRecordingLayoutLogic.useGrid(participantCount: _allParticipants.count,
+                                                           preference: _layoutPref)
         if _useGridLayout {
             renderer.setParticipantOrder(_allParticipants)
             for participantId in _allParticipants {
@@ -844,8 +909,15 @@ import LiveKit
             // activeSpeakerDidChange fires — which may fire late or never in a
             // 1-person call — causing every frame to be silently dropped and
             // leaving the recording with an entirely black video track.
-            if let firstParticipant = _allParticipants.first {
-                _activeSpeakerId = firstParticipant
+            // [B3] Prefer the first NON-LOCAL participant so _activeSpeakerId is
+            // semantically accurate for placeholder logic; fall back to first/local
+            // when there is no remote (preserves the 1-person black-video bootstrap).
+            // Slot routing no longer depends on _activeSpeakerId — see
+            // didReceiveRemoteCameraFrame's hasRemoteActiveSpeaker predicate.
+            let localId = _localParticipantIdentity
+            let bootstrapId = _allParticipants.first(where: { $0 != localId }) ?? _allParticipants.first
+            if let active = bootstrapId {
+                _activeSpeakerId = active
                 _recentSpeakers = _allParticipants   // seeds secondary speaker too
                 _activeSpeakerHoldUntil = CFAbsoluteTimeGetCurrent() + 2.0
             }
@@ -1033,6 +1105,7 @@ import LiveKit
         _recentSpeakers.removeAll()
         _activeSpeakerHoldUntil = 0
         _allParticipants.removeAll()
+        _identitiesWithLiveFrame.removeAll()
         _useGridLayout = false
         _activeScreenShareIdentity = nil
 
@@ -1416,6 +1489,21 @@ import LiveKit
         _activeSpeakerId = participantId
         _activeSpeakerHoldUntil = CFAbsoluteTimeGetCurrent() + 2.0
 
+        // The new active speaker is a remote (the local participant is never selected
+        // as active speaker). If it has not delivered a live camera frame, show its
+        // avatar placeholder in the primary slot so the previous speaker's frame does
+        // not freeze there. (Skipped in grid mode, which renders by identity.)
+        os_unfair_lock_lock(&_stateLock)
+        let localId = _localParticipantIdentity
+        os_unfair_lock_unlock(&_stateLock)
+        if !_useGridLayout, participantId != localId,
+           InterRecordingLayoutLogic.needsPlaceholder(identity: participantId,
+                                                      identitiesWithLiveFrame: _identitiesWithLiveFrame),
+           let renderer = composedRenderer {
+            let placeholder = renderer.placeholderFrame(forIdentity: participantId).takeUnretainedValue()
+            renderer.updateActiveSpeakerFrame(placeholder, identity: participantId)
+        }
+
         // After switching, check whether a valid secondary speaker still exists.
         // _recentSpeakers was already updated by _handleActiveSpeakerChange before
         // this method is called, so the new secondary is deterministic.
@@ -1435,8 +1523,7 @@ import LiveKit
     // -----------------------------------------------------------------------
 
     private static func generateOutputURL() -> URL {
-        let documentsURL = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
-        let recordingsDir = documentsURL.appendingPathComponent("Inter Recordings", isDirectory: true)
+        let recordingsDir = Self.recordingsDirectory()
 
         // Create directory if needed
         try? FileManager.default.createDirectory(at: recordingsDir,
@@ -1448,6 +1535,29 @@ import LiveKit
         let filename = "Inter Recording \(timestamp).mp4"
 
         return recordingsDir.appendingPathComponent(filename)
+    }
+
+    /// UserDefaults key for the user-chosen recordings folder (Settings →
+    /// Recording). Unset/invalid → ~/Documents/Inter Recordings.
+    @objc public static let recordingsDirectoryDefaultsKey = "InterRecordingDirectoryPath"
+
+    /// The folder local recordings are written to — the user's choice when it
+    /// exists (or can be created), else the default.
+    @objc public static func recordingsDirectory() -> URL {
+        if let custom = UserDefaults.standard.string(forKey: recordingsDirectoryDefaultsKey),
+           !custom.isEmpty {
+            let url = URL(fileURLWithPath: custom, isDirectory: true)
+            var isDir: ObjCBool = false
+            if FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir), isDir.boolValue {
+                return url
+            }
+            if (try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)) != nil {
+                return url
+            }
+            // Fall through to the default when the stored path is unusable.
+        }
+        let documentsURL = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
+        return documentsURL.appendingPathComponent("Inter Recordings", isDirectory: true)
     }
 
     // -----------------------------------------------------------------------
@@ -1828,8 +1938,28 @@ extension InterRecordingCoordinator: InterRemoteTrackRenderer {
 
     public func remoteTrackDidEnd(_ kind: InterTrackKind, forParticipant participantId: String) {
         if kind == .camera {
-            participantDidLeave(participantId)
+            // A camera track ending (unpublish / mute) is NOT a participant leaving.
+            // Forget the live-frame marker and show the avatar placeholder so the slot
+            // or grid tile reverts to a placeholder instead of freezing on the last
+            // frame. Real removal happens only via remoteParticipantDidLeave.
+            coordinatorQueue.async { [weak self] in
+                self?._identitiesWithLiveFrame.remove(participantId)
+            }
+            participantCameraDidChange(participantId, isMuted: true)
         }
+    }
+
+    public func remoteParticipantDidJoin(_ participantId: String, displayName: String) {
+        // Feed presence into the coordinator so grid/gallery mode engages for 3+
+        // participants and audio-only participants get placeholder tiles.
+        participantDidJoin(participantId)
+    }
+
+    public func remoteParticipantDidLeave(_ participantId: String) {
+        coordinatorQueue.async { [weak self] in
+            self?._identitiesWithLiveFrame.remove(participantId)
+        }
+        participantDidLeave(participantId)
     }
 }
 
@@ -1892,10 +2022,47 @@ final class InterAudioEngineAccess: NSObject, AudioEngineObserver {
     /// Whether we saw an engine stop without a subsequent start yet.
     private var _awaitingRestart = false
 
+    // MARK: - Speaker mute (local remote-audio playout)
+
+    /// When true, the engine's output mixer is muted so the local user hears no
+    /// remote audio — WITHOUT muting the mic, changing OS volume, or affecting the
+    /// recording (which taps remote audio PRE-mix via renderPreProcessing). Mirrors
+    /// the Android SDK's `setSpeakerMute` semantics (data is still received).
+    private var _speakerMuted = false
+
+    @objc static var isSpeakerMuted: Bool { shared._speakerMuted }
+
+    /// Toggle local remote-audio playout. Routes through LiveKit's MixerEngineObserver
+    /// (`AudioManager.shared.mixer.outputVolume`) — the SUPPORTED, thread-safe way to
+    /// set the engine output level: it is lock-guarded, nil-safe, and LiveKit stores the
+    /// value and RE-APPLIES it on every engine (re)start internally (so it survives
+    /// device-route changes and reconnects with no work from us).
+    ///
+    /// Do NOT poke `engine.mainMixerNode.outputVolume` directly: LiveKit's mixer owns
+    /// that node and overwrites it, and racing it from the audio thread during a
+    /// device-route change (e.g. unplugging earphones) caused an EXC_BAD_ACCESS crash.
+    /// Recording-safe (recording taps remote audio pre-mix) and covers all current +
+    /// future participants (single output node).
+    @objc static func setSpeakerMuted(_ muted: Bool) {
+        shared._speakerMuted = muted
+        AudioManager.shared.mixer.outputVolume = muted ? 0.0 : 1.0
+    }
+
     // MARK: - AudioEngineObserver (only the lifecycle callbacks that need engine capture)
 
     func engineWillStart(_ engine: AVAudioEngine, isPlayoutEnabled: Bool, isRecordingEnabled: Bool) -> Int {
         _engine = engine
+
+        // [Audio quality] Voice-Processing AGC stays DISABLED. A/B test (build "sdtzv5",
+        // AGC ON) was worse on BOTH axes: AGC drove speech to ~-15 dBFS with peaks at
+        // full scale (harsh / over-amplified, and it re-loudens the room AC between
+        // words), and it did NOT fix the "ruk-ruk" choppiness (~15% speech holes vs ~13%
+        // with AGC off). Conclusion: the choppiness is noise-suppression / VAD gating of
+        // low-level mic input — a separate lever from AGC — so AGC stays off (constant
+        // gain, quieter but natural level). Applied here because the audio device module
+        // is guaranteed ready once the engine is starting.
+        AudioManager.shared.isVoiceProcessingAGCEnabled = false
+
         // [Gap #6] If this start follows a stop, notify the coordinator to re-install the tap.
         if _awaitingRestart {
             _awaitingRestart = false
