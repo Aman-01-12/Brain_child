@@ -27,6 +27,10 @@ static const CGFloat kBottomBarHeight       = 56.0;
 @property (nonatomic, copy) NSString *appName;
 @property (nonatomic, strong, nullable) NSImage *thumbnail;
 @property (nonatomic, strong, nullable) NSImage *appIcon;
+// Display tile support (unified picker): when YES, displayID is the
+// CGDirectDisplayID for an "Entire Screen" tile and windowID is unused.
+@property (nonatomic, assign) BOOL isDisplay;
+@property (nonatomic, assign) CGDirectDisplayID displayID;
 @end
 
 @implementation InterWindowInfo
@@ -186,6 +190,9 @@ static const CGFloat kBottomBarHeight       = 56.0;
 
 @interface InterWindowPickerPanel ()
 @property (nonatomic, copy) InterWindowPickerCompletion completion;
+@property (nonatomic, copy, nullable) InterSharePickerCompletion unifiedCompletion;
+@property (nonatomic, assign) BOOL unifiedMode;
+@property (nonatomic, strong, nullable) NSButton *systemAudioCheckbox;
 @property (nonatomic, strong) NSScrollView *scrollView;
 @property (nonatomic, strong) NSView *gridContainer;
 @property (nonatomic, strong) NSMutableArray<InterWindowTileView *> *tiles;
@@ -232,6 +239,41 @@ static const CGFloat kBottomBarHeight       = 56.0;
     }];
 }
 
++ (void)showUnifiedPickerRelativeToWindow:(NSWindow *)parentWindow
+                            systemAudioOn:(BOOL)systemAudioOn
+                               completion:(InterSharePickerCompletion)completion {
+    NSRect parentFrame = parentWindow.frame;
+    CGFloat x = NSMidX(parentFrame) - kPickerWidth / 2.0;
+    CGFloat y = NSMidY(parentFrame) - kPickerHeight / 2.0;
+    NSRect panelFrame = NSMakeRect(x, y, kPickerWidth, kPickerHeight);
+
+    InterWindowPickerPanel *picker = [[InterWindowPickerPanel alloc]
+        initWithContentRect:panelFrame
+                  styleMask:(NSWindowStyleMaskTitled |
+                             NSWindowStyleMaskClosable |
+                             NSWindowStyleMaskFullSizeContentView)
+                    backing:NSBackingStoreBuffered
+                      defer:NO];
+
+    picker.unifiedMode = YES;
+    picker.unifiedCompletion = completion;
+    picker.title = @"Choose what to share";
+    picker.titlebarAppearsTransparent = YES;
+    picker.titleVisibility = NSWindowTitleHidden;
+    picker.backgroundColor = [NSColor colorWithWhite:0.10 alpha:1.0];
+    picker.opaque = NO;
+    picker.movableByWindowBackground = YES;
+    picker.releasedWhenClosed = NO;
+
+    [picker buildUI];
+    picker.systemAudioCheckbox.state = systemAudioOn ? NSControlStateValueOn : NSControlStateValueOff;
+    [picker loadWindows];
+
+    [parentWindow beginSheet:picker completionHandler:^(NSModalResponse returnCode) {
+#pragma unused(returnCode)
+    }];
+}
+
 // ---------------------------------------------------------------------------
 // MARK: UI Construction
 // ---------------------------------------------------------------------------
@@ -242,7 +284,8 @@ static const CGFloat kBottomBarHeight       = 56.0;
     content.layer.backgroundColor = [[NSColor colorWithWhite:0.10 alpha:1.0] CGColor];
 
     // Header label
-    NSTextField *headerLabel = [NSTextField labelWithString:@"Choose a window to share"];
+    NSTextField *headerLabel = [NSTextField labelWithString:
+        (self.unifiedMode ? @"Choose what to share" : @"Choose a window to share")];
     headerLabel.font = [NSFont systemFontOfSize:18 weight:NSFontWeightSemibold];
     headerLabel.textColor = [NSColor colorWithWhite:0.94 alpha:1.0];
     headerLabel.translatesAutoresizingMaskIntoConstraints = NO;
@@ -286,6 +329,23 @@ static const CGFloat kBottomBarHeight       = 56.0;
         self.shareButton.bezelColor = [NSColor systemBlueColor];
     }
     [bottomBar addSubview:self.shareButton];
+
+    // System audio toggle (unified mode only) — lives IN the picker per design.
+    if (self.unifiedMode) {
+        self.systemAudioCheckbox = [NSButton checkboxWithTitle:@"Share system audio"
+                                                        target:nil action:nil];
+        self.systemAudioCheckbox.translatesAutoresizingMaskIntoConstraints = NO;
+        NSMutableAttributedString *checkTitle = [[NSMutableAttributedString alloc]
+            initWithString:@"Share system audio"
+                attributes:@{NSForegroundColorAttributeName: [NSColor colorWithWhite:0.85 alpha:1.0],
+                             NSFontAttributeName: [NSFont systemFontOfSize:12]}];
+        self.systemAudioCheckbox.attributedTitle = checkTitle;
+        [bottomBar addSubview:self.systemAudioCheckbox];
+        [NSLayoutConstraint activateConstraints:@[
+            [self.systemAudioCheckbox.leadingAnchor constraintEqualToAnchor:bottomBar.leadingAnchor constant:kTilePadding],
+            [self.systemAudioCheckbox.centerYAnchor constraintEqualToAnchor:bottomBar.centerYAnchor],
+        ]];
+    }
 
     // Layout
     [NSLayoutConstraint activateConstraints:@[
@@ -350,16 +410,83 @@ static const CGFloat kBottomBarHeight       = 56.0;
         NSArray<InterWindowInfo *> *windows = [weakSelf filterShareableWindows:content
                                                                outSCWindows:&filteredSCWindows];
 
+        // Unified mode: prepend "Entire Screen" tiles (one per display).
+        NSArray<InterWindowInfo *> *displayInfos = @[];
+        if (weakSelf.unifiedMode) {
+            displayInfos = [weakSelf displayInfosFromContent:content];
+        }
+
         // Capture thumbnails in parallel using SCScreenshotManager
         [weakSelf captureThumbnailsForWindows:windows
                                    scWindows:filteredSCWindows
                                   completion:^(NSArray<InterWindowInfo *> *updatedWindows) {
-            dispatch_async(dispatch_get_main_queue(), ^{
-                [spinner removeFromSuperview];
-                [weakSelf buildGridWithWindows:updatedWindows];
-            });
+            [weakSelf captureThumbnailsForDisplays:displayInfos
+                                           content:content
+                                        completion:^(NSArray<InterWindowInfo *> *updatedDisplays) {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    [spinner removeFromSuperview];
+                    NSArray<InterWindowInfo *> *all =
+                        [updatedDisplays arrayByAddingObjectsFromArray:updatedWindows];
+                    [weakSelf buildGridWithWindows:all];
+                });
+            }];
         }];
     }];
+}
+
+- (NSArray<InterWindowInfo *> *)displayInfosFromContent:(SCShareableContent *)content {
+    NSMutableArray<InterWindowInfo *> *displays = [NSMutableArray array];
+    NSUInteger index = 1;
+    for (SCDisplay *display in content.displays) {
+        InterWindowInfo *info = [[InterWindowInfo alloc] init];
+        info.isDisplay = YES;
+        info.displayID = display.displayID;
+        info.windowTitle = content.displays.count > 1
+            ? [NSString stringWithFormat:@"Entire Screen %lu", (unsigned long)index]
+            : @"Entire Screen";
+        info.appName = [NSString stringWithFormat:@"%dx%d", (int)display.width, (int)display.height];
+        info.appIcon = [NSImage imageWithSystemSymbolName:@"display" accessibilityDescription:@"Display"];
+        [displays addObject:info];
+        index++;
+    }
+    return [displays copy];
+}
+
+- (void)captureThumbnailsForDisplays:(NSArray<InterWindowInfo *> *)displayInfos
+                             content:(SCShareableContent *)content
+                          completion:(void (^)(NSArray<InterWindowInfo *> *))completion {
+    if (displayInfos.count == 0) {
+        completion(displayInfos);
+        return;
+    }
+    dispatch_group_t group = dispatch_group_create();
+    for (InterWindowInfo *info in displayInfos) {
+        SCDisplay *match = nil;
+        for (SCDisplay *display in content.displays) {
+            if (display.displayID == info.displayID) { match = display; break; }
+        }
+        if (!match) { continue; }
+        dispatch_group_enter(group);
+        SCContentFilter *filter = [[SCContentFilter alloc] initWithDisplay:match excludingWindows:@[]];
+        SCStreamConfiguration *config = [[SCStreamConfiguration alloc] init];
+        config.width = 480;
+        config.height = 300;
+        config.showsCursor = NO;
+        config.scalesToFit = YES;
+        [SCScreenshotManager captureImageWithFilter:filter
+                                      configuration:config
+                                  completionHandler:^(CGImageRef _Nullable sampleImage,
+                                                      NSError * _Nullable captureError) {
+            if (sampleImage && !captureError) {
+                NSSize imageSize = NSMakeSize(CGImageGetWidth(sampleImage), CGImageGetHeight(sampleImage));
+                info.thumbnail = [[NSImage alloc] initWithCGImage:sampleImage size:imageSize];
+            }
+            dispatch_group_leave(group);
+        }];
+    }
+    dispatch_group_notify(group, dispatch_get_main_queue(), ^{
+        completion(displayInfos);
+    });
 }
 
 - (NSArray<InterWindowInfo *> *)filterShareableWindows:(SCShareableContent *)content
@@ -524,9 +651,37 @@ static const CGFloat kBottomBarHeight       = 56.0;
 
 - (void)handleShare:(id)sender {
 #pragma unused(sender)
+    InterWindowInfo *selectedInfo = self.selectedTile.windowInfo;
+
+    if (self.unifiedMode) {
+        InterSharePickerCompletion handler = self.unifiedCompletion;
+        self.unifiedCompletion = nil;
+        BOOL audioOn = (self.systemAudioCheckbox.state == NSControlStateValueOn);
+
+        NSString *identifier = nil;
+        BOOL isDisplay = NO;
+        if (selectedInfo) {
+            isDisplay = selectedInfo.isDisplay;
+            identifier = isDisplay
+                ? [NSString stringWithFormat:@"%u", selectedInfo.displayID]
+                : [NSString stringWithFormat:@"%u", selectedInfo.windowID];
+        }
+
+        NSWindow *parent = self.sheetParent;
+        if (parent) {
+            [parent endSheet:self returnCode:NSModalResponseOK];
+        } else {
+            [self orderOut:nil];
+        }
+        if (handler) {
+            handler(isDisplay, identifier, audioOn);
+        }
+        return;
+    }
+
     NSString *identifier = nil;
-    if (self.selectedTile) {
-        identifier = [NSString stringWithFormat:@"%u", self.selectedTile.windowInfo.windowID];
+    if (selectedInfo) {
+        identifier = [NSString stringWithFormat:@"%u", selectedInfo.windowID];
     }
 
     InterWindowPickerCompletion handler = self.completion;
@@ -546,6 +701,21 @@ static const CGFloat kBottomBarHeight       = 56.0;
 
 - (void)handleCancel:(id)sender {
 #pragma unused(sender)
+    if (self.unifiedMode) {
+        InterSharePickerCompletion handler = self.unifiedCompletion;
+        self.unifiedCompletion = nil;
+        NSWindow *parent = self.sheetParent;
+        if (parent) {
+            [parent endSheet:self returnCode:NSModalResponseCancel];
+        } else {
+            [self orderOut:nil];
+        }
+        if (handler) {
+            handler(NO, nil, NO);
+        }
+        return;
+    }
+
     InterWindowPickerCompletion handler = self.completion;
     self.completion = nil;
 
@@ -563,7 +733,7 @@ static const CGFloat kBottomBarHeight       = 56.0;
 
 // Handle clicking the close button as a cancel
 - (void)close {
-    if (self.completion) {
+    if (self.completion || self.unifiedCompletion) {
         [self handleCancel:nil];
         return;
     }

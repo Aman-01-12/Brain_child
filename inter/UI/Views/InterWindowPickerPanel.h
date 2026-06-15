@@ -4,16 +4,28 @@ NS_ASSUME_NONNULL_BEGIN
 
 typedef void (^InterWindowPickerCompletion)(NSString * _Nullable selectedWindowIdentifier);
 
-/// A modal-sheet window picker panel that shows live thumbnails of all
-/// on-screen windows, letting the user select which one to share.
-/// Designed to match the Google Meet / Zoom "Choose what to share" experience.
+/// Unified picker completion: `isDisplay` distinguishes an entire-screen pick
+/// (identifier = CGDirectDisplayID string) from a window pick (CGWindowID
+/// string). `shareSystemAudio` carries the in-picker audio toggle. identifier
+/// nil = cancelled.
+typedef void (^InterSharePickerCompletion)(BOOL isDisplay,
+                                           NSString * _Nullable identifier,
+                                           BOOL shareSystemAudio);
+
+/// A modal-sheet share picker showing live thumbnails of every display
+/// ("Entire Screen") and shareable window, with a "Share system audio"
+/// toggle. Designed to match the Google Meet / Zoom "Choose what to share"
+/// experience.
 @interface InterWindowPickerPanel : NSPanel
 
-/// Present the picker as a sheet on `parentWindow`. On selection the
-/// completion is called with the window identifier string (CGWindowID as
-/// NSString). On cancel, nil is passed.
+/// Legacy windows-only picker (kept for existing call sites).
 + (void)showPickerRelativeToWindow:(NSWindow *)parentWindow
                         completion:(InterWindowPickerCompletion)completion;
+
+/// Unified picker: entire-screen tiles + window grid + system-audio toggle.
++ (void)showUnifiedPickerRelativeToWindow:(NSWindow *)parentWindow
+                            systemAudioOn:(BOOL)systemAudioOn
+                               completion:(InterSharePickerCompletion)completion;
 
 @end
 

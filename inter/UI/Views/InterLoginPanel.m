@@ -65,6 +65,10 @@
     [self.host showError:message ?: @""];
 }
 
+- (void)setRegisterMode:(BOOL)isRegister {
+    [self.host setRegisterMode:isRegister];
+}
+
 - (void)showInfo:(NSString *)message {
     [self.host showInfo:message ?: @""];
 }

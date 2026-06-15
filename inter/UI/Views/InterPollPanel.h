@@ -27,13 +27,18 @@ NS_ASSUME_NONNULL_BEGIN
 
 /// [Phase 8.5] In-meeting poll panel.
 ///
+/// Hosted in a standalone movable/resizable NSWindow (Zoom-style); AppDelegate
+/// toggles the WINDOW's visibility (the 📊 Poll button). The body is SwiftUI
+/// (`PollView`) hosted via the Swift `InterPollHostView` bridge — this class is
+/// a thin Obj-C shell preserving the delegate contract, so AppDelegate's poll
+/// wiring is unchanged.
+///
 /// Dual-mode panel:
 ///   - **Host view**: Create poll form (question + options + toggles) → Launch → Live results → End
-///   - **Participant view**: Vote on active poll → See results after voting/ending
+///   - **Participant view**: Waiting → Vote on active poll → Results after voting/ending
 ///
-/// Hosted in a standalone movable/resizable NSWindow (Zoom-style).
-/// State is preserved when window is hidden/shown via toggle button.
-@interface InterPollPanel : NSView <NSTableViewDataSource, NSTableViewDelegate>
+/// State is preserved when the window is hidden/shown via the toggle button.
+@interface InterPollPanel : NSView
 
 @property (nonatomic, weak, nullable) id<InterPollPanelDelegate> delegate;
 

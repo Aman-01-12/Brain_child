@@ -177,12 +177,11 @@ private struct LobbyRow: View {
         }
         .padding(.horizontal, InterSpacing.x3)
         .padding(.vertical, InterSpacing.x3)
-        .background(Color(nsColor: hovering ? InterColor.muted : InterColor.card))
-        .overlay(
-            RoundedRectangle(cornerRadius: InterRadius.xl, style: .continuous)
-                .stroke(Color(nsColor: InterColor.border), lineWidth: 1)
+        // Flat row — hover highlight only (no bordered card-on-card).
+        .background(
+            RoundedRectangle(cornerRadius: InterRadius.md, style: .continuous)
+                .fill(hovering ? Color(nsColor: InterColor.muted) : .clear)
         )
-        .clipShape(RoundedRectangle(cornerRadius: InterRadius.xl, style: .continuous))
         .onHover { hovering = $0 }
     }
 }

@@ -22,17 +22,18 @@ NS_ASSUME_NONNULL_BEGIN
 
 /// [Phase 8.6] In-meeting Q&A panel.
 ///
-/// Hosted in a standalone movable/resizable NSWindow (Zoom-style).
-/// Displays questions sorted by upvote count (highlighted first).
-/// State is preserved when window is hidden/shown via toggle button.
+/// Hosted in a standalone movable/resizable NSWindow (Zoom-style); AppDelegate
+/// toggles the WINDOW's visibility (⌘+Shift+Q or the Q&A button). The body is
+/// SwiftUI (`QAView`) hosted via the Swift `InterQAHostView` bridge — this
+/// class is a thin Obj-C shell preserving the delegate contract, so
+/// AppDelegate's Q&A wiring is unchanged.
 ///
 /// Features:
+///   - Open / Answered tabs with live counts
 ///   - Submit questions (with optional anonymous toggle)
-///   - Upvote questions from other participants
-///   - Host actions: Highlight, Mark Answered, Dismiss
-///
-/// Toggle visibility with ⌘+Shift+Q or the Q&A button.
-@interface InterQAPanel : NSView <NSTableViewDataSource, NSTableViewDelegate>
+///   - Upvote questions
+///   - Host actions: Highlight, Mark Answered, Dismiss (removes for everyone)
+@interface InterQAPanel : NSView
 
 @property (nonatomic, weak, nullable) id<InterQAPanelDelegate> delegate;
 
@@ -42,20 +43,10 @@ NS_ASSUME_NONNULL_BEGIN
 /// Update the question list. Reloads the entire display.
 - (void)setQuestions:(NSArray<InterQuestionInfo *> *)questions;
 
-/// Set the unread badge count (shown when panel is collapsed).
+/// Legacy no-op: the unread badge only ever showed on the collapsed in-window
+/// strip, but visibility is now window-level (a hidden window can't show a
+/// badge). Kept so AppDelegate's calls compile unchanged.
 - (void)setUnreadBadge:(NSInteger)count;
-
-/// Whether the panel is currently expanded (visible).
-@property (nonatomic, readonly) BOOL isExpanded;
-
-/// Toggle the panel open/closed with animation.
-- (void)togglePanel;
-
-/// Expand the panel.
-- (void)expandPanel;
-
-/// Collapse the panel.
-- (void)collapsePanel;
 
 @end
 

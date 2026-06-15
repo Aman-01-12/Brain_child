@@ -41,6 +41,9 @@ NS_ASSUME_NONNULL_BEGIN
 /// Show an error message below the form (e.g. "Invalid credentials").
 - (void)showError:(NSString *)message;
 
+/// Preset the panel to register (sign-up) or sign-in mode before showing.
+- (void)setRegisterMode:(BOOL)isRegister;
+
 /// Show a non-error confirmation message (e.g. "reset link sent").
 - (void)showInfo:(NSString *)message;
 

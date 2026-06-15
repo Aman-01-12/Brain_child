@@ -50,15 +50,16 @@ NS_ASSUME_NONNULL_BEGIN
 
 /// [Phase 11] Schedule meeting panel.
 ///
-/// Two sections:
-///   1. **Schedule form**: Title, date/time, duration, room type, password, lobby toggle
-///   2. **Upcoming list**: Table of scheduled meetings with Join/Cancel actions
-///
-/// Hosted in a standalone movable/resizable NSWindow.
-@interface InterSchedulePanel : NSView <NSTableViewDataSource, NSTableViewDelegate>
+/// Two panes: month calendar + Hosted/Invited upcoming list (left) and the
+/// schedule form (right). Below the schedule-specific fields the form embeds a
+/// "Meeting settings" section backed by the SAME saved defaults the
+/// pre-meeting flow uses (full list on first use; quick three + Advanced ▸
+/// once defaults exist). The body is SwiftUI (`ScheduleView`) hosted via the
+/// Swift `InterScheduleHostView` bridge — this class is a thin Obj-C shell
+/// preserving the delegate contract, so AppDelegate's wiring is unchanged.
+@interface InterSchedulePanel : NSView
 
 @property (nonatomic, weak, nullable) id<InterSchedulePanelDelegate> delegate;
-@property (nonatomic, strong, readonly) NSButton *scheduleButton;
 
 /// Set the upcoming meetings list (hosted by this user).
 - (void)setUpcomingMeetings:(NSArray<InterScheduledMeeting *> *)meetings;
@@ -71,6 +72,10 @@ NS_ASSUME_NONNULL_BEGIN
 
 /// Show a brief status message (e.g. "Meeting scheduled!" or error text).
 - (void)setStatusText:(NSString *)text;
+
+/// Show/hide the submitting state on the Schedule CTA (replaces the legacy
+/// `scheduleButton.enabled` poking).
+- (void)setSubmitting:(BOOL)submitting;
 
 @end
 

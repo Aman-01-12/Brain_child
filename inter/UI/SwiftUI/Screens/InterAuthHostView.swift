@@ -80,6 +80,11 @@ public final class InterAuthHostView: NSView {
 
     // MARK: Legacy InterLoginPanel API (forwarded to the view model)
 
+    /// Preset the screen to register (sign-up) or sign-in mode before showing.
+    @objc public func setRegisterMode(_ isRegister: Bool) {
+        viewModel.mode = isRegister ? .signUp : .signIn
+    }
+
     @objc public func showError(_ message: String) {
         viewModel.isLoading = false
         // Route to the offending field (inline) when we can tell which one; otherwise the

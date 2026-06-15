@@ -2,10 +2,11 @@
 
 #import "InterInterviewToolTypes.h"
 #import "InterShareTypes.h"
+#import "InterCallMediaControlSurface.h"
 
 NS_ASSUME_NONNULL_BEGIN
 
-@interface InterLocalCallControlPanel : NSView
+@interface InterLocalCallControlPanel : NSView <InterCallMediaControlSurface>
 
 @property (nonatomic, copy, nullable) dispatch_block_t cameraToggleHandler;
 @property (nonatomic, copy, nullable) dispatch_block_t microphoneToggleHandler;

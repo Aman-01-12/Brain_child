@@ -1,39 +1,31 @@
 #import "InterChatPanel.h"
-#import <objc/runtime.h>
 
 #if __has_include("inter-Swift.h")
 #import "inter-Swift.h"
 #endif
 
-/// Stable pointer used as the associated-object key for file messages on download buttons.
-static char kFileMessageKey;
+// The chat panel BODY is now SwiftUI (`ChatView`), hosted via the Swift
+// `InterChatHostView` bridge. This class keeps what must stay AppKit — the
+// slide-in container + animation, the click pass-through hit-testing over the
+// stage, and the unread badge (it must render while the container is
+// off-screen) — and preserves the original public API and the
+// `InterChatPanelDelegate` contract, so AppDelegate (normal call) and
+// SecureWindowController (secure overlay) are unchanged. The former
+// NSTableView/NSTextField implementation was replaced — its behavior now
+// lives in `ChatViewModel` + `ChatView`.
 
-static const CGFloat InterChatPanelWidth = 300.0;
-static const CGFloat InterChatInputHeight = 36.0;
-static const CGFloat InterChatHeaderHeight = 38.0;
-static const CGFloat InterChatPadding = 8.0;
-static const CGFloat InterChatRecipientHeight = 28.0;
-static const CGFloat InterChatMessageRowMinHeight = 32.0;
+/// Catalogue panel width (ChatMock). Clamped to the overlay bounds so the
+/// secure mode's 320pt window is filled edge-to-edge.
+static const CGFloat InterChatPanelMaxWidth = 360.0;
 static const CGFloat InterChatAnimationDuration = 0.25;
 
 @interface InterChatPanel ()
 
 @property (nonatomic, strong) NSView *containerView;
-@property (nonatomic, strong) NSTextField *headerLabel;
-@property (nonatomic, strong) NSButton *closeButton;
-@property (nonatomic, strong) NSButton *exportButton;
-@property (nonatomic, strong) NSScrollView *scrollView;
-@property (nonatomic, strong) NSTableView *tableView;
-@property (nonatomic, strong) NSTextField *inputField;
-@property (nonatomic, strong) NSButton *sendButton;
-@property (nonatomic, strong) NSButton *attachButton;
-@property (nonatomic, strong) NSPopUpButton *recipientSelector;
+@property (nonatomic, strong) InterChatHostView *host;
 @property (nonatomic, strong) NSView *unreadBadgeView;
 @property (nonatomic, strong) NSTextField *unreadLabel;
-@property (nonatomic, strong) NSMutableArray<InterChatMessageInfo *> *displayMessages;
 @property (nonatomic, assign) BOOL expanded;
-@property (nonatomic, copy, nullable) NSString *selectedRecipient;
-@property (nonatomic, assign) BOOL chatInputEnabled;
 
 @end
 
@@ -42,9 +34,7 @@ static const CGFloat InterChatAnimationDuration = 0.25;
 - (instancetype)initWithFrame:(NSRect)frameRect {
     self = [super initWithFrame:frameRect];
     if (self) {
-        _displayMessages = [NSMutableArray array];
         _expanded = NO;
-        _chatInputEnabled = YES;
         [self setupViews];
     }
     return self;
@@ -52,6 +42,11 @@ static const CGFloat InterChatAnimationDuration = 0.25;
 
 - (BOOL)isExpanded {
     return self.expanded;
+}
+
+/// Effective slide-in width: the catalogue's 360pt, clamped to the overlay.
+- (CGFloat)panelWidth {
+    return MIN(InterChatPanelMaxWidth, self.bounds.size.width);
 }
 
 /// Pass through mouse events when collapsed. Only forward hits that land
@@ -78,175 +73,78 @@ static const CGFloat InterChatAnimationDuration = 0.25;
     [self setWantsLayer:YES];
     self.layer.backgroundColor = [NSColor clearColor].CGColor;
 
-    // Container: the actual panel content
+    // Container: the actual panel content (starts off-screen right)
     self.containerView = [[NSView alloc] initWithFrame:NSMakeRect(self.bounds.size.width,
                                                                    0,
-                                                                   InterChatPanelWidth,
+                                                                   [self panelWidth],
                                                                    self.bounds.size.height)];
     self.containerView.autoresizingMask = NSViewHeightSizable;
     [self.containerView setWantsLayer:YES];
-    self.containerView.layer.backgroundColor = [NSColor colorWithWhite:0.12 alpha:0.95].CGColor;
-    self.containerView.layer.borderColor = [NSColor colorWithWhite:0.25 alpha:1.0].CGColor;
-    self.containerView.layer.borderWidth = 1.0;
     [self addSubview:self.containerView];
 
-    [self setupHeader];
-    [self setupRecipientSelector];
-    [self setupMessageList];
-    [self setupInputArea];
+    [self setupChatHost];
     [self setupUnreadBadge];
 }
 
-- (void)setupHeader {
-    CGFloat containerW = InterChatPanelWidth;
-    CGFloat containerH = self.containerView.bounds.size.height;
+- (void)setupChatHost {
+    self.host = [[InterChatHostView alloc] initWithFrame:self.containerView.bounds];
+    self.host.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
 
-    // Header bar
-    NSView *headerBar = [[NSView alloc] initWithFrame:NSMakeRect(0,
-                                                                  containerH - InterChatHeaderHeight,
-                                                                  containerW,
-                                                                  InterChatHeaderHeight)];
-    headerBar.autoresizingMask = NSViewWidthSizable | NSViewMinYMargin;
-    [headerBar setWantsLayer:YES];
-    headerBar.layer.backgroundColor = [NSColor colorWithWhite:0.15 alpha:1.0].CGColor;
-    [self.containerView addSubview:headerBar];
+    __weak typeof(self) weakSelf = self;
+    self.host.onSend = ^(NSString *text) {
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf) return;
+        if ([strongSelf.delegate respondsToSelector:@selector(chatPanel:didSubmitMessage:)]) {
+            [strongSelf.delegate chatPanel:strongSelf didSubmitMessage:text];
+        }
+    };
+    self.host.onSelectRecipient = ^(NSString * _Nullable identity) {
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf) return;
+        if ([strongSelf.delegate respondsToSelector:@selector(chatPanel:didSelectRecipient:)]) {
+            [strongSelf.delegate chatPanel:strongSelf didSelectRecipient:identity];
+        }
+    };
+    self.host.onAttach = ^{
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf) return;
+        if ([strongSelf.delegate respondsToSelector:@selector(chatPanelDidRequestFileAttach:)]) {
+            [strongSelf.delegate chatPanelDidRequestFileAttach:strongSelf];
+        }
+    };
+    self.host.onExport = ^{
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf) return;
+        if ([strongSelf.delegate respondsToSelector:@selector(chatPanelDidRequestExport:)]) {
+            [strongSelf.delegate chatPanelDidRequestExport:strongSelf];
+        }
+    };
+    self.host.onDownload = ^(InterChatMessageInfo *message) {
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf) return;
+        if ([strongSelf.delegate respondsToSelector:@selector(chatPanel:didRequestDownloadFileMessage:)]) {
+            [strongSelf.delegate chatPanel:strongSelf didRequestDownloadFileMessage:message];
+        }
+    };
+    self.host.onClose = ^{
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf) return;
+        [strongSelf handleHeaderCloseRequest];
+    };
 
-    self.headerLabel = [NSTextField labelWithString:@"Chat"];
-    self.headerLabel.frame = NSMakeRect(InterChatPadding, 8, 100, 20);
-    self.headerLabel.font = [NSFont boldSystemFontOfSize:13];
-    self.headerLabel.textColor = [NSColor colorWithWhite:0.92 alpha:1.0];
-    self.headerLabel.autoresizingMask = NSViewMaxXMargin | NSViewMinYMargin;
-    [headerBar addSubview:self.headerLabel];
-
-    self.exportButton = [[NSButton alloc] initWithFrame:NSMakeRect(containerW - 82, 6, 36, 24)];
-    self.exportButton.autoresizingMask = NSViewMinXMargin | NSViewMinYMargin;
-    [self.exportButton setImage:[NSImage imageWithSystemSymbolName:@"square.and.arrow.up"
-                                         accessibilityDescription:@"Export"]];
-    [self.exportButton setImagePosition:NSImageOnly];
-    [self.exportButton setBordered:NO];
-    self.exportButton.contentTintColor = [NSColor colorWithWhite:0.7 alpha:1.0];
-    [self.exportButton setTarget:self];
-    [self.exportButton setAction:@selector(exportAction:)];
-    self.exportButton.toolTip = @"Export chat transcript";
-    self.exportButton.hidden = YES;  // revealed by host/co-host on pro+ tier
-    [headerBar addSubview:self.exportButton];
-
-    self.closeButton = [[NSButton alloc] initWithFrame:NSMakeRect(containerW - 42, 6, 36, 24)];
-    self.closeButton.autoresizingMask = NSViewMinXMargin | NSViewMinYMargin;
-    [self.closeButton setImage:[NSImage imageWithSystemSymbolName:@"xmark"
-                                        accessibilityDescription:@"Close"]];
-    [self.closeButton setImagePosition:NSImageOnly];
-    [self.closeButton setBordered:NO];
-    self.closeButton.contentTintColor = [NSColor colorWithWhite:0.7 alpha:1.0];
-    [self.closeButton setTarget:self];
-    [self.closeButton setAction:@selector(closeAction:)];
-    [headerBar addSubview:self.closeButton];
+    [self.containerView addSubview:self.host];
 }
 
-- (void)setupRecipientSelector {
-    CGFloat containerW = InterChatPanelWidth;
-    CGFloat containerH = self.containerView.bounds.size.height;
-    CGFloat y = containerH - InterChatHeaderHeight - InterChatRecipientHeight - 4;
-
-    self.recipientSelector = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(InterChatPadding, y,
-                                                                             containerW - InterChatPadding * 2,
-                                                                             InterChatRecipientHeight)
-                                                        pullsDown:NO];
-    self.recipientSelector.autoresizingMask = NSViewWidthSizable | NSViewMinYMargin;
-    [self.recipientSelector addItemWithTitle:@"Everyone"];
-    self.recipientSelector.font = [NSFont systemFontOfSize:11];
-    [self.recipientSelector setTarget:self];
-    [self.recipientSelector setAction:@selector(recipientChanged:)];
-    [self.containerView addSubview:self.recipientSelector];
-}
-
-- (void)setupMessageList {
-    CGFloat containerW = InterChatPanelWidth;
-    CGFloat containerH = self.containerView.bounds.size.height;
-    CGFloat topOffset = InterChatHeaderHeight + InterChatRecipientHeight + 8;
-    CGFloat bottomOffset = InterChatInputHeight + InterChatPadding * 2;
-    CGFloat scrollHeight = containerH - topOffset - bottomOffset;
-
-    self.scrollView = [[NSScrollView alloc] initWithFrame:NSMakeRect(0,
-                                                                      bottomOffset,
-                                                                      containerW,
-                                                                      scrollHeight)];
-    self.scrollView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
-    self.scrollView.hasVerticalScroller = YES;
-    self.scrollView.hasHorizontalScroller = NO;
-    self.scrollView.drawsBackground = NO;
-    self.scrollView.borderType = NSNoBorder;
-    [self.containerView addSubview:self.scrollView];
-
-    self.tableView = [[NSTableView alloc] initWithFrame:self.scrollView.bounds];
-    self.tableView.headerView = nil;
-    self.tableView.backgroundColor = [NSColor clearColor];
-    self.tableView.usesAlternatingRowBackgroundColors = NO;
-    self.tableView.selectionHighlightStyle = NSTableViewSelectionHighlightStyleNone;
-    self.tableView.intercellSpacing = NSMakeSize(0, 2);
-    self.tableView.rowHeight = InterChatMessageRowMinHeight;
-
-    NSTableColumn *column = [[NSTableColumn alloc] initWithIdentifier:@"message"];
-    column.width = containerW;
-    column.resizingMask = NSTableColumnAutoresizingMask;
-    [self.tableView addTableColumn:column];
-
-    self.tableView.dataSource = self;
-    self.tableView.delegate = self;
-
-    self.scrollView.documentView = self.tableView;
-}
-
-- (void)setupInputArea {
-    CGFloat containerW = InterChatPanelWidth;
-    CGFloat attachW = 32.0;
-    CGFloat sendW = 48.0;
-    CGFloat inputW = containerW - InterChatPadding * 4 - attachW - sendW;
-
-    // Attach file button (paperclip icon)
-    self.attachButton = [[NSButton alloc] initWithFrame:NSMakeRect(InterChatPadding,
-                                                                    InterChatPadding,
-                                                                    attachW,
-                                                                    InterChatInputHeight)];
-    [self.attachButton setImage:[NSImage imageWithSystemSymbolName:@"paperclip"
-                                          accessibilityDescription:@"Attach file"]];
-    [self.attachButton setImagePosition:NSImageOnly];
-    [self.attachButton setBordered:NO];
-    self.attachButton.contentTintColor = [NSColor colorWithWhite:0.7 alpha:1.0];
-    self.attachButton.autoresizingMask = NSViewMaxXMargin | NSViewMaxYMargin;
-    self.attachButton.toolTip = @"Share a file (max 10 MB)";
-    [self.attachButton setTarget:self];
-    [self.attachButton setAction:@selector(attachAction:)];
-    [self.containerView addSubview:self.attachButton];
-
-    CGFloat inputX = InterChatPadding * 2 + attachW;
-    self.inputField = [[NSTextField alloc] initWithFrame:NSMakeRect(inputX,
-                                                                     InterChatPadding,
-                                                                     inputW,
-                                                                     InterChatInputHeight)];
-    self.inputField.placeholderString = @"Type a message…";
-    self.inputField.font = [NSFont systemFontOfSize:12];
-    self.inputField.textColor = [NSColor colorWithWhite:0.92 alpha:1.0];
-    self.inputField.backgroundColor = [NSColor colorWithWhite:0.18 alpha:1.0];
-    self.inputField.drawsBackground = YES;
-    [self.inputField setWantsLayer:YES];
-    self.inputField.layer.cornerRadius = 4.0;
-    self.inputField.focusRingType = NSFocusRingTypeNone;
-    self.inputField.delegate = self;
-    self.inputField.autoresizingMask = NSViewWidthSizable | NSViewMaxYMargin;
-    [self.containerView addSubview:self.inputField];
-
-    CGFloat sendX = inputX + inputW + InterChatPadding;
-    self.sendButton = [[NSButton alloc] initWithFrame:NSMakeRect(sendX,
-                                                                  InterChatPadding,
-                                                                  sendW,
-                                                                  InterChatInputHeight)];
-    [self.sendButton setTitle:@"Send"];
-    self.sendButton.font = [NSFont systemFontOfSize:11 weight:NSFontWeightMedium];
-    self.sendButton.autoresizingMask = NSViewMinXMargin | NSViewMaxYMargin;
-    [self.sendButton setTarget:self];
-    [self.sendButton setAction:@selector(sendAction:)];
-    [self.containerView addSubview:self.sendButton];
+/// Single entry point for the in-panel header "X". The delegate owns close when it
+/// opts in (overlay-window hosts hide their window instead of sliding the panel
+/// off-screen). Otherwise fall back to the in-window collapse used by the normal
+/// call layout, which has no separate window to hide.
+- (void)handleHeaderCloseRequest {
+    if ([self.delegate respondsToSelector:@selector(chatPanelDidRequestClose:)]) {
+        [self.delegate chatPanelDidRequestClose:self];
+    } else {
+        [self collapsePanel];
+    }
 }
 
 - (void)setupUnreadBadge {
@@ -269,17 +167,7 @@ static const CGFloat InterChatAnimationDuration = 0.25;
 #pragma mark - Public API
 
 - (void)appendMessage:(InterChatMessageInfo *)message {
-    [self.displayMessages addObject:message];
-
-    [self.tableView beginUpdates];
-    NSIndexSet *indexSet = [NSIndexSet indexSetWithIndex:self.displayMessages.count - 1];
-    [self.tableView insertRowsAtIndexes:indexSet withAnimation:NSTableViewAnimationEffectNone];
-    [self.tableView endUpdates];
-
-    // Auto-scroll to bottom
-    dispatch_async(dispatch_get_main_queue(), ^{
-        [self.tableView scrollRowToVisible:self.displayMessages.count - 1];
-    });
+    [self.host appendMessage:message];
 }
 
 - (void)setUnreadBadge:(NSInteger)count {
@@ -302,25 +190,7 @@ static const CGFloat InterChatAnimationDuration = 0.25;
 }
 
 - (void)setParticipantList:(nullable NSArray<NSDictionary<NSString *, NSString *> *> *)participants {
-    // Remove all items except "Everyone"
-    while (self.recipientSelector.numberOfItems > 1) {
-        [self.recipientSelector removeItemAtIndex:self.recipientSelector.numberOfItems - 1];
-    }
-
-    if (!participants || participants.count == 0) {
-        return;
-    }
-
-    // Add separator
-    [self.recipientSelector.menu addItem:[NSMenuItem separatorItem]];
-
-    for (NSDictionary<NSString *, NSString *> *participant in participants) {
-        NSString *name = participant[@"name"] ?: @"Unknown";
-        NSString *identity = participant[@"identity"] ?: @"";
-        NSMenuItem *item = [[NSMenuItem alloc] initWithTitle:name action:nil keyEquivalent:@""];
-        item.representedObject = identity;
-        [self.recipientSelector.menu addItem:item];
-    }
+    [self.host setParticipantList:participants ?: @[]];
 }
 
 #pragma mark - Panel Toggle
@@ -338,16 +208,17 @@ static const CGFloat InterChatAnimationDuration = 0.25;
     self.expanded = YES;
     self.hidden = NO;
 
-    CGFloat targetX = self.bounds.size.width - InterChatPanelWidth;
+    CGFloat panelW = [self panelWidth];
+    CGFloat targetX = self.bounds.size.width - panelW;
 
     [NSAnimationContext runAnimationGroup:^(NSAnimationContext *context) {
         context.duration = InterChatAnimationDuration;
         context.timingFunction = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseInEaseOut];
         self.containerView.animator.frame = NSMakeRect(targetX, 0,
-                                                        InterChatPanelWidth,
+                                                        panelW,
                                                         self.bounds.size.height);
     } completionHandler:^{
-        [self.inputField becomeFirstResponder];
+        [self.host focusInput];
     }];
 }
 
@@ -361,298 +232,9 @@ static const CGFloat InterChatAnimationDuration = 0.25;
         context.duration = InterChatAnimationDuration;
         context.timingFunction = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseInEaseOut];
         self.containerView.animator.frame = NSMakeRect(offscreenX, 0,
-                                                        InterChatPanelWidth,
+                                                        [self panelWidth],
                                                         self.bounds.size.height);
     } completionHandler:nil];
-}
-
-#pragma mark - Actions
-
-- (void)sendAction:(id)sender {
-#pragma unused(sender)
-    NSString *text = self.inputField.stringValue;
-    if (text.length == 0) return;
-
-    self.inputField.stringValue = @"";
-    [self.delegate chatPanel:self didSubmitMessage:text];
-}
-
-- (void)attachAction:(id)sender {
-#pragma unused(sender)
-    if ([self.delegate respondsToSelector:@selector(chatPanelDidRequestFileAttach:)]) {
-        [self.delegate chatPanelDidRequestFileAttach:self];
-    }
-}
-
-- (void)closeAction:(id)sender {
-#pragma unused(sender)
-    [self collapsePanel];
-}
-
-- (void)exportAction:(id)sender {
-#pragma unused(sender)
-    [self.delegate chatPanelDidRequestExport:self];
-}
-
-- (void)recipientChanged:(id)sender {
-#pragma unused(sender)
-    NSInteger index = self.recipientSelector.indexOfSelectedItem;
-    if (index <= 0) {
-        // "Everyone" selected
-        self.selectedRecipient = nil;
-        self.inputField.placeholderString = @"Type a message…";
-        [self.delegate chatPanel:self didSelectRecipient:nil];
-    } else {
-        NSMenuItem *item = [self.recipientSelector selectedItem];
-        NSString *identity = item.representedObject;
-        self.selectedRecipient = identity;
-        self.inputField.placeholderString = [NSString stringWithFormat:@"DM to %@…", item.title];
-        [self.delegate chatPanel:self didSelectRecipient:identity];
-    }
-}
-
-#pragma mark - NSTextFieldDelegate
-
-- (void)controlTextDidEndEditing:(NSNotification *)obj {
-    // Check if the user pressed Enter (Return key)
-    NSEvent *event = [NSApp currentEvent];
-    if (event.type == NSEventTypeKeyDown && event.keyCode == 36) {
-        [self sendAction:nil];
-    }
-}
-
-- (BOOL)control:(NSControl *)control textView:(NSTextView *)textView doCommandBySelector:(SEL)commandSelector {
-    if (commandSelector == @selector(insertNewline:)) {
-        [self sendAction:nil];
-        return YES;
-    }
-    return NO;
-}
-
-#pragma mark - NSTableViewDataSource
-
-- (NSInteger)numberOfRowsInTableView:(NSTableView *)tableView {
-#pragma unused(tableView)
-    return (NSInteger)self.displayMessages.count;
-}
-
-#pragma mark - NSTableViewDelegate
-
-- (NSView *)tableView:(NSTableView *)tableView viewForTableColumn:(NSTableColumn *)tableColumn row:(NSInteger)row {
-#pragma unused(tableColumn)
-
-    InterChatMessageInfo *message = self.displayMessages[row];
-
-    if (message.messageType == InterChatMessageTypeFileMessage) {
-        return [self fileCellForRow:row inTableView:tableView message:message];
-    }
-    return [self textCellForRow:row inTableView:tableView message:message];
-}
-
-/// Build a text/DM/system message cell.
-- (NSView *)textCellForRow:(NSInteger)row inTableView:(NSTableView *)tableView message:(InterChatMessageInfo *)message {
-#pragma unused(row)
-    static NSString *const kCellIdentifier = @"ChatMessageCell";
-
-    NSTableCellView *cell = [tableView makeViewWithIdentifier:kCellIdentifier owner:nil];
-    if (!cell) {
-        cell = [[NSTableCellView alloc] initWithFrame:NSMakeRect(0, 0, InterChatPanelWidth, InterChatMessageRowMinHeight)];
-        cell.identifier = kCellIdentifier;
-
-        NSTextField *nameLabel = [NSTextField labelWithString:@""];
-        nameLabel.tag = 100;
-        nameLabel.font = [NSFont boldSystemFontOfSize:10];
-        nameLabel.textColor = [NSColor colorWithWhite:0.6 alpha:1.0];
-        nameLabel.frame = NSMakeRect(InterChatPadding, 0, InterChatPanelWidth - InterChatPadding * 2, 14);
-        nameLabel.autoresizingMask = NSViewWidthSizable | NSViewMinYMargin;
-        [cell addSubview:nameLabel];
-
-        NSTextField *textLabel = [NSTextField labelWithString:@""];
-        textLabel.tag = 101;
-        textLabel.font = [NSFont systemFontOfSize:12];
-        textLabel.textColor = [NSColor colorWithWhite:0.9 alpha:1.0];
-        textLabel.frame = NSMakeRect(InterChatPadding, 0, InterChatPanelWidth - InterChatPadding * 2, 18);
-        textLabel.autoresizingMask = NSViewWidthSizable | NSViewMaxYMargin;
-        textLabel.maximumNumberOfLines = 0;
-        textLabel.lineBreakMode = NSLineBreakByWordWrapping;
-        [cell addSubview:textLabel];
-    }
-
-    NSTextField *nameLabel = [cell viewWithTag:100];
-    NSTextField *textLabel = [cell viewWithTag:101];
-
-    switch (message.messageType) {
-        case InterChatMessageTypePublicMessage: {
-            NSString *header = [NSString stringWithFormat:@"%@ · %@",
-                                message.senderName, message.formattedTime];
-            nameLabel.stringValue = header;
-            nameLabel.textColor = message.isFromLocalUser
-                ? [NSColor systemBlueColor]
-                : [NSColor colorWithWhite:0.6 alpha:1.0];
-            textLabel.textColor = [NSColor colorWithWhite:0.92 alpha:1.0];
-            break;
-        }
-        case InterChatMessageTypeDirectMessage: {
-            NSString *dmPrefix;
-            if (message.isFromLocalUser) {
-                // Resolve recipient identity to display name using the selector menu.
-                NSString *recipientName = message.recipientIdentity;
-                for (NSMenuItem *item in self.recipientSelector.itemArray) {
-                    if ([item.representedObject isKindOfClass:[NSString class]] &&
-                        [item.representedObject isEqualToString:message.recipientIdentity]) {
-                        recipientName = item.title;
-                        break;
-                    }
-                }
-                dmPrefix = [NSString stringWithFormat:@"To %@", recipientName];
-            } else {
-                dmPrefix = [NSString stringWithFormat:@"DM from %@", message.senderName];
-            }
-            NSString *header = [NSString stringWithFormat:@"%@ · %@", dmPrefix, message.formattedTime];
-            nameLabel.stringValue = header;
-            nameLabel.textColor = [NSColor systemPurpleColor];
-            textLabel.textColor = [NSColor colorWithWhite:0.92 alpha:1.0];
-            break;
-        }
-        case InterChatMessageTypeSystem: {
-            nameLabel.stringValue = message.formattedTime;
-            nameLabel.textColor = [NSColor colorWithWhite:0.45 alpha:1.0];
-            textLabel.textColor = [NSColor colorWithWhite:0.55 alpha:1.0];
-            break;
-        }
-        default:
-            break;
-    }
-
-    textLabel.stringValue = message.text;
-
-    CGFloat cellW = tableView.bounds.size.width;
-    CGFloat textW = cellW - InterChatPadding * 2;
-    nameLabel.frame = NSMakeRect(InterChatPadding, cell.bounds.size.height - 14, textW, 14);
-    textLabel.frame = NSMakeRect(InterChatPadding, 2, textW, cell.bounds.size.height - 16);
-
-    return cell;
-}
-
-/// Build a file-message cell with a download button.
-- (NSView *)fileCellForRow:(NSInteger)row inTableView:(NSTableView *)tableView message:(InterChatMessageInfo *)message {
-#pragma unused(row)
-    static NSString *const kFileCellId = @"ChatFileCell";
-
-    NSTableCellView *cell = [tableView makeViewWithIdentifier:kFileCellId owner:nil];
-    if (!cell) {
-        cell = [[NSTableCellView alloc] initWithFrame:NSMakeRect(0, 0, InterChatPanelWidth, 54)];
-        cell.identifier = kFileCellId;
-
-        // Sender + time header
-        NSTextField *senderLabel = [NSTextField labelWithString:@""];
-        senderLabel.tag = 200;
-        senderLabel.font = [NSFont boldSystemFontOfSize:10];
-        senderLabel.textColor = [NSColor colorWithWhite:0.6 alpha:1.0];
-        senderLabel.autoresizingMask = NSViewWidthSizable | NSViewMinYMargin;
-        [cell addSubview:senderLabel];
-
-        // Paper icon
-        NSImageView *iconView = [[NSImageView alloc] initWithFrame:NSMakeRect(InterChatPadding, 0, 18, 18)];
-        iconView.tag = 201;
-        iconView.image = [NSImage imageWithSystemSymbolName:@"doc.fill" accessibilityDescription:@"File"];
-        iconView.contentTintColor = [NSColor systemTealColor];
-        iconView.autoresizingMask = NSViewMaxXMargin | NSViewMaxYMargin;
-        [cell addSubview:iconView];
-
-        // File name label
-        NSTextField *nameLabel = [NSTextField labelWithString:@""];
-        nameLabel.tag = 202;
-        nameLabel.font = [NSFont systemFontOfSize:12];
-        nameLabel.textColor = [NSColor colorWithWhite:0.92 alpha:1.0];
-        nameLabel.lineBreakMode = NSLineBreakByTruncatingMiddle;
-        nameLabel.maximumNumberOfLines = 1;
-        nameLabel.autoresizingMask = NSViewWidthSizable | NSViewMaxYMargin;
-        [cell addSubview:nameLabel];
-
-        // File size label
-        NSTextField *sizeLabel = [NSTextField labelWithString:@""];
-        sizeLabel.tag = 203;
-        sizeLabel.font = [NSFont systemFontOfSize:10];
-        sizeLabel.textColor = [NSColor colorWithWhite:0.5 alpha:1.0];
-        sizeLabel.autoresizingMask = NSViewWidthSizable | NSViewMaxYMargin;
-        [cell addSubview:sizeLabel];
-
-        // Download button
-        NSButton *dlButton = [[NSButton alloc] init];
-        dlButton.tag = 204;
-        [dlButton setTitle:@"Save…"];
-        dlButton.font = [NSFont systemFontOfSize:10 weight:NSFontWeightMedium];
-        dlButton.bezelStyle = NSBezelStyleRounded;
-        dlButton.autoresizingMask = NSViewMinXMargin | NSViewMaxYMargin;
-        dlButton.toolTip = @"Save file to disk";
-        [cell addSubview:dlButton];
-    }
-
-    CGFloat cellW = tableView.bounds.size.width;
-    CGFloat iconW = 18.0, iconH = 18.0;
-    CGFloat dlW = 52.0, dlH = 20.0;
-    CGFloat textX = InterChatPadding * 2 + iconW;
-    CGFloat textW = cellW - textX - dlW - InterChatPadding * 2;
-
-    // Header (top)
-    NSTextField *senderLabel = [cell viewWithTag:200];
-    NSString *prefix = message.isFromLocalUser ? @"You" : message.senderName;
-    senderLabel.stringValue = [NSString stringWithFormat:@"%@ shared a file · %@", prefix, message.formattedTime];
-    senderLabel.frame = NSMakeRect(InterChatPadding, cell.bounds.size.height - 14, cellW - InterChatPadding * 2, 14);
-
-    // Icon (middle-left)
-    NSImageView *iconView = [cell viewWithTag:201];
-    iconView.frame = NSMakeRect(InterChatPadding, cell.bounds.size.height - 36, iconW, iconH);
-
-    // File name (middle)
-    NSTextField *nameLabel = [cell viewWithTag:202];
-    nameLabel.stringValue = message.fileName;
-    nameLabel.frame = NSMakeRect(textX, cell.bounds.size.height - 32, textW, 16);
-
-    // File size (below name)
-    NSTextField *sizeLabel = [cell viewWithTag:203];
-    sizeLabel.stringValue = message.formattedFileSize;
-    sizeLabel.frame = NSMakeRect(textX, cell.bounds.size.height - 48, textW, 14);
-
-    // Download button (right side)
-    NSButton *dlButton = [cell viewWithTag:204];
-    dlButton.frame = NSMakeRect(cellW - dlW - InterChatPadding,
-                                cell.bounds.size.height - 36,
-                                dlW, dlH);
-    // Store message reference for action
-    objc_setAssociatedObject(dlButton, &kFileMessageKey, message, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    [dlButton setTarget:self];
-    [dlButton setAction:@selector(downloadFileAction:)];
-
-    return cell;
-}
-
-- (void)downloadFileAction:(NSButton *)sender {
-    InterChatMessageInfo *message = objc_getAssociatedObject(sender, &kFileMessageKey);
-    if (!message) return;
-    if ([self.delegate respondsToSelector:@selector(chatPanel:didRequestDownloadFileMessage:)]) {
-        [self.delegate chatPanel:self didRequestDownloadFileMessage:message];
-    }
-}
-
-- (CGFloat)tableView:(NSTableView *)tableView heightOfRow:(NSInteger)row {
-#pragma unused(tableView)
-
-    InterChatMessageInfo *message = self.displayMessages[row];
-
-    if (message.messageType == InterChatMessageTypeFileMessage) {
-        return 58.0; // fixed height for file cells
-    }
-
-    CGFloat textW = InterChatPanelWidth - InterChatPadding * 2;
-    NSDictionary *attrs = @{NSFontAttributeName: [NSFont systemFontOfSize:12]};
-    NSRect boundingRect = [message.text boundingRectWithSize:NSMakeSize(textW, CGFLOAT_MAX)
-                                                     options:NSStringDrawingUsesLineFragmentOrigin
-                                                  attributes:attrs
-                                                     context:nil];
-    CGFloat textHeight = ceil(boundingRect.size.height);
-    return MAX(InterChatMessageRowMinHeight, textHeight + 20.0);
 }
 
 #pragma mark - Layout
@@ -660,14 +242,15 @@ static const CGFloat InterChatAnimationDuration = 0.25;
 - (void)resizeSubviewsWithOldSize:(NSSize)oldSize {
     [super resizeSubviewsWithOldSize:oldSize];
 
+    CGFloat panelW = [self panelWidth];
     if (self.expanded) {
-        CGFloat targetX = self.bounds.size.width - InterChatPanelWidth;
+        CGFloat targetX = self.bounds.size.width - panelW;
         self.containerView.frame = NSMakeRect(targetX, 0,
-                                               InterChatPanelWidth,
+                                               panelW,
                                                self.bounds.size.height);
     } else {
         self.containerView.frame = NSMakeRect(self.bounds.size.width, 0,
-                                               InterChatPanelWidth,
+                                               panelW,
                                                self.bounds.size.height);
     }
 }
@@ -675,35 +258,17 @@ static const CGFloat InterChatAnimationDuration = 0.25;
 #pragma mark - Phase 9: Moderation
 
 - (void)setChatInputEnabled:(BOOL)enabled {
-    _chatInputEnabled = enabled;
-    self.inputField.enabled = enabled;
-    self.sendButton.enabled = enabled;
-    self.attachButton.enabled = enabled;
-    if (!enabled) {
-        self.inputField.placeholderString = @"Chat is disabled";
-    } else if (self.selectedRecipient) {
-        NSString *displayName = self.recipientSelector.selectedItem.title ?: self.selectedRecipient;
-        self.inputField.placeholderString = [NSString stringWithFormat:@"DM to %@…", displayName];
-    } else {
-        self.inputField.placeholderString = @"Type a message…";
-    }
+    [self.host setChatInputEnabled:enabled];
 }
+
 - (void)setExportButtonHidden:(BOOL)hidden {
-    self.exportButton.hidden = hidden;
+    [self.host setExportButtonHidden:hidden];
 }
+
 - (void)setUploadInProgress:(BOOL)inProgress {
-    // Only re-enable the attach button when chat input is also enabled;
-    // setUploadInProgress:NO must not override a prior setChatInputEnabled:NO.
-    self.attachButton.enabled = !inProgress && self.chatInputEnabled;
-    if (inProgress) {
-        [self.attachButton setImage:[NSImage imageWithSystemSymbolName:@"clock"
-                                              accessibilityDescription:@"Uploading…"]];
-        self.attachButton.toolTip = @"Uploading…";
-    } else {
-        [self.attachButton setImage:[NSImage imageWithSystemSymbolName:@"paperclip"
-                                              accessibilityDescription:@"Attach file"]];
-        self.attachButton.toolTip = @"Share a file (max 10 MB)";
-    }
+    // The view model keeps the upload and moderation flags separate, so ending
+    // an upload never re-enables a composer that moderation disabled.
+    [self.host setUploadInProgress:inProgress];
 }
 
 - (void)displaySystemMessage:(NSString *)text {

@@ -137,6 +137,12 @@ extern NSString *const InterSharingConflictAnyCanPreempt;
 /// Must be called before the view appears.
 - (void)setDisplayName:(NSString *)displayName;
 
+/// Seed the per-meeting name verbatim (green-room → Meeting Settings path).
+- (void)setMeetingName:(NSString *)meetingName;
+
+/// Seed the per-meeting password; empty string clears it.
+- (void)setMeetingPassword:(NSString *)meetingPassword;
+
 /// Gates the pro-only toggles (Auto-Record, Auto-Transcript).
 /// Pass the user's tier string: "free", "pro", "pro+", or "hiring".
 - (void)setUserTier:(NSString *)tier;

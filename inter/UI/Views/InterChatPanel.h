@@ -12,6 +12,12 @@ NS_ASSUME_NONNULL_BEGIN
 - (void)chatPanel:(InterChatPanel *)panel didSubmitMessage:(NSString *)text;
 /// User requested to export the chat transcript.
 - (void)chatPanelDidRequestExport:(InterChatPanel *)panel;
+/// User clicked the in-panel header close ("X"). If the delegate implements this,
+/// it OWNS the close behavior (e.g. an overlay-window host hides its window and
+/// syncs toolbar state). If NOT implemented, the panel falls back to collapsing
+/// itself — the in-window slide-out used by the normal call layout, where the
+/// panel lives inside the call window rather than a dedicated window.
+- (void)chatPanelDidRequestClose:(InterChatPanel *)panel;
 /// User selected a participant for DM. Pass nil to switch back to public.
 - (void)chatPanel:(InterChatPanel *)panel didSelectRecipient:(nullable NSString *)recipientIdentity;
 /// User clicked the "Attach file" button. The delegate should show an NSOpenPanel
@@ -24,15 +30,21 @@ NS_ASSUME_NONNULL_BEGIN
 
 /// [Phase 8.1.3] In-meeting chat panel.
 ///
-/// Slide-in panel from the right edge. Contains:
-///   - Message list (NSScrollView + NSTableView)
+/// Slide-in panel from the right edge. The slide container, click pass-through
+/// hit-testing, and the unread badge remain AppKit; the panel BODY is SwiftUI
+/// (`ChatView`) hosted via the Swift `InterChatHostView` bridge — this class
+/// is a thin shell preserving the original public API and the
+/// `InterChatPanelDelegate` contract, so AppDelegate (normal call) and
+/// SecureWindowController (secure overlay) wiring is unchanged.
+///
+/// Contains:
+///   - Message feed (bubbles: own / public / DM / system / file)
 ///   - Recipient selector (Everyone / specific participant)
-///   - Text input field + send button + attach file button
-///   - Unread badge
-///   - Dark theme matching the app
+///   - Composer (attach + input + emoji + send) with moderation disable
+///   - Unread badge (shown when panel is collapsed)
 ///
 /// Toggle visibility with ⌘+Shift+C or the chat button.
-@interface InterChatPanel : NSView <NSTableViewDataSource, NSTableViewDelegate, NSTextFieldDelegate>
+@interface InterChatPanel : NSView
 
 @property (nonatomic, weak, nullable) id<InterChatPanelDelegate> delegate;
 
