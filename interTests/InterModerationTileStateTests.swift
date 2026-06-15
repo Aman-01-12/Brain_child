@@ -1,7 +1,14 @@
 // interTests/InterModerationTileStateTests.swift
-// Unit tests for InterModerationTileState.deriveMic — the cause-derived host
-// per-tile mic state. This matrix is the verification lever that substitutes for
-// a live 2-client call (spec §7).
+// Unit tests for InterModerationTileState.deriveMic / deriveCamera — the
+// cause-derived host per-tile state matrix. This matrix is the verification lever
+// that substitutes for a live 2-client call (spec §7).
+//
+// PRODUCT CHANGE (host-side "Ask to Unmute" / "Ask to Turn On Camera" removed):
+// For a participant who is self-muted / camera-off (and NOT host-blocked, NOT under
+// a global mute/lock-all), the host's primary action is now an enforce-BLOCK
+// (`.mute` rendered as "Block mic" / `.stopVideo` rendered as "Lock camera")
+// instead of the consent "ask" nudge. The host keeps direct Mute/Block and the
+// host-block lift (Remove Mute / Remove Lock) and mute-all "Allow to Speak".
 
 import XCTest
 @testable import inter
@@ -30,18 +37,21 @@ final class InterModerationTileStateTests: XCTestCase {
         XCTAssertEqual(s.cause, .micOn)
         XCTAssertEqual(s.captionText, "Mic on")
         XCTAssertEqual(s.primaryAction, .mute)
+        XCTAssertEqual(s.primaryActionTitle, "Mute Mic")
         XCTAssertEqual(s.secondaryAction, .none)
     }
 
-    // MARK: - Self-mute vs block-lift (Finding A)
+    // MARK: - Self-mute → enforce-block (ask flow removed)
 
-    func test_genuineSelfMute_isSelfMuted_withBlockSecondary() {
+    func test_genuineSelfMute_isSelfMuted_offersBlock() {
         let s = derive(reallyMuted: true, hostBlocked: false, globalMute: false,
                        pendingSelfAction: false)
         XCTAssertEqual(s.cause, .selfMuted)
         XCTAssertEqual(s.captionText, "Self-muted")
-        XCTAssertEqual(s.primaryAction, .askToUnmute)
-        XCTAssertEqual(s.secondaryAction, .blockMic)
+        // Host-side "Ask to Unmute" removed: the host's direct control is enforce-block.
+        XCTAssertEqual(s.primaryAction, .mute)
+        XCTAssertEqual(s.primaryActionTitle, "Block mic")
+        XCTAssertEqual(s.secondaryAction, .none)
     }
 
     func test_blockLiftedAwaitingTap_isOffCanUnmute_notSelfMuted() {
@@ -51,15 +61,17 @@ final class InterModerationTileStateTests: XCTestCase {
         XCTAssertEqual(s.cause, .offCanUnmute)
         XCTAssertEqual(s.captionText, "Off — can unmute")
         XCTAssertNotEqual(s.cause, .selfMuted)
-        XCTAssertEqual(s.primaryAction, .askToUnmute)
+        XCTAssertEqual(s.primaryAction, .mute)
+        XCTAssertEqual(s.primaryActionTitle, "Block mic")
     }
 
-    func test_askPending_refinesCaptionToAskedToUnmute() {
+    func test_askPending_noLongerChangesCause_afterAskRemoved() {
+        // The host-side "Ask to Unmute" flow was removed, so askPending no longer
+        // refines the caption to "Asked to unmute" — a pending tap stays "Off — can unmute".
         let s = derive(reallyMuted: true, hostBlocked: false, globalMute: false,
                        pendingSelfAction: true, askPending: true)
-        XCTAssertEqual(s.cause, .askedToUnmute)
-        XCTAssertEqual(s.captionText, "Asked to unmute")
-        XCTAssertEqual(s.primaryAction, .askToUnmute)
+        XCTAssertEqual(s.cause, .offCanUnmute)
+        XCTAssertEqual(s.primaryAction, .mute)
     }
 
     // MARK: - Host block
@@ -85,7 +97,7 @@ final class InterModerationTileStateTests: XCTestCase {
         XCTAssertEqual(s.cause, .mutedByMuteAll)
         XCTAssertEqual(s.captionText, "Muted (mute-all)")
         XCTAssertEqual(s.primaryAction, .allowToSpeak)
-        XCTAssertNotEqual(s.primaryAction, .mute, "Mute must never appear beside a muted caption")
+        XCTAssertNotEqual(s.primaryAction, .mute, "Mute/Block must never appear beside a mute-all caption")
         XCTAssertEqual(s.secondaryAction, .blockMic)
     }
 
@@ -98,11 +110,14 @@ final class InterModerationTileStateTests: XCTestCase {
         XCTAssertEqual(s.primaryAction, .removeMute)
     }
 
-    // MARK: - Enforce-block secondary availability
+    // MARK: - Enforce-block availability
 
-    func test_blockMicSecondary_presentWhereExpected() {
-        // Present for self-muted and mute-all.
-        XCTAssertEqual(derive(reallyMuted: true, hostBlocked: false, globalMute: false).secondaryAction, .blockMic)
+    func test_blockMic_isPrimaryForSelfMute_secondaryOnlyForMuteAll() {
+        // Self-muted: block is now the PRIMARY action (ask removed), no secondary.
+        let selfMuted = derive(reallyMuted: true, hostBlocked: false, globalMute: false)
+        XCTAssertEqual(selfMuted.primaryAction, .mute)
+        XCTAssertEqual(selfMuted.secondaryAction, .none)
+        // Mute-all: primary is Allow to Speak, with the enforce-block secondary.
         XCTAssertEqual(derive(reallyMuted: true, hostBlocked: false, globalMute: true).secondaryAction, .blockMic)
         // Absent for mic-on and host-muted.
         XCTAssertEqual(derive(reallyMuted: false, hostBlocked: false, globalMute: false).secondaryAction, .none)
@@ -112,10 +127,10 @@ final class InterModerationTileStateTests: XCTestCase {
     // MARK: - Interview mode
 
     func test_interviewMode_forcesActivationActions() {
-        // Self-muted interviewee: activation action force-executes (+ indicator).
+        // Self-muted interviewee: primary is now Block (a restriction) → never forced.
         let self_ = derive(reallyMuted: true, hostBlocked: false, globalMute: false, interview: true)
-        XCTAssertEqual(self_.primaryAction, .askToUnmute)
-        XCTAssertTrue(self_.activationForcesDevice)
+        XCTAssertEqual(self_.primaryAction, .mute)
+        XCTAssertFalse(self_.activationForcesDevice)
 
         // Host-muted: removeMute is an activation → forces in interview.
         let hostMuted = derive(reallyMuted: true, hostBlocked: true, globalMute: false, interview: true)
@@ -127,15 +142,12 @@ final class InterModerationTileStateTests: XCTestCase {
         XCTAssertFalse(live.activationForcesDevice)
     }
 
-    func test_interviewMode_primaryReadsDirectUnmute() {
-        // Every activation action in interview mode shows a direct "Unmute" label,
-        // because it force-turns the mic on (user decision 2026-06-11).
-        let selfMuted = derive(reallyMuted: true, hostBlocked: false, globalMute: false, interview: true)
-        XCTAssertEqual(selfMuted.primaryActionTitle, "Unmute")
-
+    func test_interviewMode_primaryReadsDirectUnmuteForActivationOnly() {
+        // Host-muted (removeMute) force-turns the mic on in interview → direct "Unmute".
         let hostMuted = derive(reallyMuted: true, hostBlocked: true, globalMute: false, interview: true)
         XCTAssertEqual(hostMuted.primaryActionTitle, "Unmute")
 
+        // Mute-all (allowToSpeak) force-grants in interview → "Unmute".
         let muteAll = derive(reallyMuted: true, hostBlocked: false, globalMute: true, interview: true)
         XCTAssertEqual(muteAll.primaryActionTitle, "Unmute")
 
@@ -143,16 +155,17 @@ final class InterModerationTileStateTests: XCTestCase {
         let live = derive(reallyMuted: false, hostBlocked: false, globalMute: false, interview: true)
         XCTAssertEqual(live.primaryActionTitle, "Mute Mic")
 
-        // Normal mode keeps the consent-flow wording (NOT "Unmute").
+        // Self-muted now offers an enforce-block ("Block mic") in BOTH modes — no ask.
+        let selfMutedInterview = derive(reallyMuted: true, hostBlocked: false, globalMute: false, interview: true)
+        XCTAssertEqual(selfMutedInterview.primaryActionTitle, "Block mic")
         let selfMutedNormal = derive(reallyMuted: true, hostBlocked: false, globalMute: false, interview: false)
-        XCTAssertEqual(selfMutedNormal.primaryActionTitle, "Ask to Unmute")
+        XCTAssertEqual(selfMutedNormal.primaryActionTitle, "Block mic")
     }
 
-    func test_interviewMode_keepsBlockSecondary() {
-        // Block stays available in interview mode (superset of host control).
+    func test_interviewMode_blockSecondaryOnlyForMuteAll() {
+        // Self-muted's block is now the PRIMARY (no secondary) in interview too.
         let selfMuted = derive(reallyMuted: true, hostBlocked: false, globalMute: false, interview: true)
-        XCTAssertEqual(selfMuted.secondaryAction, .blockMic)
-        XCTAssertEqual(selfMuted.secondaryActionTitle, "Block mic")
+        XCTAssertEqual(selfMuted.secondaryAction, .none)
 
         let muteAll = derive(reallyMuted: true, hostBlocked: false, globalMute: true, interview: true)
         XCTAssertEqual(muteAll.secondaryAction, .blockMic)
@@ -180,7 +193,7 @@ final class InterModerationTileStateTests: XCTestCase {
 
     // MARK: - Full enumeration: the no-contradiction invariant
 
-    func test_invariant_muteOnlyWhenLive_acrossAllInputs() {
+    func test_invariant_muteLabelMatchesCause_acrossAllInputs() {
         for reallyMuted in [true, false] {
             for hostBlocked in [true, false] {
                 for globalMute in [true, false] {
@@ -190,13 +203,20 @@ final class InterModerationTileStateTests: XCTestCase {
                                 let s = derive(reallyMuted: reallyMuted, hostBlocked: hostBlocked,
                                                globalMute: globalMute, pendingSelfAction: pending,
                                                askPending: askPending, interview: interview)
-                                // The core guarantee: "Mute" is offered IFF the mic is live,
-                                // so the action can never contradict a muted caption.
+                                // `.mute` is offered when live (Mute) AND for an un-blocked
+                                // muted participant (enforce Block). It must NEVER appear for
+                                // host-block or mute-all causes (those offer removeMute /
+                                // allowToSpeak), so the action can't contradict the caption.
                                 if s.primaryAction == .mute {
-                                    XCTAssertEqual(s.cause, .micOn)
-                                    XCTAssertFalse(s.cause.isMuted)
+                                    XCTAssertTrue(s.cause == .micOn || s.cause == .selfMuted || s.cause == .offCanUnmute,
+                                                  "Mute/Block only from live/self-muted/off-can-unmute")
+                                    if s.cause == .micOn {
+                                        XCTAssertEqual(s.primaryActionTitle, "Mute Mic")
+                                    } else {
+                                        XCTAssertEqual(s.primaryActionTitle, "Block mic")
+                                    }
                                 }
-                                // And conversely, a live mic always offers Mute.
+                                // A live mic always offers Mute.
                                 if s.cause == .micOn {
                                     XCTAssertEqual(s.primaryAction, .mute)
                                 }
@@ -213,7 +233,7 @@ final class InterModerationTileStateTests: XCTestCase {
         }
     }
 
-    // MARK: - Camera (PR #2 — mirror of the mic matrix)
+    // MARK: - Camera (mirror of the mic matrix)
 
     private func deriveCam(cameraReallyOff: Bool,
                            hostLocked: Bool,
@@ -234,15 +254,18 @@ final class InterModerationTileStateTests: XCTestCase {
         XCTAssertEqual(s.cause, .camOn)
         XCTAssertEqual(s.captionText, "Camera on")
         XCTAssertEqual(s.primaryAction, .stopVideo)
+        XCTAssertEqual(s.primaryActionTitle, "Stop Video")
         XCTAssertEqual(s.secondaryAction, .none)
     }
 
-    func test_cam_selfOff_offersAskToTurnOn_withLockSecondary() {
+    func test_cam_selfOff_offersLock() {
         let s = deriveCam(cameraReallyOff: true, hostLocked: false, globalLock: false)
         XCTAssertEqual(s.cause, .selfOff)
         XCTAssertEqual(s.captionText, "Camera off")
-        XCTAssertEqual(s.primaryAction, .askToTurnOn)
-        XCTAssertEqual(s.secondaryAction, .lockCamera)
+        // Host-side "Ask to Turn On Camera" removed: the host's direct control is enforce-lock.
+        XCTAssertEqual(s.primaryAction, .stopVideo)
+        XCTAssertEqual(s.primaryActionTitle, "Lock camera")
+        XCTAssertEqual(s.secondaryAction, .none)
     }
 
     func test_cam_lockLifted_isOffCanTurnOn_notSelfOff() {
@@ -250,7 +273,8 @@ final class InterModerationTileStateTests: XCTestCase {
                           pendingSelfAction: true)
         XCTAssertEqual(s.cause, .offCanTurnOn)
         XCTAssertEqual(s.captionText, "Off — can turn on")
-        XCTAssertEqual(s.primaryAction, .askToTurnOn)
+        XCTAssertEqual(s.primaryAction, .stopVideo)
+        XCTAssertEqual(s.primaryActionTitle, "Lock camera")
     }
 
     func test_cam_lockedByHost_offersRemoveLock_noAsk() {
@@ -277,19 +301,31 @@ final class InterModerationTileStateTests: XCTestCase {
         XCTAssertEqual(s.primaryAction, .removeLock)
     }
 
-    func test_cam_interviewMode_directTurnOnLabel_keepsLockSecondary() {
-        // Self-off interviewee in interview mode: activation force-restores → direct label.
+    func test_cam_interviewMode_forceLabelOnlyForWiredLiftPath() {
+        // Self-off interviewee: primary is now Lock (a restriction), never forced.
         let selfOff = deriveCam(cameraReallyOff: true, hostLocked: false, globalLock: false, interview: true)
-        XCTAssertTrue(selfOff.activationForcesDevice)
-        XCTAssertEqual(selfOff.primaryActionTitle, "Turn On Camera")
-        XCTAssertEqual(selfOff.secondaryAction, .lockCamera)
+        XCTAssertFalse(selfOff.activationForcesDevice)
+        XCTAssertEqual(selfOff.primaryActionTitle, "Lock camera")
+        XCTAssertEqual(selfOff.secondaryAction, .none)
+
+        // Host-locked interviewee: the lift path DOES force-restore in interview, so this is
+        // the one camera action that legitimately reads the direct "Turn On Camera".
+        let locked = deriveCam(cameraReallyOff: true, hostLocked: true, globalLock: false, interview: true)
+        XCTAssertTrue(locked.activationForcesDevice)
+        XCTAssertEqual(locked.primaryActionTitle, "Turn On Camera")
+
+        // Lock-all: "Allow Camera" is a slot grant, never a force.
+        let lockAll = deriveCam(cameraReallyOff: true, hostLocked: false, globalLock: true, interview: true)
+        XCTAssertFalse(lockAll.activationForcesDevice)
+        XCTAssertEqual(lockAll.primaryActionTitle, "Allow Camera")
+
         // Camera-on interviewee: Stop Video is a restriction, never a forced activation.
         let live = deriveCam(cameraReallyOff: false, hostLocked: false, globalLock: false, interview: true)
         XCTAssertEqual(live.primaryAction, .stopVideo)
         XCTAssertFalse(live.activationForcesDevice)
     }
 
-    func test_cam_invariant_stopVideoOnlyWhenLive_acrossAllInputs() {
+    func test_cam_invariant_stopVideoLabelMatchesCause_acrossAllInputs() {
         for reallyOff in [true, false] {
             for hostLocked in [true, false] {
                 for globalLock in [true, false] {
@@ -300,8 +336,13 @@ final class InterModerationTileStateTests: XCTestCase {
                                                   globalLock: globalLock, pendingSelfAction: pending,
                                                   askPending: askPending, interview: interview)
                                 if s.primaryAction == .stopVideo {
-                                    XCTAssertEqual(s.cause, .camOn)
-                                    XCTAssertFalse(s.cause.isOff)
+                                    XCTAssertTrue(s.cause == .camOn || s.cause == .selfOff || s.cause == .offCanTurnOn,
+                                                  "Stop/Lock only from live/self-off/off-can-turn-on")
+                                    if s.cause == .camOn {
+                                        XCTAssertEqual(s.primaryActionTitle, "Stop Video")
+                                    } else {
+                                        XCTAssertEqual(s.primaryActionTitle, "Lock camera")
+                                    }
                                 }
                                 if s.cause == .camOn {
                                     XCTAssertEqual(s.primaryAction, .stopVideo)

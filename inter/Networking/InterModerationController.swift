@@ -509,7 +509,14 @@ import LiveKit
     /// toggle state reflects the room's true mute state even when a co-host
     /// initiated the change.
     @objc public func applyExternalGlobalMuteChanged(_ newValue: Bool) {
-        DispatchQueue.main.async { [weak self] in
+        // Use completeOnMain (NOT DispatchQueue.main.async): the callers in
+        // _handleControlSignal are ALREADY on the main queue, where a plain
+        // main.async would defer this mutation past the synchronous delegate
+        // notification that immediately follows — so the delegate (and any KVO
+        // observer of the dynamic isAllMuted) would read a stale value. completeOnMain
+        // runs synchronously on-main so state is updated BEFORE the delegate is told,
+        // and still falls back to async dispatch if ever called off-main.
+        completeOnMain { [weak self] in
             self?.isAllMuted = newValue
         }
     }
@@ -757,7 +764,10 @@ import LiveKit
     /// label ("Turn Off All Cameras" vs "Allow All Cameras") reflects the room's
     /// true state. Mirrors `applyExternalGlobalMuteChanged` for microphones.
     @objc public func applyExternalGlobalCameraMuteChanged(_ newValue: Bool) {
-        DispatchQueue.main.async { [weak self] in
+        // See applyExternalGlobalMuteChanged: same ordering fix — synchronous on-main
+        // so isAllCameraMuted is updated before the delegate notification that follows
+        // it in _handleControlSignal (.requestMuteCameraAll / .liftCameraLockAll).
+        completeOnMain { [weak self] in
             self?.isAllCameraMuted = newValue
         }
     }
@@ -1588,10 +1598,16 @@ import LiveKit
 
         case .requestUnmuteAll:
             interLogInfo(InterLog.room, "ModerationController: received requestUnmuteAll from %{public}@", signal.senderName)
+            // Keep THIS client's authoritative global-mute flag in sync for ALL clients
+            // (co-hosts included), mirroring the camera lift-all path. Without this a
+            // co-host's isAllMuted stayed stale, so a co-host promoted during / present
+            // for a mute-all session saw the wrong cause-derived menu label.
+            applyExternalGlobalMuteChanged(false)
             delegate?.moderationControllerReceivedUnmuteAllRequest?(self)
 
         case .requestMuteAll:
             interLogInfo(InterLog.room, "ModerationController: received requestMuteAll from %{public}@", signal.senderName)
+            applyExternalGlobalMuteChanged(true)
             delegate?.moderationControllerReceivedMuteAllRequest?(self)
 
         case .requestMuteOne:
@@ -1933,14 +1949,14 @@ import LiveKit
             return
         }
 
+        guard let tokenService = roomController?.tokenService else {
+            completion(.failure(makeError("No active session for moderation request")))
+            return
+        }
+
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-
-        // T6: Send auth token — server requires JWT for moderation endpoints.
-        if let token = roomController?.tokenService.currentAccessToken {
-            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        }
 
         do {
             request.httpBody = try JSONSerialization.data(withJSONObject: body)
@@ -1949,14 +1965,14 @@ import LiveKit
             return
         }
 
-        var taskRef: URLSessionDataTask?
-        let task = session.dataTask(with: request) { [weak self] data, response, error in
-            if let t = taskRef {
-                self?.inflightLock.lock()
-                self?.inflightTasks.remove(t)
-                self?.inflightLock.unlock()
-            }
-
+        // Route through the token service's authenticated path so a 401
+        // TOKEN_EXPIRED triggers a silent refresh-and-retry. The host's access
+        // token can expire mid-call; without this, EVERY moderation HTTP action
+        // (promote / mute / camera-lock) 401s and fails silently until the host
+        // rejoins — the root cause of "block mic / stop video stopped working"
+        // after a failed co-host promote. performAuthenticatedRequest sets the
+        // Authorization header itself.
+        tokenService.performAuthenticatedRequest(request) { [weak self] data, response, error in
             if let error = error {
                 completion(.failure(error as NSError))
                 return
@@ -1971,17 +1987,10 @@ import LiveKit
             if (200..<300).contains(httpResponse.statusCode) {
                 completion(.success(data))
             } else {
-                let bodyStr = String(data: data, encoding: .utf8) ?? ""
                 let errorMsg = self?.parseJSON(data)?["error"] as? String ?? "Server error \(httpResponse.statusCode)"
                 completion(.failure(self?.makeError(errorMsg) ?? NSError(domain: "InterModeration", code: -1)))
             }
         }
-
-        taskRef = task
-        inflightLock.lock()
-        inflightTasks.insert(task)
-        inflightLock.unlock()
-        task.resume()
     }
 
     private func parseJSON(_ data: Data) -> [String: Any]? {

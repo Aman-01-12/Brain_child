@@ -152,7 +152,11 @@ import Foundation
     /// actions keep their own titles. (`activationForcesDevice` is exactly
     /// `interview && primaryAction.isActivation`.)
     @objc public var primaryActionTitle: String {
-        activationForcesDevice ? "Unmute" : primaryAction.title
+        if activationForcesDevice { return "Unmute" }
+        // A `.mute` primary on an already-muted participant is an enforce-block
+        // (the host-side "Ask to Unmute" nudge was removed), so label it "Block mic".
+        if primaryAction == .mute && cause.isMuted { return "Block mic" }
+        return primaryAction.title
     }
 
     /// The secondary "Block mic" remains available in interview mode — interview is a
@@ -283,7 +287,11 @@ import Foundation
     /// In interview mode an activation force-turns the camera on, so it reads a direct
     /// **"Turn On Camera"** rather than the consent-flow wording.
     @objc public var primaryActionTitle: String {
-        activationForcesDevice ? "Turn On Camera" : primaryAction.title
+        if activationForcesDevice { return "Turn On Camera" }
+        // A `.stopVideo` primary on an already-off camera is an enforce-lock (the
+        // host-side "Ask to Turn On Camera" nudge was removed), so label it "Lock camera".
+        if primaryAction == .stopVideo && cause.isOff { return "Lock camera" }
+        return primaryAction.title
     }
 
     /// "Lock camera" secondary remains available in interview mode (superset of control).
@@ -350,13 +358,17 @@ import Foundation
             primary = .mute                  // the ONLY state where Mute is offered
             secondary = .none
         } else if pendingSelfAction {
-            cause = askPending ? .askedToUnmute : .offCanUnmute
-            primary = .askToUnmute
-            secondary = .blockMic
+            // Host-side "Ask to Unmute" nudge removed (product decision): for a
+            // participant who is off-but-can-unmute, the host's direct control is to
+            // enforce a block. Caption still distinguishes the "permitted, hasn't
+            // acted" nuance; the action is a block (no consent round-trip).
+            cause = .offCanUnmute
+            primary = .mute                  // enforce-block (renders as "Block mic")
+            secondary = .none
         } else {
             cause = .selfMuted
-            primary = .askToUnmute
-            secondary = .blockMic
+            primary = .mute                  // enforce-block; no host-side "Ask to Unmute"
+            secondary = .none
         }
 
         let forces = isInterviewMode && primary.isActivation
@@ -398,16 +410,27 @@ import Foundation
             primary = .stopVideo             // the ONLY state where Stop Video is offered
             secondary = .none
         } else if pendingSelfAction {
-            cause = askPending ? .askedToTurnOn : .offCanTurnOn
-            primary = .askToTurnOn
-            secondary = .lockCamera
+            // Host-side "Ask to Turn On Camera" nudge removed (product decision):
+            // mirror of the mic side — the host's direct control is to enforce a lock.
+            cause = .offCanTurnOn
+            primary = .stopVideo             // enforce-lock (renders as "Lock camera")
+            secondary = .none
         } else {
             cause = .selfOff
-            primary = .askToTurnOn
-            secondary = .lockCamera
+            primary = .stopVideo             // enforce-lock; no host-side "Ask to Turn On Camera"
+            secondary = .none
         }
 
-        let forces = isInterviewMode && primary.isActivation
+        // Interview force-restore is only actually WIRED for the lock-lift path
+        // (`removeLock` → applyHostCameraLiftForParticipant force-restores in interview).
+        // `askToTurnOn` (self-off) only sends a consent request and `allowCamera` only grants
+        // a one-time slot — neither force-activates — so they must NOT show the direct
+        // "Turn On Camera" label or claim activationForcesDevice. Labeling them as forced was
+        // the bug: host saw "Turn On Camera" but the participant merely got a request. When
+        // the migration agent wires true self-off interview force-restore + the mandatory
+        // "host enabled your camera" indicator (see InterMediaWiringController TODO), extend
+        // this to those actions too.
+        let forces = isInterviewMode && primary == .removeLock
         return InterCamTileState(cause: cause,
                                  primaryAction: primary,
                                  secondaryAction: secondary,
