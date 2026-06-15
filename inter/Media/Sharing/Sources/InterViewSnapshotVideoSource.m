@@ -4,12 +4,35 @@
 #import <CoreMedia/CoreMedia.h>
 #import <CoreVideo/CoreVideo.h>
 #import <os/lock.h>
+#if DEBUG
+#import <os/log.h>
+#endif
 
 #import "InterShareTypes.h"
 
+#if DEBUG
+// [B1] DEBUG-only Retina-confirmation diagnostic. This supports the B1 Retina
+// hypothesis (off-screen tool host captured at 1x instead of 2x): it lets a
+// developer running a live secure session with the tool host parked off-screen
+// confirm at runtime whether the captured pixels are 1x or 2x relative to the
+// view's point bounds. It changes NO capture behavior — the robust
+// backing-scale handling lands in task 16.1. Compiled out of release builds.
+static os_log_t InterViewSnapshotLog(void) {
+    static os_log_t log;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        log = os_log_create("com.inter.sharing", "viewsnapshot");
+    });
+    return log;
+}
+#endif
+
+// [B1] Capture stays at 10 fps (finding H1): the publisher already throttles the
+// uplink to 15 fps, and raising snapshot fps would only worsen B6 main-thread
+// contention (cacheDisplayInRect runs on main). Do NOT raise this to 15.
 static const NSTimeInterval InterViewSnapshotFrameInterval = (1.0 / 10.0);
-static const size_t InterViewSnapshotMaxWidth = 1600;
-static const size_t InterViewSnapshotMaxHeight = 900;
+static const size_t InterViewSnapshotMaxWidth = 1920;
+static const size_t InterViewSnapshotMaxHeight = 1080;
 static const CGFloat InterViewSnapshotBackgroundIntensity = 0.04;
 
 static CGSize InterViewSnapshotScaledSize(CGSize sourceSize, CGFloat maxWidth, CGFloat maxHeight) {
@@ -231,16 +254,81 @@ static CGSize InterViewSnapshotScaledSize(CGSize sourceSize, CGFloat maxWidth, C
 
     [capturedView layoutSubtreeIfNeeded];
 
-    NSBitmapImageRep *bitmap = [capturedView bitmapImageRepForCachingDisplayInRect:capturedView.bounds];
+    // [B1] Capture at NATIVE backing scale (Retina) robustly. AppKit's
+    // bitmapImageRepForCachingDisplayInRect: derives its scale from the view's
+    // window; an off-screen / window-less tool host yields a 1x rep and blurry
+    // text after the <=1920x1080 cap. Build the rep explicitly at native pixel
+    // dimensions (ceil(points * scale)) and set its point size to the bounds, so
+    // cacheDisplayInRect: renders the points-sized view into native-pixel backing
+    // even with no window. Falls back to the main display's backing scale
+    // (typically 2.0) when the view has no window, then to 1.0 as a last resort.
+    CGFloat scale = capturedView.window.backingScaleFactor;
+    if (scale < 1.5) {
+        scale = NSScreen.mainScreen.backingScaleFactor;
+    }
+    if (scale < 1.0) {
+        scale = 1.0;
+    }
+
+    CGFloat boundsW = capturedView.bounds.size.width;
+    CGFloat boundsH = capturedView.bounds.size.height;
+    NSBitmapImageRep *bitmap =
+        [[NSBitmapImageRep alloc] initWithBitmapDataPlanes:NULL
+                                                pixelsWide:(NSInteger)ceil(boundsW * scale)
+                                                pixelsHigh:(NSInteger)ceil(boundsH * scale)
+                                             bitsPerSample:8
+                                           samplesPerPixel:4
+                                                  hasAlpha:YES
+                                                  isPlanar:NO
+                                            colorSpaceName:NSDeviceRGBColorSpace
+                                               bytesPerRow:0
+                                              bitsPerPixel:0];
     if (!bitmap) {
         return nil;
     }
+    // Point size = bounds so AppKit renders the points-sized view into the
+    // native-pixel backing above.
+    bitmap.size = NSMakeSize(boundsW, boundsH);
 
     [capturedView cacheDisplayInRect:capturedView.bounds toBitmapImageRep:bitmap];
     CGImageRef cgImage = bitmap.CGImage;
     if (!cgImage) {
         return nil;
     }
+
+#if DEBUG
+    // [B1] Retina-confirmation diagnostic (gates task 16.1 backing-scale fix).
+    // Log captured pixel dimensions vs the view's point bounds and backing scale
+    // so a developer can confirm whether the off-screen capture is 1x or 2x.
+    // Throttled to at most once per second to avoid spamming the log at 10 fps.
+    {
+        static os_unfair_lock diagnosticLock = OS_UNFAIR_LOCK_INIT;
+        static NSTimeInterval lastLogTime = 0.0;
+        NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
+        BOOL shouldLog = NO;
+        os_unfair_lock_lock(&diagnosticLock);
+        if (now - lastLogTime >= 1.0) {
+            lastLogTime = now;
+            shouldLog = YES;
+        }
+        os_unfair_lock_unlock(&diagnosticLock);
+
+        if (shouldLog) {
+            CGFloat windowScale = capturedView.window.backingScaleFactor;
+            CGFloat mainScreenScale = NSScreen.mainScreen.backingScaleFactor;
+            CGSize pointSize = capturedView.bounds.size;
+            size_t pixelWidth = CGImageGetWidth(cgImage);
+            size_t pixelHeight = CGImageGetHeight(cgImage);
+            os_log(InterViewSnapshotLog(),
+                   "[B1 Retina] window.backingScale=%.2f (mainScreen.backingScale=%.2f fallback) "
+                   "bounds(points)=%.1fx%.1f captured(pixels)=%zux%zu bitmap(pixels)=%ldx%ld",
+                   windowScale, mainScreenScale,
+                   pointSize.width, pointSize.height,
+                   pixelWidth, pixelHeight,
+                   (long)bitmap.pixelsWide, (long)bitmap.pixelsHigh);
+        }
+    }
+#endif
 
     return CGImageCreateCopy(cgImage);
 }

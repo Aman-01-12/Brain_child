@@ -350,7 +350,7 @@ import LiveKit
         enqueueScreenSharePublishCompletion(completion)
 
         let options = VideoPublishOptions(
-            screenShareEncoding: VideoEncoding(maxBitrate: 2_500_000, maxFps: 15),
+            screenShareEncoding: VideoEncoding(maxBitrate: 4_500_000, maxFps: 15),
             simulcast: false,
             preferredCodec: .h264
         )

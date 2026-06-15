@@ -155,6 +155,7 @@
             screenSource.selectedWindowIdentifier = configuration.selectedWindowIdentifier;
             [screenSource startCaptureForSelectedWindow];
         } else {
+            screenSource.selectedDisplayIdentifier = configuration.selectedDisplayIdentifier;
             [screenSource startCaptureForSelectedDisplay];
         }
     } else {

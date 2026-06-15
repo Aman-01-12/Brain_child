@@ -33,6 +33,10 @@ typedef NS_ERROR_ENUM(InterShareErrorDomain, InterShareErrorCode) {
 /// available non-own window.
 @property (nonatomic, copy, nullable) NSString *selectedWindowIdentifier;
 
+/// For InterShareModeEntireScreen — the CGDirectDisplayID (as string) chosen
+/// by the user in the share picker. When nil, the main display is captured.
+@property (nonatomic, copy, nullable) NSString *selectedDisplayIdentifier;
+
 + (instancetype)defaultConfiguration;
 
 @end

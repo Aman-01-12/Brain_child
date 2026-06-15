@@ -21,6 +21,7 @@ NSErrorDomain const InterShareErrorDomain = @"secure.inter.share";
     copy.networkPublishEnabled = self.isNetworkPublishEnabled;
     copy.shareSystemAudioEnabled = self.isShareSystemAudioEnabled;
     copy.selectedWindowIdentifier = self.selectedWindowIdentifier;
+    copy.selectedDisplayIdentifier = self.selectedDisplayIdentifier;
     return copy;
 }
 
