@@ -360,3 +360,74 @@ Reopen this document only when at least one of the following becomes a product r
 3. temporary release from secure mode,
 4. remote secure-mode restore,
 5. administrative participant controls during a live interview.
+
+
+---
+
+## Feature: ML Noise & Echo Cancellation (double-talk hardening)
+
+### Status
+Deferred. Current behavior is acceptable for v1 — simultaneous speech is rare in
+practice, and the headset/earphone path is already clean. Revisit only if users
+report background noise or speech "breaking" on built-in mics during real calls.
+
+### What we observed (investigated via the virtual-participant harness)
+When a participant uses the **built-in Mac mic with speakers** and another person
+is talking at the same time, the speaker's own voice in the transmitted/recorded
+audio shows two artifacts:
+1. **Background noise leakage** — a constant room source (e.g. AC) rides under the
+   voice. Measured noise floor on the built-in mic was ~-47 to -53 dBFS with AC on
+   vs ~-90 to -100 dBFS with AC off. It's environmental; the built-in mic is
+   omnidirectional and picks up the room.
+2. **Speech "breaking" / suppression during double-talk** — when a second
+   participant's audio plays out the speakers, the built-in mic hears it, and the
+   echo-canceller suppresses the near-end (the user's own, often quieter) speech to
+   prevent echo leakage. Measured: intra-speech dropouts roughly **doubled** when a
+   second talker was present (≈9% → ≈19% on the same mic), and were **much milder on
+   an earphone** (no speaker→mic echo loop) and essentially absent on headphones.
+
+### Root cause (confirmed, not a defect in our code)
+- It is **not** the recorder, **not** the network, and **not** a regression from our
+  changes (an AC-off run on the same code was pristine, ~-95 dBFS floor / ~67 dB SNR).
+- It is the **OS/WebRTC voice-processing (AEC + basic noise suppression) on macOS**.
+  On macOS LiveKit uses Apple's Voice-Processing I/O; its echo suppression ducks the
+  near-end during far-end activity (classic double-talk behavior), and its noise
+  suppression doesn't fully remove steady broadband noise like an AC. There is no
+  simple "aggressiveness" dial for it, and the WebRTC software NS options
+  (`AudioCaptureOptions.noiseSuppression`, etc.) default off / are superseded by VPIO
+  on macOS, so toggling them does nothing.
+- An A/B that re-enabled Voice-Processing AGC made it **worse** (over-amplified to
+  full scale, re-loudened the AC, did not fix the breaking) — so AGC stays off.
+
+### How production apps solve this
+Zoom and Microsoft Teams do **not** rely on this class of DSP. They use a
+**deep-learning denoiser** (Zoom: selectable Auto/Low/Medium/High "Suppress
+background noise" + optional voiceprint "audio isolation"; Teams: AI "voice
+isolation"), trained on speech + common noise including HVAC/AC hum, which both
+removes steady background and handles double-talk far better. Tradeoff they expose:
+high suppression can clip soft speakers — so it is a tunable level, not max-on.
+
+### Proposed future approach
+Integrate an **ML noise/echo cancellation processor** via LiveKit's
+`AudioManager.capturePostProcessingDelegate` (the `.tfEnhancedNoiseCancellation`
+hook) — i.e. the LiveKit **Krisp-based noise-filter plugin** (separate Swift package).
+Expose a user setting mirroring Zoom: **Off / Low / High** (treat "Off" like Zoom's
+"Original Sound" for high-fidelity/music). 
+
+Decisions required before building:
+1. Krisp licensing terms and cost.
+2. Dependency / binary-size impact of the noise-cancellation package.
+3. Default level (likely "Low/Auto") and where the toggle lives in settings.
+4. Interaction with the existing Apple VPIO path (bypass vs layer).
+
+### Interim guidance (v1)
+- Use a headset/earphone mic — measured ~7-9 dB lower noise floor and the
+  double-talk breaking largely disappears (no speaker→mic echo loop).
+- Keep the room AC/fan off or the mic away from it when on the built-in mic.
+- Voice-Processing AGC stays disabled (constant gain; AGC-on was worse).
+
+### Trigger for reopening
+Real users (on separate machines, not the single-Mac test rig) reporting either
+(a) audible background noise on the built-in mic, or (b) their speech cutting out
+when others talk over them. At that point, scope the Krisp/enhanced-NC integration
+through the normal plan → council → paranoid flow.

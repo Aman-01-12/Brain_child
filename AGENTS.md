@@ -13,3 +13,4 @@ the developer. Never auto-invoke any skill unprompted.
 
 When the developer names a skill, load it from the 
 path above and follow it fully without skipping steps.
+

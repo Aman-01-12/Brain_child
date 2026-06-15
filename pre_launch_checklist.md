@@ -336,6 +336,21 @@ When the server is on `api.inter.com`:
 5. Update all server-side redirects to use `https://api.inter.com/billing/success` etc. instead of `com-inter-app://billing/success` where the AASA paths cover them
 6. Keep the custom scheme as a fallback for older OS versions or until Universal Links are confirmed working
 
+### 6.1 Password-Reset Deep-Link Phishing (R5-F1) — security context for this migration
+
+🟠 **Status:** Not addressed. This is the concrete reason §6 matters for auth, plus one fix that §6 does **not** cover on its own.
+
+**The risk.** The reset deep link (`com-inter-app://reset-password?token=…`) drops the user straight into a native `NSAlert` + `NSSecureTextField` password prompt (`handlePasswordResetDeepLinkWithToken:` in `inter/App/AppDelegate.m`). That prompt shows **no account identity and no origin**. Because *any* app can register the same custom scheme, a malicious local app can fire the link with an **attacker-controlled token**; the victim types a new password, which resets the **attacker's** account — leaking a reused password into an account the attacker controls.
+
+**What "bound via `apple-app-site-association`" actually buys us.** A Universal Link is only routed into our app if a file served over TLS from our own domain (`https://api.inter.com/.well-known/apple-app-site-association`) explicitly names our signed app (`<TEAM_ID>.com.inter.app`). The "binding" = **domain ownership + TLS cert + our specific Team ID/bundle ID**, instead of a freely-claimable string. An attacker can't host that file on our domain and can't forge our Team ID, so they **can't silently claim** the link. If the app isn't installed, the link just opens in the browser (safe default). This removes the "any app can grab the scheme" enabler of R5-F1.
+
+**Caveat — step 6 above keeps the custom scheme as a fallback.** While `com-inter-app://reset-password` still routes into the app, the freely-claimable surface remains in parallel. To actually close R5-F1, once Universal Links are confirmed working: **stop routing password reset through the custom scheme** — drop the `reset-password` host from the allowlist in `application:openURLs:` (keep billing/oauth on the scheme if still needed), so reset only arrives via the domain-bound Universal Link.
+
+**The decisive fix (NOT covered by §6, add it too) — show the account identity at the password prompt.** This is what Google/Microsoft do, and it neutralises the phishing variant even before the scheme is retired: before the password field, display *"Reset password for `a••@example.com`"* so the user can tell whose account they're about to change.
+- **Safe — no enumeration oracle.** Resolving the email requires a valid, unexpired, single-use token that only the real account owner ever receives (by email). An attacker can therefore only resolve the masked email for accounts they **already control**, so revealing it at redemption leaks nothing.
+- **Server:** add an endpoint that takes the token and returns only a masked email, validating the token exactly like redemption (unexpired, unused) but **without consuming it** — e.g. `POST /auth/reset-password/identity` → `{ "maskedEmail": "a••@e•••.com" }`; return a generic failure for an invalid/expired token.
+- **Client:** in `handlePasswordResetDeepLinkWithToken:`, after resolving the issuing server, call that endpoint and prepend the masked email to the alert (header line or `informativeText`). If the lookup fails, abort **before** prompting for a password.
+
 ---
 
 ## 7. App Store / Distribution Prep
