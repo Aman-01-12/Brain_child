@@ -77,6 +77,7 @@ const redis = require('./redis');
 const db = require('./db');
 const auth = require('./auth');
 const { requireIdempotencyKey } = require('./idempotency');
+const { createReconcileEmptyRoom } = require('./roomReconcile');
 
 const app = express();
 
@@ -140,7 +141,12 @@ app.use('/calendar', calendarRouter);
 
 // [Phase 11.4] Mount teams router
 const teamsRouter = require('./teams');
+const { attachTeamsNamespace } = require('./teamsRealtime');
 app.use('/teams', teamsRouter);
+
+// [Settings] Mount profile preferences router (GET/PATCH /auth/profile)
+const profileRouter = require('./profile');
+app.use('/auth', profileRouter);
 
 // ---------------------------------------------------------------------------
 // Configuration — from environment or dev defaults
@@ -209,29 +215,47 @@ const RATE_LIMIT_WINDOW_SECONDS = 60;
 // Stricter window than room rate limits: 10 attempts per 15 min per email.
 // Redis failure is non-blocking — logs error and allows request through.
 // ---------------------------------------------------------------------------
-async function rateLimitAuth(req, res, next) {
-  const email = req.body?.email;
-  const identifier = email
-    ? `ratelimit:auth:${email.toLowerCase().trim()}`
-    : `ratelimit:auth:ip:${req.ip}`;
+// Factory so different auth flows can use SEPARATE counters. Sharing one counter
+// across flows lets an attacker who floods one flow (e.g. forgot-password, which
+// only needs the victim's email) exhaust the budget for ANOTHER flow (login) for
+// the same email — a login-lockout DoS. Each flow that must not be lockable by
+// another gets its own namespace. [Finding 5]
+function makeAuthRateLimiter(namespace) {
+  return async function (req, res, next) {
+    const email = req.body?.email;
+    // Guard: email may be a non-string (number/object/array) on a malformed body.
+    // Only key on it when it is actually a string; otherwise fall back to IP-keying
+    // (still rate-limited) rather than throwing on .toLowerCase(). Format validation
+    // is the route handler's job, not the limiter's.
+    const safeEmail = typeof email === 'string' ? email.toLowerCase().trim() : null;
+    const identifier = safeEmail
+      ? `ratelimit:${namespace}:${safeEmail}`
+      : `ratelimit:${namespace}:ip:${req.ip}`;
 
-  try {
-    const count = await redis.incr(identifier);
-    if (count === 1) await redis.expire(identifier, 900); // 15-min window
+    try {
+      const count = await redis.incr(identifier);
+      if (count === 1) await redis.expire(identifier, 900); // 15-min window
 
-    if (count > 10) {
-      const ttl = await redis.ttl(identifier);
-      res.setHeader('Retry-After', String(ttl > 0 ? ttl : 900));
-      return res.status(429).json({
-        error: 'Too many authentication attempts. Please try again later.',
-      });
+      if (count > 10) {
+        const ttl = await redis.ttl(identifier);
+        res.setHeader('Retry-After', String(ttl > 0 ? ttl : 900));
+        return res.status(429).json({
+          error: 'Too many authentication attempts. Please try again later.',
+        });
+      }
+    } catch (redisErr) {
+      // Redis unavailability must not block legitimate logins
+      console.error('[auth rate limit] Redis error:', redisErr.message);
     }
-  } catch (redisErr) {
-    // Redis unavailability must not block legitimate logins
-    console.error('[auth rate limit] Redis error:', redisErr.message);
-  }
-  next();
+    next();
+  };
 }
+
+// Login / register / change-email / reset-password share the `auth` budget.
+const rateLimitAuth = makeAuthRateLimiter('auth');
+// Forgot-password has its OWN budget so flooding it can never lock the victim out of
+// login (login keys on `ratelimit:auth:<email>`; this keys on `ratelimit:auth:forgot:<email>`).
+const rateLimitForgotPassword = makeAuthRateLimiter('auth:forgot');
 
 // ---------------------------------------------------------------------------
 // Refresh token endpoint rate limiter — protects /auth/refresh
@@ -436,6 +460,8 @@ app.post('/auth/login', rateLimitAuth, async (req, res) => {
 app.get('/auth/me', auth.requireAuth, (req, res) => {
   res.json(req.user);
 });
+
+// GET/PATCH /auth/profile live in profile.js (mounted above).
 
 // ---------------------------------------------------------------------------
 // POST /auth/refresh — rotate refresh token, issue new access token
@@ -962,7 +988,7 @@ const { sendPasswordResetEmail, sendVerificationEmail, sendSecurityAlertEmail } 
 // Body: { email }
 // ALWAYS returns 200 with generic message (anti-enumeration).
 // ---------------------------------------------------------------------------
-app.post('/auth/forgot-password', rateLimitAuth, async (req, res) => {
+app.post('/auth/forgot-password', rateLimitForgotPassword, async (req, res) => {
   const email = String(req.body?.email || '').toLowerCase().trim();
 
   // Fire-and-forget — never let DB/email timing leak email existence
@@ -970,6 +996,15 @@ app.post('/auth/forgot-password', rateLimitAuth, async (req, res) => {
     try {
       const result = await db.query('SELECT id FROM users WHERE email = $1', [email]);
       if (result.rows.length === 0) return;
+
+      // [Finding 4] Invalidate any earlier unused reset tokens for this user before
+      // issuing a new one, so a given account never has multiple live reset links
+      // outstanding (each request should supersede the last).
+      await db.query(
+        `UPDATE password_reset_tokens SET used_at = NOW()
+         WHERE user_id = $1 AND used_at IS NULL`,
+        [result.rows[0].id]
+      );
 
       const rawToken  = crypto.randomBytes(32);
       const tokenHash = crypto.createHash('sha256').update(rawToken).digest();
@@ -994,7 +1029,7 @@ app.post('/auth/forgot-password', rateLimitAuth, async (req, res) => {
 // POST /auth/reset-password — JSON API (consumed by macOS client)
 // Body: { token (base64url), newPassword }
 // ---------------------------------------------------------------------------
-app.post('/auth/reset-password', async (req, res) => {
+app.post('/auth/reset-password', rateLimitAuth, async (req, res) => {
   const { token, newPassword } = req.body || {};
   try {
     const userId = await auth.resetPassword(token, newPassword);
@@ -1011,7 +1046,7 @@ app.post('/auth/reset-password', async (req, res) => {
 // POST /auth/reset-password-web — form submission variant (browser fallback)
 // Returns HTML instead of JSON.
 // ---------------------------------------------------------------------------
-app.post('/auth/reset-password-web', express.urlencoded({ extended: false }), async (req, res) => {
+app.post('/auth/reset-password-web', rateLimitAuth, express.urlencoded({ extended: false }), async (req, res) => {
   const { token, newPassword } = req.body || {};
   try {
     const userId = await auth.resetPassword(token, newPassword);
@@ -1185,6 +1220,11 @@ setInterval(() => {
   // Also purge expired handoff codes from DB (fire-and-forget)
   db.query(`DELETE FROM pending_oauth_handoffs WHERE expires_at < NOW() - INTERVAL '1 hour'`)
     .catch(err => console.error('[OAuth] Handoff cleanup failed:', err.message));
+  // [Finding 2] Purge spent/expired password-reset tokens so the table never grows
+  // unbounded — no other job cleans it. A used or expired token is useless, and the
+  // partial index keeps lookups fast but does not bound table size. Fire-and-forget.
+  db.query(`DELETE FROM password_reset_tokens WHERE expires_at < NOW() - INTERVAL '1 hour'`)
+    .catch(err => console.error('[auth] reset-token cleanup failed:', err.message));
 }, 5 * 60 * 1000);
 
 const OAUTH_PROVIDERS = new Set(['google', 'microsoft']);
@@ -2119,6 +2159,20 @@ async function addParticipant(code, identity) {
   return await redis.sadd(roomParticipantsKey(code), identity);
 }
 
+// Reconcile the Redis participant set against LiveKit's authoritative occupancy.
+// See roomReconcile.js for the full rationale. Only acts when LiveKit confirms
+// the room is empty (purging stale membership), never deletes the room hash, and
+// fails safe to the original count if LiveKit is unreachable.
+const reconcileEmptyRoom = createReconcileEmptyRoom({
+  redis,
+  roomService,
+  keys: {
+    participantsKey: roomParticipantsKey,
+    rolesKey: roomRolesKey,
+    namesKey: roomNamesKey,
+  },
+});
+
 /// Admit all lobby members for a room: generate tokens, add as participants,
 /// store polling status, then clear lobby keys. Returns the count admitted.
 /// Enforces MAX_PARTICIPANTS_PER_ROOM — excess members get status 'room_full'.
@@ -2187,8 +2241,17 @@ async function admitAllFromLobby(code, roomData) {
 //         joinBeforeHost?, allowUnmuting?, chatPermissions?, sharingPermissions?,
 //         shareConflictPolicy?, autoRecord?, autoTranscript?, lobbyEnabled?, password? }
 // Returns: { roomCode, roomName, token, serverURL, roomType }
+//
+// AUTH: requireAuth — room creation is authenticated-only by design, so the host's
+// userId is always bound to their identity (roomUserBindingKey). This is the
+// load-bearing invariant for moderation: validateModerator cross-checks every
+// moderator action against that binding, and co-host promotion refuses unbound
+// targets (TARGET_NOT_AUTHENTICATED). Guests may still JOIN unauthenticated; only
+// hosting requires a signed-in account. (The global authenticateToken has already
+// populated req.user or returned 401 for a present-but-expired token; the macOS
+// client recovers from that 401 by refreshing the access token and retrying once.)
 // ---------------------------------------------------------------------------
-app.post('/room/create', requireIdempotencyKey, async (req, res) => {
+app.post('/room/create', auth.requireAuth, requireIdempotencyKey, async (req, res) => {
   const {
     identity, displayName,
     roomType: rawRoomType,
@@ -2369,11 +2432,39 @@ app.post('/room/join', async (req, res) => {
   }
 
   const code = roomCode.toUpperCase();
-  const roomData = await getRoomData(code);
+  let roomData = await getRoomData(code);
 
   if (!roomData) {
-    // Room doesn't exist — either invalid code or expired (Redis TTL auto-deleted)
-    return res.status(404).json({ error: 'Invalid or expired room code' });
+    // Room doesn't exist — invalid code, expired (Redis TTL), or a scheduled
+    // meeting that hasn't been opened yet. When the meeting allows joining
+    // before the host, the first arrival auto-registers the room; otherwise
+    // tell them the host must start it.
+    try {
+      const sched = await db.query(
+        `SELECT * FROM scheduled_meetings
+         WHERE room_code = $1 AND status = 'scheduled' AND scheduled_at > NOW() - INTERVAL '1 day'`,
+        [code]
+      );
+      if (sched.rows.length > 0) {
+        const meeting = sched.rows[0];
+        const ms = (meeting.settings && typeof meeting.settings === 'object') ? meeting.settings : {};
+        if (ms.joinBeforeHost === true) {
+          await schedulingRouter.registerScheduledRoom(meeting, {});
+          roomData = await getRoomData(code);
+          console.log(`[audit] Scheduled room auto-registered (join-before-host): code=${code}`);
+        } else {
+          return res.status(404).json({
+            error: "This meeting hasn't started yet. The host needs to start it first.",
+            notStarted: true,
+          });
+        }
+      }
+    } catch (dbErr) {
+      console.error('[warn] scheduled-meeting lookup on join failed:', dbErr.message);
+    }
+    if (!roomData) {
+      return res.status(404).json({ error: 'Invalid or expired room code' });
+    }
   }
 
   // Ban check — must run before any other validation so banned users cannot
@@ -2506,7 +2597,18 @@ app.post('/room/join', async (req, res) => {
 
     // When the host rejoins with a fresh identity, repoint hostIdentity at it so
     // host-presence and join-before-host checks for OTHER participants stay correct.
+    // Also REMOVE the host's previous identity from the room state: it is stale
+    // (the host left, or /meetings/:id/start pre-registered it), and leaving it
+    // in the participants set double-counts the host and strands a ghost entry
+    // that keeps "remaining 1" alive after everyone has left.
     if (isReturningHost) {
+      const staleHostIdentity = roomData.hostIdentity;
+      if (staleHostIdentity && staleHostIdentity !== identity) {
+        await redis.srem(roomParticipantsKey(code), staleHostIdentity);
+        await redis.hdel(roomNamesKey(code), staleHostIdentity);
+        await redis.hdel(roomRolesKey(code), staleHostIdentity);
+        await redis.hdel(roomUserBindingKey(code), staleHostIdentity);
+      }
       await redis.hset(roomKey(code), 'hostIdentity', identity);
     }
 
@@ -2683,6 +2785,25 @@ app.post('/room/promote', auth.requireAuth, rateLimitRoomAction('promote'), asyn
   const targetCurrentRole = await getParticipantRole(code, targetIdentity);
   if (roleLevel(targetCurrentRole) >= roleLevel(callerRole)) {
     return res.status(403).json({ error: 'Cannot modify role of a participant with equal or higher privileges.' });
+  }
+
+  // Promotion to a MODERATOR role (co-host / interviewer) requires the TARGET to
+  // have joined AUTHENTICATED — i.e. their identity is bound to a user account.
+  // The binding (roomUserBindingKey) is written only on an authenticated
+  // create/join, so "has a binding" == "was signed in when they joined". This is
+  // the load-bearing invariant for moderator authorization: validateModerator
+  // cross-checks every moderator action against this binding, so an UNBOUND
+  // moderator could be impersonated by any peer claiming its (peer-visible)
+  // identity. Refusing to promote a guest keeps the invariant — every moderator
+  // is bound — and the host is told to have the guest sign in and rejoin.
+  if (isModeratorRole(newRole)) {
+    const targetBoundUser = await redis.hget(roomUserBindingKey(code), targetIdentity);
+    if (!targetBoundUser) {
+      return res.status(409).json({
+        error: 'This participant joined as a guest. They need to sign in and rejoin before they can be made a co-host.',
+        code: 'TARGET_NOT_AUTHENTICATED',
+      });
+    }
   }
 
   try {
@@ -3081,12 +3202,18 @@ app.post('/room/leave', async (req, res) => {
   const remaining = await getParticipantCount(code);
   console.log(`[audit] Leave: code=${code} identity=${identity} removed=${wasMember} remaining=${remaining}`);
 
+  // Reconcile against LiveKit: if the room is actually empty, a residual count is a
+  // stale ghost (see reconcileEmptyRoom). Purges membership and reports a true 0 so
+  // the empty-room cleanup below runs. No-op when remaining is already 0 or LiveKit
+  // is unreachable.
+  const effectiveRemaining = await reconcileEmptyRoom(code, roomData.roomName, remaining);
+
   // When the last participant leaves, clean up any uploaded files for this room
-  if (remaining === 0) {
+  if (effectiveRemaining === 0) {
     deleteRoomFiles(code).catch(() => {});
   }
 
-  res.json({ success: true, participantCount: remaining });
+  res.json({ success: true, participantCount: effectiveRemaining });
 });
 
 // ---------------------------------------------------------------------------
@@ -3493,6 +3620,49 @@ app.get('/room/lobby-status/:code/:identity', async (req, res) => {
   }
 
   res.json({ status: 'waiting', position: rank + 1 });
+});
+
+// ---------------------------------------------------------------------------
+// POST /room/lobby/leave — participant withdraws their own waiting-room request.
+// Body: { roomCode, identity }  Header: x-poll-token (or ?pollToken=)
+//
+// Authenticated by the per-join pollToken (the participant's own secret), exactly like
+// /room/lobby-status — no JWT, because a lobby waiter may be anonymous. Idempotent and
+// best-effort: removes the participant from the lobby queue + names + all per-join keys.
+// Returns { success: true } even if they were already gone (left twice, admitted/denied,
+// or the room expired), so the client can fire-and-forget without special-casing races.
+// ---------------------------------------------------------------------------
+app.post('/room/lobby/leave', async (req, res) => {
+  const code = String(req.body?.roomCode || '').toUpperCase();
+  const identity = req.body?.identity;
+  const pollToken = req.headers['x-poll-token'] || req.body?.pollToken;
+
+  if (!code || !identity) {
+    return res.status(400).json({ error: 'roomCode and identity are required' });
+  }
+  if (!pollToken) {
+    return res.status(401).json({ error: 'pollToken is required' });
+  }
+
+  // Validate the caller owns this lobby slot. If the token key is already gone (race with
+  // admit/deny that consumed it, or expiry), treat as success — the slot is no longer theirs
+  // to hold and there is nothing left to leak.
+  const storedPollToken = await redis.get(`room:${code}:lobby:${identity}:pollToken`);
+  if (storedPollToken && storedPollToken !== pollToken) {
+    return res.status(403).json({ error: 'Invalid pollToken' });
+  }
+
+  // Remove from the waiting queue + name map + any pending per-join keys. Each op is a
+  // no-op if the key is already gone, so concurrent admit/deny/leave converge safely.
+  await redis.zrem(roomLobbyKey(code), identity);
+  await redis.hdel(roomLobbyNamesKey(code), identity);
+  await redis.del(`room:${code}:lobby:${identity}:status`);
+  await redis.del(`room:${code}:lobby:${identity}:token`);
+  await redis.del(`room:${code}:lobby:${identity}:serverURL`);
+  await redis.del(`room:${code}:lobby:${identity}:pollToken`);
+
+  console.log(`[audit] Lobby leave: code=${code} identity=${identity}`);
+  res.json({ success: true });
 });
 
 // ---------------------------------------------------------------------------
@@ -4182,6 +4352,12 @@ app.post('/webhooks/egress', express.raw({ type: 'application/webhook+json' }), 
           await redis.hdel(roomNamesKey(matchedCode), identity);
           const remaining = await getParticipantCount(matchedCode);
           console.log(`[webhook] participant_left: room=${roomName} code=${matchedCode} identity=${identity} removed=${wasMember} remaining=${remaining}`);
+          // Same reconcile as /room/leave: if LiveKit shows the room empty, purge any
+          // stale Redis membership and run the empty-room file cleanup. Fail-safe.
+          const effectiveRemaining = await reconcileEmptyRoom(matchedCode, roomName, remaining);
+          if (effectiveRemaining === 0) {
+            deleteRoomFiles(matchedCode).catch(() => {});
+          }
         } else {
           console.log(`[webhook] participant_left: room=${roomName} identity=${identity} — no matching room code found`);
         }
@@ -4835,41 +5011,10 @@ const CHAT_ROOM_MAX_TOTAL_BYTES = 200 * 1024 * 1024;  // 200 MB per room
 const CHAT_UPLOAD_DIR = path.join(os.tmpdir(), 'inter-chat-uploads');
 fs.mkdirSync(CHAT_UPLOAD_DIR, { recursive: true });
 
-// Allowed MIME prefixes (validated against magic-byte detection, not the client header)
-const ALLOWED_MIME_PREFIXES = [
-  'image/',
-  'application/pdf',
-  'text/',
-  'application/vnd.',                     // MS Office + OpenDocument formats
-  'application/msword',
-  'application/vnd.ms-excel',
-  'application/vnd.ms-powerpoint',
-  'application/rtf',
-  'application/zip',                      // .zip archives (often docx/xlsx containers)
-  'application/x-zip-compressed',
-];
-
-// MIME types that are explicitly blocked regardless of prefix match
-const BLOCKED_MIME_EXACT = new Set([
-  'application/x-msdownload',
-  'application/x-dosexec',
-  'application/x-executable',
-  'application/x-mach-binary',
-  'application/x-sh',
-  'application/x-shellscript',
-  'application/x-httpd-php',
-  'application/javascript',
-  'application/x-javascript',
-  'application/x-perl',
-  'application/x-python-code',
-]);
-
-function isMimeAllowed(mime) {
-  if (!mime) return false;
-  const lower = mime.toLowerCase();
-  if (BLOCKED_MIME_EXACT.has(lower)) return false;
-  return ALLOWED_MIME_PREFIXES.some(prefix => lower.startsWith(prefix));
-}
+// File MIME allow/block logic is centralized in fileValidation.js so the in-call
+// chat upload and the team file upload (teams.js) share ONE hardened allowlist —
+// the two paths cannot drift to different accepted types (OWASP File Upload).
+const { isMimeAllowed } = require('./fileValidation');
 
 // Multer: store with UUID filename (original name never touches the filesystem)
 const chatFileStorage = multer.diskStorage({
@@ -5169,6 +5314,12 @@ const io = new SocketIOServer(httpServer, {
     methods: ['GET', 'POST'],
   },
 });
+
+// Attach the dedicated /teams chat namespace (Task 3). Its JWT handshake guard
+// and membership-gated joins live in teamsRealtime.js and are fully isolated
+// from the in-call default namespace below — attaching it does not alter in-call
+// moderation behavior.
+attachTeamsNamespace(io);
 
 // ---------------------------------------------------------------------------
 // Mic-state Redis key helpers

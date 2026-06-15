@@ -483,11 +483,7 @@ function authenticateToken(req, res, next) {
     : authHeader;
 
   try {
-    const decoded = jwt.verify(token, JWT_SECRET, {
-      algorithms: ['HS256'],
-      issuer:     'inter-token-server',
-      audience:   'inter-macos-client',
-    });
+    const decoded = verifyAccessToken(token);
     req.user = {
       userId:      decoded.userId,
       email:       decoded.email,
@@ -504,6 +500,22 @@ function authenticateToken(req, res, next) {
     // Tampered, wrong issuer, wrong audience, or structurally invalid
     return res.status(401).json({ error: 'Invalid auth token', code: 'TOKEN_INVALID' });
   }
+}
+
+// ---------------------------------------------------------------------------
+// verifyAccessToken(token) → decoded payload (throws on invalid/expired)
+//
+// Single source of truth for access-token verification, used by both the
+// Express authenticateToken middleware and the Socket.IO /teams handshake guard
+// (C2). HS256 only, with issuer + audience + expiry enforced by jwt.verify.
+// Throws jwt errors (TokenExpiredError / JsonWebTokenError) — callers map them.
+// ---------------------------------------------------------------------------
+function verifyAccessToken(token) {
+  return jwt.verify(token, JWT_SECRET, {
+    algorithms: ['HS256'],
+    issuer:     'inter-token-server',
+    audience:   'inter-macos-client',
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -624,11 +636,27 @@ async function resetPassword(token, newPassword) {
   }
 
   // NIST SP 800-63B §5.1.1.2 — check against breach corpus
-  await checkPwnedPassword(newPassword);
-
   const tokenHash = crypto.createHash('sha256')
     .update(Buffer.from(token, 'base64url'))
     .digest();
+
+  // [Finding 1 — DoS guard] Validate the token with a cheap, indexed lookup BEFORE the
+  // expensive operations below. checkPwnedPassword (external HIBP HTTP call) and bcrypt
+  // (~300 ms CPU) must NOT run for a definitely-invalid token — otherwise an
+  // unauthenticated caller could flood this endpoint with garbage tokens to exhaust CPU
+  // and the HIBP quota. This is only a fast-fail; the authoritative single-use claim is
+  // the atomic UPDATE inside the transaction below.
+  const preCheck = await db.query(
+    `SELECT 1 FROM password_reset_tokens
+     WHERE token_hash = $1 AND used_at IS NULL AND expires_at > NOW()`,
+    [tokenHash]
+  );
+  if (preCheck.rows.length === 0) {
+    throw Object.assign(new Error('Invalid or expired reset token'), { status: 400 });
+  }
+
+  // Breach-corpus check only AFTER the token is known valid (see DoS guard above).
+  await checkPwnedPassword(newPassword);
 
   // Compute bcrypt hash BEFORE opening the transaction — bcrypt is CPU-bound
   // (~300 ms) and would hold the DB connection/transaction lock unnecessarily.
@@ -638,22 +666,24 @@ async function resetPassword(token, newPassword) {
   try {
     await dbClient.query('BEGIN');
 
-    const result = await dbClient.query(
-      `SELECT id, user_id FROM password_reset_tokens
-       WHERE token_hash = $1 AND used_at IS NULL AND expires_at > NOW()`,
+    // [Finding 3 — atomic single-use claim] Claim the token with a conditional UPDATE
+    // rather than SELECT-then-UPDATE. The WHERE guard (unused AND unexpired) plus
+    // RETURNING means only ONE of two concurrent requests for the same token can
+    // succeed — a racing request gets zero rows and is rejected. This closes the
+    // read-modify-write window where a token could otherwise be redeemed twice.
+    const claim = await dbClient.query(
+      `UPDATE password_reset_tokens SET used_at = NOW()
+       WHERE token_hash = $1 AND used_at IS NULL AND expires_at > NOW()
+       RETURNING user_id`,
       [tokenHash]
     );
 
-    if (result.rows.length === 0) {
+    if (claim.rows.length === 0) {
       throw Object.assign(new Error('Invalid or expired reset token'), { status: 400 });
     }
 
-    const { id: tokenId, user_id: userId } = result.rows[0];
+    const userId = claim.rows[0].user_id;
 
-    await dbClient.query(
-      'UPDATE password_reset_tokens SET used_at = NOW() WHERE id = $1',
-      [tokenId]
-    );
     await dbClient.query(
       'UPDATE users SET password_hash = $1 WHERE id = $2',
       [newHash, userId]
@@ -696,6 +726,7 @@ module.exports = {
   register,
   login,
   authenticateToken,
+  verifyAccessToken,
   requireAuth,
   requireTier,
   generateAccessToken,

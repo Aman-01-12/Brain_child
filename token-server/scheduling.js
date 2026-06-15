@@ -129,6 +129,7 @@ router.post('/schedule', auth.requireAuth, requireIdempotencyKey, async (req, re
       lobbyEnabled,
       recurrenceRule,
       hostTimezone,
+      settings: rawSettings,
     } = req.body;
 
     // --- Validation ---
@@ -160,11 +161,29 @@ router.post('/schedule', auth.requireAuth, requireIdempotencyKey, async (req, re
     const type = roomType === 'interview' ? 'interview' : 'call';
     const roomCode = generateRoomCode();
 
+    // Meeting-settings snapshot (mirrors /room/create validation). Stored with
+    // the meeting so /meetings/:id/start can apply it to the room hash — the
+    // settings must come from the meeting row, not from whichever client
+    // arrives first (an invitee may start the room before the host).
+    const VALID_CHAT_PERMS      = ['everyone', 'hostOnly', 'disabled'];
+    const VALID_SHARE_PERMS     = ['hostOnly', 'everyone', 'request'];
+    const VALID_CONFLICT_POLICY = ['oneattime', 'hostCanPreempt', 'anyCanPreempt'];
+    const s = (rawSettings && typeof rawSettings === 'object') ? rawSettings : {};
+    const settings = {
+      muteOnJoin:          s.muteOnJoin          === true,
+      cameraOffOnJoin:     s.cameraOffOnJoin     === true,
+      joinBeforeHost:      s.joinBeforeHost      === true,
+      allowUnmuting:       s.allowUnmuting       !== false, // default true
+      chatPermissions:     VALID_CHAT_PERMS.includes(s.chatPermissions)         ? s.chatPermissions     : 'everyone',
+      sharingPermissions:  VALID_SHARE_PERMS.includes(s.sharingPermissions)     ? s.sharingPermissions  : 'hostOnly',
+      shareConflictPolicy: VALID_CONFLICT_POLICY.includes(s.shareConflictPolicy) ? s.shareConflictPolicy : 'oneattime',
+    };
+
     const result = await db.query(
       `INSERT INTO scheduled_meetings
          (host_user_id, title, description, scheduled_at, duration_minutes,
-          room_type, room_code, password, lobby_enabled, recurrence_rule, host_timezone)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+          room_type, room_code, password, lobby_enabled, recurrence_rule, host_timezone, settings)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
        RETURNING *`,
       [
         req.user.userId,
@@ -178,6 +197,7 @@ router.post('/schedule', auth.requireAuth, requireIdempotencyKey, async (req, re
         lobbyEnabled === true,
         recurrenceRule || null,
         hostTimezone,
+        JSON.stringify(settings),
       ]
     );
 
@@ -235,6 +255,90 @@ router.get('/upcoming', auth.requireAuth, async (req, res) => {
   } catch (err) {
     console.error('[scheduling] GET /upcoming error:', err.message);
     res.status(500).json({ error: 'Failed to fetch upcoming meetings' });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// GET /meetings/history — Past + live rooms the user hosted or joined
+//
+// Backed by the `meetings` / `meeting_participants` tables that /room/create
+// and /room/join already write. Registered BEFORE /:id (Express matches in
+// declaration order — "history" must not be captured as an :id param).
+//
+// Status truth policy (the DB alone lies — nothing writes status='ended' today):
+//   • status='failed'  → excluded (the room never actually existed).
+//   • status='ended'   → 'ended' (future-proof; honored if ever written).
+//   • status='active'  → genuinely live ONLY if the Redis room key still exists
+//     (same liveness definition as markPhantomMeetingsFailed); otherwise the
+//     room expired (24h TTL) or was torn down → reported as 'ended'.
+// Durations are only reported when ended_at exists — never fabricated.
+// ---------------------------------------------------------------------------
+router.get('/history', auth.requireAuth, async (req, res) => {
+  try {
+    const limit  = Math.min(parseInt(req.query.limit, 10) || 20, 50);
+    const offset = parseInt(req.query.offset, 10) || 0;
+
+    // One row per meeting the user hosted OR participated in. `my_role` prefers
+    // the host relationship; otherwise the user's first participant row's role.
+    // COUNT(DISTINCT identity) so rejoin rows don't inflate the count.
+    const result = await db.query(
+      `SELECT m.id, m.room_code, m.room_name, m.room_type, m.status,
+              m.started_at, m.ended_at,
+              CASE WHEN m.host_user_id = $1 THEN 'host'
+                   ELSE COALESCE((
+                     SELECT mp2.role FROM meeting_participants mp2
+                     WHERE mp2.meeting_id = m.id AND mp2.user_id = $1
+                     ORDER BY mp2.joined_at ASC LIMIT 1
+                   ), 'participant')
+              END AS my_role,
+              (SELECT COUNT(DISTINCT mp3.identity) FROM meeting_participants mp3
+               WHERE mp3.meeting_id = m.id) AS participant_count
+       FROM meetings m
+       WHERE m.status <> 'failed'
+         AND (m.host_user_id = $1
+              OR EXISTS (SELECT 1 FROM meeting_participants mp
+                         WHERE mp.meeting_id = m.id AND mp.user_id = $1))
+       ORDER BY m.started_at DESC
+       LIMIT $2 OFFSET $3`,
+      [req.user.userId, limit, offset]
+    );
+
+    // Liveness check: a DB-'active' row is only truly live if its Redis room
+    // key still exists. Bounded fan-out (≤ limit ≤ 50 EXISTS calls).
+    const meetings = await Promise.all(result.rows.map(async (row) => {
+      let status = row.status;
+      if (status === 'active') {
+        let live = false;
+        try {
+          live = (await redis.exists(_rKey(row.room_code))) === 1;
+        } catch (_) {
+          // Redis unavailable — age fallback: within the 24h room TTL it may
+          // still be live; older cannot be.
+          live = (Date.now() - new Date(row.started_at).getTime()) < _ROOM_CODE_EXPIRY * 1000;
+        }
+        status = live ? 'active' : 'ended';
+      }
+      const durationMinutes = row.ended_at
+        ? Math.max(0, Math.round((new Date(row.ended_at) - new Date(row.started_at)) / 60000))
+        : null;
+      return {
+        id: row.id,
+        roomCode: row.room_code,
+        roomName: row.room_name,
+        roomType: row.room_type,
+        status,
+        startedAt: row.started_at,
+        endedAt: row.ended_at,
+        durationMinutes,
+        participantCount: parseInt(row.participant_count, 10) || 0,
+        role: row.my_role,
+      };
+    }));
+
+    res.json({ meetings });
+  } catch (err) {
+    console.error('[scheduling] GET /history error:', err.message);
+    res.status(500).json({ error: 'Failed to fetch meeting history' });
   }
 });
 
@@ -632,33 +736,45 @@ router.post('/:id/start', auth.requireAuth, async (req, res) => {
     // Register room in Redis if not already active (idempotent)
     const alreadyExists = await redis.exists(_rKey(roomCode));
     if (!alreadyExists) {
-      // Apply the meeting's lobby + password settings into the room hash so they
-      // are actually ENFORCED at join time (mirrors /room/create). Without this,
-      // /room/join — which reads `lobbyEnabled` and `passwordHash` from the room
-      // hash — never saw the scheduled meeting's settings, so a scheduled password
-      // or waiting room had no effect. Hash the password (bcrypt, 10 rounds) so it
-      // is never stored in plaintext in Redis.
-      const lobbyEnabledStr = (meeting.lobby_enabled === true) ? 'true' : 'false';
-      let passwordHash = '';
-      if (meeting.password && typeof meeting.password === 'string' && meeting.password.length > 0) {
-        passwordHash = await bcrypt.hash(meeting.password, 10);
+      // Meeting-settings snapshot stored at schedule time (migration 020).
+      // The HOST may override the snapshot from the green room's Meeting
+      // Settings sheet (req.body.settings) — enum fields are allowlisted.
+      let settingsOverride = null;
+      if (isHost && req.body.settings && typeof req.body.settings === 'object') {
+        const o = req.body.settings;
+        const chatAllowed  = ['everyone', 'hostOnly', 'disabled'];
+        const shareAllowed = ['hostOnly', 'everyone', 'request'];
+        const conflictAllowed = ['oneattime', 'hostCanPreempt', 'anyCanPreempt'];
+        settingsOverride = {
+          muteOnJoin:          o.muteOnJoin          === true,
+          cameraOffOnJoin:     o.cameraOffOnJoin     === true,
+          joinBeforeHost:      o.joinBeforeHost      === true,
+          allowUnmuting:       o.allowUnmuting       !== false,
+          chatPermissions:     chatAllowed.includes(o.chatPermissions) ? o.chatPermissions : 'everyone',
+          sharingPermissions:  shareAllowed.includes(o.sharingPermissions) ? o.sharingPermissions : 'hostOnly',
+          shareConflictPolicy: conflictAllowed.includes(o.shareConflictPolicy) ? o.shareConflictPolicy : 'oneattime',
+        };
+        console.log(`[audit] Scheduled start settings override applied: meeting=${id}`);
       }
 
-      const pipe = redis.pipeline();
-      pipe.hset(_rKey(roomCode),
-        'roomName',     roomName,
-        'createdAt',    Date.now().toString(),
-        'hostIdentity', identity,
-        'roomType',     roomType,
-        'hostTier',     req.user.tier || 'free',
-        'meetingId',    id,
-        'lobbyEnabled', lobbyEnabledStr,
-        'passwordHash', passwordHash
-      );
-      pipe.expire(_rKey(roomCode), _ROOM_CODE_EXPIRY);
-      pipe.sadd(_rPKey(roomCode), identity);
-      pipe.expire(_rPKey(roomCode), _ROOM_CODE_EXPIRY);
-      await pipe.exec();
+      const meetingsTableId = await registerScheduledRoom(meeting, {
+        hostIdentity: identity,
+        hostTier: req.user.tier || 'free',
+        settings: settingsOverride,
+      });
+
+      if (isHost && meetingsTableId) {
+        try {
+          await db.query(
+            `INSERT INTO meeting_participants (meeting_id, user_id, identity, display_name, role)
+             VALUES ($1, $2, $3, $4, $5)`,
+            [meetingsTableId, req.user.userId, identity, displayName,
+             (roomType === 'interview') ? 'interviewer' : 'host']
+          );
+        } catch (dbErr) {
+          console.error('[warn] Failed to persist scheduled host participant:', dbErr.message);
+        }
+      }
 
       if (isHost) {
         const hostRole = (roomType === 'interview') ? 'interviewer' : 'host';
@@ -692,6 +808,12 @@ router.post('/:id/start', auth.requireAuth, async (req, res) => {
 
     console.log(`[audit] Scheduled meeting started: meeting=${id} code=${roomCode} isHost=${isHost}`);
 
+    // Room settings for the caller — read back from the room hash (the
+    // authoritative copy, whether this call created it or an earlier one did)
+    // so every starter/joiner applies the same host-configured behaviour.
+    // Shape mirrors /room/join's settings block.
+    const roomData = await redis.hgetall(_rKey(roomCode));
+
     res.json({
       roomCode,
       roomName,
@@ -699,6 +821,18 @@ router.post('/:id/start', auth.requireAuth, async (req, res) => {
       serverURL: _LIVEKIT_SERVER_URL,
       roomType,
       isHost,
+      roomSettings: {
+        meetingDisplayName:  roomData.meetingDisplayName  || meeting.title || '',
+        muteOnJoin:          roomData.muteOnJoin          === 'true',
+        cameraOffOnJoin:     roomData.cameraOffOnJoin     === 'true',
+        joinBeforeHost:      roomData.joinBeforeHost      === 'true',
+        allowUnmuting:       roomData.allowUnmuting       !== 'false', // default true
+        chatPermissions:     roomData.chatPermissions     || 'everyone',
+        sharingPermissions:  roomData.sharingPermissions  || 'hostOnly',
+        shareConflictPolicy: roomData.shareConflictPolicy || 'oneattime',
+        lobbyEnabled:        roomData.lobbyEnabled        === 'true',
+        hasPassword:         !!roomData.passwordHash,
+      },
     });
   } catch (err) {
     console.error('[scheduling] POST /:id/start error:', err.message);
@@ -734,5 +868,78 @@ function formatMeeting(row) {
 function camelToSnake(str) {
   return str.replace(/[A-Z]/g, letter => `_${letter.toLowerCase()}`);
 }
+
+// ---------------------------------------------------------------------------
+// Shared room registration
+//
+// Registers the Redis room hash + `meetings` table row for a scheduled
+// meeting. Used by POST /meetings/:id/start AND /room/join's join-before-host
+// auto-registration (index.js): when the meeting allows joining before the
+// host, the first participant to arrive opens the room. `hostIdentity` is ''
+// in that case — the host's later /start repoints it and binds moderation.
+// ---------------------------------------------------------------------------
+async function registerScheduledRoom(meeting, { hostIdentity = '', hostTier = 'free', settings = null } = {}) {
+  const roomCode = meeting.room_code;
+  const roomName = `inter-${roomCode}`;
+  const roomType = meeting.room_type || 'call';
+  const lobbyEnabledStr = (meeting.lobby_enabled === true) ? 'true' : 'false';
+  let passwordHash = '';
+  if (meeting.password && typeof meeting.password === 'string' && meeting.password.length > 0) {
+    passwordHash = await bcrypt.hash(meeting.password, 10);
+  }
+
+  // Settings: explicit override (host green-room edit) > schedule-time snapshot.
+  const ms = (settings && typeof settings === 'object')
+    ? settings
+    : ((meeting.settings && typeof meeting.settings === 'object') ? meeting.settings : {});
+
+  const pipe = redis.pipeline();
+  pipe.hset(_rKey(roomCode),
+    'roomName',     roomName,
+    'createdAt',    Date.now().toString(),
+    'hostIdentity', hostIdentity,
+    'roomType',     roomType,
+    'hostTier',     hostTier,
+    // Meeting settings (parity with /room/create's hash fields)
+    'meetingDisplayName',  meeting.title || '',
+    'muteOnJoin',          ms.muteOnJoin          === true  ? 'true' : 'false',
+    'cameraOffOnJoin',     ms.cameraOffOnJoin     === true  ? 'true' : 'false',
+    'joinBeforeHost',      ms.joinBeforeHost      === true  ? 'true' : 'false',
+    'allowUnmuting',       ms.allowUnmuting       === false ? 'false' : 'true',
+    'chatPermissions',     ms.chatPermissions     || 'everyone',
+    'sharingPermissions',  ms.sharingPermissions  || 'hostOnly',
+    'shareConflictPolicy', ms.shareConflictPolicy || 'oneattime',
+    'lobbyEnabled', lobbyEnabledStr,
+    'passwordHash', passwordHash
+  );
+  pipe.expire(_rKey(roomCode), _ROOM_CODE_EXPIRY);
+  if (hostIdentity) {
+    pipe.sadd(_rPKey(roomCode), hostIdentity);
+    pipe.expire(_rPKey(roomCode), _ROOM_CODE_EXPIRY);
+  }
+  await pipe.exec();
+
+  // Persist a `meetings` table row (parity with /room/create). The room hash's
+  // meetingId MUST reference meetings.id — meeting_participants' FK points
+  // there, NOT at scheduled_meetings.
+  let meetingsTableId = null;
+  try {
+    const meetingRow = await db.query(
+      `INSERT INTO meetings (host_user_id, room_code, room_name, room_type)
+       VALUES ($1, $2, $3, $4)
+       RETURNING id`,
+      [meeting.host_user_id, roomCode, roomName, roomType]
+    );
+    meetingsTableId = meetingRow.rows[0].id;
+    await redis.hset(_rKey(roomCode), 'meetingId', meetingsTableId);
+    await redis.hset(_rKey(roomCode), 'scheduledMeetingId', meeting.id);
+    console.log(`[audit] Scheduled meeting persisted: meetings.id=${meetingsTableId} for room ${roomCode}`);
+  } catch (dbErr) {
+    console.error('[warn] Failed to persist scheduled meeting row:', dbErr.message);
+  }
+  return meetingsTableId;
+}
+
+router.registerScheduledRoom = registerScheduledRoom;
 
 module.exports = router;
