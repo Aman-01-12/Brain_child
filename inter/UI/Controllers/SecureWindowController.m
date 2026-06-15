@@ -29,11 +29,12 @@ static const CGFloat InterSecureTopMargin = 40.0;
 static const CGFloat InterSecureLeftMargin = 40.0;
 static const CGFloat InterSecureBottomWorkspaceMargin = 100.0;
 
-@interface SecureWindowController () <InterParticipantOverlayDelegate, InterChatPanelDelegate, InterChatControllerDelegate>
+@interface SecureWindowController () <InterParticipantOverlayDelegate, InterChatPanelDelegate, InterChatControllerDelegate, NSWindowDelegate>
 @property (nonatomic, strong) NSView *renderView;
 @property (nonatomic, strong) InterSecureInterviewStageView *stageView;
 @property (nonatomic, strong) InterSecureToolHostView *toolHostView;
-@property (nonatomic, strong) InterLocalCallControlPanel *controlPanel;
+@property (nonatomic, strong) InterSecureChromeBridge *controlPanel;
+@property (nonatomic, strong, nullable) NSView *selfPreviewStrip;
 @property (nonatomic, strong) InterLocalMediaController *localMediaController;
 @property (nonatomic, strong) InterSurfaceShareController *surfaceShareController;
 @property (nonatomic, strong, nullable) InterRemoteVideoLayoutManager *remoteLayout;
@@ -44,7 +45,6 @@ static const CGFloat InterSecureBottomWorkspaceMargin = 100.0;
 // Chat overlay (floating panel window sitting above the secure window)
 @property (nonatomic, strong, nullable) NSPanel *chatOverlayWindow;
 @property (nonatomic, strong, nullable) InterChatPanel *secureChatPanel;
-@property (nonatomic, strong, nullable) NSButton *chatToggleButton;
 @end
 
 @implementation SecureWindowController
@@ -98,45 +98,10 @@ static const CGFloat InterSecureBottomWorkspaceMargin = 100.0;
     self.toolHostView = self.stageView.toolCaptureHostView;
     self.remoteLayout = self.stageView.remoteLayoutManager;
 
-    NSTextField *headline = [NSTextField labelWithString:@"Interview secure surface (Metal)"];
-    headline.frame = NSMakeRect(InterSecureLeftMargin,
-                                view.bounds.size.height - 52.0,
-                                NSMaxX([self secureToolHostFrameInView:view]) - InterSecureLeftMargin,
-                                24.0);
-    headline.font = [NSFont boldSystemFontOfSize:15];
-    headline.textColor = [NSColor colorWithWhite:0.92 alpha:1.0];
-    headline.autoresizingMask = NSViewWidthSizable | NSViewMinYMargin;
-    [view addSubview:headline];
-
     [self attachControlPanelInView:view];
     [self startLocalMediaFlow];
     [self updateSecureWorkspacePresentationAnimated:NO];
     [self.stageView layoutSubtreeIfNeeded];
-
-    NSButton *exitButton =
-    [[NSButton alloc] initWithFrame:NSMakeRect(40, 40, 140, 45)];
-    exitButton.autoresizingMask = NSViewMaxXMargin | NSViewMaxYMargin;
-
-    [exitButton setTitle:@"Exit Session"];
-    [exitButton setTarget:self];
-    [exitButton setAction:@selector(exitSession)];
-
-    [view addSubview:exitButton];
-
-    // Chat toggle button — sits to the right of the exit button
-    self.chatToggleButton = [[NSButton alloc] initWithFrame:NSMakeRect(200, 40, 44, 44)];
-    self.chatToggleButton.autoresizingMask = NSViewMaxXMargin | NSViewMaxYMargin;
-    [self.chatToggleButton setImage:[NSImage imageWithSystemSymbolName:@"bubble.left.and.bubble.right"
-                                              accessibilityDescription:@"Chat"]];
-    [self.chatToggleButton setImagePosition:NSImageOnly];
-    [self.chatToggleButton setBordered:NO];
-    self.chatToggleButton.contentTintColor = [NSColor colorWithWhite:0.8 alpha:1.0];
-    self.chatToggleButton.toolTip = @"Toggle chat (⌘⇧C)";
-    [self.chatToggleButton setKeyEquivalent:@"c"];
-    [self.chatToggleButton setKeyEquivalentModifierMask:NSEventModifierFlagCommand | NSEventModifierFlagShift];
-    [self.chatToggleButton setTarget:self];
-    [self.chatToggleButton setAction:@selector(toggleChatOverlay)];
-    [view addSubview:self.chatToggleButton];
 
     [self setupChatOverlayWindow];
     [self.secureWindow makeKeyAndOrderFront:nil];
@@ -168,6 +133,11 @@ static const CGFloat InterSecureBottomWorkspaceMargin = 100.0;
     // the secure surface during a live interview; without this it would be the one
     // unshielded surface a capture tool could read while everything else is black.
     [self.chatOverlayWindow setSharingType:InterWindowSharingType()];
+    // Own the window's close lifecycle: the red title-bar close button is routed
+    // through -windowShouldClose: so it HIDES (orderOut) and syncs toolbar state
+    // rather than truly closing — the panel is a persistent hide/show overlay
+    // (releasedWhenClosed == NO), so its content must survive every close path.
+    self.chatOverlayWindow.delegate = self;
 
     // InterChatPanel fills the window's content view (always expanded in overlay mode)
     NSView *contentView = self.chatOverlayWindow.contentView;
@@ -189,15 +159,53 @@ static const CGFloat InterSecureBottomWorkspaceMargin = 100.0;
     if (!self.chatOverlayWindow) return;
 
     if (self.chatOverlayWindow.isVisible) {
-        [self.chatOverlayWindow orderOut:nil];
-        self.chatController.isChatVisible = NO;
-        self.chatToggleButton.contentTintColor = [NSColor colorWithWhite:0.8 alpha:1.0];
+        [self hideChatOverlaySyncingState];
     } else {
         [self.chatOverlayWindow makeKeyAndOrderFront:nil];
         self.chatController.isChatVisible = YES;  // setting YES resets unreadCount inside Swift
         [self.secureChatPanel setUnreadBadge:0];
-        self.chatToggleButton.contentTintColor = [NSColor systemBlueColor];
+        [self.controlPanel setChatVisible:YES];
+        [self.controlPanel setChatUnread:0];
     }
+}
+
+/// Single hide path for the chat overlay, shared by the toolbar toggle, the
+/// in-panel header "X" (chatPanelDidRequestClose:), and the window's red close
+/// button (windowShouldClose:). Hides the window (never collapses the panel, so
+/// its content stays expanded for the next open) and syncs the toolbar/visibility
+/// state so the chat button never shows a stale "active" highlight.
+- (void)hideChatOverlaySyncingState {
+    if (!self.chatOverlayWindow) return;
+    if (self.chatOverlayWindow.isVisible) {
+        [self.chatOverlayWindow orderOut:nil];
+    }
+    self.chatController.isChatVisible = NO;
+    [self.controlPanel setChatVisible:NO];
+}
+
+#pragma mark - InterChatPanelDelegate (close)
+
+// In secure/interview mode the chat lives in a floating overlay window whose
+// visibility is the toggle. The header "X" must HIDE that window — not collapse
+// the InterChatPanel off-screen (which would leave an empty window on reopen,
+// since the panel is force-expanded only once at setup and toggleChatOverlay
+// only flips window visibility).
+- (void)chatPanelDidRequestClose:(InterChatPanel *)panel {
+#pragma unused(panel)
+    [self hideChatOverlaySyncingState];
+}
+
+#pragma mark - NSWindowDelegate (chat overlay)
+
+// Route the red title-bar close button through the same hide path and veto the
+// real close, keeping the overlay (and its expanded panel content) alive for the
+// next open. Only governs the chat overlay window; any other window closes normally.
+- (BOOL)windowShouldClose:(NSWindow *)sender {
+    if (sender == self.chatOverlayWindow) {
+        [self hideChatOverlaySyncingState];
+        return NO;
+    }
+    return YES;
 }
 
 - (void)exitSession {
@@ -233,15 +241,22 @@ static const CGFloat InterSecureBottomWorkspaceMargin = 100.0;
 }
 
 - (void)destroySecureWindow {
-    if (self.controlPanel) {
-        self.controlPanel.cameraToggleHandler = nil;
-        self.controlPanel.microphoneToggleHandler = nil;
-        self.controlPanel.shareToggleHandler = nil;
-        self.controlPanel.shareModeChangedHandler = nil;
-        self.controlPanel.audioInputSelectionChangedHandler = nil;
-        self.controlPanel.shareSystemAudioChangedHandler = nil;
-        self.controlPanel.interviewToolChangedHandler = nil;
+    // [review HIGH] The chrome bridge is a @MainActor Swift object and the
+    // window/views are AppKit — teardown MUST run on the main thread. Re-route
+    // defensively rather than assert: a background-thread release of the bridge
+    // would tear down SwiftUI state off-main.
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{ [self destroySecureWindow]; });
+        return;
     }
+
+    // [paranoid #8] Drop every chrome handler block so none (and the controller
+    // state they capture) outlives the session.
+    [self.controlPanel invalidateHandlers];
+    // [review MEDIUM] Explicitly detach the hosted chrome views (don't rely on
+    // window dealloc cascading while the bridge may still be referenced).
+    [self.controlPanel.topBarView removeFromSuperview];
+    [self.controlPanel.bottomBarView removeFromSuperview];
 
     [self.surfaceShareController stopSharingFromSurfaceView:nil];
     // [2.6.5] Clear network sink but do NOT disconnect room
@@ -270,6 +285,10 @@ static const CGFloat InterSecureBottomWorkspaceMargin = 100.0;
     }
 
     self.controlPanel = nil;
+    if (self.selfPreviewStrip) {
+        [self.selfPreviewStrip removeFromSuperview];
+        self.selfPreviewStrip = nil;
+    }
 
     [self.stageView removeFromSuperview];
     self.stageView = nil;
@@ -282,11 +301,11 @@ static const CGFloat InterSecureBottomWorkspaceMargin = 100.0;
     // Tear down chat overlay
     if (self.chatOverlayWindow) {
         self.chatController.chatDelegate = nil;
+        self.chatOverlayWindow.delegate = nil;
         [self.chatOverlayWindow orderOut:nil];
         self.chatOverlayWindow = nil;
         self.secureChatPanel = nil;
     }
-    self.chatToggleButton = nil;
 
     [self.secureWindow orderOut:nil];
     self.secureWindow = nil;
@@ -296,48 +315,83 @@ static const CGFloat InterSecureBottomWorkspaceMargin = 100.0;
 #pragma mark - Controls
 
 - (void)attachControlPanelInView:(NSView *)view {
-    NSRect panelFrame = [self secureControlPanelFrameInView:view];
-    self.controlPanel = [[InterLocalCallControlPanel alloc] initWithFrame:panelFrame];
-    self.controlPanel.autoresizingMask = NSViewMinXMargin | NSViewMaxYMargin;
-    [self.controlPanel setPanelTitleText:@"Interview Controls"];
-    [self.controlPanel setShareModeSelectorHidden:YES];
-    [self.controlPanel setInterviewToolSelectorHidden:NO];
-    [self.controlPanel setSelectedInterviewToolKind:InterInterviewToolKindNone];
-    [self.controlPanel setShareMode:InterShareModeThisApp];
-    [self.controlPanel setShareSystemAudioEnabled:NO];
-    [self.controlPanel setShareSystemAudioToggleHidden:YES];
-    [self.controlPanel setShareStartPending:NO];
-    [self.controlPanel setShareStatusText:@"Secure tool share is off."];
-    [view addSubview:self.controlPanel];
+    // [Task: interviewee chrome] SwiftUI top status bar + bottom control bar
+    // hosted INSIDE the capture-protected kiosk window (no new windows —
+    // paranoid #2). The stage view, tool capture host, and chat overlay stay
+    // AppKit; their geometry is untouched (#1): the bottom bar (88pt) fits
+    // inside the stage's 100pt bottom workspace margin, the top bar (48pt)
+    // inside its 70pt top reserve.
+    InterSecureChromeBridge *chrome = [[InterSecureChromeBridge alloc] init];
+    self.controlPanel = chrome;
+
+    NSView *topBar = chrome.topBarView;
+    topBar.frame = NSMakeRect(0, view.bounds.size.height - 48.0, view.bounds.size.width, 48.0);
+    topBar.autoresizingMask = NSViewWidthSizable | NSViewMinYMargin;
+    [view addSubview:topBar];
+
+    NSView *bottomBar = chrome.bottomBarView;
+    bottomBar.frame = NSMakeRect(0, 0, view.bounds.size.width, 88.0);
+    bottomBar.autoresizingMask = NSViewWidthSizable | NSViewMaxYMargin;
+    [view addSubview:bottomBar];
+
+    // Self-preview PiP in the sidebar column, above the bottom bar (the old
+    // panel's preview container is gone). Camera preview attaches as a
+    // sublayer; the network indicator overlays it as a subview.
+    NSRect pipFrame = NSMakeRect(view.bounds.size.width - InterSecureSidebarTrailingMargin - InterSecureSidebarWidth,
+                                 100.0,
+                                 InterSecureSidebarWidth,
+                                 157.0);
+    NSView *pip = [[NSView alloc] initWithFrame:pipFrame];
+    pip.autoresizingMask = NSViewMinXMargin | NSViewMaxYMargin;
+    pip.wantsLayer = YES;
+    pip.layer.backgroundColor = [[NSColor colorWithWhite:0.08 alpha:1.0] CGColor];
+    pip.layer.cornerRadius = 10.0;
+    pip.layer.masksToBounds = YES;
+    pip.layer.borderWidth = 1.0;
+    pip.layer.borderColor = [[NSColor colorWithWhite:1.0 alpha:0.08] CGColor];
+    [view addSubview:pip];
+    self.selfPreviewStrip = pip;
+
+    // Initial chrome state.
+    [chrome setSelectedInterviewToolKind:InterInterviewToolKindNone];
+    [chrome setShareStartPending:NO];
+    [chrome setShareStatusText:@"Nothing is shared. Select Code or Board, then press Share."];
+    if (self.roomController.roomCode.length > 0) {
+        [chrome setRoomCodeText:self.roomController.roomCode];
+    }
 
     __weak typeof(self) weakSelf = self;
-    self.controlPanel.cameraToggleHandler = ^{
+    chrome.cameraToggleHandler = ^{
         // [2.6.3] [G2] Two-phase camera toggle via shared wiring controller
         [weakSelf.mediaWiring twoPhaseToggleCamera];
     };
-    self.controlPanel.microphoneToggleHandler = ^{
+    chrome.microphoneToggleHandler = ^{
         // [2.6.3] [G2] Two-phase mic toggle via shared wiring controller
         [weakSelf.mediaWiring twoPhaseToggleMicrophone];
     };
-    self.controlPanel.shareToggleHandler = ^{
+    chrome.shareToggleHandler = ^{
+        // [paranoid #7] The ONLY publish trigger — tool selection never lands here.
         [weakSelf toggleSurfaceShare];
     };
-    self.controlPanel.audioInputSelectionChangedHandler = ^(NSString * _Nullable deviceID) {
+    chrome.audioInputSelectionChangedHandler = ^(NSString * _Nullable deviceID) {
         [weakSelf handleSecureAudioInputSelection:deviceID];
     };
-    self.controlPanel.interviewToolChangedHandler = ^(InterInterviewToolKind toolKind) {
-        [weakSelf handleInterviewToolSelection:toolKind];
+    chrome.interviewToolChangedHandler = ^(NSInteger toolKind) {
+        [weakSelf handleInterviewToolSelection:(InterInterviewToolKind)toolKind];
+    };
+    chrome.chatToggleHandler = ^{
+        [weakSelf toggleChatOverlay];
+    };
+    chrome.leaveHandler = ^{
+        // [paranoid #5] The candidate's only escape from kiosk mode — routes
+        // through the confirmation alert in exitSession (never exits silently).
+        [weakSelf exitSession];
     };
 
-    // [3.4.4] Network quality signal bars
-    self.networkStatusView = [[InterNetworkStatusView alloc] initWithFrame:NSMakeRect(0, 0, 40, 16)];
-    [self.controlPanel.networkStatusContainerView addSubview:self.networkStatusView];
-
-    // [3.4.5] Triple-click diagnostic via wiring controller
-    NSClickGestureRecognizer *tripleClick = [[NSClickGestureRecognizer alloc] initWithTarget:self
-                                                                                      action:@selector(forwardDiagnosticTripleClick:)];
-    tripleClick.numberOfClicksRequired = 3;
-    [self.controlPanel.networkStatusContainerView addGestureRecognizer:tripleClick];
+    // [3.4.4] Network quality signal bars — overlays the self-preview.
+    self.networkStatusView = [[InterNetworkStatusView alloc] initWithFrame:NSMakeRect(6.0, pipFrame.size.height - 22.0, 40.0, 16.0)];
+    self.networkStatusView.autoresizingMask = NSViewMaxXMargin | NSViewMinYMargin;
+    [pip addSubview:self.networkStatusView];
 }
 
 - (void)startLocalMediaFlow {
@@ -380,7 +434,7 @@ static const CGFloat InterSecureBottomWorkspaceMargin = 100.0;
     };
 
     [self.controlPanel setMediaStatusText:@"Requesting camera/mic permission..."];
-    [self.localMediaController attachPreviewToView:self.controlPanel.previewContainerView];
+    [self.localMediaController attachPreviewToView:self.selfPreviewStrip];
 
     [self.localMediaController prepareWithCompletion:^(BOOL success, NSString * _Nullable failureReason) {
         if (!success) {
@@ -401,8 +455,44 @@ static const CGFloat InterSecureBottomWorkspaceMargin = 100.0;
         }
         [weakSelf.controlPanel setMediaStatusText:message];
 
-        // [2.6.2] Wire network publishing if room is connected
-        [weakSelf.mediaWiring wireNetworkPublish];
+        // [Green room] Apply the candidate's pre-join mic/cam-off choices.
+        // Same [R5] ordering rule as the normal flow: wireNetworkPublish must
+        // wait for these async disables to land, or it reads stale enabled
+        // state and publishes a ghost WebRTC mic track that keeps capturing
+        // after the AVCaptureSession input is removed.
+        dispatch_group_t joinGroup = dispatch_group_create();
+        if (weakSelf.startWithMicrophoneOff) {
+            dispatch_group_enter(joinGroup);
+            [weakSelf.localMediaController setMicrophoneEnabled:NO completion:^(BOOL __unused s) {
+                [weakSelf.controlPanel setMicrophoneEnabled:NO];
+                dispatch_group_leave(joinGroup);
+            }];
+        }
+        if (weakSelf.startWithCameraOff) {
+            dispatch_group_enter(joinGroup);
+            [weakSelf.localMediaController setCameraEnabled:NO completion:^(BOOL __unused s) {
+                [weakSelf.controlPanel setCameraEnabled:NO];
+                dispatch_group_leave(joinGroup);
+            }];
+        }
+        dispatch_group_notify(joinGroup, dispatch_get_main_queue(), ^{
+            // [2.6.2] Wire network publishing if room is connected
+            [weakSelf.mediaWiring wireNetworkPublish];
+            // Seed the self-tile mic/cam badges from the now-accurate device state
+            // (parity with the normal-call path — the capture flags are only true
+            // after start + join-time mute settles).
+            [weakSelf.mediaWiring refreshLocalMediaStateInRoster];
+
+            // [Mic preference] Apply the candidate's selected mic to LiveKit's native
+            // capture (parity with the normal path); otherwise LiveKit uses the system
+            // default at join. No-op when the preferred device already IS the default.
+            NSString *prefMicID = [weakSelf.localMediaController selectedAudioInputDeviceID];
+            if (prefMicID.length > 0) {
+                NSString *prefMicName = [AVCaptureDevice deviceWithUniqueID:prefMicID].localizedName;
+                [weakSelf.roomController setNetworkAudioInputWithDeviceID:prefMicID name:prefMicName];
+            }
+            [weakSelf refreshSecureAudioInputOptions];
+        });
     }];
 
     // [B1] Create and wire shared media wiring controller
@@ -475,6 +565,17 @@ static const CGFloat InterSecureBottomWorkspaceMargin = 100.0;
     }
 
     NSArray<NSDictionary<NSString *, NSString *> *> *options = [self.localMediaController availableAudioInputOptions];
+
+    // The checkmark is derived solely from the AVCapture-validated selection.
+    // -selectedAudioInputDeviceID validates against the live discovery list, so it never
+    // returns an id missing from the menu (fixes the stale/orphan tick on hot-unplug).
+    //
+    // We deliberately DO NOT query LiveKit's AudioManager.inputDevice here. That getter is
+    // a synchronous WebRTC Thread::BlockingCall; issuing it on the main thread during an
+    // audio route change (earphone plug/unplug) blocked the main thread (UI/video freeze)
+    // AND poked the AudioDeviceModule on the same WebRTC thread that was tearing down the
+    // AVAudioEngine, racing CoreAudio's route-change property listener into an
+    // EXC_BAD_ACCESS. See spec: audio-route-change-crash-fix.
     NSString *selectedDeviceID = [self.localMediaController selectedAudioInputDeviceID];
     [self.controlPanel setAudioInputOptions:options selectedDeviceID:selectedDeviceID];
 }
@@ -552,6 +653,24 @@ static const CGFloat InterSecureBottomWorkspaceMargin = 100.0;
         return;
     }
 
+    // While connected, re-point LiveKit's native capture instead of reconfiguring the
+    // shared AVCaptureSession (which would momentarily interrupt video). Parity with the
+    // normal-call path. Pre-connect, reconfigure the capture session as before.
+    InterRoomController *rc = self.roomController;
+    if (rc && rc.connectionState == InterRoomConnectionStateConnected) {
+        [self.localMediaController storePreferredAudioDeviceID:deviceID];
+        NSString *deviceName = nil;
+        if (deviceID.length > 0) {
+            deviceName = [AVCaptureDevice deviceWithUniqueID:deviceID].localizedName;
+        }
+        BOOL switched = [rc setNetworkAudioInputWithDeviceID:deviceID name:deviceName];
+        if (!switched) {
+            [self.controlPanel setMediaStatusText:@"Couldn't switch microphone for the call."];
+        }
+        [self refreshSecureAudioInputOptions];
+        return;
+    }
+
     __weak typeof(self) weakSelf = self;
     [self.localMediaController selectAudioInputDeviceWithID:deviceID completion:^(BOOL success) {
         [weakSelf refreshSecureAudioInputOptions];
@@ -607,7 +726,7 @@ static const CGFloat InterSecureBottomWorkspaceMargin = 100.0;
 #pragma mark - Network Wiring [2.6]
 
 // [B1] twoPhaseToggleCamera, twoPhaseToggleMicrophone, wireSecureNetworkPublish,
-// wireNetworkSinkOnSurfaceShareController:, handleDiagnosticTripleClick:,
+// wireNetworkSinkOnSurfaceShareController:,
 // setupRoomControllerKVO, teardownRoomControllerKVO, observeValueForKeyPath:,
 // handleConnectionStateChanged:, handlePresenceStateChanged:
 // are now in InterMediaWiringController (self.mediaWiring).
@@ -622,6 +741,12 @@ static const CGFloat InterSecureBottomWorkspaceMargin = 100.0;
     self.trackRendererBridge = [[InterTrackRendererBridge alloc] initWithLayoutManager:self.remoteLayout
                                                                       previewObserver:self.stageView];
     rc.subscriber.trackRenderer = (id<InterRemoteTrackRenderer>)self.trackRendererBridge;
+    // [B5] Parity with AppDelegate.wireNormalRemoteRendering: subscriber.attach() ran pre-connect
+    // with an empty remoteParticipants set, and LiveKit fires no participantDidConnect for
+    // participants already in the room, so the trackRenderer didSet only resyncs an empty roster.
+    // Reseed now so a host already present (camera on OR off) is seeded into the roster and its
+    // tile appears immediately on candidate join. reseedPresence is @objc and idempotent.
+    [rc.subscriber reseedPresence];
 
     // [3.3.3] [G6] Show waiting overlay when alone + connected
     if (rc.connectionState == InterRoomConnectionStateConnected &&
@@ -648,12 +773,6 @@ static const CGFloat InterSecureBottomWorkspaceMargin = 100.0;
 // [Phase 8.1.5] Chat panel implemented: floating NSPanel overlay above secure window.
 // Wire chatController by setting .chatController before createSecureWindow.
 
-/// [B1] Trampoline: gesture recognizer target must be self; forward to wiring controller.
-- (void)forwardDiagnosticTripleClick:(NSClickGestureRecognizer *)recognizer {
-#pragma unused(recognizer)
-    [self.mediaWiring handleDiagnosticTripleClick];
-}
-
 #pragma mark - InterChatControllerDelegate
 
 - (void)chatController:(InterChatController *)controller
@@ -662,10 +781,8 @@ static const CGFloat InterSecureBottomWorkspaceMargin = 100.0;
     if (!self.chatOverlayWindow.isVisible) {
         NSInteger unread = controller.unreadCount;
         [self.secureChatPanel setUnreadBadge:unread];
-        // Tint the toggle button to signal unread messages
-        if (unread > 0) {
-            self.chatToggleButton.contentTintColor = [NSColor systemOrangeColor];
-        }
+        // Badge on the top-bar chat button signals unread messages.
+        [self.controlPanel setChatUnread:unread];
     }
 }
 
@@ -673,9 +790,7 @@ static const CGFloat InterSecureBottomWorkspaceMargin = 100.0;
    didUpdateUnreadCount:(NSInteger)count {
     if (!self.chatOverlayWindow.isVisible) {
         [self.secureChatPanel setUnreadBadge:count];
-        self.chatToggleButton.contentTintColor = count > 0
-            ? [NSColor systemOrangeColor]
-            : [NSColor colorWithWhite:0.8 alpha:1.0];
+        [self.controlPanel setChatUnread:count];
     }
 }
 

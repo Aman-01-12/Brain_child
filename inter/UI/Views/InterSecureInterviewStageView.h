@@ -1,4 +1,5 @@
 #import <Cocoa/Cocoa.h>
+#import <QuartzCore/QuartzCore.h>
 
 #import "InterInterviewToolTypes.h"
 #import "InterTrackRendererBridge.h"
@@ -7,6 +8,16 @@ NS_ASSUME_NONNULL_BEGIN
 
 @class InterRemoteVideoLayoutManager;
 @class InterSecureToolHostView;
+
+/// [B6] Pure, side-effect-free ingest gate for the kiosk preview-observer path.
+///
+/// Returns YES when enough time has elapsed since the last accepted frame to
+/// emit another one (i.e. `(now - last) >= interval`). Declared here so the
+/// Swift test target can reach it through the test bridging header without
+/// widening any production-public Objective-C API.
+///
+/// Pass `last = -INFINITY` to always admit the first frame for a participant.
+BOOL InterPreviewShouldIngest(CFTimeInterval now, CFTimeInterval last, CFTimeInterval interval);
 
 /// Secure interview-specific stage system.
 ///

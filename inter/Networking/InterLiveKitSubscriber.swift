@@ -90,9 +90,16 @@ import LiveKit
             // Pipe roster snapshots to whatever delegate is current, then resync so a
             // late-wired delegate (the participant-side race) immediately gets the full
             // roster — including participants already present when we attached.
-            let weakRenderer = trackRenderer
-            roster.onSnapshot = { entries in
-                weakRenderer?.applyParticipantSnapshot?(entries)
+            //
+            // Capture self weakly and read the (weak) trackRenderer at emit time. The
+            // roster is owned by self and never clears onSnapshot (reset()/detach() keep
+            // it), so capturing the renderer strongly here would pin it for the
+            // subscriber's whole lifetime — silently breaking the `weak var` contract and
+            // leaking the renderer's view hierarchy. Reading self?.trackRenderer per emit
+            // also means a re-wired delegate is always honoured. ([weak self] additionally
+            // avoids a subscriber→roster→closure→subscriber retain cycle.)
+            roster.onSnapshot = { [weak self] entries in
+                self?.trackRenderer?.applyParticipantSnapshot?(entries)
             }
             roster.resync()
         }
@@ -102,6 +109,13 @@ import LiveKit
     /// When non-nil, receives the same remote camera frames as `trackRenderer`.
     /// Used by the recording coordinator to feed frames to the composed renderer.
     @objc public weak var recordingFrameDelegate: InterRemoteTrackRenderer?
+
+    /// Current remote participant identities (presence-driven), for seeding the
+    /// recording coordinator with participants already present when recording starts.
+    /// Call on the main thread.
+    @objc public func recordingSeedParticipantIdentities() -> [String] {
+        return roster.remoteIdentitiesSnapshot()
+    }
 
     /// The pixel format of the last received camera frame. [G3]
     @objc public private(set) var detectedCameraFormat: OSType = 0
@@ -386,6 +400,7 @@ extension InterLiveKitSubscriber: RoomDelegate {
         interLogInfo(InterLog.media, "Subscriber: participant connected %{public}@", pid)
         DispatchQueue.main.async {
             self.trackRenderer?.remoteParticipantDidJoin?(pid, displayName: name)
+            self.recordingFrameDelegate?.remoteParticipantDidJoin?(pid, displayName: name)
             self.roster.participantJoined(pid, displayName: name)
         }
 
@@ -414,6 +429,7 @@ extension InterLiveKitSubscriber: RoomDelegate {
             self.cleanUpTrack(source: .camera, participantId: pid)
             self.cleanUpTrack(source: .screenShareVideo, participantId: pid)
             self.trackRenderer?.remoteParticipantDidLeave?(pid)
+            self.recordingFrameDelegate?.remoteParticipantDidLeave?(pid)
             self.roster.participantLeft(pid)
         }
     }
@@ -463,9 +479,10 @@ extension InterLiveKitSubscriber: RoomDelegate {
                                             (format >> 8) & 0xFF,
                                             format & 0xFF))
                     }
-                    self?.trackRenderer?.didReceiveRemoteCameraFrame(pixelBuffer, fromParticipant: participantId)
-                    // [Phase 10] Forward to recording frame delegate
-                    self?.recordingFrameDelegate?.didReceiveRemoteCameraFrame(pixelBuffer, fromParticipant: participantId)
+                    // Forwarding extracted verbatim into a seam method (no behavior change)
+                    // so the camera/screen-share forwarding asymmetry is testable without a
+                    // live LiveKit Room/Track. See `forwardRemoteCameraFrame`.
+                    self?.forwardRemoteCameraFrame(pixelBuffer, fromParticipant: participantId)
                     // Signal first frame to roster so cameraOn flips in the snapshot.
                     self?.roster.cameraFirstFrame(participantId)
                 }
@@ -492,7 +509,10 @@ extension InterLiveKitSubscriber: RoomDelegate {
                                             (format >> 8) & 0xFF,
                                             format & 0xFF))
                     }
-                    self?.trackRenderer?.didReceiveRemoteScreenShareFrame(pixelBuffer, fromParticipant: participantId)
+                    // Forwarding extracted verbatim into a seam method (no behavior change)
+                    // so the screen-share forwarding can be exercised without a live LiveKit
+                    // Room/Track. See `forwardRemoteScreenShareFrame`.
+                    self?.forwardRemoteScreenShareFrame(pixelBuffer, fromParticipant: participantId)
                 }
                 self.screenShareRenderers[participantId] = renderer
                 self.screenShareTracks[participantId] = videoTrack
@@ -620,6 +640,41 @@ extension InterLiveKitSubscriber: RoomDelegate {
 
         trackRenderer?.remoteParticipantDidUpdateDisplayName?(displayName, forParticipant: participantId)
         roster.updateDisplayName(displayName, for: participantId)
+    }
+}
+
+// MARK: - Remote Frame Forwarding (B2 seam)
+
+extension InterLiveKitSubscriber {
+    /// Forward a decoded remote **camera** frame to the active delegates.
+    ///
+    /// Extracted *verbatim* from the `didSubscribeTrack` `.camera`
+    /// `RemoteFrameRenderer` closure (no behavior change). The closure itself can
+    /// only be built from a live LiveKit subscription, so this seam lets the
+    /// forwarding contract be exercised in unit tests. The camera path forwards to
+    /// BOTH `trackRenderer` (spotlight/UI) and `recordingFrameDelegate` (recording).
+    func forwardRemoteCameraFrame(_ pixelBuffer: CVPixelBuffer, fromParticipant participantId: String) {
+        trackRenderer?.didReceiveRemoteCameraFrame(pixelBuffer, fromParticipant: participantId)
+        // [Phase 10] Forward to recording frame delegate
+        recordingFrameDelegate?.didReceiveRemoteCameraFrame(pixelBuffer, fromParticipant: participantId)
+    }
+
+    /// Forward a decoded remote **screen-share** frame to the active delegates.
+    ///
+    /// Extracted *verbatim* from the `didSubscribeTrack` `.screenShareVideo`
+    /// `RemoteFrameRenderer` closure (no behavior change).
+    ///
+    /// [B2] This now forwards to BOTH `trackRenderer` (spotlight/UI) and
+    /// `recordingFrameDelegate` (recording), matching the camera counterpart above.
+    /// Forwarding to the recording delegate is what composites a remote (candidate)
+    /// screen share into the host's recording.
+    func forwardRemoteScreenShareFrame(_ pixelBuffer: CVPixelBuffer, fromParticipant participantId: String) {
+        trackRenderer?.didReceiveRemoteScreenShareFrame(pixelBuffer, fromParticipant: participantId)
+        // [B2] Forward to recording frame delegate (mirrors forwardRemoteCameraFrame) so a remote
+        // (candidate) screen share is composited into the host's recording. Safe no-op when not
+        // recording (recordingFrameDelegate is weak/nil). The coordinator's _activeScreenShareIdentity
+        // shouldAccept gate prevents any double-feed with the local-share sink path.
+        recordingFrameDelegate?.didReceiveRemoteScreenShareFrame(pixelBuffer, fromParticipant: participantId)
     }
 }
 

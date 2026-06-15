@@ -1,6 +1,7 @@
 #import "InterSecureInterviewStageView.h"
 
 #import <CoreImage/CoreImage.h>
+#import <os/lock.h>
 
 #import "InterRemoteVideoLayoutManager.h"
 #import "InterSecureToolHostView.h"
@@ -25,6 +26,14 @@ static const CGFloat InterSecureStageRailTileAspectRatio = 9.0 / 16.0;
 static const CFTimeInterval InterSecureStagePreviewUpdateInterval = 1.0 / 6.0;
 static NSString * const InterSecureStageScreenShareTileKey = @"__screenshare__";
 static NSString * const InterSecureStageToolPreviewKey = @"__tool__";
+
+// [B6] Pure ingest gate: admit a frame only when at least `interval` seconds
+// have elapsed since the last accepted frame. Defined here (declared in the
+// header) so the decode-thread hot path and the Swift tests share one source
+// of truth.
+BOOL InterPreviewShouldIngest(CFTimeInterval now, CFTimeInterval last, CFTimeInterval interval) {
+    return (now - last) >= interval;
+}
 
 typedef NS_ENUM(NSUInteger, InterSecureInterviewCenterContent) {
     InterSecureInterviewCenterContentRemote = 0,
@@ -136,7 +145,14 @@ typedef NS_ENUM(NSUInteger, InterSecureInterviewCenterContent) {
 @property (nonatomic, assign) InterSecureInterviewCenterContent centerContent;
 @end
 
-@implementation InterSecureInterviewStageView
+@implementation InterSecureInterviewStageView {
+    // [B6] Source-side preview ingest throttle state. `_previewEmitTimestamps`
+    // maps participantId -> last-accepted CACurrentMediaTime, guarded by
+    // `_previewEmitLock` because `observeRemoteCameraFrame:` runs on the
+    // LiveKit decode thread (off main).
+    NSMutableDictionary<NSString *, NSNumber *> *_previewEmitTimestamps;
+    os_unfair_lock _previewEmitLock;
+}
 
 - (instancetype)initWithFrame:(NSRect)frameRect {
     self = [super initWithFrame:frameRect];
@@ -223,6 +239,21 @@ typedef NS_ENUM(NSUInteger, InterSecureInterviewCenterContent) {
         return;
     }
 
+    // [B6] Source-side throttle: gate ingest on the decode thread BEFORE the
+    // retain + main-queue hop so only ~6 fps per participant reach main, instead
+    // of every ~30 fps decoded frame. The downstream renderer is throttled to
+    // the same `InterSecureStagePreviewUpdateInterval` cadence.
+    CFTimeInterval now = CACurrentMediaTime();
+    os_unfair_lock_lock(&_previewEmitLock);
+    NSNumber *lastValue = _previewEmitTimestamps[participantId];
+    CFTimeInterval last = lastValue ? lastValue.doubleValue : -INFINITY;
+    if (!InterPreviewShouldIngest(now, last, InterSecureStagePreviewUpdateInterval)) {
+        os_unfair_lock_unlock(&_previewEmitLock);
+        return;
+    }
+    _previewEmitTimestamps[participantId] = @(now);
+    os_unfair_lock_unlock(&_previewEmitLock);
+
     CVPixelBufferRetain(pixelBuffer);
     dispatch_async(dispatch_get_main_queue(), ^{
         NSString *displayName = [self.remoteLayoutManager displayNameForTileKey:participantId] ?: @"Participant";
@@ -276,6 +307,10 @@ typedef NS_ENUM(NSUInteger, InterSecureInterviewCenterContent) {
     self.remotePreviewImages = [NSMutableDictionary dictionary];
     self.remotePreviewTimestamps = [NSMutableDictionary dictionary];
     self.remoteCameraOrder = [NSMutableArray array];
+
+    // [B6] Initialize the source-side ingest throttle state.
+    _previewEmitTimestamps = [NSMutableDictionary dictionary];
+    _previewEmitLock = OS_UNFAIR_LOCK_INIT;
 
     self.remoteLayoutManager = [[InterRemoteVideoLayoutManager alloc] initWithFrame:NSZeroRect];
     self.remoteLayoutManager.autoresizingMask = NSViewNotSizable;
@@ -637,6 +672,12 @@ typedef NS_ENUM(NSUInteger, InterSecureInterviewCenterContent) {
     [self.remotePreviewViews removeObjectForKey:tileKey];
     [self.remotePreviewImages removeObjectForKey:tileKey];
     [self.remotePreviewTimestamps removeObjectForKey:tileKey];
+
+    // [B6] Drop the source-side throttle entry so the dictionary can't grow
+    // unbounded as participants/tiles come and go.
+    os_unfair_lock_lock(&_previewEmitLock);
+    [_previewEmitTimestamps removeObjectForKey:tileKey];
+    os_unfair_lock_unlock(&_previewEmitLock);
 
     if ([self.selectedRemoteTileKey isEqualToString:tileKey]) {
         self.selectedRemoteTileKey = nil;

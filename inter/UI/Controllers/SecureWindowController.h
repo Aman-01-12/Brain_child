@@ -14,6 +14,14 @@ NS_ASSUME_NONNULL_BEGIN
 /// Set by AppDelegate before createSecureWindow is called.
 @property (nonatomic, weak, nullable) InterRoomController *roomController;
 
+/// [Green room] Start with the mic / camera disabled (candidate turned them
+/// off in the pre-join green room). Set BEFORE -createSecureWindow; applied
+/// once after the capture session starts. Interview rooms have no host
+/// muteOnJoin/cameraOffOnJoin (no pre-meeting), so only these user choices
+/// shape the initial device state.
+@property (nonatomic, assign) BOOL startWithMicrophoneOff;
+@property (nonatomic, assign) BOOL startWithCameraOff;
+
 /// Chat controller for in-session messaging. Set by AppDelegate after attach.
 @property (nonatomic, weak, nullable) InterChatController *chatController;
 
