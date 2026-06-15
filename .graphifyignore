@@ -1,0 +1,12 @@
+# Ignore everything except the real project code folders.
+# This keeps Graphify focused on app and test sources and skips docs, notes, and other workspace clutter.
+
+*
+!inter/
+!inter/**
+!interTests/
+!interTests/**
+!inter.xcodeproj/
+!inter.xcodeproj/**
+!token-server/
+!token-server/**

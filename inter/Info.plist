@@ -39,6 +39,10 @@
 	</array>
 	<key>NSPrincipalClass</key>
 	<string>NSApplication</string>
+	<key>InterLiveKitServerURL</key>
+	<string>ws://localhost:7880</string>
+	<key>InterTokenServerURL</key>
+	<string>http://localhost:3000</string>
 	<key>NSScreenCaptureUsageDescription</key>
 	<string>Screen sharing captures this app's secure call surface.</string>
 	<key>NSCalendarsUsageDescription</key>

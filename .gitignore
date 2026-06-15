@@ -1,4 +1,13 @@
 .vscode/
 token-server/node_modules
 token-server/.env
-docs/
+
+/memory
+/.kiro
+/inter-design-handoff
+/tools
+/.venv
+/.github
+
+# Scratch crash-dump / scratch notes (not for VCS)
+temp_test
