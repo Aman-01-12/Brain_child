@@ -25,7 +25,7 @@ static void *InterWiringPresenceStateContext   = &InterWiringPresenceStateContex
 static void *InterWiringActiveSpeakerContext   = &InterWiringActiveSpeakerContext;
 static void *InterWiringParticipantCountContext = &InterWiringParticipantCountContext;
 
-@interface InterMediaWiringController ()
+@interface InterMediaWiringController () <InterRemoteVideoLayoutManagerDelegate>
 @property (nonatomic, assign) BOOL isObservingRoomController;
 /// Timer that fires after 30 seconds of continuous reconnection.
 @property (nonatomic, strong, nullable) dispatch_source_t reconnectionTimeoutTimer;
@@ -97,6 +97,14 @@ static void *InterWiringParticipantCountContext = &InterWiringParticipantCountCo
     _remoteLayout = remoteLayout;
 
     if (remoteLayout) {
+        // [Phase 7.3.3/7.3.4] Wire the visibility/quality seam. The layout
+        // manager emits page-in/page-out + preferred-dimension events; we relay
+        // them to InterLiveKitSubscriber so paged-out participants stop costing
+        // bandwidth and visible tiles request the right simulcast layer. This
+        // assignment was the missing link — the seam existed unwired, so every
+        // participant kept a full-rate subscription regardless of pagination.
+        remoteLayout.layoutDelegate = self;
+
         // Push active speaker so the first speaker highlight is correct.
         NSString *currentSpeaker = self.roomController.activeSpeakerIdentity;
         if (currentSpeaker.length > 0) {
@@ -133,6 +141,50 @@ static void *InterWiringParticipantCountContext = &InterWiringParticipantCountCo
 - (void)dealloc {
     [self teardownRoomControllerKVO];
     [self cancelReconnectionTimeout];
+}
+
+#pragma mark - InterRemoteVideoLayoutManagerDelegate (visibility/quality relay) [Phase 7.3.3/7.3.4]
+
+// Relay tile visibility (page-in/page-out, mode switches) to the subscriber so
+// LiveKit pauses delivery for hidden tiles. Uses set(enabled:) downstream — no
+// SFU renegotiation, cheap to flip on every page turn.
+//
+// Mitigation #5 (security): participantId originates from the roster/snapshot
+// (server-issued identities); downstream is an exact-match lookup against
+// LiveKit's own participant map, so a crafted value can at worst toggle
+// delivery of streams THIS client already has access to. Mitigation #2/#6:
+// only camera/screenShare kinds are relayed; anything else is dropped here.
+- (void)layoutManager:(InterRemoteVideoLayoutManager *)manager
+  didChangeVisibility:(BOOL)visible
+       forParticipant:(NSString *)participantId
+               source:(NSUInteger)trackKind {
+#pragma unused(manager)
+    if (participantId.length == 0) return;
+    if (trackKind != (NSUInteger)InterTrackKindCamera &&
+        trackKind != (NSUInteger)InterTrackKindScreenShare) return;
+    InterLiveKitSubscriber *subscriber = self.roomController.subscriber;
+    if (!subscriber) return;
+    [subscriber setTrackVisibility:visible
+                    forParticipant:participantId
+                            source:(InterTrackKind)trackKind];
+}
+
+// Relay the layout's preferred render size so the SFU serves the matching
+// simulcast layer (320×180 for dense grids / filmstrip, 1280×720 for stage).
+- (void)layoutManager:(InterRemoteVideoLayoutManager *)manager
+ didRequestDimensions:(CGSize)dimensions
+       forParticipant:(NSString *)participantId
+               source:(NSUInteger)trackKind {
+#pragma unused(manager)
+    if (participantId.length == 0) return;
+    if (dimensions.width <= 0 || dimensions.height <= 0) return;
+    if (trackKind != (NSUInteger)InterTrackKindCamera &&
+        trackKind != (NSUInteger)InterTrackKindScreenShare) return;
+    InterLiveKitSubscriber *subscriber = self.roomController.subscriber;
+    if (!subscriber) return;
+    [subscriber setPreferredDimensions:dimensions
+                        forParticipant:participantId
+                                source:(InterTrackKind)trackKind];
 }
 
 #pragma mark - Simple Device Toggles
@@ -192,10 +244,27 @@ static void *InterWiringParticipantCountContext = &InterWiringParticipantCountCo
         if (summary) {
             [weakSelf.controlPanel setMediaStatusText:summary];
         }
-        // Push local mic state to roster so snapshot reflects it.
-        BOOL micMuted = !weakSelf.mediaController.isMicrophoneEnabled;
-        [weakSelf.roomController.subscriber.roster setLocalMicMuted:micMuted];
+        // Push local mic state to roster so the self-tile badge reflects it.
+        [weakSelf refreshLocalMediaStateInRoster];
     }];
+}
+
+- (void)refreshLocalMediaStateInRoster {
+    InterRoomController *rc = self.roomController;
+    InterLocalMediaController *media = self.mediaController;
+    if (!rc || !media) { return; }
+    InterParticipantRoster *roster = rc.subscriber.roster;
+    if (!roster) { return; }
+
+    // Mic-muted truth = the same source the control button derives from:
+    //   • connected  → the LiveKit track mute (isMicNetworkMuted) is authoritative;
+    //   • pre-connect → the capture-session mic enable state.
+    // Camera-on is the capture device enable state in both cases. The roster no-ops
+    // unchanged values, so this is safe to call from hot paths (mic button derivation).
+    BOOL connected = (rc.connectionState == InterRoomConnectionStateConnected);
+    BOOL micMuted = connected ? self.isMicNetworkMuted : !media.isMicrophoneEnabled;
+    [roster setLocalCameraOn:media.isCameraEnabled];
+    [roster setLocalMicMuted:micMuted];
 }
 
 #pragma mark - G2 Two-Phase Toggles
@@ -430,6 +499,11 @@ static void *InterWiringParticipantCountContext = &InterWiringParticipantCountCo
         [self.controlPanel setMicrophoneEnabled:!self.isMicNetworkMuted];
         [self.controlPanel setMicrophoneButtonTitle:nil];
     }
+
+    // Keep the self-tile mic badge in lockstep with the button — this is the single
+    // mic-state derivation point, so pushing here covers every connected mic change
+    // (toggle, host mute/unmute, mute-all, approvals).
+    [self refreshLocalMediaStateInRoster];
 }
 
 /// F6 mitigation: cancel the pending-approval safety-net timer.
@@ -737,12 +811,34 @@ static void *InterWiringParticipantCountContext = &InterWiringParticipantCountCo
     self.cameraUnlockApproved = NO;
     self.cameraUnlockRequestPending = NO;
     self.cameraWasEnabledWhileApproved = NO;
+    InterRoomController *rc = self.roomController;
+    BOOL interview = [rc.roomType isEqualToString:@"interview"];
     InterLocalMediaController *media = self.mediaController;
+
+    // Consent-first (PR #2): in NORMAL mode, lifting a host camera lock is LIFT-ONLY — it
+    // re-enables the participant's own camera button but does NOT turn their camera on.
+    // The participant taps to start their camera (camera frames require their device, and
+    // auto-restoring would be a force-activation that violates the consent-first model).
+    // INTERVIEW mode keeps force-restore: if the camera was on before the host lock, bring
+    // it back (the ratified interview exception).
+    if (!interview) {
+        self.cameraWasEnabledBeforeHostLock = NO;   // discard the pre-lock memory; no auto-on
+        [self deriveCameraButton];
+        return;
+    }
+
+    // Interview mode — force-restore the camera if the host lock was the reason it went off.
+    //
+    // TODO [migration — interview "host enabled your camera" indicator; UI work]: this force
+    // path turns the interviewee's camera back on WITHOUT showing them a persistent "Host
+    // turned on your camera" indicator. The ratified spec (§5 / Finding B) requires interview
+    // force-activation to be NEVER silent. Add the indicator on this branch (and mirror it on
+    // the mic interview force in applyRemoteMicUnmute). Until then this is a known silent
+    // force, accepted only because interview mode is consented proctoring.
     if (media && self.cameraWasEnabledBeforeHostLock) {
         // The host lock was the reason the camera went off — restore it.
         self.cameraWasEnabledBeforeHostLock = NO;
         __weak typeof(self) weakSelf = self;
-        InterRoomController *rc = self.roomController;
         BOOL isConnected = rc && rc.connectionState == InterRoomConnectionStateConnected;
         if (isConnected && rc.publisher.cameraSource != nil) {
             // G2 enable: start capture device first, then let first frame auto-unmute the track.
@@ -1011,6 +1107,13 @@ static void *InterWiringParticipantCountContext = &InterWiringParticipantCountCo
         [self.networkStatusView setQualityLevel:quality];
     }
 
+    // Normal-mode SwiftUI bar renders the signal bars beside the room code
+    // (the floating self-preview PiP that used to host networkStatusView was
+    // removed). The AppKit panel does not implement this selector.
+    if ([self.controlPanel respondsToSelector:@selector(setNetworkQualityLevel:)]) {
+        [self.controlPanel setNetworkQualityLevel:(NSInteger)quality];
+    }
+
     // Reconnection timeout management [4.1 row 5]
     switch (state) {
         case InterRoomConnectionStateReconnecting:
@@ -1053,6 +1156,11 @@ static void *InterWiringParticipantCountContext = &InterWiringParticipantCountCo
 
     // Remember the state so the next transition can be classified correctly.
     self.lastConnectionState = state;
+
+    // Re-sync the self-tile mic badge: the mic-muted truth source flips between the
+    // capture-session enable state (pre-connect) and the LiveKit track mute (connected),
+    // so a connection-state change must re-derive it.
+    [self refreshLocalMediaStateInRoster];
 
     // Notify delegate for mode-specific follow-up actions
     if ([self.delegate respondsToSelector:@selector(mediaWiringControllerDidChangeConnectionState:)]) {
@@ -1188,33 +1296,6 @@ static void *InterWiringParticipantCountContext = &InterWiringParticipantCountCo
     InterRemoteVideoLayoutManager *layout = self.remoteLayout;
     if (layout) {
         [layout setRemoteParticipantCount:(NSUInteger)count];
-    }
-}
-
-#pragma mark - Diagnostics
-
-- (void)handleDiagnosticTripleClick {
-    InterRoomController *rc = self.roomController;
-    if (!rc || !rc.statsCollector) return;
-
-    NSString *snapshot = [rc.statsCollector captureDiagnosticSnapshot];
-    if (snapshot.length == 0) return;
-
-    NSPasteboard *pb = [NSPasteboard generalPasteboard];
-    [pb clearContents];
-    [pb setString:snapshot forType:NSPasteboardTypeString];
-
-    if (self.controlPanel) {
-        [self.controlPanel setConnectionStatusText:@"Diagnostic copied!"];
-        __weak typeof(self) weakSelf = self;
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            InterRoomController *r = weakSelf.roomController;
-            if (r) {
-                NSString *label = [[weakSelf class] connectionLabelForState:r.connectionState];
-                [weakSelf.controlPanel setConnectionStatusText:label];
-            }
-        });
     }
 }
 

@@ -8,6 +8,7 @@
 
 /* Begin PBXBuildFile section */
 		041DDB122F56B32C009968CE /* LiveKit in Frameworks */ = {isa = PBXBuildFile; productRef = 041DDB112F56B32C009968CE /* LiveKit */; };
+		04500C0C2F00000A00000003 /* SocketIO in Frameworks */ = {isa = PBXBuildFile; productRef = 04500C0B2F00000A00000002 /* SocketIO */; };
 		04C0290D2F6BC7E6007A9D76 /* Atomics in Frameworks */ = {isa = PBXBuildFile; productRef = 04C8E1A12F79B00C009968CE /* Atomics */; };
 /* End PBXBuildFile section */
 
@@ -46,6 +47,7 @@
 			files = (
 				04C0290D2F6BC7E6007A9D76 /* Atomics in Frameworks */,
 				041DDB122F56B32C009968CE /* LiveKit in Frameworks */,
+				04500C0C2F00000A00000003 /* SocketIO in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -99,6 +101,7 @@
 			packageProductDependencies = (
 				041DDB112F56B32C009968CE /* LiveKit */,
 				04C8E1A12F79B00C009968CE /* Atomics */,
+				04500C0B2F00000A00000002 /* SocketIO */,
 			);
 			productName = inter;
 			productReference = 042FD4022F1A72D60031193C /* inter.app */;
@@ -155,6 +158,7 @@
 			packageReferences = (
 				041DDB102F56B32C009968CE /* XCRemoteSwiftPackageReference "client-sdk-swift" */,
 				04C8E1A02F79B00C009968CE /* XCRemoteSwiftPackageReference "swift-atomics" */,
+				04500C0A2F00000A00000001 /* XCRemoteSwiftPackageReference "socket" */,
 			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = 042FD4032F1A72D60031193C /* Products */;
@@ -394,6 +398,7 @@
 				PRODUCT_BUNDLE_IDENTIFIER = Secure.interTests;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_EMIT_LOC_STRINGS = NO;
+				"SWIFT_OBJC_BRIDGING_HEADER[arch=*]" = "interTests/interTests-Bridging-Header.h";
 				SWIFT_VERSION = 5.0;
 				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/inter.app/Contents/MacOS/inter";
 			};
@@ -410,6 +415,7 @@
 				PRODUCT_BUNDLE_IDENTIFIER = Secure.interTests;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_EMIT_LOC_STRINGS = NO;
+				"SWIFT_OBJC_BRIDGING_HEADER[arch=*]" = "interTests/interTests-Bridging-Header.h";
 				SWIFT_VERSION = 5.0;
 				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/inter.app/Contents/MacOS/inter";
 			};
@@ -456,6 +462,14 @@
 				version = 2.12.1;
 			};
 		};
+		04500C0A2F00000A00000001 /* XCRemoteSwiftPackageReference "socket" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/socketio/socket.io-client-swift";
+			requirement = {
+				kind = exactVersion;
+				version = 16.1.1;
+			};
+		};
 		04C8E1A02F79B00C009968CE /* XCRemoteSwiftPackageReference "swift-atomics" */ = {
 			isa = XCRemoteSwiftPackageReference;
 			repositoryURL = "https://github.com/apple/swift-atomics.git";
@@ -471,6 +485,11 @@
 			isa = XCSwiftPackageProductDependency;
 			package = 041DDB102F56B32C009968CE /* XCRemoteSwiftPackageReference "client-sdk-swift" */;
 			productName = LiveKit;
+		};
+		04500C0B2F00000A00000002 /* SocketIO */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 04500C0A2F00000A00000001 /* XCRemoteSwiftPackageReference "socket" */;
+			productName = SocketIO;
 		};
 		04C8E1A12F79B00C009968CE /* Atomics */ = {
 			isa = XCSwiftPackageProductDependency;

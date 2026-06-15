@@ -15,12 +15,7 @@
 #import "InterRemoteVideoLayoutManager.h"
 #import "InterTrackRendererBridge.h"
 #import "InterParticipantOverlayView.h"
-#import "InterNetworkStatusView.h"
 #import "InterChatPanel.h"
-#import "InterSpeakerQueuePanel.h"
-#import "InterScreenShareQueuePanel.h"
-#import "InterCameraUnlockQueuePanel.h"
-#import "InterMicUnlockQueuePanel.h"
 #import "InterPollPanel.h"
 #import "InterQAPanel.h"
 #import "InterLobbyPanel.h"
@@ -29,8 +24,6 @@
 #import "InterRecordingListPanel.h"
 #import "InterRecordingConsentPanel.h"
 #import "InterSchedulePanel.h"
-#import "InterTeamsPanel.h"
-#import "InterAccountPanel.h"
 #import "InterFeatureGate.h"
 #import "InterPreMeetingPanel.h"
 
@@ -42,7 +35,7 @@
 #import "inter-Swift.h"
 #endif
 
-@interface AppDelegate () <NSWindowDelegate, InterConnectionSetupPanelDelegate, InterLoginPanelDelegate, InterAuthSessionDelegate, InterParticipantOverlayDelegate, InterChatPanelDelegate, InterSpeakerQueuePanelDelegate, InterScreenShareQueuePanelDelegate, InterCameraUnlockQueuePanelDelegate, InterMicUnlockQueuePanelDelegate, InterPollPanelDelegate, InterQAPanelDelegate, InterMediaWiringDelegate, InterModerationDelegate, InterLobbyPanelDelegate, InterRecordingCoordinatorDelegate, InterRecordingSignalDelegate, InterRecordingListPanelDelegate, InterRecordingConsentPanelDelegate, InterSchedulePanelDelegate, InterTeamsPanelDelegate, InterAccountPanelDelegate, InterLobbyWaitingViewDelegate, ASWebAuthenticationPresentationContextProviding, InterPreMeetingPanelDelegate>
+@interface AppDelegate () <NSWindowDelegate, InterConnectionSetupPanelDelegate, InterLoginPanelDelegate, InterAuthSessionDelegate, InterParticipantOverlayDelegate, InterChatPanelDelegate, InterPollPanelDelegate, InterQAPanelDelegate, InterMediaWiringDelegate, InterModerationDelegate, InterLobbyPanelDelegate, InterRecordingCoordinatorDelegate, InterRecordingSignalDelegate, InterRecordingListPanelDelegate, InterRecordingConsentPanelDelegate, InterSchedulePanelDelegate, InterLobbyWaitingViewDelegate, ASWebAuthenticationPresentationContextProviding, InterPreMeetingPanelDelegate>
 @property (nonatomic, strong) NSMutableArray<CapWindow *> *capWindows;
 @property (nonatomic, strong) SecureWindowController *secureController;
 @property (nonatomic, strong) NSWindow *setupWindow;
@@ -52,28 +45,25 @@
 @property (nonatomic, strong) NSView *normalRenderView;
 @property (nonatomic, strong) InterLocalMediaController *normalMediaController;
 @property (nonatomic, strong) InterSurfaceShareController *normalSurfaceShareController;
-@property (nonatomic, strong) InterLocalCallControlPanel *normalControlPanel;
+@property (nonatomic, strong) InterCallControlBarBridge *normalControlPanel;
 @property (nonatomic, strong) InterCallSessionCoordinator *sessionCoordinator;
 @property (nonatomic, strong, nullable) InterConnectionSetupPanel *connectionPanel;
 @property (nonatomic, strong, nullable) InterRemoteVideoLayoutManager *normalRemoteLayout;
 @property (nonatomic, strong, nullable) InterTrackRendererBridge *normalTrackRendererBridge;
-@property (nonatomic, strong, nullable) InterNetworkStatusView *normalNetworkStatusView;
 @property (nonatomic, strong, nullable) InterMediaWiringController *normalMediaWiring;
+/// Transient bottom-left toast that alerts the host to new waiting-room arrivals.
+@property (nonatomic, strong, nullable) InterLobbyToastPresenter *normalLobbyToast;
+/// Transient toast that alerts the host/co-host to new in-call requests
+/// (raise hand, screen share, unlock). Stacked just above the lobby toast.
+@property (nonatomic, strong, nullable) InterLobbyToastPresenter *normalRequestToast;
 
 // [Phase 8] In-meeting communication
 @property (nonatomic, strong, nullable) InterChatController *chatController;
 @property (nonatomic, strong, nullable) InterChatPanel *normalChatPanel;
 @property (nonatomic, strong, nullable) InterSpeakerQueue *speakerQueue;
-@property (nonatomic, strong, nullable) InterSpeakerQueuePanel *normalSpeakerQueuePanel;
-@property (nonatomic, strong, nullable) InterScreenShareQueuePanel *normalScreenShareQueuePanel;
 @property (nonatomic, strong, nullable) InterScreenShareQueue *screenShareQueue;
-@property (nonatomic, strong, nullable) InterCameraUnlockQueuePanel *normalCameraUnlockQueuePanel;
 @property (nonatomic, strong, nullable) InterCameraUnlockQueue *cameraUnlockQueue;
-@property (nonatomic, strong, nullable) InterMicUnlockQueuePanel *normalMicUnlockQueuePanel;
 @property (nonatomic, strong, nonnull) InterMicUnlockQueue *micUnlockQueue;
-@property (nonatomic, strong, nullable) NSButton *normalChatToggleButton;
-@property (nonatomic, strong, nullable) NSButton *normalHandRaiseButton;
-@property (nonatomic, strong, nullable) NSButton *normalQueueToggleButton;
 /// Identities of participants individually muted by the host via the tile three-dot menu.
 /// Used to show the "Allow" button in the speaker queue for those participants' raise-hand entries.
 @property (nonatomic, strong, nonnull) NSMutableSet<NSString *> *hostMutedParticipants;
@@ -85,21 +75,16 @@
 @property (nonatomic, strong, nullable) InterPollController *pollController;
 @property (nonatomic, strong, nullable) InterPollPanel *normalPollPanel;
 @property (nonatomic, strong, nullable) NSWindow *normalPollWindow;
-@property (nonatomic, strong, nullable) NSButton *normalPollToggleButton;
 
 // [Phase 8.6] Q&A
 @property (nonatomic, strong, nullable) InterQAController *qaController;
 @property (nonatomic, strong, nullable) InterQAPanel *normalQAPanel;
 @property (nonatomic, strong, nullable) NSWindow *normalQAWindow;
-@property (nonatomic, strong, nullable) NSButton *normalQAToggleButton;
 
 // [Phase 9] Meeting management
 @property (nonatomic, strong, nullable) InterModerationController *moderationController;
 @property (nonatomic, strong, nullable) InterLobbyPanel *normalLobbyPanel;
 @property (nonatomic, strong, nullable) NSWindow *normalLobbyWindow;
-@property (nonatomic, strong, nullable) NSButton *normalLobbyToggleButton;
-@property (nonatomic, strong, nullable) NSButton *normalModerationButton;
-@property (nonatomic, strong, nullable) NSButton *normalMoreButton;
 @property (nonatomic, strong, nullable) NSTimer *lobbyPollTimer;
 @property (nonatomic, assign) BOOL coHostLocalRecordingAllowed;
 
@@ -146,18 +131,12 @@
 @property (nonatomic, strong, nullable) InterCalendarService *calendarService;
 
 // [Phase 11.4] Teams
-@property (nonatomic, strong, nullable) InterTeamsPanel *teamsPanel;
+@property (nonatomic, strong, nullable) InterTeamsPanelBridge *teamsPanel;
 @property (nonatomic, strong, nullable) NSWindow *teamsWindow;
 
 // [Phase 11.5] Account management
-@property (nonatomic, strong, nullable) InterAccountPanel *accountPanel;
-@property (nonatomic, strong, nullable) NSWindow *accountWindow;
-
-// Settings window — calendar connect/disconnect buttons (rebuilt each open)
-@property (nonatomic, strong, nullable) NSButton *settingsGoogleButton;
-@property (nonatomic, strong, nullable) NSButton *settingsOutlookButton;
-@property (nonatomic, strong, nullable) NSTextField *settingsGoogleStatusLabel;
-@property (nonatomic, strong, nullable) NSTextField *settingsOutlookStatusLabel;
+// [Settings] Unified settings window (SwiftUI) — account + meetings + devices.
+@property (nonatomic, strong, nullable) InterSettingsHostView *settingsHostView;
 
 // [2.5.2] Room controller — persists across mode transitions [G4]
 @property (nonatomic, strong, nullable) InterRoomController *roomController;
@@ -172,9 +151,6 @@
 @property (nonatomic, strong, nullable) NSView *setupChromeView;
 
 // Billing — upgrade/manage buttons on setup overlay
-@property (nonatomic, strong, nullable) NSButton *upgradeButton;
-@property (nonatomic, strong, nullable) NSButton *manageSubscriptionButton;
-@property (nonatomic, strong, nullable) NSTextField *billingStatusLabel;
 @property (nonatomic, assign) BOOL isBillingPollInProgress;
 @property (nonatomic, assign) NSUInteger billingPollGeneration;
 
@@ -192,8 +168,8 @@
 @property (nonatomic, strong, nullable) NSWindow *preMeetingWindow;
 @property (nonatomic, strong, nullable) InterPreMeetingPanel *preMeetingPanel;
 /// Standalone editor for the host's default meeting settings (opened from Settings).
-@property (nonatomic, strong, nullable) NSWindow *meetingDefaultsWindow;
-@property (nonatomic, strong, nullable) InterPreMeetingPanel *meetingDefaultsPanel;
+@property (nonatomic, strong, nullable) NSWindow *meetingDefaultsWindow; // legacy — always nil now
+@property (nonatomic, strong, nullable) InterPreMeetingPanel *meetingDefaultsPanel; // legacy — always nil now
 /// Host-configured settings gathered from the pre-meeting panel. Consumed once
 /// in connectAndEnterMode: and cleared after launch.
 @property (nonatomic, strong, nullable) InterPreMeetingSettings *pendingMeetingSettings;
@@ -204,6 +180,26 @@
 /// The connection panel whose host-call action was intercepted. Kept alive while
 /// the pre-meeting panel is open so we can hand control back on cancel.
 @property (nonatomic, weak, nullable) InterConnectionSetupPanel *pendingConnectionPanel;
+
+// [Green room] Pre-join device check — every connect path passes through it.
+@property (nonatomic, strong, nullable) NSWindow *greenRoomWindow;
+@property (nonatomic, strong, nullable) InterGreenRoomHostView *greenRoomHost;
+/// User's green-room device choices. "WantsOff" semantics so the BOOL default
+/// (NO = device on) is safe; they can only ADD restriction on top of the
+/// host's muteOnJoin / cameraOffOnJoin enforcement, never lift it. Consumed
+/// and reset by startNormalLocalMediaFlow.
+@property (nonatomic, assign) BOOL greenRoomWantsMicOff;
+@property (nonatomic, assign) BOOL greenRoomWantsCamOff;
+/// Display name edited in the green room; overrides panel.displayName for the
+/// next connect/join, then clears.
+@property (nonatomic, copy, nullable) NSString *pendingDisplayNameOverride;
+/// Scheduled meeting flowing through the green room: the meeting to start when
+/// the green room submits (nil = plain code join). Set by the schedule panel
+/// delegate, consumed in greenRoomDidSubmitWithRole:, cleared on cancel.
+@property (nonatomic, copy, nullable) NSString *pendingScheduledMeetingId;
+/// IDs of upcoming meetings the signed-in user HOSTS (from the last schedule
+/// fetch). Decides the green room's CTA: Start Meeting vs Join Now.
+@property (nonatomic, copy, nullable) NSSet<NSString *> *hostedScheduledMeetingIds;
 
 @end
 
@@ -713,9 +709,6 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
     // so the participant must re-request if still locked after rejoining.
     [self.normalMediaWiring resetCameraUnlockFlowState];
     [self.hostMutedParticipants removeAllObjects];
-    if (self.normalSpeakerQueuePanel) {
-        self.normalSpeakerQueuePanel.hostMutedIdentities = [NSSet set];
-    }
 
     if (isIntervieweeMode) {
         [self applyKioskRestrictions];
@@ -725,6 +718,13 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
         self.secureController.roomController = self.roomController;
         // [8.1.5] Pass chat controller so the chat overlay can receive/send messages
         self.secureController.chatController = self.chatController;
+        // [Green room] Hand the candidate's pre-join mic/cam-off choices to the
+        // secure media flow, then consume the flags (the normal flow's consumer,
+        // startNormalLocalMediaFlow, never runs in interviewee mode).
+        self.secureController.startWithMicrophoneOff = self.greenRoomWantsMicOff;
+        self.secureController.startWithCameraOff = self.greenRoomWantsCamOff;
+        self.greenRoomWantsMicOff = NO;
+        self.greenRoomWantsCamOff = NO;
         __weak typeof(self) weakSelf = self;
         self.secureController.exitSessionHandler = ^{
             [weakSelf requestExitCurrentMode];
@@ -756,10 +756,12 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
                                     defer:NO];
 
     [self.setupWindow center];
-    [self.setupWindow setTitle:@"Secure Call Setup"];
+    [self.setupWindow setTitle:@"Secure Call Setup"]; // Mission Control/⌘-Tab label; not drawn
     [self.setupWindow setSharingType:InterWindowSharingType()];
     [self.setupWindow setDelegate:self];
-    [self.setupWindow setBackgroundColor:[NSColor blackColor]];
+    // Seamless chrome (canonical migrated-screen treatment): the home screen
+    // extends to the window top; traffic lights float over its surface.
+    [InterWindowChrome applySeamlessChromeTo:self.setupWindow];
     [self.setupWindow setMinSize:NSMakeSize(660.0, 600.0)];
     [self.setupWindow setCollectionBehavior:NSWindowCollectionBehaviorFullScreenPrimary];
 
@@ -774,46 +776,60 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
 
     [self launchNativeSetupControlsInContainerView:view];
 
+    // Avatar account menu beside the traffic lights — a real titlebar
+    // accessory so the full chip is clickable (content under the titlebar
+    // band loses hit-testing to the window drag region).
+    NSTitlebarAccessoryViewController *avatarAccessory = [self.connectionPanel makeTitlebarAccessory];
+    if (avatarAccessory) {
+        [self.setupWindow addTitlebarAccessoryViewController:avatarAccessory];
+    }
+
     [self.setupWindow makeKeyAndOrderFront:nil];
     [NSApp activateIgnoringOtherApps:YES];
 }
 
 - (void)launchNativeSetupControlsInContainerView:(NSView *)containerView {
-    // Clear billing UI from any previous setup window lifecycle
-    [self.upgradeButton removeFromSuperview];
-    self.upgradeButton = nil;
-    [self.manageSubscriptionButton removeFromSuperview];
-    self.manageSubscriptionButton = nil;
-    [self.billingStatusLabel removeFromSuperview];
-    self.billingStatusLabel = nil;
+    // Reset billing poll state from any previous setup window lifecycle.
     self.isBillingPollInProgress = NO;
     self.billingPollGeneration++;
 
-    NSView *overlayView = [[NSView alloc] initWithFrame:containerView.bounds];
-    overlayView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
-    [overlayView setWantsLayer:YES];
-    overlayView.layer.backgroundColor = NSColor.clearColor.CGColor;
-    [containerView addSubview:overlayView];
-
-    // [3.1.1] Connection setup panel — server URLs, display name, room code, action buttons.
-    // The panel is created once and survives auth state changes. Only the chrome
-    // (Sign In/Out, Settings, Billing) around it is rebuilt.
-    CGFloat panelW = 420.0;
-    CGFloat panelH = 480.0;
-    CGFloat panelX = (containerView.bounds.size.width - panelW) / 2.0;
-    CGFloat panelY = (containerView.bounds.size.height - panelH) / 2.0;
-    self.connectionPanel = [[InterConnectionSetupPanel alloc] initWithFrame:NSMakeRect(panelX, panelY, panelW, panelH)];
-    self.connectionPanel.autoresizingMask = NSViewMinXMargin | NSViewMaxXMargin | NSViewMinYMargin | NSViewMaxYMargin;
+    // [3.1.1] Home / launch screen (SwiftUI via the thin shell). The screen is
+    // self-contained: identity, action tiles, join-by-code, billing status and
+    // meeting history all live inside it — the loose chrome buttons that used
+    // to be built around a small centered panel are gone.
+    self.connectionPanel = [[InterConnectionSetupPanel alloc] initWithFrame:containerView.bounds];
+    self.connectionPanel.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
     self.connectionPanel.delegate = self;
-    [overlayView addSubview:self.connectionPanel];
+    [containerView addSubview:self.connectionPanel];
 
-    [self buildSetupChromeInOverlay:overlayView];
+    // Chrome actions → the same AppDelegate handlers the old buttons targeted.
+    __weak typeof(self) weakSelf = self;
+    self.connectionPanel.onSignIn = ^{ [weakSelf handleSignIn]; };
+    self.connectionPanel.onSignOut = ^{ [weakSelf handleLogout]; };
+    self.connectionPanel.onOpenSettings = ^{ [weakSelf openSettingsWindow]; };
+    self.connectionPanel.onOpenAccountSettings = ^{ [weakSelf openAccountSettingsWindow]; };
+    self.connectionPanel.onViewPlans = ^{ [weakSelf handleViewPlans]; };
+    self.connectionPanel.onManageSubscription = ^{ [weakSelf handleManageSubscription]; };
+    self.connectionPanel.onOpenSchedule = ^{ [weakSelf handleShowSchedulePanel]; };
+    self.connectionPanel.onOpenTeams = ^{ [weakSelf openTeamsPanel:nil]; };
+    self.connectionPanel.onJoinScheduledMeeting = ^(NSString *roomCode, NSString *meetingId, BOOL isHosted) {
+        __strong typeof(weakSelf) s = weakSelf;
+        if (!s) return;
+        // The home Today strip knows hosted-vs-invited from /meetings/upcoming;
+        // seed the hosted set so the green room shows the host chrome even when
+        // the schedule window was never opened this launch.
+        if (isHosted) {
+            NSMutableSet *ids = [NSMutableSet setWithSet:(s.hostedScheduledMeetingIds ?: [NSSet set])];
+            [ids addObject:meetingId];
+            s.hostedScheduledMeetingIds = ids;
+        }
+        [s schedulePanel:nil didRequestJoin:roomCode meetingId:meetingId];
+    };
 
-    // Apply feature-tier badge immediately after panel creation so the correct
-    // state is visible from the first frame — regardless of when the auth delegate
-    // fires relative to launchSetupUI (e.g. during session restore at startup the
-    // delegate fires before the new connectionPanel exists, causing refreshSetupChrome
-    // to return early; this ensures the badge is always set on the fresh panel).
+    // Feed the screen its auth/tier/identity source and render the right state
+    // (signed out / signed in / offline-with-persisted-session) from the first frame.
+    [self.connectionPanel configureWithTokenService:self.roomController.tokenService];
+
     if (self.roomController && self.roomController.tokenService) {
         NSString *tier = self.roomController.tokenService.currentTier ?: @"free";
         [self.connectionPanel setHostInterviewButtonRequiresPro:
@@ -821,148 +837,19 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
     }
 }
 
-/// Build (or rebuild) the auth-dependent controls that surround the connection panel.
-///
-/// Layout varies by auth state:
-/// - Unauthenticated: "Sign In / Sign Up" (right), Settings (left — gated),
-///   Billing (center — gated), billingStatusLabel.
-/// - Authenticated: "Sign Out" (left), Settings (right), Billing (functional),
-///   billingStatusLabel.
-/// - Offline with persisted session: "Sign Out" (left), Settings (right),
-///   Billing (cached tier), billingStatusLabel shows "Offline — reconnecting…".
-///   The user sees their identity but server-dependent actions are unavailable
-///   until the background retry timer restores the session.
-///
-/// This method removes any existing chrome view before building a new one,
-/// preserving the connection panel and its field values.
-- (void)buildSetupChromeInOverlay:(NSView *)overlayView {
-    // Remove previous chrome controls — everything except the connection panel.
-    for (NSView *sub in [overlayView.subviews copy]) {
-        if (sub != self.connectionPanel) {
-            [sub removeFromSuperview];
-        }
-    }
-    self.upgradeButton = nil;
-    self.manageSubscriptionButton = nil;
-    self.billingStatusLabel = nil;
-
-    CGFloat panelW = 420.0;
-    CGFloat panelH = 480.0;
-    CGFloat panelX = (overlayView.bounds.size.width - panelW) / 2.0;
-    CGFloat panelY = (overlayView.bounds.size.height - panelH) / 2.0;
-
-    BOOL isAuth = self.roomController.tokenService.isAuthenticated;
-    BOOL isOfflineWithSession = !isAuth && self.roomController.tokenService.hasPersistedSession;
-
-    // Row 1: Left button + Right button (positioned above the connection panel)
-    if (isAuth || isOfflineWithSession) {
-        NSButton *signOutButton = [[NSButton alloc] initWithFrame:NSMakeRect(panelX, panelY + panelH + 8, 100, 26)];
-        signOutButton.autoresizingMask = NSViewMaxXMargin | NSViewMinYMargin;
-        [signOutButton setTitle:@"Sign Out"];
-        [signOutButton setTarget:self];
-        [signOutButton setAction:@selector(handleLogout)];
-        [overlayView addSubview:signOutButton];
-
-        NSButton *settingsButton = [[NSButton alloc] initWithFrame:NSMakeRect(panelX + panelW - 112, panelY + panelH + 8, 112, 26)];
-        settingsButton.autoresizingMask = NSViewMinXMargin | NSViewMinYMargin;
-        [settingsButton setTitle:@"Settings"];
-        [settingsButton setTarget:self];
-        [settingsButton setAction:@selector(openSettingsWindow)];
-        [overlayView addSubview:settingsButton];
-    } else {
-        NSButton *settingsButton = [[NSButton alloc] initWithFrame:NSMakeRect(panelX, panelY + panelH + 8, 112, 26)];
-        settingsButton.autoresizingMask = NSViewMaxXMargin | NSViewMinYMargin;
-        [settingsButton setTitle:@"Settings"];
-        [settingsButton setTarget:self];
-        [settingsButton setAction:@selector(openSettingsWindow)];
-        [overlayView addSubview:settingsButton];
-
-        NSButton *signInButton = [[NSButton alloc] initWithFrame:NSMakeRect(panelX + panelW - 140, panelY + panelH + 8, 140, 26)];
-        signInButton.autoresizingMask = NSViewMinXMargin | NSViewMinYMargin;
-        [signInButton setTitle:@"Sign In / Sign Up"];
-        [signInButton setTarget:self];
-        [signInButton setAction:@selector(handleSignIn)];
-        [overlayView addSubview:signInButton];
-    }
-
-    // Row 2: Billing buttons (centered, above row 1)
-    CGFloat billingY = panelY + panelH + 42;
-
-    if (isAuth || isOfflineWithSession) {
-        NSString *currentTier = self.roomController.tokenService.currentTier ?: @"free";
-        BOOL isPaid = ([currentTier isEqualToString:@"pro"] || [currentTier isEqualToString:@"pro+"]);
-        NSLog(@"[Billing UI] Setting up buttons — currentTier=%@ isPaid=%@", currentTier, isPaid ? @"YES" : @"NO");
-
-        if (!isPaid) {
-            self.upgradeButton = [[NSButton alloc] initWithFrame:NSMakeRect(panelX + (panelW - 100) / 2.0, billingY, 100, 26)];
-            self.upgradeButton.autoresizingMask = NSViewMinXMargin | NSViewMaxXMargin | NSViewMinYMargin;
-            [self.upgradeButton setTitle:@"View Plans"];
-            [self.upgradeButton setTarget:self];
-            [self.upgradeButton setAction:@selector(handleViewPlans)];
-            [overlayView addSubview:self.upgradeButton];
-        } else {
-            self.manageSubscriptionButton = [[NSButton alloc] initWithFrame:NSMakeRect(panelX + (panelW - 160) / 2.0, billingY, 160, 26)];
-            self.manageSubscriptionButton.autoresizingMask = NSViewMinXMargin | NSViewMaxXMargin | NSViewMinYMargin;
-            [self.manageSubscriptionButton setTitle:@"Manage Subscription"];
-            [self.manageSubscriptionButton setTarget:self];
-            [self.manageSubscriptionButton setAction:@selector(handleManageSubscription)];
-            [overlayView addSubview:self.manageSubscriptionButton];
-        }
-    } else {
-        self.upgradeButton = [[NSButton alloc] initWithFrame:NSMakeRect(panelX + (panelW - 100) / 2.0, billingY, 100, 26)];
-        self.upgradeButton.autoresizingMask = NSViewMinXMargin | NSViewMaxXMargin | NSViewMinYMargin;
-        [self.upgradeButton setTitle:@"View Plans"];
-        [self.upgradeButton setTarget:self];
-        [self.upgradeButton setAction:@selector(handleViewPlans)];
-        [overlayView addSubview:self.upgradeButton];
-    }
-
-    self.billingStatusLabel = [[NSTextField alloc] initWithFrame:NSMakeRect(panelX, panelY - 28, panelW, 20)];
-    self.billingStatusLabel.autoresizingMask = NSViewMinXMargin | NSViewMaxXMargin | NSViewMinYMargin | NSViewMaxYMargin;
-    self.billingStatusLabel.font = [NSFont systemFontOfSize:12 weight:NSFontWeightMedium];
-    self.billingStatusLabel.alignment = NSTextAlignmentCenter;
-    self.billingStatusLabel.editable = NO;
-    self.billingStatusLabel.selectable = NO;
-    self.billingStatusLabel.bezeled = NO;
-    self.billingStatusLabel.drawsBackground = NO;
-    [overlayView addSubview:self.billingStatusLabel];
-
-    // Show offline indicator when signed in but server is unreachable
-    if (isOfflineWithSession) {
-        NSString *displayName = self.roomController.tokenService.currentDisplayName ?: @"";
-        if (displayName.length > 0) {
-            self.billingStatusLabel.stringValue = [NSString stringWithFormat:@"%@ — Offline, reconnecting…", displayName];
-        } else {
-            self.billingStatusLabel.stringValue = @"Offline — reconnecting…";
-        }
-        self.billingStatusLabel.textColor = [NSColor systemOrangeColor];
-    } else {
-        self.billingStatusLabel.stringValue = @"";
-        self.billingStatusLabel.textColor = [NSColor secondaryLabelColor];
-    }
-
-    // [Phase 11] Schedule Meetings button — shown for authenticated users and
-    // offline-with-session (T5: role-based rendering, not connectivity-based).
-    // When offline, clicking opens the panel; the server call fails gracefully via T3.
-    if (isAuth || isOfflineWithSession) {
-        CGFloat schedY = panelY - 34;
-        NSButton *scheduleButton = [[NSButton alloc] initWithFrame:NSMakeRect(panelX + (panelW - 160) / 2.0, schedY, 160, 26)];
-        scheduleButton.autoresizingMask = NSViewMinXMargin | NSViewMaxXMargin | NSViewMaxYMargin;
-        [scheduleButton setTitle:@"Schedule Meeting"];
-        [scheduleButton setTarget:self];
-        [scheduleButton setAction:@selector(handleShowSchedulePanel)];
-        [overlayView addSubview:scheduleButton];
-    }
-}
-
-/// Rebuild the auth-dependent chrome (Sign In/Out, Settings, Billing) in-place
-/// without tearing down the setup window or the connection panel.
+/// Re-render the auth-dependent chrome in-place without tearing down the setup
+/// window. The screen owns the chrome now — this just pushes fresh auth state.
 - (void)refreshSetupChrome {
+    // Keep the settings window's auth gate live (it may be open during sign-in/out).
+    if (self.settingsHostView && self.settingsWindow.isVisible) {
+        InterTokenService *ts = self.roomController.tokenService;
+        [self.settingsHostView setTier:ts.currentTier ?: @"free"];
+        [self.settingsHostView reload];
+    }
     if (!self.connectionPanel || !self.connectionPanel.superview) {
         return;
     }
-    NSView *overlayView = self.connectionPanel.superview;
-    [self buildSetupChromeInOverlay:overlayView];
+    [self.connectionPanel refreshAuthChrome];
     // Update feature tier badges whenever auth/tier state changes.
     // This runs every time the user signs in, token refreshes, or tier changes.
     if (self.roomController && self.roomController.tokenService) {
@@ -978,6 +865,13 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
 /// Called from the "Sign In / Sign Up" button on the unauthenticated setup screen.
 - (void)handleSignIn {
     [self showLoginWindow];
+    [self.loginPanel setRegisterMode:NO];
+}
+
+/// Same window, preset to the register form (settings gate "Sign Up" button).
+- (void)handleSignUp {
+    [self showLoginWindow];
+    [self.loginPanel setRegisterMode:YES];
 }
 
 /// Auth-gated action: user tapped Settings while not signed in.
@@ -991,6 +885,8 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
 - (void)handleShowSchedulePanel {
     if (![self requireFeature:InterFeatureScheduledMeetings]) return;
     if (self.normalScheduleWindow) {
+        // Fresh visit: stale status ("Meeting scheduled!") must not persist.
+        [self.normalSchedulePanel setStatusText:@""];
         [self.normalScheduleWindow makeKeyAndOrderFront:nil];
         [self reloadScheduleData];
         return;
@@ -1013,12 +909,16 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
                                                                        NSWindowStyleMaskMiniaturizable)
                                                               backing:NSBackingStoreBuffered
                                                                 defer:NO];
-    self.normalScheduleWindow.title = @"Schedule Meeting";
+    self.normalScheduleWindow.title = @"Schedule Meeting"; // Mission Control/⌘-Tab label; not drawn
     self.normalScheduleWindow.minSize = NSMakeSize(680, 560);
     self.normalScheduleWindow.releasedWhenClosed = NO;
     self.normalScheduleWindow.level = NSFloatingWindowLevel;
     [self.normalScheduleWindow setSharingType:InterWindowSharingType()];
     [self.normalScheduleWindow setAppearance:[NSAppearance appearanceNamed:NSAppearanceNameDarkAqua]];
+    // Seamless chrome (canonical migrated-screen treatment): no title-bar band —
+    // content extends to the window top; the calendar rail insets below the
+    // floating traffic lights.
+    [InterWindowChrome applySeamlessChromeTo:self.normalScheduleWindow];
     self.normalScheduleWindow.contentView = self.normalSchedulePanel;
     [self.normalScheduleWindow makeKeyAndOrderFront:nil];
 
@@ -1046,6 +946,14 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
             InterScheduledMeeting *m = [self meetingFromDictionary:dict];
             if (m) [invited addObject:m];
         }
+
+        // Cache hosted IDs so the green room can label scheduled starts
+        // "Start Meeting" (host) vs "Join Now" (invitee).
+        NSMutableSet<NSString *> *hostedIds = [NSMutableSet set];
+        for (InterScheduledMeeting *m in hosted) {
+            if (m.meetingId.length > 0) [hostedIds addObject:m.meetingId];
+        }
+        self.hostedScheduledMeetingIds = hostedIds;
 
         [self.normalSchedulePanel setUpcomingMeetings:hosted];
         [self.normalSchedulePanel setInvitedMeetings:invited];
@@ -1094,6 +1002,22 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
              inviteeEmails:(NSArray<NSString *> *)emails {
 
     InterTokenService *ts = self.roomController.tokenService;
+    // Meeting-settings snapshot: the schedule screen persists its settings
+    // section to the shared defaults store synchronously before this delegate
+    // fires, so reading the defaults here captures exactly what the user just
+    // configured. The server stores the snapshot with the meeting and applies
+    // it to the room hash at start — honoring the screen's "these settings
+    // will be used" promise for whoever arrives first.
+    InterPreMeetingSettings *snap = [InterPreMeetingSettings settingsWithDefaults];
+    NSDictionary *settingsDict = @{
+        @"muteOnJoin":          @(snap.muteOnJoin),
+        @"cameraOffOnJoin":     @(snap.cameraOffOnJoin),
+        @"joinBeforeHost":      @(snap.joinBeforeHost),
+        @"allowUnmuting":       @(snap.allowUnmuting),
+        @"chatPermissions":     snap.chatPermissions ?: @"everyone",
+        @"sharingPermissions":  snap.sharingPermissions ?: @"hostOnly",
+        @"shareConflictPolicy": snap.shareConflictPolicy ?: @"oneattime",
+    };
     [ts scheduleMeetingWithTitle:title
                     description:description
                     scheduledAt:scheduledAt
@@ -1102,15 +1026,21 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
                    hostTimezone:timezone
                        password:password
                    lobbyEnabled:lobbyEnabled
+                       settings:settingsDict
                      completion:^(NSDictionary * _Nullable result, NSError * _Nullable error) {
-        if (error) {
+        // The token service reports non-201 responses as (nil, nil) — a nil
+        // result is a FAILURE even when no transport error occurred (this was
+        // showing "Meeting scheduled!" while the server 500'd).
+        if (error || !result) {
             [panel setStatusText:@"Could not schedule meeting. Please try again."];
-            panel.scheduleButton.enabled = YES;
+            [panel setSubmitting:NO];
             return;
         }
         [panel resetForm];
-        panel.scheduleButton.enabled = YES;
+        [panel setSubmitting:NO];
         [self reloadScheduleData];
+        // Keep the home screen's "Today" events strip live.
+        [self.connectionPanel reloadMeetings];
 
         NSString *meetingId = result[@"id"];
         NSString *roomCode  = result[@"roomCode"];
@@ -1174,6 +1104,7 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
             return;
         }
         [self reloadScheduleData];
+        [self.connectionPanel reloadMeetings];
 
         // [Phase 11.1] Remove from Apple Calendar
         [self.calendarService removeEventForMeetingId:meetingId];
@@ -1184,10 +1115,16 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
 }
 
 - (void)schedulePanel:(InterSchedulePanel *)panel didRequestJoin:(NSString *)roomCode meetingId:(NSString *)meetingId {
-    // Close the schedule window and switch to the connection panel.
+    // Close the schedule window and route through the green room (device
+    // check + join-without-video), exactly like the other connect paths.
     [self.normalScheduleWindow orderOut:nil];
     [self.connectionPanel setRoomCodeText:roomCode];
-    [self _joinScheduledMeetingWithRoomCode:roomCode meetingId:meetingId password:nil];
+    self.pendingScheduledMeetingId = meetingId;
+    BOOL hosted = [self.hostedScheduledMeetingIds containsObject:meetingId];
+    [self showGreenRoomWithRole:(hosted ? InterGreenRoomRoleScheduledStart
+                                        : InterGreenRoomRoleJoin)
+                          panel:self.connectionPanel
+                       roomCode:roomCode];
 }
 
 /// Join a scheduled meeting. Handles the meeting's password prompt and waiting room
@@ -1206,7 +1143,11 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
 
     NSString *serverURL   = self.connectionPanel.serverURL;
     NSString *tokenURL    = self.connectionPanel.tokenServerURL;
-    NSString *displayName = self.connectionPanel.displayName;
+    // Green-room display-name override, read non-destructively (the password
+    // retry re-enters this method and must keep the same chosen name; a fresh
+    // override is set on every green-room submit, cleared on cancel).
+    NSString *displayName = self.pendingDisplayNameOverride.length > 0
+        ? self.pendingDisplayNameOverride : self.connectionPanel.displayName;
 
     if (displayName.length == 0) {
         [self.connectionPanel setStatusText:@"Enter a display name first."];
@@ -1229,6 +1170,22 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
     config.scheduledMeetingId = meetingId;
     // Thread the password (if supplied on retry) so the server can validate it.
     config.meetingPassword = password ?: @"";
+    // Host-edited settings from the green room's Meeting Settings sheet —
+    // pendingMeetingSettings is only non-nil here when the sheet was saved
+    // during THIS green-room session (cleared on cancel/host-create consume).
+    InterPreMeetingSettings *override = self.pendingMeetingSettings;
+    if (override) {
+        config.scheduledSettingsOverride = @{
+            @"muteOnJoin":          @(override.muteOnJoin),
+            @"cameraOffOnJoin":     @(override.cameraOffOnJoin),
+            @"joinBeforeHost":      @(override.joinBeforeHost),
+            @"allowUnmuting":       @(override.allowUnmuting),
+            @"chatPermissions":     override.chatPermissions ?: @"everyone",
+            @"sharingPermissions":  override.sharingPermissions ?: @"hostOnly",
+            @"shareConflictPolicy": override.shareConflictPolicy ?: @"oneattime",
+        };
+        self.pendingMeetingSettings = nil;
+    }
 
     // Store the lobby/overlay state up front (no window shown yet — same as the
     // room-code join after the flicker fix) so the waiting-room poll can reuse the
@@ -1361,114 +1318,6 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
         } else {
             NSLog(@"[Schedule] Invitations sent for meeting %@", meetingId);
             [self reloadScheduleData];
-        }
-    }];
-}
-
-// ============================================================================
-#pragma mark - InterTeamsPanelDelegate
-// ============================================================================
-
-- (void)teamsPanelDidRequestRefresh:(InterTeamsPanel *)panel {
-    [self reloadTeamsData];
-    // Also refresh members if a team is already selected
-    NSString *teamId = [panel selectedTeamId];
-    if (!teamId) return;
-    InterTokenService *ts = self.roomController.tokenService;
-    if (!ts) return;
-    __weak typeof(self) weakSelf = self;
-    [ts fetchTeamDetailsWithTeamId:teamId completion:^(NSDictionary<NSString *,id> *team, NSArray<NSDictionary<NSString *,id> *> *members, NSString *callerRole, NSError *error) {
-        __strong typeof(weakSelf) strongSelf = weakSelf;
-        if (error) {
-            [strongSelf.teamsPanel setStatusText:@"Could not load team details. Please try again."];
-            return;
-        }
-        [strongSelf.teamsPanel setCurrentTeamMembers:members ?: @[] callerRole:callerRole ?: @""];
-    }];
-}
-
-- (void)teamsPanel:(InterTeamsPanel *)panel
-  didRequestCreateTeamName:(NSString *)name
-               description:(NSString *)description {
-    InterTokenService *ts = self.roomController.tokenService;
-    if (!ts) return;
-    __weak typeof(self) weakSelf = self;
-    [ts createTeamWithName:name teamDescription:description completion:^(NSDictionary<NSString *,id> *team, NSError *error) {
-        __strong typeof(weakSelf) strongSelf = weakSelf;
-        [strongSelf.teamsPanel resetCreateButton];
-        if (error) {
-            [strongSelf.teamsPanel setStatusText:@"Could not create team. Please try again."];
-        } else {
-            [strongSelf.teamsPanel setStatusText:@"Team created!"];
-            [strongSelf reloadTeamsData];
-        }
-    }];
-}
-
-- (void)teamsPanel:(InterTeamsPanel *)panel
-didRequestInviteEmails:(NSArray<NSString *> *)emails
-            toTeamId:(NSString *)teamId {
-    InterTokenService *ts = self.roomController.tokenService;
-    if (!ts) return;
-    __weak typeof(self) weakSelf = self;
-    [ts inviteToTeamWithTeamId:teamId emails:emails completion:^(BOOL success, NSError *error) {
-        __strong typeof(weakSelf) strongSelf = weakSelf;
-        [strongSelf.teamsPanel resetInviteButton];
-        if (error || !success) {
-            [strongSelf.teamsPanel setStatusText:@"Could not send invitations. Please try again."];
-        } else {
-            [strongSelf.teamsPanel setStatusText:@"Invitations sent!"];
-        }
-    }];
-}
-
-- (void)teamsPanel:(InterTeamsPanel *)panel
-didRequestAcceptInvitationForTeamId:(NSString *)teamId {
-    InterTokenService *ts = self.roomController.tokenService;
-    if (!ts) return;
-    __weak typeof(self) weakSelf = self;
-    [ts acceptTeamInvitationWithTeamId:teamId completion:^(BOOL success, NSError *error) {
-        __strong typeof(weakSelf) strongSelf = weakSelf;
-        [strongSelf.teamsPanel resetAcceptButton];
-        if (error || !success) {
-            [strongSelf.teamsPanel setStatusText:@"Could not accept invitation. Please try again."];
-        } else {
-            [strongSelf.teamsPanel setStatusText:@"Joined team!"];
-            [strongSelf reloadTeamsData];
-        }
-    }];
-}
-
-- (void)teamsPanel:(InterTeamsPanel *)panel
-didRequestRemoveMemberId:(NSString *)memberId
-         fromTeamId:(NSString *)teamId {
-    InterTokenService *ts = self.roomController.tokenService;
-    if (!ts) return;
-    __weak typeof(self) weakSelf = self;
-    [ts removeTeamMemberWithTeamId:teamId memberId:memberId completion:^(BOOL success, NSError *error) {
-        __strong typeof(weakSelf) strongSelf = weakSelf;
-        if (error || !success) {
-            [strongSelf.teamsPanel setStatusText:@"Could not remove member. Please try again."];
-        } else {
-            [strongSelf.teamsPanel setStatusText:@"Member removed."];
-            [strongSelf teamsPanelDidRequestRefresh:panel];
-        }
-    }];
-}
-
-- (void)teamsPanel:(InterTeamsPanel *)panel
-didRequestDeleteTeamId:(NSString *)teamId {
-    InterTokenService *ts = self.roomController.tokenService;
-    if (!ts) return;
-    __weak typeof(self) weakSelf = self;
-    [ts deleteTeamWithTeamId:teamId completion:^(BOOL success, NSError *error) {
-        __strong typeof(weakSelf) strongSelf = weakSelf;
-        [strongSelf.teamsPanel resetDeleteButton];
-        if (error || !success) {
-            [strongSelf.teamsPanel setStatusText:@"Could not delete team. Please try again."];
-        } else {
-            [strongSelf.teamsPanel setStatusText:@"Team deleted."];
-            [strongSelf reloadTeamsData];
         }
     }];
 }
@@ -1665,6 +1514,18 @@ didRequestDeleteTeamId:(NSString *)teamId {
             [panel showError:msg];
             return;
         }
+        // Persist the EXACT server that issued this link ONLY after the request SUCCEEDS, so
+        // a failed / misrouted request never poisons the deep-link redemption target
+        // (handlePasswordResetDeepLinkWithToken: prefers this stored value). The server
+        // always returns 200 (anti-enumeration), so "no error" confirms tokenServerURL is
+        // reachable and behaving like our backend — the only safe moment to record it.
+        // Stamp the persist time: the stored issuer is only meaningful while a token from
+        // this request could still be live (server reset tokens expire in 1 hour); the
+        // redemption side discards it after that window and clears it after a successful
+        // reset, so a stale issuer can never steer a future, unrelated redemption.
+        NSUserDefaults *resetDefaults = [NSUserDefaults standardUserDefaults];
+        [resetDefaults setObject:tokenServerURL forKey:@"InterPasswordResetIssuingServerURL"];
+        [resetDefaults setObject:[NSDate date] forKey:@"InterPasswordResetIssuingServerSetAt"];
         // Server always responds generically (anti-enumeration) — never confirm the email
         // exists. The reset is finished via the emailed deep link.
         [panel showInfo:@"If that email is registered, you'll receive a reset link shortly. Check your inbox."];
@@ -1753,7 +1614,18 @@ didRequestDeleteTeamId:(NSString *)teamId {
         }
         return;
     }
-    [self showPreMeetingPanelForPanel:panel];
+    // First-time hosts configure everything once (full sheet → "Save & Next"
+    // → green room). Returning hosts go straight to the green room — the old
+    // compact sheet is retired; its name/password fields live in the green
+    // room's SESSION section and the saved defaults sit behind the
+    // "Meeting Settings" button.
+    if ([InterPreMeetingSettings hasConfiguredDefaults]) {
+        self.pendingConnectionPanel = panel;
+        self.pendingMeetingSettings = [InterPreMeetingSettings settingsWithDefaults];
+        [self showGreenRoomWithRole:InterGreenRoomRoleHostCreate panel:panel roomCode:@""];
+    } else {
+        [self showPreMeetingPanelForPanel:panel];
+    }
 }
 
 - (void)setupPanelDidRequestHostInterview:(InterConnectionSetupPanel *)panel {
@@ -1766,7 +1638,7 @@ didRequestDeleteTeamId:(NSString *)teamId {
         return;
     }
     if (![self requireFeature:InterFeatureHostInterview]) return;
-    [self connectAndEnterMode:InterCallModeInterview role:InterInterviewRoleInterviewer panel:panel];
+    [self showGreenRoomWithRole:InterGreenRoomRoleHostInterview panel:panel roomCode:@""];
 }
 
 - (void)setupPanelDidRequestJoin:(InterConnectionSetupPanel *)panel {
@@ -1776,25 +1648,21 @@ didRequestDeleteTeamId:(NSString *)teamId {
         return;
     }
 
-    [self joinRoomWithCode:code panel:panel password:nil];
+    [self showGreenRoomWithRole:InterGreenRoomRoleJoin panel:panel roomCode:code];
 }
 
-/// [Pre-meeting] Show the pre-meeting settings panel for a host-call action.
-/// Intercepts setupPanelDidRequestHostCall: before creating the room.
+/// [Pre-meeting] Show the FULL pre-meeting settings sheet (first-time hosts,
+/// and "Meeting Settings" from the green room). The compact mode is retired —
+/// returning hosts go straight to the green room.
 - (void)showPreMeetingPanelForPanel:(InterConnectionSetupPanel *)panel {
     self.pendingConnectionPanel = panel;
 
-    // First-time hosts see the full setup panel; returning hosts (who have saved
-    // defaults) see the compact panel — name + optional password + "Advanced ▸".
-    BOOL useCompact = [InterPreMeetingSettings hasConfiguredDefaults];
-
     static const CGFloat kW = 440.0;
-    CGFloat kH = useCompact ? [InterPreMeetingPanel compactPanelHeight]
-                            : [InterPreMeetingPanel fullPanelHeight];
+    CGFloat kH = [InterPreMeetingPanel fullPanelHeight];
 
     InterPreMeetingPanel *content =
         [[InterPreMeetingPanel alloc] initWithFrame:NSMakeRect(0, 0, kW, kH)
-                                        compactMode:useCompact];
+                                        compactMode:NO];
     content.delegate = self;
     [content setDisplayName:panel.displayName];
     [content setUserTier:self.roomController.tokenService.effectiveTier ?: @"free"];
@@ -1817,6 +1685,15 @@ didRequestDeleteTeamId:(NSString *)teamId {
     self.preMeetingPanel  = content;
     self.preMeetingWindow = win;
 
+    // When the green room is open, the sheet is its "Meeting Settings" editor:
+    // attach it there, seeded with the green room's current per-meeting fields.
+    if (self.greenRoomWindow) {
+        [content setMeetingName:self.greenRoomHost.meetingNameValue];
+        [content setMeetingPassword:self.greenRoomHost.passwordValue];
+        [self.greenRoomWindow beginSheet:win completionHandler:nil];
+        return;
+    }
+
     // Disable host-call actions on the setup panel while settings panel is open
     [panel setActionsEnabled:NO];
 
@@ -1827,18 +1704,24 @@ didRequestDeleteTeamId:(NSString *)teamId {
 
 - (void)preMeetingPanel:(InterPreMeetingPanel *)panel
   didStartWithSettings:(InterPreMeetingSettings *)settings {
-    [self dismissPreMeetingPanel];
-
-    // Store settings so connectAndEnterMode: can bake them into the configuration
+#pragma unused(panel)
     self.pendingMeetingSettings = settings;
 
-    InterConnectionSetupPanel *setupPanel = self.pendingConnectionPanel;
-    self.pendingConnectionPanel = nil;
-    if (!setupPanel) return;
+    // "Save & Next" from the green room's Meeting Settings sheet — stay in the
+    // green room; refresh its SESSION fields with what the sheet collected.
+    if (self.greenRoomWindow) {
+        [self dismissPreMeetingPanel];
+        [self.greenRoomHost setMeetingName:settings.meetingDisplayName ?: @""];
+        [self.greenRoomHost setMeetingPassword:settings.meetingPassword ?: @""];
+        [self.greenRoomHost setUsingDefaultsCaption:@"Using custom settings"];
+        return;
+    }
 
-    [self connectAndEnterMode:InterCallModeNormal
-                         role:InterInterviewRoleNone
-                        panel:setupPanel];
+    // First-time host: "Save & Next" → green room (the meeting starts there).
+    [self dismissPreMeetingPanel];
+    InterConnectionSetupPanel *setupPanel = self.pendingConnectionPanel;
+    if (!setupPanel) return;
+    [self showGreenRoomWithRole:InterGreenRoomRoleHostCreate panel:setupPanel roomCode:@""];
 }
 
 - (void)preMeetingPanelDidCancel:(InterPreMeetingPanel *)panel {
@@ -1847,6 +1730,9 @@ didRequestDeleteTeamId:(NSString *)teamId {
         return;
     }
     [self dismissPreMeetingPanel];
+    // Cancelled from the green room's Meeting Settings sheet — the green room
+    // stays up and still owns the pending panel; nothing more to unwind.
+    if (self.greenRoomWindow) return;
     [self.pendingConnectionPanel setActionsEnabled:YES];
     self.pendingConnectionPanel = nil;
 }
@@ -1857,37 +1743,10 @@ didRequestDeleteTeamId:(NSString *)teamId {
 /// Editing here changes the saved defaults used by future host calls / scheduled
 /// meetings; it does not start a meeting.
 - (void)openMeetingDefaultsEditor {
-    // Recreate each time for a fresh state.
-    [self _closeMeetingDefaultsEditor];
-
-    static const CGFloat kW = 440.0;
-    CGFloat kH = [InterPreMeetingPanel fullPanelHeight];
-
-    InterPreMeetingPanel *content =
-        [[InterPreMeetingPanel alloc] initWithFrame:NSMakeRect(0, 0, kW, kH)
-                                     defaultsEditor:YES];
-    content.delegate = self;
-    [content setUserTier:self.roomController.tokenService.effectiveTier ?: @"free"];
-
-    NSWindow *win = [[NSWindow alloc]
-        initWithContentRect:NSMakeRect(0, 0, kW, kH)
-                  styleMask:NSWindowStyleMaskTitled |
-                            NSWindowStyleMaskClosable |
-                            NSWindowStyleMaskFullSizeContentView
-                    backing:NSBackingStoreBuffered
-                      defer:NO];
-    win.title = @"";
-    win.titlebarAppearsTransparent = YES;
-    win.movableByWindowBackground  = YES;
-    win.releasedWhenClosed = NO;
-    [win setAppearance:[NSAppearance appearanceNamed:NSAppearanceNameDarkAqua]];
-    win.contentView = content;
-    [win center];
-
-    self.meetingDefaultsPanel  = content;
-    self.meetingDefaultsWindow = win;
-    [win makeKeyAndOrderFront:nil];
-    [NSApp activateIgnoringOtherApps:YES];
+    // Meeting defaults live in the unified settings window now — deep-link to
+    // the Meeting Defaults tab. (Selector preserved for any existing callers.)
+    [self openSettingsWindow];
+    [self.settingsHostView selectAnchor:InterSettingsTabAnchorMeetingDefaults];
 }
 
 - (void)_closeMeetingDefaultsEditor {
@@ -1919,11 +1778,164 @@ didRequestDeleteTeamId:(NSString *)teamId {
 
 - (void)dismissPreMeetingPanel {
     if (self.preMeetingWindow) {
-        [self.setupWindow endSheet:self.preMeetingWindow];
+        // The sheet may be attached to the setup window (first-time host) or
+        // the green room window (Meeting Settings) — end it on its real parent.
+        NSWindow *parent = self.preMeetingWindow.sheetParent ?: self.setupWindow;
+        [parent endSheet:self.preMeetingWindow];
         [self.preMeetingWindow orderOut:nil];
         self.preMeetingWindow = nil;
         self.preMeetingPanel  = nil;
     }
+}
+
+#pragma mark - Green Room (pre-join device check)
+
+/// Presents the green room for any connect path. The user checks devices,
+/// optionally edits per-meeting fields (host create), and proceeds — the
+/// actual connect happens from the green room's primary action.
+- (void)showGreenRoomWithRole:(InterGreenRoomRole)role
+                        panel:(InterConnectionSetupPanel *)panel
+                     roomCode:(NSString *)roomCode {
+    if (self.greenRoomWindow) return; // already open
+
+    self.pendingConnectionPanel = panel;
+    [panel setActionsEnabled:NO];
+
+    static const CGFloat kW = 780.0, kH = 560.0;
+    InterGreenRoomHostView *host =
+        [[InterGreenRoomHostView alloc] initWithFrame:NSMakeRect(0, 0, kW, kH)
+                                                 role:role
+                                             roomCode:roomCode];
+    [host setDisplayName:panel.displayName];
+    [host setTokenServerURL:panel.tokenServerURL];
+
+    if (role == InterGreenRoomRoleHostCreate) {
+        InterPreMeetingSettings *settings = self.pendingMeetingSettings;
+        NSString *meetingName = settings.meetingDisplayName;
+        if (meetingName.length == 0) {
+            meetingName = [NSString stringWithFormat:@"%@'s Meeting", panel.displayName];
+        }
+        [host setMeetingName:meetingName];
+        [host setMeetingPassword:settings.meetingPassword ?: @""];
+        [host setUsingDefaultsCaption:[InterPreMeetingSettings hasConfiguredDefaults]
+                                          ? @"Using default settings"
+                                          : @"Using the settings you just saved"];
+    }
+
+    __weak typeof(self) weakSelf = self;
+    host.onPrimary = ^{
+        [weakSelf greenRoomDidSubmitWithRole:role roomCode:roomCode];
+    };
+    host.onCancel = ^{
+        [weakSelf cancelGreenRoom];
+    };
+    host.onOpenMeetingSettings = ^{
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf || !strongSelf.pendingConnectionPanel) return;
+        [strongSelf showPreMeetingPanelForPanel:strongSelf.pendingConnectionPanel];
+    };
+
+    NSWindow *win = [[NSWindow alloc]
+        initWithContentRect:NSMakeRect(0, 0, kW, kH)
+                  styleMask:NSWindowStyleMaskTitled |
+                            NSWindowStyleMaskClosable |
+                            NSWindowStyleMaskMiniaturizable
+                    backing:NSBackingStoreBuffered
+                      defer:NO];
+    win.title = @"Green Room — Check your camera & mic";
+    win.releasedWhenClosed = NO;
+    [win setAppearance:[NSAppearance appearanceNamed:NSAppearanceNameDarkAqua]];
+    win.contentView = host;
+    win.delegate = self;
+    [win center];
+
+    self.greenRoomHost = host;
+    self.greenRoomWindow = win;
+    [win makeKeyAndOrderFront:nil];
+    [host startPreview];
+}
+
+/// Green room primary action — capture the user's choices, close, connect.
+/// The host view has already torn down its preview capture session.
+- (void)greenRoomDidSubmitWithRole:(InterGreenRoomRole)role
+                          roomCode:(NSString *)roomCode {
+    InterGreenRoomHostView *host = self.greenRoomHost;
+    InterConnectionSetupPanel *panel = self.pendingConnectionPanel;
+    if (!host || !panel) { [self cancelGreenRoom]; return; }
+
+    // Join-state rule: host enforcement OR user choice (user can only add OFF).
+    self.greenRoomWantsMicOff = !host.micOnChoice;
+    self.greenRoomWantsCamOff = !host.camOnChoice;
+    self.pendingDisplayNameOverride = host.displayNameValue;
+
+    if (role == InterGreenRoomRoleHostCreate) {
+        // Per-meeting fields edited in the green room are authoritative.
+        InterPreMeetingSettings *settings =
+            self.pendingMeetingSettings ?: [InterPreMeetingSettings settingsWithDefaults];
+        settings.meetingDisplayName = host.meetingNameValue;
+        settings.meetingPassword = host.passwordValue;
+        self.pendingMeetingSettings = settings;
+    }
+
+    [self closeGreenRoomWindow];
+    self.pendingConnectionPanel = nil;
+
+    // Scheduled meeting flowing through the green room — both the host start
+    // and the invitee join use the scheduled endpoint (the server assigns the
+    // role from the meeting's host binding).
+    NSString *scheduledMeetingId = self.pendingScheduledMeetingId;
+    self.pendingScheduledMeetingId = nil;
+    if (scheduledMeetingId.length > 0) {
+        [self _joinScheduledMeetingWithRoomCode:roomCode
+                                      meetingId:scheduledMeetingId
+                                       password:nil];
+        return;
+    }
+
+    switch (role) {
+        case InterGreenRoomRoleHostCreate:
+            [self connectAndEnterMode:InterCallModeNormal
+                                 role:InterInterviewRoleNone
+                                panel:panel];
+            break;
+        case InterGreenRoomRoleJoin:
+            [self joinRoomWithCode:roomCode panel:panel password:nil];
+            break;
+        case InterGreenRoomRoleScheduledStart:
+            // Unreachable without pendingScheduledMeetingId (handled above);
+            // kept for switch exhaustiveness.
+            break;
+        case InterGreenRoomRoleHostInterview:
+            [self connectAndEnterMode:InterCallModeInterview
+                                 role:InterInterviewRoleInterviewer
+                                panel:panel];
+            break;
+    }
+}
+
+/// User backed out (close button / Cancel) — unwind to the setup screen.
+- (void)cancelGreenRoom {
+    [self.greenRoomHost teardown];
+    [self closeGreenRoomWindow];
+    [self.pendingConnectionPanel setActionsEnabled:YES];
+    self.pendingConnectionPanel = nil;
+    self.pendingMeetingSettings = nil;
+    self.pendingScheduledMeetingId = nil;
+    self.greenRoomWantsMicOff = NO;
+    self.greenRoomWantsCamOff = NO;
+    self.pendingDisplayNameOverride = nil;
+}
+
+- (void)closeGreenRoomWindow {
+    // Dismiss any Meeting Settings sheet still attached to the green room.
+    if (self.preMeetingWindow && self.preMeetingWindow.sheetParent == self.greenRoomWindow) {
+        [self dismissPreMeetingPanel];
+    }
+    if (self.greenRoomWindow) {
+        [self.greenRoomWindow orderOut:nil];
+        self.greenRoomWindow = nil;
+    }
+    self.greenRoomHost = nil;
 }
 
 /// [3.1.2] Host flow: create room → get code → display it → connect → enter mode.
@@ -1932,7 +1944,12 @@ didRequestDeleteTeamId:(NSString *)teamId {
                       panel:(InterConnectionSetupPanel *)panel {
     NSString *serverURL    = panel.serverURL;
     NSString *tokenURL     = panel.tokenServerURL;
-    NSString *displayName  = panel.displayName;
+    // The green room lets the user edit their display name pre-join. Read
+    // non-destructively: every connect path passes through the green room,
+    // which sets a fresh override on each submit (cancel clears it), and the
+    // password-retry rejoin must keep using the same chosen name.
+    NSString *displayName  = self.pendingDisplayNameOverride.length > 0
+        ? self.pendingDisplayNameOverride : panel.displayName;
 
     if (displayName.length == 0) {
         [panel setStatusText:@"Enter a display name."];
@@ -2026,7 +2043,11 @@ didRequestDeleteTeamId:(NSString *)teamId {
                 password:(nullable NSString *)password {
     NSString *serverURL    = panel.serverURL;
     NSString *tokenURL     = panel.tokenServerURL;
-    NSString *displayName  = panel.displayName;
+    // Green-room display-name override, read non-destructively: the password
+    // retry re-enters this method and must keep the same chosen name. A fresh
+    // override is set on every green-room submit; cancel clears it.
+    NSString *displayName  = self.pendingDisplayNameOverride.length > 0
+        ? self.pendingDisplayNameOverride : panel.displayName;
 
     if (displayName.length == 0) {
         [panel setStatusText:@"Enter a display name."];
@@ -2384,7 +2405,16 @@ didRequestDeleteTeamId:(NSString *)teamId {
     [view addSubview:self.normalRenderView];
 
     // [3.2.1] Remote video layout (camera + screen share views + participant overlay)
-    self.normalRemoteLayout = [[InterRemoteVideoLayoutManager alloc] initWithFrame:view.bounds];
+    // Reserve the bottom control-bar band so video tiles are never occluded by the
+    // leave/mic/cam bar. The layout view sits ABOVE the bar; with width+height
+    // flexible and the bottom margin fixed (origin.y = bar height), the grid tracks
+    // window resize while always clearing the bar. (Secure/interview mode frames its
+    // own layout manager inside InterSecureInterviewStageView and is unaffected.)
+    CGFloat callBarInset = [InterDesignTokens callControlBarHeight];
+    NSRect remoteLayoutFrame = NSMakeRect(0, callBarInset,
+                                          view.bounds.size.width,
+                                          MAX(0.0, view.bounds.size.height - callBarInset));
+    self.normalRemoteLayout = [[InterRemoteVideoLayoutManager alloc] initWithFrame:remoteLayoutFrame];
     self.normalRemoteLayout.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
     [view addSubview:self.normalRemoteLayout];
 
@@ -2420,7 +2450,6 @@ didRequestDeleteTeamId:(NSString *)teamId {
     // [B1] Wire shared media wiring controller — properties that exist now
     self.normalMediaWiring.controlPanel = self.normalControlPanel;
     self.normalMediaWiring.remoteLayout = self.normalRemoteLayout;
-    self.normalMediaWiring.networkStatusView = self.normalNetworkStatusView;
     __weak typeof(self) weakMediaSummarySelf = self;
     self.normalMediaWiring.mediaStateSummaryBlock = ^NSString *{
         return [weakMediaSummarySelf normalMediaStateSummary];
@@ -2453,33 +2482,12 @@ didRequestDeleteTeamId:(NSString *)teamId {
     self.normalChatPanel.delegate = self;
     [view addSubview:self.normalChatPanel];
 
-    // [Phase 8] Speaker queue panel (positioned above the bottom control bar)
-    CGFloat queueX = view.bounds.size.width - 300.0 - 260.0 - 12.0;
-    self.normalSpeakerQueuePanel = [[InterSpeakerQueuePanel alloc] initWithFrame:NSMakeRect(queueX, 90.0, 260.0, 300.0)];
-    self.normalSpeakerQueuePanel.autoresizingMask = NSViewMinXMargin | NSViewMaxYMargin;
-    self.normalSpeakerQueuePanel.delegate = self;
-    [view addSubview:self.normalSpeakerQueuePanel];
-
-    // Screen share request queue panel — positioned to left of speaker queue
-    CGFloat ssQueueX = queueX - 290.0;
-    self.normalScreenShareQueuePanel = [[InterScreenShareQueuePanel alloc] initWithFrame:NSMakeRect(ssQueueX, 90.0, 280.0, 280.0)];
-    self.normalScreenShareQueuePanel.autoresizingMask = NSViewMinXMargin | NSViewMaxYMargin;
-    self.normalScreenShareQueuePanel.delegate = self;
-    [view addSubview:self.normalScreenShareQueuePanel];
-
-    // Camera unlock request queue panel — positioned to left of screen share queue
-    CGFloat cuQueueX = ssQueueX - 290.0;
-    self.normalCameraUnlockQueuePanel = [[InterCameraUnlockQueuePanel alloc] initWithFrame:NSMakeRect(cuQueueX, 90.0, 280.0, 280.0)];
-    self.normalCameraUnlockQueuePanel.autoresizingMask = NSViewMinXMargin | NSViewMaxYMargin;
-    self.normalCameraUnlockQueuePanel.delegate = self;
-    [view addSubview:self.normalCameraUnlockQueuePanel];
-
-    // Mic unlock request queue panel — positioned to left of camera unlock queue
-    CGFloat muQueueX = cuQueueX - 292.0;
-    self.normalMicUnlockQueuePanel = [[InterMicUnlockQueuePanel alloc] initWithFrame:NSMakeRect(muQueueX, 90.0, 280.0, 280.0)];
-    self.normalMicUnlockQueuePanel.autoresizingMask = NSViewMinXMargin | NSViewMaxYMargin;
-    self.normalMicUnlockQueuePanel.delegate = self;
-    [view addSubview:self.normalMicUnlockQueuePanel];
+    // [Phase 8] Speaker / screen-share / camera-unlock / mic-unlock request
+    // queues are surfaced by the consolidated Requests panel in the control
+    // bar's More menu (the bridge observes the queues directly). The legacy
+    // per-queue AppKit panels are no longer created in normal mode — their
+    // delegate methods below remain the moderation logic, and all setEntries:/
+    // showPanel: push sites are harmless no-ops on the nil panel references.
 
     // [Phase 8] Wire chat controller delegates
     self.chatController.chatDelegate = (id<InterChatControllerDelegate>)self;
@@ -2679,37 +2687,41 @@ didRequestDeleteTeamId:(NSString *)teamId {
 }
 
 - (void)attachNormalCallControlsInView:(NSView *)view {
-    NSTextField *label = [NSTextField labelWithString:@"Metal surface shell for secure video call UI composition."];
-    label.frame = NSMakeRect(70, 560, 480, 24);
-    label.autoresizingMask = NSViewMaxXMargin | NSViewMinYMargin;
-    label.font = [NSFont systemFontOfSize:15];
-    label.textColor = [NSColor colorWithWhite:0.92 alpha:1.0];
-    [view addSubview:label];
+    // [Task 8] SwiftUI in-call control bar — single full-width bottom bar that
+    // replaces the legacy AppKit panel + loose buttons (the secure/candidate
+    // window keeps the AppKit panel; the bridge conforms to the same
+    // InterCallMediaControlSurface protocol the wiring controller drives).
+    CGFloat barHeight = [InterDesignTokens callControlBarHeight];
+    InterCallControlBarBridge *bar = [[InterCallControlBarBridge alloc]
+        initWithFrame:NSMakeRect(0, 0, view.bounds.size.width, barHeight)];
+    bar.autoresizingMask = NSViewWidthSizable | NSViewMaxYMargin;
+    self.normalControlPanel = bar;
+    [view addSubview:bar];
 
-    NSButton *exitButton = [[NSButton alloc] initWithFrame:NSMakeRect(40, 40, 160, 42)];
-    exitButton.autoresizingMask = NSViewMaxXMargin | NSViewMaxYMargin;
-    [exitButton setTitle:@"End Call"];
-    [exitButton setTarget:self];
-    [exitButton setAction:@selector(requestExitCurrentMode)];
-    [view addSubview:exitButton];
+    // Waiting-room arrival toast: floats bottom-left, just above the bar. The
+    // "Open" action surfaces the Waiting Room panel so the host can admit.
+    self.normalLobbyToast = [[InterLobbyToastPresenter alloc] initWithParentView:view
+                                                                        barInset:barHeight];
+    __weak typeof(self) weakToastSelf = self;
+    self.normalLobbyToast.onOpen = ^{
+        __strong typeof(weakToastSelf) strongToastSelf = weakToastSelf;
+        if (!strongToastSelf) return;
+        // No-op if the panel is already in front; otherwise create/show it.
+        if (strongToastSelf.normalLobbyWindow && strongToastSelf.normalLobbyWindow.isVisible) return;
+        [strongToastSelf toggleNormalLobbyPanel];
+    };
 
-    NSRect panelFrame = NSMakeRect(view.bounds.size.width - 300.0,
-                                   22.0,
-                                   278.0,
-                                   470.0);
-    self.normalControlPanel = [[InterLocalCallControlPanel alloc] initWithFrame:panelFrame];
-    self.normalControlPanel.autoresizingMask = NSViewMinXMargin | NSViewMaxYMargin;
-    [self.normalControlPanel setPanelTitleText:@"Normal Call Controls"];
-    [self.normalControlPanel setShareModeSelectorHidden:NO];
-    [self.normalControlPanel setShareMode:InterShareModeWindow];
-    [self.normalControlPanel setShareSystemAudioEnabled:NO];
-    [self.normalControlPanel setShareSystemAudioToggleHidden:YES];
-    [self.normalControlPanel setShareModeOptionEnabled:YES forMode:InterShareModeWindow];
-    [self.normalControlPanel setShareModeOptionEnabled:YES forMode:InterShareModeEntireScreen];
-    [view addSubview:self.normalControlPanel];
+    // In-call request toast (raise hand / screen share / unlock). Stacked above the
+    // lobby toast so the two never overlap; "Open" surfaces the Requests panel.
+    self.normalRequestToast = [[InterLobbyToastPresenter alloc] initWithParentView:view
+                                                                          barInset:(barHeight + 80.0)];
+    self.normalRequestToast.onOpen = ^{
+        __strong typeof(weakToastSelf) strongToastSelf = weakToastSelf;
+        [strongToastSelf.normalControlPanel showRequestsPanel];
+    };
 
     __weak typeof(self) weakSelf = self;
-    self.normalControlPanel.cameraToggleHandler = ^{
+    bar.cameraToggleHandler = ^{
         InterMediaWiringController *wiring = weakSelf.normalMediaWiring;
         // If locked (per-participant or global), intercept and route to unlock-request flow.
         if (wiring.isHostCameraLocked || wiring.globalCameraLockActive) {
@@ -2727,7 +2739,7 @@ didRequestDeleteTeamId:(NSString *)teamId {
         // [2.5.6] [G2] Normal two-phase camera toggle via shared wiring controller.
         [wiring twoPhaseToggleCamera];
     };
-    self.normalControlPanel.microphoneToggleHandler = ^{
+    bar.microphoneToggleHandler = ^{
         // [R3] If the host has disabled unmuting and this participant is muted
         // (i.e. they would be trying to unmute), block the action.
         if (!weakSelf.roomController.isHost
@@ -2753,143 +2765,193 @@ didRequestDeleteTeamId:(NSString *)teamId {
         // Normal path: self-toggle (mute ↔ unmute).
         [weakSelf.normalMediaWiring twoPhaseToggleMicrophone];
     };
-    self.normalControlPanel.shareToggleHandler = ^{
+    bar.speakerToggleHandler = ^{
+        // Local "mute speaker": silence incoming meeting audio at the engine output
+        // (mic, system volume, and recording are all unaffected). Push the new state
+        // back so the button reflects it.
+        BOOL newMuted = ![InterAudioEngineAccess isSpeakerMuted];
+        [InterAudioEngineAccess setSpeakerMuted:newMuted];
+        [weakSelf.normalControlPanel setSpeakerMuted:newMuted];
+    };
+    bar.shareToggleHandler = ^{
         [weakSelf toggleNormalSurfaceShare];
     };
-    self.normalControlPanel.shareModeChangedHandler = ^(InterShareMode shareMode) {
-        [weakSelf handleNormalShareModeChanged:shareMode];
-    };
-    self.normalControlPanel.audioInputSelectionChangedHandler = ^(NSString * _Nullable deviceID) {
+    bar.audioInputSelectionChangedHandler = ^(NSString * _Nullable deviceID) {
         [weakSelf handleNormalAudioInputSelection:deviceID];
     };
-    self.normalControlPanel.shareSystemAudioChangedHandler = ^(BOOL enabled) {
-        [weakSelf handleNormalShareSystemAudioChanged:enabled];
+
+    // Panels + self state (formerly loose AppKit buttons).
+    bar.chatToggleHandler = ^{ [weakSelf toggleNormalChatPanel]; };
+    bar.pollToggleHandler = ^{ [weakSelf toggleNormalPollPanel]; };
+    bar.qaToggleHandler = ^{ [weakSelf toggleNormalQAPanel]; };
+    bar.raiseHandToggleHandler = ^{ [weakSelf toggleNormalHandRaise]; };
+    bar.leaveHandler = ^{ [weakSelf requestExitCurrentMode]; };
+
+    // More menu routes (the Moderation menu is now SwiftUI — each row routes
+    // to the same selectors the legacy NSMenu targeted).
+    bar.lobbyHandler = ^{ [weakSelf toggleNormalLobbyPanel]; };
+    bar.renameHandler = ^{ [weakSelf selfRenameAction:nil]; };
+    bar.moderationMenuWillOpenHandler = ^{ [weakSelf pushModerationStateToBar]; };
+    bar.toggleMuteAllHandler = ^{
+        if (weakSelf.moderationController.isAllMuted) [weakSelf moderationUnmuteAll];
+        else [weakSelf moderationMuteAll];
+        [weakSelf pushModerationStateToBar];
     };
+    bar.toggleAllCamerasHandler = ^{
+        if (weakSelf.moderationController.isAllCameraMuted) [weakSelf moderationLiftCameraAll];
+        else [weakSelf moderationMuteCameraAll];
+        [weakSelf pushModerationStateToBar];
+    };
+    bar.stopAllSharesHandler = ^{ [weakSelf moderationStopAllScreenShares]; };
+    bar.toggleChatDisabledHandler = ^{
+        if (weakSelf.moderationController.isChatDisabled) [weakSelf moderationEnableChat];
+        else [weakSelf moderationDisableChat];
+        [weakSelf pushModerationStateToBar];
+    };
+    bar.toggleCoHostRecordingHandler = ^{
+        [weakSelf moderationToggleCoHostLocalRecording];
+        [weakSelf pushModerationStateToBar];
+    };
+    bar.toggleLockHandler = ^{
+        if (weakSelf.moderationController.isMeetingLocked) [weakSelf moderationUnlockMeeting];
+        else [weakSelf moderationLockMeeting];
+        [weakSelf pushModerationStateToBar];
+    };
+    bar.passwordViewHandler = ^{ [weakSelf moderationViewPassword]; };
+    bar.passwordChangeHandler = ^{ [weakSelf moderationSetPassword]; };
+    bar.passwordRemoveHandler = ^{ [weakSelf moderationRemovePassword]; };
+    bar.shareConflictChangedHandler = ^(NSString *policy) {
+        if ([policy isEqualToString:@"hostCanPreempt"]) [weakSelf moderationShareConflictHostCanPreempt];
+        else if ([policy isEqualToString:@"anyCanPreempt"]) [weakSelf moderationShareConflictAnyCanPreempt];
+        else [weakSelf moderationShareConflictOneAtATime];
+        [weakSelf pushModerationStateToBar];
+    };
+
+    // Participants panel: live list + the same per-participant host-mute the
+    // tile three-dot menu performs (mute, not block — they can ask to unmute).
+    bar.participantsProvider = ^NSArray<NSDictionary<NSString *, NSString *> *> *{
+        __strong typeof(weakSelf) s = weakSelf;
+        if (!s) return @[];
+        NSMutableArray *rows = [NSMutableArray array];
+        for (NSDictionary<NSString *, NSString *> *p in [s.roomController remoteParticipantList]) {
+            NSString *identity = p[@"identity"] ?: @"";
+            if (identity.length == 0) continue;
+            [rows addObject:@{
+                @"identity": identity,
+                @"name": p[@"name"] ?: identity,
+                @"hostMuted": [s.hostMutedParticipants containsObject:identity] ? @"1" : @"0",
+            }];
+        }
+        return rows;
+    };
+    bar.participantMuteHandler = ^(NSString *identity) {
+        [weakSelf handleTileModerationAction:@"muteMic" forParticipant:identity];
+    };
+    bar.participantUnmuteHandler = ^(NSString *identity) {
+        // Lift the host block (same flow as the tile menu's "Remove Mute").
+        [weakSelf handleTileModerationAction:@"removeMute" forParticipant:identity];
+    };
+
+    // Consolidated requests panel — the bridge KVO-observes the queues' counts;
+    // approve/deny route to the same delegate bodies the legacy queue panels used.
+    bar.requestApproveHandler = ^(NSString *kindRaw, NSString *identity) {
+        [weakSelf handleRequestForKind:kindRaw identity:identity approved:YES];
+    };
+    bar.requestDenyHandler = ^(NSString *kindRaw, NSString *identity) {
+        [weakSelf handleRequestForKind:kindRaw identity:identity approved:NO];
+    };
+    [bar attachQueuesWithSpeakerQueue:self.speakerQueue
+                     screenShareQueue:self.screenShareQueue
+                    cameraUnlockQueue:self.cameraUnlockQueue
+                       micUnlockQueue:self.micUnlockQueue];
 
     // [Phase 10] Record toggle — visible to anyone with canStartRecording (host + co-host)
     BOOL canRecord = [InterPermissionMatrix
                       role:self.moderationController.localRole
                       hasPermission:(InterPermission)InterPermissionCanStartRecording];
-    [self.normalControlPanel setRecordingButtonHidden:!canRecord];
-    self.normalControlPanel.recordToggleHandler = ^{
+    [bar setRecordingButtonHidden:!canRecord];
+    bar.recordToggleHandler = ^{
         [weakSelf handleRecordToggle];
     };
 
     // [Phase 10 R2] View Recordings — visible to authenticated users
     BOOL canViewRecordings = self.roomController.tokenService.isAuthenticated;
-    [self.normalControlPanel setViewRecordingsButtonHidden:!canViewRecordings];
-    self.normalControlPanel.viewRecordingsHandler = ^{
+    [bar setViewRecordingsButtonHidden:!canViewRecordings];
+    bar.viewRecordingsHandler = ^{
         [weakSelf toggleNormalRecordingListPanel];
     };
 
-    // Screen share permission mode toggle — host only
+    // Screen share permission mode selector ("Who can share") — host only
     if (self.roomController.isHost) {
         NSString *initialMode = self.roomController.activeSharingPermissions ?: @"hostOnly";
-        [self.normalControlPanel setScreenSharePermissionMode:initialMode];
-        __weak typeof(self) weakSelf = self;
-        self.normalControlPanel.screenShareModeChangedHandler = ^(NSString *mode) {
+        [bar setScreenSharePermissionMode:initialMode];
+        bar.screenShareModeChangedHandler = ^(NSString *mode) {
             [weakSelf handleScreenShareModeChanged:mode];
         };
     }
 
-    // [3.4.4] Network quality signal bars in the control panel
-    self.normalNetworkStatusView = [[InterNetworkStatusView alloc] initWithFrame:NSMakeRect(0, 0, 40, 16)];
-    [self.normalControlPanel.networkStatusContainerView addSubview:self.normalNetworkStatusView];
-
-    // [3.4.5] [G9] Triple-click diagnostic: copy snapshot to clipboard via wiring controller
-    NSClickGestureRecognizer *tripleClick = [[NSClickGestureRecognizer alloc] initWithTarget:self
-                                                                                      action:@selector(forwardDiagnosticTripleClick:)];
-    tripleClick.numberOfClicksRequired = 3;
-    [self.normalControlPanel.networkStatusContainerView addGestureRecognizer:tripleClick];
-
-    // [Phase 8] Chat, hand-raise, and queue toggle buttons — bottom bar next to End Call
-    self.normalChatToggleButton = [[NSButton alloc] initWithFrame:NSMakeRect(220, 40, 80, 42)];
-    self.normalChatToggleButton.autoresizingMask = NSViewMaxXMargin | NSViewMaxYMargin;
-    [self.normalChatToggleButton setTitle:@"💬 Chat"];
-    [self.normalChatToggleButton setTarget:self];
-    [self.normalChatToggleButton setAction:@selector(toggleNormalChatPanel)];
-    [self.normalChatToggleButton setKeyEquivalent:@"c"];
-    [self.normalChatToggleButton setKeyEquivalentModifierMask:(NSEventModifierFlagCommand | NSEventModifierFlagShift)];
-    [view addSubview:self.normalChatToggleButton];
-
-    self.normalHandRaiseButton = [[NSButton alloc] initWithFrame:NSMakeRect(310, 40, 100, 42)];
-    self.normalHandRaiseButton.autoresizingMask = NSViewMaxXMargin | NSViewMaxYMargin;
-    [self.normalHandRaiseButton setTitle:@"✋ Raise"];
-    [self.normalHandRaiseButton setTarget:self];
-    [self.normalHandRaiseButton setAction:@selector(toggleNormalHandRaise)];
-    [view addSubview:self.normalHandRaiseButton];
-
-    // Show speaker queue button to host and co-host
+    // Moderation / requests / lobby visibility (host + co-host); self-rename for
+    // non-moderators (moderators reach rename via the Moderation menu).
     BOOL canModerateUI = [InterPermissionMatrix
                           role:self.moderationController.localRole
                           hasPermission:(InterPermission)InterPermissionCanMuteOthers];
-
-    // [Phase 8.5] Poll toggle button
-    CGFloat pollX = canModerateUI ? 520.0 : 420.0;
-    self.normalPollToggleButton = [[NSButton alloc] initWithFrame:NSMakeRect(pollX, 40, 80, 42)];
-    self.normalPollToggleButton.autoresizingMask = NSViewMaxXMargin | NSViewMaxYMargin;
-    [self.normalPollToggleButton setTitle:@"📊 Poll"];
-    [self.normalPollToggleButton setTarget:self];
-    [self.normalPollToggleButton setAction:@selector(toggleNormalPollPanel)];
-    [view addSubview:self.normalPollToggleButton];
-
-    // [Phase 8.6] Q&A toggle button
-    CGFloat qaX = pollX + 90.0;
-    self.normalQAToggleButton = [[NSButton alloc] initWithFrame:NSMakeRect(qaX, 40, 80, 42)];
-    self.normalQAToggleButton.autoresizingMask = NSViewMaxXMargin | NSViewMaxYMargin;
-    [self.normalQAToggleButton setTitle:@"❓ Q&A"];
-    [self.normalQAToggleButton setTarget:self];
-    [self.normalQAToggleButton setAction:@selector(toggleNormalQAPanel)];
-    [view addSubview:self.normalQAToggleButton];
-
-    // [Phase 9] Queue, lobby, and moderation buttons (host/co-host only)
-    if (canModerateUI) {
-        CGFloat modX = qaX + 90.0;
-        [self _ensureModerationToolbarInView:view queueX:420.0 lobbyX:modX];
-    } else if ([self.moderationController canLocalParticipantSelfRename]) {
-        // Non-moderator self-service "More" menu. Currently hosts self-rename; designed as
-        // the home for future participant-facing items. Placed after Q&A (x=600) so it
-        // never collides with the moderator toolbar (which this branch never builds).
-        // Moderators reach self-rename via the "Moderate" menu instead, so no button here.
-        CGFloat moreX = qaX + 90.0;
-        self.normalMoreButton = [[NSButton alloc] initWithFrame:NSMakeRect(moreX, 40, 90, 42)];
-        self.normalMoreButton.autoresizingMask = NSViewMaxXMargin | NSViewMaxYMargin;
-        [self.normalMoreButton setTitle:@"⋯ More"];
-        [self.normalMoreButton setTarget:self];
-        [self.normalMoreButton setAction:@selector(showMoreMenu:)];
-        [view addSubview:self.normalMoreButton];
-    }
+    [bar setModerationVisible:canModerateUI];
+    [bar setRenameVisible:(!canModerateUI && [self.moderationController canLocalParticipantSelfRename])];
+    [self pushModerationStateToBar];
 }
 
-/// Creates the three moderator-only toolbar buttons (queue, lobby, moderation) if they do not
-/// already exist. Safe to call from both initial setup and mid-meeting promotion paths.
-/// @param queueX   Left edge for the queue button (420 at launch with canModerateUI=YES;
-///                 600 when promoted, to clear the non-moderator poll/QA layout).
-/// @param lobbyX   Left edge for the lobby button (both paths use 700).
-- (void)_ensureModerationToolbarInView:(NSView *)view queueX:(CGFloat)queueX lobbyX:(CGFloat)lobbyX {
-    if (!self.normalQueueToggleButton) {
-        self.normalQueueToggleButton = [[NSButton alloc] initWithFrame:NSMakeRect(queueX, 40, 90, 42)];
-        self.normalQueueToggleButton.autoresizingMask = NSViewMaxXMargin | NSViewMaxYMargin;
-        [self.normalQueueToggleButton setTitle:@"📋 Queue"];
-        [self.normalQueueToggleButton setTarget:self];
-        [self.normalQueueToggleButton setAction:@selector(toggleNormalSpeakerQueue)];
-        [view addSubview:self.normalQueueToggleButton];
+/// Push the moderation controller's current state into the SwiftUI bar so the
+/// Moderation menu renders fresh labels (Mute All vs Unmute All, …). Called
+/// before the menu opens and after every menu action.
+- (void)pushModerationStateToBar {
+    InterCallControlBarBridge *bar = self.normalControlPanel;
+    if (!bar || !self.moderationController) return;
+    BOOL hasPlaintext = (self.currentMeetingPassword.length > 0);
+    BOOL hasPassword = self.roomController.activeHasPassword || hasPlaintext;
+    [bar setModerationStateWithAllMuted:self.moderationController.isAllMuted
+                          allCamerasOff:self.moderationController.isAllCameraMuted
+                           chatDisabled:self.moderationController.isChatDisabled
+                 coHostRecordingAllowed:self.coHostLocalRecordingAllowed
+                          meetingLocked:self.moderationController.isMeetingLocked
+                            hasPassword:hasPassword
+                   hasPlaintextPassword:hasPlaintext
+                    shareConflictPolicy:self.moderationController.shareConflictPolicy ?: @"oneattime"
+                             isHostRole:self.roomController.isHost];
+}
+
+/// Routes an approve/deny from the consolidated Requests panel to the same
+/// delegate bodies the legacy per-queue panels used (panels are gone in normal
+/// mode; their delegate methods remain the single source of moderation logic).
+/// kindRaw matches CallRequestKind.rawValue.
+- (void)handleRequestForKind:(NSString *)kindRaw identity:(NSString *)identity approved:(BOOL)approved {
+    if ([kindRaw isEqualToString:@"Raised Hands"]) {
+        // Approve = acknowledge/lower the hand. (Allow-to-speak for host-muted
+        // participants stays on the participant tile menu, unchanged.)
+        [self acknowledgeRaisedHandForParticipant:identity];
+        return;
     }
-    if (!self.normalLobbyToggleButton) {
-        self.normalLobbyToggleButton = [[NSButton alloc] initWithFrame:NSMakeRect(lobbyX, 40, 90, 42)];
-        self.normalLobbyToggleButton.autoresizingMask = NSViewMaxXMargin | NSViewMaxYMargin;
-        [self.normalLobbyToggleButton setTitle:@"🚪 Lobby"];
-        [self.normalLobbyToggleButton setTarget:self];
-        [self.normalLobbyToggleButton setAction:@selector(toggleNormalLobbyPanel)];
-        [view addSubview:self.normalLobbyToggleButton];
+    if ([kindRaw isEqualToString:@"Screen Share"]) {
+        if (approved) {
+            [self approveScreenShareRequestForParticipant:identity];
+        } else {
+            [self denyScreenShareRequestForParticipant:identity];
+        }
+        return;
     }
-    if (!self.normalModerationButton) {
-        self.normalModerationButton = [[NSButton alloc] initWithFrame:NSMakeRect(lobbyX + 100, 40, 120, 42)];
-        self.normalModerationButton.autoresizingMask = NSViewMaxXMargin | NSViewMaxYMargin;
-        [self.normalModerationButton setTitle:@"⚙️ Moderate"];
-        [self.normalModerationButton setTarget:self];
-        [self.normalModerationButton setAction:@selector(showModerationMenu:)];
-        [view addSubview:self.normalModerationButton];
+    if ([kindRaw isEqualToString:@"Camera Unlock"]) {
+        if (approved) {
+            [self approveCameraUnlockRequestForParticipant:identity];
+        } else {
+            [self denyCameraUnlockRequestForParticipant:identity];
+        }
+        return;
+    }
+    if ([kindRaw isEqualToString:@"Mic Unlock"]) {
+        if (approved) {
+            [self approveMicUnlockRequestForParticipant:identity];
+        } else {
+            [self denyMicUnlockRequestForParticipant:identity];
+        }
     }
 }
 
@@ -2897,8 +2959,10 @@ didRequestDeleteTeamId:(NSString *)teamId {
     self.normalShareSystemAudioEnabled = NO;
     self.normalMediaController = [[InterLocalMediaController alloc] init];
     self.normalSurfaceShareController = [[InterSurfaceShareController alloc] init];
+    // Default to Window mode; the unified share picker decides the real source
+    // (window vs entire screen) per share, so this is just the initial config.
     [self.normalSurfaceShareController configureWithSessionKind:InterShareSessionKindNormal
-                                                      shareMode:self.normalControlPanel.selectedShareMode];
+                                                      shareMode:InterShareModeWindow];
     [self.normalSurfaceShareController setShareSystemAudioEnabled:self.normalShareSystemAudioEnabled];
     __weak typeof(self) weakSelf = self;
     self.normalMediaController.audioInputOptionsChangedHandler = ^{
@@ -2926,21 +2990,7 @@ didRequestDeleteTeamId:(NSString *)teamId {
         weakSelf.normalMediaController.audioSampleBufferHandler = sampleHandler;
     };
 
-    [self.normalMediaController attachPreviewToView:self.normalControlPanel.previewContainerView];
     [self.normalControlPanel setMediaStatusText:@"Requesting camera/mic permission..."];
-
-    // Self-rename: right-click the local preview ("your tile") to change your own name.
-    // Only attached when allowed (interviewees in an interview room are excluded); the
-    // receive side enforces the same rule, so this is a convenience surface only.
-    if ([self.moderationController canLocalParticipantSelfRename]) {
-        NSMenu *selfTileMenu = [[NSMenu alloc] initWithTitle:@"Self"];
-        NSMenuItem *renameItem = [[NSMenuItem alloc] initWithTitle:@"✏️ Change My Name…"
-                                                            action:@selector(selfRenameAction:)
-                                                     keyEquivalent:@""];
-        renameItem.target = self;
-        [selfTileMenu addItem:renameItem];
-        self.normalControlPanel.previewContainerView.menu = selfTileMenu;
-    }
 
     [self.normalMediaController prepareWithCompletion:^(BOOL success, NSString * _Nullable failureReason) {
         if (!success) {
@@ -2979,14 +3029,23 @@ didRequestDeleteTeamId:(NSString *)teamId {
         // was removed, leaving audio flowing while the button showed "Turn Mic On".
         dispatch_group_t joinGroup = dispatch_group_create();
 
-        if (weakSelf.roomController.activeMuteOnJoin) {
+        // Join-state rule: the host's enforcement (muteOnJoin/cameraOffOnJoin)
+        // OR the user's green-room choice ("join muted" / "join without
+        // video"). The user choice can only add OFF — it never overrides a
+        // host enforcement. Consumed once per launch, then reset.
+        BOOL micOffOnJoin = weakSelf.roomController.activeMuteOnJoin || weakSelf.greenRoomWantsMicOff;
+        BOOL camOffOnJoin = weakSelf.roomController.activeCameraOffOnJoin || weakSelf.greenRoomWantsCamOff;
+        weakSelf.greenRoomWantsMicOff = NO;
+        weakSelf.greenRoomWantsCamOff = NO;
+
+        if (micOffOnJoin) {
             dispatch_group_enter(joinGroup);
             [weakSelf.normalMediaController setMicrophoneEnabled:NO completion:^(BOOL __unused s) {
                 [weakSelf.normalControlPanel setMicrophoneEnabled:NO];
                 dispatch_group_leave(joinGroup);
             }];
         }
-        if (weakSelf.roomController.activeCameraOffOnJoin) {
+        if (camOffOnJoin) {
             dispatch_group_enter(joinGroup);
             [weakSelf.normalMediaController setCameraEnabled:NO completion:^(BOOL __unused s) {
                 [weakSelf.normalControlPanel setCameraEnabled:NO];
@@ -2997,55 +3056,31 @@ didRequestDeleteTeamId:(NSString *)teamId {
         // [2.5.4] Wire network publishing only after join-time mute/disable operations
         // have fully applied (isMicrophoneEnabled / isCameraEnabled are now correct).
         dispatch_group_notify(joinGroup, dispatch_get_main_queue(), ^{
+            // Re-derive the "Camera …, Mic …" summary AFTER join-time settings
+            // applied — the earlier push ran before camOffOnJoin/micOffOnJoin
+            // and reported stale state ("Camera on" while the camera was off).
+            [weakSelf.normalControlPanel setMediaStatusText:[weakSelf normalMediaStateSummary]];
             [weakSelf.normalMediaWiring wireNetworkPublish];
+            // Seed the self-tile mic/cam badges from the now-accurate device state.
+            // The roster's local entry was seeded at wiring time before the capture
+            // session started (mediaController nil / device flags still NO), which left
+            // the self-tile mic icon stuck "muted"; this is the first point the true
+            // state is known. wireNetworkPublish (above) has set isMicNetworkMuted, so
+            // the connected mic truth is also correct here.
+            [weakSelf.normalMediaWiring refreshLocalMediaStateInRoster];
+
+            // [Mic preference] Apply the user's selected mic (green-room / persisted
+            // choice) to LiveKit's native capture. Without this, LiveKit captures from
+            // the system default at join regardless of the picker. No-op when the
+            // preferred device already IS the system default (avoids an ADM restart).
+            NSString *prefMicID = [weakSelf.normalMediaController selectedAudioInputDeviceID];
+            if (prefMicID.length > 0) {
+                NSString *prefMicName = [AVCaptureDevice deviceWithUniqueID:prefMicID].localizedName;
+                [weakSelf.roomController setNetworkAudioInputWithDeviceID:prefMicID name:prefMicName];
+            }
+            [weakSelf refreshNormalAudioInputOptions];
         });
     }];
-}
-
-- (void)handleNormalShareModeChanged:(InterShareMode)shareMode {
-    if (self.normalSurfaceShareController.isSharing) {
-        [self.normalControlPanel setShareMode:self.normalSurfaceShareController.configuration.shareMode];
-        [self.normalControlPanel setShareStatusText:@"Stop sharing before changing source mode."];
-        return;
-    }
-
-    BOOL supportsSystemAudio = shareMode != InterShareModeThisApp;
-    [self.normalControlPanel setShareSystemAudioToggleHidden:!supportsSystemAudio];
-    if (!supportsSystemAudio) {
-        self.normalShareSystemAudioEnabled = NO;
-        [self.normalControlPanel setShareSystemAudioEnabled:NO];
-    }
-
-    [self.normalSurfaceShareController configureWithSessionKind:InterShareSessionKindNormal
-                                                      shareMode:shareMode];
-    [self.normalSurfaceShareController setShareSystemAudioEnabled:self.normalShareSystemAudioEnabled];
-
-    if (shareMode == InterShareModeThisApp) {
-        [self.normalControlPanel setShareStatusText:@"Share This App is ready."];
-        return;
-    }
-
-    if (shareMode == InterShareModeWindow) {
-        NSString *status = self.normalShareSystemAudioEnabled ? @"Share Window + system audio is ready." : @"Share Window is ready.";
-        [self.normalControlPanel setShareStatusText:status];
-        return;
-    }
-
-    NSString *status = self.normalShareSystemAudioEnabled ? @"Share Entire Screen + system audio is ready." : @"Share Entire Screen is ready.";
-    [self.normalControlPanel setShareStatusText:status];
-}
-
-- (void)handleNormalShareSystemAudioChanged:(BOOL)enabled {
-    self.normalShareSystemAudioEnabled = enabled;
-    [self.normalSurfaceShareController setShareSystemAudioEnabled:enabled];
-
-    if (self.normalControlPanel.selectedShareMode == InterShareModeWindow) {
-        NSString *status = enabled ? @"Share Window + system audio is ready." : @"Share Window is ready.";
-        [self.normalControlPanel setShareStatusText:status];
-    } else if (self.normalControlPanel.selectedShareMode == InterShareModeEntireScreen) {
-        NSString *status = enabled ? @"Share Entire Screen + system audio is ready." : @"Share Entire Screen is ready.";
-        [self.normalControlPanel setShareStatusText:status];
-    }
 }
 
 - (NSString *)normalMediaStateSummary {
@@ -3072,6 +3107,17 @@ didRequestDeleteTeamId:(NSString *)teamId {
     }
 
     NSArray<NSDictionary<NSString *, NSString *> *> *options = [self.normalMediaController availableAudioInputOptions];
+
+    // The checkmark is derived solely from the AVCapture-validated selection.
+    // -selectedAudioInputDeviceID validates against the live discovery list, so it never
+    // returns an id missing from the menu (fixes the stale/orphan tick on hot-unplug).
+    //
+    // We deliberately DO NOT query LiveKit's AudioManager.inputDevice here. That getter is
+    // a synchronous WebRTC Thread::BlockingCall; issuing it on the main thread during an
+    // audio route change (earphone plug/unplug) blocked the main thread (UI/video freeze)
+    // AND poked the AudioDeviceModule on the same WebRTC thread that was tearing down the
+    // AVAudioEngine, racing CoreAudio's route-change property listener into an
+    // EXC_BAD_ACCESS. See spec: audio-route-change-crash-fix.
     NSString *selectedDeviceID = [self.normalMediaController selectedAudioInputDeviceID];
     [self.normalControlPanel setAudioInputOptions:options selectedDeviceID:selectedDeviceID];
 }
@@ -3082,17 +3128,31 @@ didRequestDeleteTeamId:(NSString *)teamId {
     }
 
     // When connected, modifying the AVCaptureSession's audio input calls
-    // beginConfiguration / commitConfiguration which momentarily interrupts
-    // ALL session outputs — including the camera video preview. LiveKit
-    // captures the mic natively (not through the session) so changing the
-    // session's audio input has no effect on what remote participants hear.
-    // Store the preference and skip the disruptive reconfiguration.
+    // beginConfiguration / commitConfiguration which momentarily interrupts ALL
+    // session outputs — including the camera video preview. And the AVCaptureSession
+    // mic is NOT the network mic: LiveKit captures natively via its audio device
+    // module. So instead of reconfiguring the session, we re-point LiveKit's capture
+    // device directly (below), which is what actually changes the transmitted audio.
     InterRoomController *rc = self.roomController;
     BOOL isConnected = rc && rc.connectionState == InterRoomConnectionStateConnected;
     if (isConnected) {
-        // Remember the selection so it's applied on next session setup /
-        // reconnect, and refresh the UI to reflect the stored choice.
+        // Remember the selection (applied to the AVCapture path on next session setup).
         [self.normalMediaController storePreferredAudioDeviceID:deviceID];
+
+        // Re-point LiveKit's NATIVE capture so the change actually affects the
+        // transmitted (and recorded) audio. Previously this was a silent no-op while
+        // connected — the picker only touched the AVCaptureSession (which isn't the
+        // network mic) and that reconfig is skipped mid-call. Match LiveKit's input
+        // device by id/name; a no-op if no match. A switch briefly interrupts audio.
+        NSString *deviceName = nil;
+        if (deviceID.length > 0) {
+            AVCaptureDevice *dev = [AVCaptureDevice deviceWithUniqueID:deviceID];
+            deviceName = dev.localizedName;
+        }
+        BOOL switched = [rc setNetworkAudioInputWithDeviceID:deviceID name:deviceName];
+        if (!switched) {
+            [self.normalControlPanel setMediaStatusText:@"Couldn't switch microphone for the call."];
+        }
         [self refreshNormalAudioInputOptions];
         return;
     }
@@ -3190,53 +3250,52 @@ didRequestDeleteTeamId:(NSString *)teamId {
         // If no policy matched (unknown value), fall through safely to start share.
     }
 
-    InterShareMode selectedMode = self.normalControlPanel.selectedShareMode;
-
-    BOOL requiresScreenRecordingPermission = (selectedMode == InterShareModeWindow ||
-                                              selectedMode == InterShareModeEntireScreen);
-    if (requiresScreenRecordingPermission && ![InterScreenCaptureVideoSource preflightScreenCaptureAccess]) {
+    // Both share kinds (window + entire screen) require screen-recording permission.
+    if (![InterScreenCaptureVideoSource preflightScreenCaptureAccess]) {
         (void)[InterScreenCaptureVideoSource requestScreenCaptureAccessIfNeeded];
-        [self.normalControlPanel setShareStatusText:@"Screen recording permission is required. Enable it in System Settings, then click Start Surface Share again."];
+        [self.normalControlPanel setShareStatusText:@"Screen recording permission is required. Enable it in System Settings, then click Share again."];
         [self.normalControlPanel setShareStartPending:NO];
         [self.normalControlPanel setSharingEnabled:NO];
         return;
     }
 
-    // For Window mode, show the picker first so the user can choose which window
-    if (selectedMode == InterShareModeWindow) {
-        NSWindow *parent = self.normalCallWindow;
-        if (!parent) { return; }
-
-        __weak typeof(self) weakSelf = self;
-        [InterWindowPickerPanel showPickerRelativeToWindow:parent completion:^(NSString * _Nullable selectedWindowIdentifier) {
-            if (!selectedWindowIdentifier) {
-                // User cancelled — do nothing
-                return;
-            }
-
-            [weakSelf startNormalWindowShareWithIdentifier:selectedWindowIdentifier];
-        }];
-        return;
-    }
-
-    [self startNormalShareWithMode:selectedMode windowIdentifier:nil];
+    [self presentNormalSharePicker];
 }
 
-/// Start window share after the user picked a specific window.
-- (void)startNormalWindowShareWithIdentifier:(NSString *)windowIdentifier {
-    [self startNormalShareWithMode:InterShareModeWindow windowIdentifier:windowIdentifier];
+/// Presents the unified share picker (entire-screen tiles + window grid +
+/// "Share system audio" toggle) and starts the share with the selection.
+- (void)presentNormalSharePicker {
+    NSWindow *parent = self.normalCallWindow;
+    if (!parent) { return; }
+
+    __weak typeof(self) weakSelf = self;
+    [InterWindowPickerPanel showUnifiedPickerRelativeToWindow:parent
+                                                systemAudioOn:self.normalShareSystemAudioEnabled
+                                                   completion:^(BOOL isDisplay,
+                                                                NSString * _Nullable identifier,
+                                                                BOOL shareSystemAudio) {
+        if (!identifier) { return; }   // cancelled
+        weakSelf.normalShareSystemAudioEnabled = shareSystemAudio;
+        InterShareMode mode = isDisplay ? InterShareModeEntireScreen : InterShareModeWindow;
+        [weakSelf startNormalShareWithMode:mode sourceIdentifier:identifier];
+    }];
 }
 
-/// Common path for starting a normal surface share, optionally with a pre-selected
-/// window identifier (for Window mode).
+/// Common path for starting a normal surface share with the picker's selection.
+/// `sourceIdentifier` is a CGWindowID string (Window mode) or CGDirectDisplayID
+/// string (EntireScreen mode).
 - (void)startNormalShareWithMode:(InterShareMode)shareMode
-                windowIdentifier:(NSString * _Nullable)windowIdentifier {
+                sourceIdentifier:(NSString * _Nullable)sourceIdentifier {
     [self.normalSurfaceShareController configureWithSessionKind:InterShareSessionKindNormal
                                                       shareMode:shareMode];
     [self.normalSurfaceShareController setShareSystemAudioEnabled:self.normalShareSystemAudioEnabled];
 
-    if (windowIdentifier.length > 0) {
-        self.normalSurfaceShareController.configuration.selectedWindowIdentifier = windowIdentifier;
+    if (sourceIdentifier.length > 0) {
+        if (shareMode == InterShareModeEntireScreen) {
+            self.normalSurfaceShareController.configuration.selectedDisplayIdentifier = sourceIdentifier;
+        } else {
+            self.normalSurfaceShareController.configuration.selectedWindowIdentifier = sourceIdentifier;
+        }
     }
 
     // [2.5.5] Wire network sink before starting share
@@ -3358,18 +3417,13 @@ didRequestDeleteTeamId:(NSString *)teamId {
     if (localIdentity.length > 0 && [self.speakerQueue isHandRaisedFor:localIdentity]) {
         [self.chatController lowerHand];
         [self.speakerQueue removeHandFor:localIdentity];
-        [self.normalHandRaiseButton setTitle:@"✋ Raise"];
+        [self.normalControlPanel setHandRaised:NO];
     } else {
         [self.chatController raiseHand];
         NSString *displayName = self.roomController.localParticipantName;
         [self.speakerQueue addHandWithIdentity:localIdentity displayName:displayName];
-        [self.normalHandRaiseButton setTitle:@"🖐 Lower"];
+        [self.normalControlPanel setHandRaised:YES];
     }
-    [self.normalSpeakerQueuePanel setEntries:self.speakerQueue.entries];
-}
-
-- (void)toggleNormalSpeakerQueue {
-    [self.normalSpeakerQueuePanel togglePanel];
 }
 
 // MARK: InterChatControllerDelegate
@@ -3379,6 +3433,7 @@ didRequestDeleteTeamId:(NSString *)teamId {
     [self.normalChatPanel appendMessage:message];
     if (!self.normalChatPanel.isExpanded) {
         [self.normalChatPanel setUnreadBadge:controller.unreadCount];
+        [self.normalControlPanel setChatUnread:controller.unreadCount];
     }
 }
 
@@ -3386,6 +3441,7 @@ didRequestDeleteTeamId:(NSString *)teamId {
    didUpdateUnreadCount:(NSInteger)count {
     if (!self.normalChatPanel.isExpanded) {
         [self.normalChatPanel setUnreadBadge:count];
+        [self.normalControlPanel setChatUnread:count];
     }
 }
 
@@ -3395,14 +3451,14 @@ didRequestDeleteTeamId:(NSString *)teamId {
   participantDidRaiseHand:(NSString *)identity
             displayName:(NSString *)displayName {
     [self.speakerQueue addHandWithIdentity:identity displayName:displayName];
-    [self.normalSpeakerQueuePanel setEntries:self.speakerQueue.entries];
     [self.normalRemoteLayout setHandRaised:YES forParticipant:identity];
+    [self notifyHostOfInCallRequest:[NSString stringWithFormat:@"%@ raised their hand",
+                                     displayName.length ? displayName : @"Someone"]];
 }
 
 - (void)chatController:(InterChatController *)controller
   participantDidLowerHand:(NSString *)identity {
     [self.speakerQueue removeHandFor:identity];
-    [self.normalSpeakerQueuePanel setEntries:self.speakerQueue.entries];
     [self.normalRemoteLayout setHandRaised:NO forParticipant:identity];
 
     // If the dismissed identity is our own (host lowered our hand), reset the
@@ -3410,7 +3466,7 @@ didRequestDeleteTeamId:(NSString *)teamId {
     // deriveParticipantMicButton — do NOT override it here.
     NSString *localIdentity = self.roomController.localParticipantIdentity;
     if ([identity isEqualToString:localIdentity]) {
-        [self.normalHandRaiseButton setTitle:@"✋ Raise"];
+        [self.normalControlPanel setHandRaised:NO];
     }
 }
 
@@ -3548,44 +3604,16 @@ didRequestDeleteTeamId:(NSString *)teamId {
     }];
 }
 
-// MARK: InterSpeakerQueuePanelDelegate
+// MARK: - Requests moderation logic (raised hands)
+// Routed from -handleRequestForKind:identity:approved:. The consolidated SwiftUI
+// Requests panel (More ▸ Requests) refreshes from the queue MODEL via KVO, so no
+// panel push is needed here — we mutate the queue + network + tile state only.
 
-- (void)speakerQueuePanel:(InterSpeakerQueuePanel *)panel didDismissParticipant:(NSString *)identity {
-#pragma unused(panel)
-    // Lower the hand via network so participant gets notified
+- (void)acknowledgeRaisedHandForParticipant:(NSString *)identity {
+    // Lower the hand via network so the participant gets notified.
     [self.chatController lowerHandForParticipant:identity];
     [self.speakerQueue removeHandFor:identity];
-    [self.normalSpeakerQueuePanel setEntries:self.speakerQueue.entries];
     [self.normalRemoteLayout setHandRaised:NO forParticipant:identity];
-}
-
-- (void)speakerQueuePanel:(InterSpeakerQueuePanel *)panel didAllowParticipant:(NSString *)identity {
-#pragma unused(panel)
-    // Grant a mic unlock slot via the new approval flow (replaces legacy
-    // allowToSpeak which is now a no-op). Participant's applyMicUnlockApproved
-    // takes the global-mute path: they see normal toggle buttons for one slot.
-    [self.moderationController approveMicUnlockWithIdentity:identity];
-
-    // Lower the hand via network + remove from queue
-    [self.chatController lowerHandForParticipant:identity];
-    [self.speakerQueue removeHandFor:identity];
-    [self.normalSpeakerQueuePanel setEntries:self.speakerQueue.entries];
-    [self.normalRemoteLayout setHandRaised:NO forParticipant:identity];
-    // Participant is approved to speak — flip tile menu to "Mute Mic" so the
-    // host can silence them directly if needed.
-    [self.normalRemoteLayout setHostMuted:NO forParticipant:identity];
-}
-
-- (void)speakerQueuePanelDidDismissAll:(InterSpeakerQueuePanel *)panel {
-#pragma unused(panel)
-    // Dismiss each raised hand via the network so participants get notified
-    NSArray<InterRaisedHandEntry *> *entries = [self.speakerQueue.entries copy];
-    for (InterRaisedHandEntry *entry in entries) {
-        [self.chatController lowerHandForParticipant:entry.participantIdentity];
-        [self.normalRemoteLayout setHandRaised:NO forParticipant:entry.participantIdentity];
-    }
-    [self.speakerQueue reset];
-    [self.normalSpeakerQueuePanel setEntries:self.speakerQueue.entries];
 }
 
 // MARK: Phase 8.5 — Poll Toggle & Delegate
@@ -3661,6 +3689,7 @@ didRequestDeleteTeamId:(NSString *)teamId {
         [self.normalQAWindow makeKeyAndOrderFront:nil];
         self.qaController.isQAVisible = YES;
         [self.normalQAPanel setUnreadBadge:0];
+        [self.normalControlPanel setQAUnread:0];
     }
 }
 
@@ -3696,6 +3725,7 @@ didRequestDeleteTeamId:(NSString *)teamId {
     [self.normalQAPanel setQuestions:questions];
     if (!self.normalQAWindow.isVisible) {
         [self.normalQAPanel setUnreadBadge:controller.unreadCount];
+        [self.normalControlPanel setQAUnread:controller.unreadCount];
     }
 }
 
@@ -3803,8 +3833,6 @@ didRequestDeleteTeamId:(NSString *)teamId {
             // session are not left behind when the server returns an empty list.
             [weakSelf.screenShareQueue reset];
             if (entries.count == 0) {
-                [weakSelf.normalScreenShareQueuePanel setEntries:@[]];
-                [weakSelf.normalScreenShareQueuePanel hidePanel];
                 return;
             }
             for (NSDictionary *entry in entries) {
@@ -3817,8 +3845,6 @@ didRequestDeleteTeamId:(NSString *)teamId {
                                                            timestamp:timestamp];
                 }
             }
-            [weakSelf.normalScreenShareQueuePanel setEntries:weakSelf.screenShareQueue.entries];
-            [weakSelf.normalScreenShareQueuePanel showPanel];
         });
     }] resume];
 }
@@ -3958,7 +3984,6 @@ didRequestDeleteTeamId:(NSString *)teamId {
             if (wasLocalHostMuted && !weakSelf.localMicHostMuted) {
                 [weakSelf.normalMediaWiring applyRemoteMicUnmute];
             }
-            weakSelf.normalSpeakerQueuePanel.hostMutedIdentities = [weakSelf.hostMutedParticipants copy];
         });
     }] resume];
 }
@@ -3977,22 +4002,25 @@ didRequestDeleteTeamId:(NSString *)teamId {
     NSString *endpoint = lock ? @"/room/camera-lock-one" : @"/room/camera-lift-one";
     NSURL *url = [NSURL URLWithString:[NSString stringWithFormat:@"%@%@", serverURL, endpoint]];
     if (!url) { if (completion) completion(NO); return; }
+    InterTokenService *tokenService = self.roomController.tokenService;
+    if (!tokenService) { if (completion) completion(NO); return; }
     NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
     req.timeoutInterval = 10.0;
     req.HTTPMethod = @"POST";
     [req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
-    NSString *token = self.roomController.tokenService.currentAccessToken;
-    if (token.length) {
-        [req setValue:[NSString stringWithFormat:@"Bearer %@", token] forHTTPHeaderField:@"Authorization"];
-    }
     NSDictionary *body = @{ @"roomCode": roomCode, @"callerIdentity": callerIdentity, @"targetIdentity": targetIdentity };
     req.HTTPBody = [NSJSONSerialization dataWithJSONObject:body options:0 error:nil];
-    [[[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
+    // Route through the token service so an expired host access token is silently
+    // refreshed and the request retried (mirrors the moderation HTTP path). Without
+    // this, a mid-call token expiry made Stop Video / Lock Camera silently no-op —
+    // and because the DataChannel signal is chained inside this success block, the
+    // block never reached the participant either.
+    [tokenService performAuthenticatedRequest:req completion:^(NSData *d, NSURLResponse *r, NSError *e) {
         NSHTTPURLResponse *http = (NSHTTPURLResponse *)r;
         BOOL ok = !e && (http.statusCode >= 200 && http.statusCode <= 299);
         if (!ok) NSLog(@"[CameraLock] persistCameraLock failed: %@", e.localizedDescription ?: @"non-2xx");
         if (completion) completion(ok);
-    }] resume];
+    }];
 }
 
 /// T7: Host changed screen share permission mid-meeting.
@@ -4040,8 +4068,6 @@ didRequestDeleteTeamId:(NSString *)teamId {
             // Moving away from "request" mode: clear the pending share queue.
             if ([mode isEqualToString:@"everyone"] || [mode isEqualToString:@"hostOnly"]) {
                 [weakSelf.screenShareQueue reset];
-                [weakSelf.normalScreenShareQueuePanel setEntries:@[]];
-                [weakSelf.normalScreenShareQueuePanel hidePanel];
             }
         });
     }] resume];
@@ -4171,6 +4197,7 @@ didRequestDeleteTeamId:(NSString *)teamId {
         if (!strongSelf) return;
         if (success) {
             [strongSelf.normalLobbyPanel removeWaitingParticipant:identity];
+            [strongSelf refreshLobbyWaitingBadge];
         } else {
             NSLog(@"[Phase 9] Admit failed: %@", error.localizedDescription);
         }
@@ -4185,6 +4212,7 @@ didRequestDeleteTeamId:(NSString *)teamId {
         if (!strongSelf) return;
         if (success) {
             [strongSelf.normalLobbyPanel removeWaitingParticipant:identity];
+            [strongSelf refreshLobbyWaitingBadge];
         } else {
             NSLog(@"[Phase 9] Deny failed: %@", error.localizedDescription);
         }
@@ -4199,6 +4227,7 @@ didRequestDeleteTeamId:(NSString *)teamId {
         if (!strongSelf) return;
         if (success) {
             [strongSelf.normalLobbyPanel clearWaitingList];
+            [strongSelf refreshLobbyWaitingBadge];
             NSLog(@"[Phase 9] Admitted all: %ld participants", (long)count);
         } else {
             NSLog(@"[Phase 9] Admit all failed: %@", error.localizedDescription);
@@ -4469,13 +4498,10 @@ didRequestDeleteTeamId:(NSString *)teamId {
         if (!success) return;
         __strong typeof(weakSelf) strongSelf = weakSelf;
         if (!strongSelf) return;
-        // Update lobby button badge count
-        NSUInteger count = strongSelf.moderationController.lobbyWaitingParticipants.count;
-        if (count > 0) {
-            [strongSelf.normalLobbyToggleButton setTitle:[NSString stringWithFormat:@"🚪 Lobby (%lu)", (unsigned long)count]];
-        } else {
-            [strongSelf.normalLobbyToggleButton setTitle:@"🚪 Lobby"];
-        }
+        // Update the combined More badge + "Waiting Room (n)…" row from the
+        // authoritative count (single source). Toast firing is handled by the
+        // join delegate, which the poll invokes for each newly-seen waiter.
+        [strongSelf refreshLobbyWaitingBadge];
     }];
 }
 
@@ -4507,146 +4533,14 @@ didRequestDeleteTeamId:(NSString *)teamId {
     }
 }
 
-/// Builds and shows the non-moderator participant "More" menu. Currently hosts the
-/// self-rename entry; designed as the home for future self-service items.
-- (void)showMoreMenu:(NSButton *)sender {
-    NSMenu *menu = [[NSMenu alloc] initWithTitle:@"More"];
-    if ([self.moderationController canLocalParticipantSelfRename]) {
-        [menu addItemWithTitle:@"✏️ Change My Name…" action:@selector(selfRenameAction:) keyEquivalent:@""];
-    }
-    if (menu.numberOfItems == 0) {
-        NSMenuItem *placeholder = [[NSMenuItem alloc] initWithTitle:@"No actions available"
-                                                             action:nil
-                                                      keyEquivalent:@""];
-        placeholder.enabled = NO;
-        [menu addItem:placeholder];
-    }
-    [NSMenu popUpContextMenu:menu withEvent:[NSApp currentEvent] forView:sender];
-}
-
 // MARK: - Phase 9 — Moderation Menu
 
-- (void)showModerationMenu:(NSButton *)sender {
-    NSMenu *menu = [[NSMenu alloc] initWithTitle:@"Moderation"];
-
-    // Self-service: a moderator can always change their own name (the participant "More"
-    // menu is non-moderator only, so moderators reach self-rename from here).
-    if ([self.moderationController canLocalParticipantSelfRename]) {
-        [menu addItemWithTitle:@"✏️ Change My Name…" action:@selector(selfRenameAction:) keyEquivalent:@""];
-        [menu addItem:[NSMenuItem separatorItem]];
-    }
-
-    // Mute All / Unmute All
-    if (self.moderationController.isAllMuted) {
-        [menu addItemWithTitle:@"🔊 Unmute All" action:@selector(moderationUnmuteAll) keyEquivalent:@""];
-    } else {
-        [menu addItemWithTitle:@"🔇 Mute All" action:@selector(moderationMuteAll) keyEquivalent:@""];
-    }
-
-    // Turn Off All Cameras / Allow All Cameras (mirrors Mute All, camera variant)
-    if (self.moderationController.isAllCameraMuted) {
-        [menu addItemWithTitle:@"📷 Allow All Cameras" action:@selector(moderationLiftCameraAll) keyEquivalent:@""];
-    } else {
-        [menu addItemWithTitle:@"📷 Turn Off All Cameras" action:@selector(moderationMuteCameraAll) keyEquivalent:@""];
-    }
-
-    // Stop All Screen Shares (one-shot)
-    [menu addItemWithTitle:@"🛑 Stop All Screen Shares" action:@selector(moderationStopAllScreenShares) keyEquivalent:@""];
-
-    // Disable/Enable Chat
-    if (self.moderationController.isChatDisabled) {
-        [menu addItemWithTitle:@"💬 Enable Chat" action:@selector(moderationEnableChat) keyEquivalent:@""];
-    } else {
-        [menu addItemWithTitle:@"🚫 Disable Chat" action:@selector(moderationDisableChat) keyEquivalent:@""];
-    }
-
-    // Co-host local recording toggle (host-only)
-    if (self.roomController.isHost) {
-        NSString *coHostRecordTitle = self.coHostLocalRecordingAllowed
-            ? @"🎥 Disallow Co-Host Local Recording"
-            : @"🎥 Allow Co-Host Local Recording";
-        [menu addItemWithTitle:coHostRecordTitle
-                        action:@selector(moderationToggleCoHostLocalRecording)
-                 keyEquivalent:@""];
-    }
-
-    [menu addItem:[NSMenuItem separatorItem]];
-
-    // Lock/Unlock Meeting
-    if (self.moderationController.isMeetingLocked) {
-        [menu addItemWithTitle:@"🔓 Unlock Meeting" action:@selector(moderationUnlockMeeting) keyEquivalent:@""];
-    } else {
-        [menu addItemWithTitle:@"🔒 Lock Meeting" action:@selector(moderationLockMeeting) keyEquivalent:@""];
-    }
-
-    [menu addItem:[NSMenuItem separatorItem]];
-
-    // Meeting Password — state-aware (mirrors the pre-meeting setting).
-    // When a password is set, the host can view/copy it (to share), change it, or remove it.
-    NSMenu *pwSub = [[NSMenu alloc] initWithTitle:@"Meeting Password"];
-    // "Is a password set?" is server-authoritative (roomController.activeHasPassword), so a
-    // rejoining host or a co-host — who never went through the pre-meeting panel — still see
-    // the correct items. View/Copy is offered only when the plaintext is known locally (the
-    // session that set it): the server stores a bcrypt hash and never returns the plaintext.
-    BOOL hasPlaintext = (self.currentMeetingPassword.length > 0);
-    BOOL hasPassword  = self.roomController.activeHasPassword || hasPlaintext;
-    if (hasPassword) {
-        if (hasPlaintext) {
-            [pwSub addItemWithTitle:@"👁 View / Copy Password" action:@selector(moderationViewPassword) keyEquivalent:@""];
-        }
-        [pwSub addItemWithTitle:@"✏️ Change Password…" action:@selector(moderationSetPassword) keyEquivalent:@""];
-        [pwSub addItemWithTitle:@"🗑 Remove Password" action:@selector(moderationRemovePassword) keyEquivalent:@""];
-    } else {
-        [pwSub addItemWithTitle:@"➕ Set Password…" action:@selector(moderationSetPassword) keyEquivalent:@""];
-    }
-    NSMenuItem *pwParent = [[NSMenuItem alloc] initWithTitle:@"🔑 Meeting Password" action:nil keyEquivalent:@""];
-    pwParent.submenu = pwSub;
-    [menu addItem:pwParent];
-
-    [menu addItem:[NSMenuItem separatorItem]];
-
-    // Share-conflict policy submenu (host/co-host only)
-    BOOL canModerate = [InterPermissionMatrix
-                        role:self.moderationController.localRole
-                        hasPermission:(InterPermission)InterPermissionCanMuteOthers];
-    if (canModerate) {
-        NSMenu *conflictSub = [[NSMenu alloc] initWithTitle:@"Share Takeover"];
-        NSString *currentPolicy = self.moderationController.shareConflictPolicy ?: @"oneattime";
-
-        NSMenuItem *oneItem = [[NSMenuItem alloc] initWithTitle:@"One at a Time"
-                                                         action:@selector(moderationShareConflictOneAtATime)
-                                                  keyEquivalent:@""];
-        NSMenuItem *hostItem = [[NSMenuItem alloc] initWithTitle:@"Host Can Take Over"
-                                                          action:@selector(moderationShareConflictHostCanPreempt)
-                                                   keyEquivalent:@""];
-        NSMenuItem *anyItem  = [[NSMenuItem alloc] initWithTitle:@"Anyone Can Take Over"
-                                                          action:@selector(moderationShareConflictAnyCanPreempt)
-                                                   keyEquivalent:@""];
-
-        oneItem.state  = [currentPolicy isEqualToString:@"oneattime"]      ? NSControlStateValueOn : NSControlStateValueOff;
-        hostItem.state = [currentPolicy isEqualToString:@"hostCanPreempt"] ? NSControlStateValueOn : NSControlStateValueOff;
-        anyItem.state  = [currentPolicy isEqualToString:@"anyCanPreempt"]  ? NSControlStateValueOn : NSControlStateValueOff;
-
-        [conflictSub addItem:oneItem];
-        [conflictSub addItem:hostItem];
-        [conflictSub addItem:anyItem];
-
-        NSMenuItem *conflictParent = [[NSMenuItem alloc] initWithTitle:@"📺 Share Takeover"
-                                                                action:nil
-                                                         keyEquivalent:@""];
-        conflictParent.submenu = conflictSub;
-        [menu addItem:conflictParent];
-    }
-
-    [NSMenu popUpContextMenu:menu withEvent:[NSApp currentEvent] forView:sender];
-}
 
 - (void)moderationMuteAll {
     [self.moderationController muteAllWithCompletion:^(BOOL success, NSInteger count, NSError *error) {
         if (success) {
             NSLog(@"[Phase 9] Muted %ld participants", (long)count);
             // Show "Allow" buttons in the speaker queue for raised hands
-            self.normalSpeakerQueuePanel.showAllowActions = YES;
             // Mute-All is a ROOM-WIDE cause, distinct from a per-tile host block. Set the
             // layout's globalMuteActive so the cause-derived menu shows "Allow to Speak" on
             // mute-all'd participants (NOT "Remove Mute & Ask"). We must NOT stamp
@@ -4682,8 +4576,6 @@ didRequestDeleteTeamId:(NSString *)teamId {
             weakSelf.normalRemoteLayout.globalCameraLockActive = YES;
             // Any pending camera-unlock requests are moot now that all cameras are locked.
             [weakSelf.cameraUnlockQueue reset];
-            [weakSelf.normalCameraUnlockQueuePanel setEntries:weakSelf.cameraUnlockQueue.entries];
-            [weakSelf.normalCameraUnlockQueuePanel hidePanel];
         });
     }];
 }
@@ -4775,12 +4667,9 @@ didRequestDeleteTeamId:(NSString *)teamId {
             // shows an "Allow" button if this participant raises their hand.
             [weakSelf.normalRemoteLayout setHostMuted:YES forParticipant:participantIdentity];
             [weakSelf.hostMutedParticipants addObject:participantIdentity];
-            weakSelf.normalSpeakerQueuePanel.hostMutedIdentities = [weakSelf.hostMutedParticipants copy];
             // Remove any pending mic unlock request from this participant — it is
             // now stale since they are being re-muted.
             [weakSelf.micUnlockQueue removeRequestWithIdentity:participantIdentity];
-            [weakSelf.normalMicUnlockQueuePanel setEntries:weakSelf.micUnlockQueue.entries];
-            if (weakSelf.micUnlockQueue.count == 0) [weakSelf.normalMicUnlockQueuePanel hidePanel];
         }];
 
     } else if ([actionType isEqualToString:@"allowToSpeak"]) {
@@ -4790,7 +4679,6 @@ didRequestDeleteTeamId:(NSString *)teamId {
         [self.moderationController approveMicUnlockWithIdentity:participantIdentity];
         [self.chatController lowerHandForParticipant:participantIdentity];
         [self.speakerQueue removeHandFor:participantIdentity];
-        [self.normalSpeakerQueuePanel setEntries:self.speakerQueue.entries];
         [self.normalRemoteLayout setHandRaised:NO forParticipant:participantIdentity];
 
     } else if ([actionType isEqualToString:@"askToUnmute"]) {
@@ -4821,11 +4709,11 @@ didRequestDeleteTeamId:(NSString *)teamId {
         [self.moderationController unmuteParticipantWithIdentity:participantIdentity];
         [self.normalRemoteLayout setHostMuted:NO forParticipant:participantIdentity];
         [self.hostMutedParticipants removeObject:participantIdentity];
-        self.normalSpeakerQueuePanel.hostMutedIdentities = [self.hostMutedParticipants copy];
 
-    } else if ([actionType isEqualToString:@"lockCamera"]) {
-        // "Mute Camera" — persist lock to Redis FIRST for durability, then send DataChannel signal.
-        // Participant will see "Ask to Unlock Camera" instead of a hard-disabled button.
+    } else if ([actionType isEqualToString:@"stopCamera"] || [actionType isEqualToString:@"lockCamera"]) {
+        // "Stop Video" (camera live) and "Lock camera" (enforce-lock a self/globally-off
+        // camera) are the same host action: persist a per-tile lock to Redis FIRST for
+        // durability, then send the DataChannel signal. Participant sees "Ask to Unlock".
         __weak typeof(self) weakSelf = self;
         NSString *captured = participantIdentity;
         [self persistCameraLock:YES identity:captured completion:^(BOOL success) {
@@ -4838,32 +4726,57 @@ didRequestDeleteTeamId:(NSString *)teamId {
                     // Remove any pending unlock request for this participant
                     // since the lock is being freshly applied.
                     [weakSelf.cameraUnlockQueue removeRequestWithIdentity:captured];
-                    [weakSelf.normalCameraUnlockQueuePanel setEntries:weakSelf.cameraUnlockQueue.entries];
-                    if (weakSelf.cameraUnlockQueue.count == 0) {
-                        [weakSelf.normalCameraUnlockQueuePanel hidePanel];
-                    }
                 });
             }
         }];
 
-    } else if ([actionType isEqualToString:@"liftCameraLock"]) {
+    } else if ([actionType isEqualToString:@"removeCameraLock"]) {
+        // "Remove Lock" (locked-by-host) — lift the per-tile lock ONLY. The participant can
+        // then turn their own camera on; we do NOT auto-send a request (same consent-first
+        // refinement as removeMute). The participant-side applyHostCameraLiftForParticipant
+        // is lift-only in normal mode / force-restore in interview mode.
         __weak typeof(self) weakSelf = self;
         NSString *captured = participantIdentity;
         [self persistCameraLock:NO identity:captured completion:^(BOOL success) {
             if (success) {
                 dispatch_async(dispatch_get_main_queue(), ^{
                     [weakSelf.moderationController liftCameraLockOneWithIdentity:captured];
-                    // Update the tile badge immediately — same reason as lockCamera.
+                    // Update the tile badge immediately — same reason as the lock path.
                     [weakSelf.normalRemoteLayout setIsHostCameraLocked:NO forParticipant:captured];
                     // Remove any pending unlock request for this participant.
                     [weakSelf.cameraUnlockQueue removeRequestWithIdentity:captured];
-                    [weakSelf.normalCameraUnlockQueuePanel setEntries:weakSelf.cameraUnlockQueue.entries];
-                    if (weakSelf.cameraUnlockQueue.count == 0) {
-                        [weakSelf.normalCameraUnlockQueuePanel hidePanel];
-                    }
                 });
             }
         }];
+
+    } else if ([actionType isEqualToString:@"askToTurnOnCamera"]) {
+        // Self-off participant (no host lock). Consent-first: send a REQUEST — the
+        // participant turns their own camera on (no force; camera frames require their
+        // device). The menu reads "Ask to Turn On Camera" in ALL modes for this cause,
+        // including interview: deriveCamera only force-labels the wired removeLock path, so
+        // there is no label/behavior mismatch here.
+        //
+        // TODO [migration — interview self-off camera force]: the ratified spec allows the
+        // interviewer to force-restore a camera in interview mode (Option 2), but that is
+        // intentionally NOT wired for the self-off (never-locked) case yet, because a true
+        // force MUST be accompanied by the participant-facing "host enabled your camera"
+        // indicator (spec §5 / Finding B) — which is also deferred. Wire BOTH together: a
+        // force path that publishes the interviewee's camera + the persistent indicator,
+        // then set deriveCamera's `forces` for askToTurnOn in interview and route this branch
+        // to the force instead of a request. Until then, this stays a consent request.
+        [self.moderationController askToUnmuteCameraWithIdentity:participantIdentity];
+
+    } else if ([actionType isEqualToString:@"allowCamera"]) {
+        // Lock-All cause: grant this participant a one-time camera slot (existing approve
+        // flow). approveCameraUnlock sends the signal; participant may turn camera on once.
+        //
+        // TODO [migration — host "Asked ✓" + cooldown, camera; UI work]: like the mic ask,
+        // after issuing askToTurnOnCamera / allowCamera the host gets NO delivery feedback and
+        // can re-click repeatedly, spamming the participant. Add a transient "Asked ✓" state +
+        // a short per-(tile,host) cooldown on these camera actions. Mirror the mic-side TODO;
+        // do both together. (Host still sees the live state via the tile caption/badge.)
+        [self.moderationController approveCameraUnlockWithIdentity:participantIdentity];
+        [self.cameraUnlockQueue removeRequestWithIdentity:participantIdentity];
 
     } else if ([actionType isEqualToString:@"pinForAll"]) {
         [self.moderationController addPinnedParticipantWithIdentity:participantIdentity];
@@ -4878,10 +4791,31 @@ didRequestDeleteTeamId:(NSString *)teamId {
         }];
 
     } else if ([actionType isEqualToString:@"makeCoHost"]) {
+        __weak typeof(self) weakSelf = self;
         [self.moderationController promoteParticipantWithIdentity:participantIdentity
                                                            toRole:InterParticipantRoleCoHost
                                                        completion:^(BOOL success, NSError *error) {
-            if (!success) { NSLog(@"[Moderation] makeCoHost failed for %@: %@", participantIdentity, error.localizedDescription); }
+            if (!success) {
+                NSLog(@"[Moderation] makeCoHost failed for %@: %@", participantIdentity, error.localizedDescription);
+                // The server rejects promoting a guest to co-host (TARGET_NOT_AUTHENTICATED):
+                // a moderator must have joined signed-in so their identity is bound to an
+                // account — the invariant validateModerator relies on (see /room/promote).
+                // Surface the server's guidance so the host knows to have them sign in + rejoin.
+                // TODO(SwiftUI migration): replace this NSAlert with the in-call toast/banner
+                // surface when host-controls UI is migrated (tracked in ui_migration_todos).
+                NSAlert *alert = [[NSAlert alloc] init];
+                alert.alertStyle = NSAlertStyleInformational;
+                alert.messageText = @"Can't make co-host";
+                alert.informativeText = error.localizedDescription
+                    ?: @"This participant joined as a guest. They need to sign in and rejoin to become a co-host.";
+                [alert addButtonWithTitle:@"OK"];
+                NSWindow *noticeWindow = weakSelf.normalCallWindow ?: NSApp.keyWindow;
+                if (noticeWindow) {
+                    [alert beginSheetModalForWindow:noticeWindow completionHandler:nil];
+                } else {
+                    [alert runModal];
+                }
+            }
             // Badge update is handled by moderationController:participantRoleChanged: via DataChannel echo.
         }];
 
@@ -4916,7 +4850,6 @@ didRequestDeleteTeamId:(NSString *)teamId {
         if (success) {
             NSLog(@"[Phase 9] Broadcast unmute-all request to participants");
             // Global mute session is over — hide the raise-hand gate in the queue.
-            self.normalSpeakerQueuePanel.showAllowActions = NO;
             // Clear the room-wide mute-all cause so the menu stops showing "Allow to Speak".
             // Individually-blocked tiles keep their isHostMuted (per-tile mute persists, §8.1),
             // so their menu correctly stays "Remove Mute & Ask".
@@ -4924,7 +4857,6 @@ didRequestDeleteTeamId:(NSString *)teamId {
             // Individual per-tile mutes persist after UnmuteAll (§8.1).
             // hostMutedParticipants retains those identities; update the queue
             // panel so it still shows Allow actions for their hand-raises.
-            self.normalSpeakerQueuePanel.hostMutedIdentities = [self.hostMutedParticipants copy];
         } else {
             NSLog(@"[Phase 9] Unmute all failed: %@", error.localizedDescription);
         }
@@ -5111,6 +5043,13 @@ didRequestDeleteTeamId:(NSString *)teamId {
 
 - (void)moderationController:(InterModerationController *)controller receivedCameraUnmuteRequest:(NSString *)fromIdentity displayName:(NSString *)displayName {
 #pragma unused(controller, fromIdentity)
+    // TODO [migration — persistent affordance, camera; UI work]: per spec §4.3 this should be
+    // a NON-modal, PERSISTENT affordance — the participant's OWN camera button pulses + a
+    // small "Host asked you to turn on your camera" chip stays until they act or dismiss it
+    // (dismiss is local-only, no "declined" signal). The modal below is the interim consent
+    // prompt: non-silent (satisfies "never force, always ask") but it interrupts and conflates
+    // "declined" with "never saw it". Mirror of the mic receivedUnmuteRequest: TODO; do both
+    // together in the UI redesign. Keep "participant makes the final tap".
     NSAlert *alert = [[NSAlert alloc] init];
     alert.messageText = @"Camera Request";
     alert.informativeText = [NSString stringWithFormat:@"%@ is asking you to turn your camera on.", displayName];
@@ -5126,15 +5065,20 @@ didRequestDeleteTeamId:(NSString *)teamId {
 #pragma unused(controller)
     NSLog(@"[Phase 9] Host unmuted all — restoring mic toggle ability");
     [self.normalMediaWiring applyUnmuteAll];
-    // Bug 3 fix: if we are a host who received this from a co-host, sync
-    // the Mute All toggle state and clear all tile host-mute indicators.
+    // Clear the room-wide mute-all cause for ANY moderator (host or co-host) so the
+    // cause-derived per-tile menu stops showing "Allow to Speak". Individually-blocked
+    // tiles keep their own isHostMuted. (Was previously host-only, leaving standing
+    // co-hosts with a stale menu.)
+    BOOL canModerate = [InterPermissionMatrix
+                        role:controller.localRole
+                        hasPermission:(InterPermission)InterPermissionCanMuteOthers];
+    if (canModerate) {
+        self.normalRemoteLayout.globalMuteActive = NO;
+    }
+    // Host-specific speaker-queue bookkeeping (the host owns the raise-hand gate UI).
     if (self.roomController.isHost) {
         [self.moderationController applyExternalGlobalMuteChanged:NO];
-        self.normalSpeakerQueuePanel.showAllowActions = NO;
         // Preserve individual tile-mutes — same §8.1 rule as moderationUnmuteAll.
-        self.normalSpeakerQueuePanel.hostMutedIdentities = [self.hostMutedParticipants copy];
-        // Clear the room-wide mute-all cause; individually-blocked tiles keep isHostMuted.
-        self.normalRemoteLayout.globalMuteActive = NO;
     }
 }
 
@@ -5144,16 +5088,17 @@ didRequestDeleteTeamId:(NSString *)teamId {
     [self.normalMediaWiring applyRemoteMicMute];
     // Cancel any pending mic unlock requests — they are invalidated by the new mute.
     [self.micUnlockQueue reset];
-    [self.normalMicUnlockQueuePanel setEntries:@[]];
-    [self.normalMicUnlockQueuePanel hidePanel];
-    // Bug 3 fix: if we are a host who received this from a co-host, sync
-    // the Mute All toggle state and mark all remote tiles as host-muted so
-    // the three-dot menu shows "Unmute Mic" for all participants.
+    // Set the room-wide mute-all cause for ANY moderator (host or co-host) so the
+    // cause-derived per-tile menu shows "Allow to Speak". (Was previously host-only.)
+    BOOL canModerate = [InterPermissionMatrix
+                        role:controller.localRole
+                        hasPermission:(InterPermission)InterPermissionCanMuteOthers];
+    if (canModerate) {
+        self.normalRemoteLayout.globalMuteActive = YES;
+    }
+    // Host-specific speaker-queue bookkeeping (the host owns the raise-hand gate UI).
     if (self.roomController.isHost) {
         [self.moderationController applyExternalGlobalMuteChanged:YES];
-        self.normalSpeakerQueuePanel.showAllowActions = YES;
-        // Room-wide mute-all cause — the cause-derived menu shows "Allow to Speak".
-        self.normalRemoteLayout.globalMuteActive = YES;
     }
 }
 
@@ -5187,9 +5132,8 @@ didRequestDeleteTeamId:(NSString *)teamId {
     NSString *localIdentity = self.roomController.localParticipantIdentity;
     if (localIdentity.length > 0 && [self.speakerQueue isHandRaisedFor:localIdentity]) {
         [self.speakerQueue removeHandFor:localIdentity];
-        [self.normalSpeakerQueuePanel setEntries:self.speakerQueue.entries];
     }
-    [self.normalHandRaiseButton setTitle:@"✋ Raise"];
+    [self.normalControlPanel setHandRaised:NO];
 }
 
 // [R4] Screen share request flow — participant sends request, host approves/denies.
@@ -5202,54 +5146,22 @@ didRequestDeleteTeamId:(NSString *)teamId {
                                     hasPermission:(InterPermission)InterPermissionCanMuteOthers];
     if (!canModerate) return;
     [self.screenShareQueue addRequestWithIdentity:fromIdentity displayName:displayName timestamp:[NSDate date].timeIntervalSince1970];
-    [self.normalScreenShareQueuePanel setEntries:self.screenShareQueue.entries];
-    [self.normalScreenShareQueuePanel showPanel];
+    [self notifyHostOfInCallRequest:[NSString stringWithFormat:@"%@ wants to share their screen",
+                                     displayName.length ? displayName : @"Someone"]];
 }
 
-// MARK: - InterScreenShareQueuePanelDelegate
+// MARK: - Requests moderation logic (screen-share requests)
 
-- (void)screenShareQueuePanel:(InterScreenShareQueuePanel *)panel
-        didApproveParticipant:(NSString *)identity {
-#pragma unused(panel)
+- (void)approveScreenShareRequestForParticipant:(NSString *)identity {
     [self.screenShareQueue removeRequestWithIdentity:identity];
-    [self.normalScreenShareQueuePanel setEntries:self.screenShareQueue.entries];
-    if (self.screenShareQueue.entries.count == 0) [self.normalScreenShareQueuePanel hidePanel];
     [self.moderationController approveScreenShareWithIdentity:identity];
     [self resolveScreenShareRequest:identity approved:YES];
 }
 
-- (void)screenShareQueuePanel:(InterScreenShareQueuePanel *)panel
-          didDenyParticipant:(NSString *)identity {
-#pragma unused(panel)
+- (void)denyScreenShareRequestForParticipant:(NSString *)identity {
     [self.screenShareQueue removeRequestWithIdentity:identity];
-    [self.normalScreenShareQueuePanel setEntries:self.screenShareQueue.entries];
-    if (self.screenShareQueue.entries.count == 0) [self.normalScreenShareQueuePanel hidePanel];
     [self.moderationController denyScreenShareWithIdentity:identity];
     [self resolveScreenShareRequest:identity approved:NO];
-}
-
-- (void)screenShareQueuePanelDidApproveAll:(InterScreenShareQueuePanel *)panel {
-#pragma unused(panel)
-    NSArray<InterScreenShareEntry *> *entries = [self.screenShareQueue.entries copy];
-    for (InterScreenShareEntry *entry in entries) {
-        [self.moderationController approveScreenShareWithIdentity:entry.participantIdentity];
-        [self resolveScreenShareRequest:entry.participantIdentity approved:YES];
-    }
-    [self.screenShareQueue reset];
-    [self.normalScreenShareQueuePanel setEntries:@[]];
-    [self.normalScreenShareQueuePanel hidePanel];
-}
-
-- (void)screenShareQueuePanelDidDenyAll:(InterScreenShareQueuePanel *)panel {
-#pragma unused(panel)
-    NSArray<InterScreenShareEntry *> *entries = [self.screenShareQueue.entries copy];
-    for (InterScreenShareEntry *entry in entries) {
-        [self.moderationController denyScreenShareWithIdentity:entry.participantIdentity];
-        [self resolveScreenShareRequest:entry.participantIdentity approved:NO];
-    }
-    [self.screenShareQueue reset];
-    [self.normalScreenShareQueuePanel setEntries:@[]];
-    [self.normalScreenShareQueuePanel hidePanel];
 }
 
 /// Best-effort server call to remove a resolved request from Redis ZSET.
@@ -5287,15 +5199,11 @@ didRequestDeleteTeamId:(NSString *)teamId {
     }] resume];
 }
 
-// MARK: - InterCameraUnlockQueuePanelDelegate
+// MARK: - Requests moderation logic (camera-unlock requests)
 
-- (void)cameraUnlockQueuePanel:(InterCameraUnlockQueuePanel *)panel
-         didApproveParticipant:(NSString *)identity {
-#pragma unused(panel)
+- (void)approveCameraUnlockRequestForParticipant:(NSString *)identity {
     // Remove from queue immediately so the UI stays responsive.
     [self.cameraUnlockQueue removeRequestWithIdentity:identity];
-    [self.normalCameraUnlockQueuePanel setEntries:self.cameraUnlockQueue.entries];
-    if (self.cameraUnlockQueue.count == 0) [self.normalCameraUnlockQueuePanel hidePanel];
     // Persist to Redis first; only then send the DataChannel approval and clear the tile badge.
     // Always proceed even on Redis failure (best-effort) so the participant is not left locked.
     // We send `approveCameraUnlock` (NOT liftCameraLockOne), mirroring the mic flow's
@@ -5313,53 +5221,15 @@ didRequestDeleteTeamId:(NSString *)teamId {
     }];
 }
 
-- (void)cameraUnlockQueuePanel:(InterCameraUnlockQueuePanel *)panel
-           didDenyParticipant:(NSString *)identity {
-#pragma unused(panel)
+- (void)denyCameraUnlockRequestForParticipant:(NSString *)identity {
     // Notify the participant so they can clear their pending-request flag.
     [self.moderationController denyCameraUnlockWithIdentity:identity];
     [self.cameraUnlockQueue removeRequestWithIdentity:identity];
-    [self.normalCameraUnlockQueuePanel setEntries:self.cameraUnlockQueue.entries];
-    if (self.cameraUnlockQueue.count == 0) [self.normalCameraUnlockQueuePanel hidePanel];
 }
 
-- (void)cameraUnlockQueuePanelDidApproveAll:(InterCameraUnlockQueuePanel *)panel {
-#pragma unused(panel)
-    NSArray<InterCameraUnlockEntry *> *entries = [self.cameraUnlockQueue.entries copy];
-    // Clear queue and hide panel immediately.
-    [self.cameraUnlockQueue reset];
-    [self.normalCameraUnlockQueuePanel setEntries:@[]];
-    [self.normalCameraUnlockQueuePanel hidePanel];
-    // Persist each lift to Redis first, then signal + update tile badge in the completion.
-    __weak typeof(self) weakSelf = self;
-    for (InterCameraUnlockEntry *entry in entries) {
-        NSString *pid = entry.participantIdentity;
-        [self persistCameraLock:NO identity:pid completion:^(BOOL success) {
-#pragma unused(success)
-            dispatch_async(dispatch_get_main_queue(), ^{
-                [weakSelf.moderationController liftCameraLockOneWithIdentity:pid];
-                [weakSelf.normalRemoteLayout setIsHostCameraLocked:NO forParticipant:pid];
-            });
-        }];
-    }
-}
+// MARK: - Requests moderation logic (mic-unlock requests)
 
-- (void)cameraUnlockQueuePanelDidDenyAll:(InterCameraUnlockQueuePanel *)panel {
-#pragma unused(panel)
-    NSArray<InterCameraUnlockEntry *> *entries = [self.cameraUnlockQueue.entries copy];
-    for (InterCameraUnlockEntry *entry in entries) {
-        [self.moderationController denyCameraUnlockWithIdentity:entry.participantIdentity];
-    }
-    [self.cameraUnlockQueue reset];
-    [self.normalCameraUnlockQueuePanel setEntries:@[]];
-    [self.normalCameraUnlockQueuePanel hidePanel];
-}
-
-// MARK: - InterMicUnlockQueuePanelDelegate
-
-- (void)micUnlockQueuePanel:(InterMicUnlockQueuePanel *)panel
-    didApproveParticipant:(NSString *)identity {
-#pragma unused(panel)
+- (void)approveMicUnlockRequestForParticipant:(NSString *)identity {
     // Send approval signal to participant.
     [self.moderationController approveMicUnlockWithIdentity:identity];
     // Only lift tile badge and hostMutedParticipants when mute-all is NOT active.
@@ -5371,84 +5241,31 @@ didRequestDeleteTeamId:(NSString *)teamId {
     if (!self.moderationController.isAllMuted) {
         [self.normalRemoteLayout setHostMuted:NO forParticipant:identity];
         [self.hostMutedParticipants removeObject:identity];
-        self.normalSpeakerQueuePanel.hostMutedIdentities = [self.hostMutedParticipants copy];
     }
     // Remove from queue.
     [self.micUnlockQueue removeRequestWithIdentity:identity];
-    [self.normalMicUnlockQueuePanel setEntries:self.micUnlockQueue.entries];
-    if (self.micUnlockQueue.count == 0) [self.normalMicUnlockQueuePanel hidePanel];
 }
 
-- (void)micUnlockQueuePanel:(InterMicUnlockQueuePanel *)panel
-       didDenyParticipant:(NSString *)identity {
-#pragma unused(panel)
+- (void)denyMicUnlockRequestForParticipant:(NSString *)identity {
     // Notify the participant so they can clear their pending-request flag.
     [self.moderationController denyMicUnlockWithIdentity:identity];
     [self.micUnlockQueue removeRequestWithIdentity:identity];
-    [self.normalMicUnlockQueuePanel setEntries:self.micUnlockQueue.entries];
-    if (self.micUnlockQueue.count == 0) [self.normalMicUnlockQueuePanel hidePanel];
-}
-
-- (void)micUnlockQueuePanelDidApproveAll:(InterMicUnlockQueuePanel *)panel {
-#pragma unused(panel)
-    BOOL muteAllActive = self.moderationController.isAllMuted;
-    NSArray<InterMicUnlockEntry *> *entries = [self.micUnlockQueue.entries copy];
-    for (InterMicUnlockEntry *entry in entries) {
-        [self.moderationController approveMicUnlockWithIdentity:entry.participantIdentity];
-        // Same guard as single-approve: only lift per-tile state when mute-all
-        // is not active, to avoid corrupting the F1 filter state.
-        if (!muteAllActive) {
-            [self.normalRemoteLayout setHostMuted:NO forParticipant:entry.participantIdentity];
-            [self.hostMutedParticipants removeObject:entry.participantIdentity];
-        }
-    }
-    if (!muteAllActive) {
-        self.normalSpeakerQueuePanel.hostMutedIdentities = [self.hostMutedParticipants copy];
-    }
-    [self.micUnlockQueue reset];
-    [self.normalMicUnlockQueuePanel setEntries:@[]];
-    [self.normalMicUnlockQueuePanel hidePanel];
-}
-
-- (void)micUnlockQueuePanelDidDenyAll:(InterMicUnlockQueuePanel *)panel {
-#pragma unused(panel)
-    NSArray<InterMicUnlockEntry *> *entries = [self.micUnlockQueue.entries copy];
-    for (InterMicUnlockEntry *entry in entries) {
-        [self.moderationController denyMicUnlockWithIdentity:entry.participantIdentity];
-    }
-    [self.micUnlockQueue reset];
-    [self.normalMicUnlockQueuePanel setEntries:@[]];
-    [self.normalMicUnlockQueuePanel hidePanel];
 }
 
 - (void)moderationControllerScreenShareRequestApproved:(InterModerationController *)controller {
 #pragma unused(controller)
     self.normalShareRequestPending = NO;
     [self.normalControlPanel setShareStartPending:NO];
-    [self.normalControlPanel setShareStatusText:@"Screen share approved — starting..."];
+    [self.normalControlPanel setShareStatusText:@"Screen share approved — choose what to share..."];
 
     // Now actually start the share on behalf of the participant.
-    InterShareMode selectedMode = self.normalControlPanel.selectedShareMode;
-
-    BOOL requiresScreenRecordingPermission = (selectedMode == InterShareModeWindow ||
-                                              selectedMode == InterShareModeEntireScreen);
-    if (requiresScreenRecordingPermission && ![InterScreenCaptureVideoSource preflightScreenCaptureAccess]) {
+    if (![InterScreenCaptureVideoSource preflightScreenCaptureAccess]) {
         (void)[InterScreenCaptureVideoSource requestScreenCaptureAccessIfNeeded];
         [self.normalControlPanel setShareStatusText:@"Screen recording permission is required. Enable it in System Settings."];
         return;
     }
 
-    if (selectedMode == InterShareModeWindow) {
-        NSWindow *parent = self.normalCallWindow;
-        if (!parent) return;
-        __weak typeof(self) weakSelf = self;
-        [InterWindowPickerPanel showPickerRelativeToWindow:parent completion:^(NSString *selectedWindowIdentifier) {
-            if (!selectedWindowIdentifier) return;
-            [weakSelf startNormalWindowShareWithIdentifier:selectedWindowIdentifier];
-        }];
-    } else {
-        [self startNormalShareWithMode:selectedMode windowIdentifier:nil];
-    }
+    [self presentNormalSharePicker];
 }
 
 - (void)moderationControllerScreenShareRequestDenied:(InterModerationController *)controller {
@@ -5526,6 +5343,14 @@ didRequestDeleteTeamId:(NSString *)teamId {
 #pragma unused(controller)
     // Host locked ALL cameras off — apply to our local camera.
     [self.normalMediaWiring applyHostCameraMuteForAll];
+    // Sync the room-wide lock-all cause for ANY moderator (host or co-host) so the
+    // cause-derived camera menu shows "Allow Camera" (mirror of the mic mute-all path).
+    BOOL canModerate = [InterPermissionMatrix
+                        role:controller.localRole
+                        hasPermission:(InterPermission)InterPermissionCanMuteOthers];
+    if (canModerate) {
+        self.normalRemoteLayout.globalCameraLockActive = YES;
+    }
 }
 
 - (void)moderationControllerReceivedCameraLiftOne:(InterModerationController *)controller {
@@ -5538,6 +5363,12 @@ didRequestDeleteTeamId:(NSString *)teamId {
 #pragma unused(controller)
     // Host lifted camera lock for everyone — apply to our local camera.
     [self.normalMediaWiring applyHostCameraLiftForAll];
+    BOOL canModerate = [InterPermissionMatrix
+                        role:controller.localRole
+                        hasPermission:(InterPermission)InterPermissionCanMuteOthers];
+    if (canModerate) {
+        self.normalRemoteLayout.globalCameraLockActive = NO;
+    }
 }
 
 - (void)moderationController:(InterModerationController *)controller
@@ -5565,8 +5396,8 @@ didRequestDeleteTeamId:(NSString *)teamId {
     if (!canModerate) return;
     // A locked participant is requesting camera unlock — show in the panel.
     [self.cameraUnlockQueue addRequestWithIdentity:fromIdentity displayName:displayName];
-    [self.normalCameraUnlockQueuePanel setEntries:self.cameraUnlockQueue.entries];
-    [self.normalCameraUnlockQueuePanel showPanel];
+    [self notifyHostOfInCallRequest:[NSString stringWithFormat:@"%@ asked to turn on their camera",
+                                     displayName.length ? displayName : @"Someone"]];
 }
 
 - (void)moderationController:(InterModerationController *)controller
@@ -5583,8 +5414,8 @@ didRequestDeleteTeamId:(NSString *)teamId {
         return;
     }
     [self.micUnlockQueue addRequestWithIdentity:fromIdentity displayName:displayName];
-    [self.normalMicUnlockQueuePanel setEntries:self.micUnlockQueue.entries];
-    [self.normalMicUnlockQueuePanel showPanel];
+    [self notifyHostOfInCallRequest:[NSString stringWithFormat:@"%@ asked to unmute",
+                                     displayName.length ? displayName : @"Someone"]];
 }
 
 - (void)moderationControllerCameraUnlockApproved:(InterModerationController *)controller {
@@ -5625,8 +5456,6 @@ didRequestDeleteTeamId:(NSString *)teamId {
     // If moving away from "request", clear the pending queue locally
     if ([mode isEqualToString:@"everyone"] || [mode isEqualToString:@"hostOnly"]) {
         [self.screenShareQueue reset];
-        [self.normalScreenShareQueuePanel setEntries:@[]];
-        [self.normalScreenShareQueuePanel hidePanel];
     }
 }
 
@@ -5710,6 +5539,15 @@ didRequestDeleteTeamId:(NSString *)teamId {
         // When becoming a moderator mid-meeting, mark existing host tiles so the
         // tile menu shows only pin/unpin for the host participant.
         if (canModerate) {
+            // Sync the room-wide moderation cause flags onto the layout so a co-host
+            // promoted DURING an active Mute-All / camera Lock-All sees the correct
+            // cause-derived menu ("Allow to Speak" / "Allow Camera") instead of
+            // "Mute Mic" / "Stop Video". isAllMuted/isAllCameraMuted are the controller's
+            // authoritative global state (kept accurate for all clients via the receive
+            // path), so this is correct whether the restriction was set before or after
+            // this user was promoted.
+            self.normalRemoteLayout.globalMuteActive = self.moderationController.isAllMuted;
+            self.normalRemoteLayout.globalCameraLockActive = self.moderationController.isAllCameraMuted;
             for (NSDictionary<NSString *, NSString *> *p in [self.roomController remoteParticipantList]) {
                 NSString *pid = p[@"identity"];
                 if (!pid.length) continue;
@@ -5745,23 +5583,10 @@ didRequestDeleteTeamId:(NSString *)teamId {
                                  hasPermission:(InterPermission)InterPermissionCanStartRecording];
             [self.normalControlPanel setRecordingButtonHidden:!canRecordNow];
         }
-        // Manage queue, lobby, and moderation buttons on promotion/demotion.
-        // _ensureModerationToolbarInView: is safe to call even when buttons exist —
-        // it only creates them if they are nil.  After that, explicitly
-        // show or hide so re-promotion after a demotion works correctly.
-        if (nowCoHostOrHost) {
-            [self _ensureModerationToolbarInView:self.normalCallWindow.contentView
-                                          queueX:600.0
-                                          lobbyX:700.0];
-            [self.normalQueueToggleButton setHidden:NO];
-            [self.normalLobbyToggleButton setHidden:NO];
-            [self.normalModerationButton setHidden:NO];
-        } else {
-            // Demoted from co-host — hide moderator-only toolbar buttons.
-            [self.normalQueueToggleButton setHidden:YES];
-            [self.normalLobbyToggleButton setHidden:YES];
-            [self.normalModerationButton setHidden:YES];
-        }
+        // Manage moderation chrome (More-menu items + Requests) on promotion/demotion.
+        [self.normalControlPanel setModerationVisible:nowCoHostOrHost];
+        [self.normalControlPanel setRenameVisible:(!nowCoHostOrHost &&
+            [self.moderationController canLocalParticipantSelfRename])];
         if (self.normalLobbyPanel) {
             [self.normalLobbyPanel setLobbyToggleEnabled:self.roomController.isHost];
         }
@@ -5864,6 +5689,12 @@ didRequestDeleteTeamId:(NSString *)teamId {
     if (self.normalLobbyPanel) {
         [self.normalLobbyPanel addWaitingParticipant:identity displayName:displayName];
     }
+    // Instant badge update — don't wait for the 4s poll. Single source of truth:
+    // the controller's lobbyWaitingParticipants count.
+    [self refreshLobbyWaitingBadge];
+    // Transient toast for the host/co-host (the controller only fires this
+    // delegate for newly-seen waiters, so no de-dupe needed here).
+    [self presentLobbyToastForNewWaiter:displayName];
 }
 
 - (void)moderationController:(InterModerationController *)controller lobbyParticipantLeft:(NSString *)identity {
@@ -5873,9 +5704,87 @@ didRequestDeleteTeamId:(NSString *)teamId {
     if (self.normalLobbyPanel) {
         [self.normalLobbyPanel removeWaitingParticipant:identity];
     }
+    [self refreshLobbyWaitingBadge];
+}
+
+/// Push the authoritative lobby-waiting count to the bar (drives the combined
+/// More badge + "Waiting Room (n)…" row) and dismiss the toast once the lobby
+/// empties. Single source: moderationController.lobbyWaitingParticipants.
+- (void)refreshLobbyWaitingBadge {
+    NSUInteger count = self.moderationController.lobbyWaitingParticipants.count;
+    [self.normalControlPanel setLobbyWaitingCount:(NSInteger)count];
+    if (count == 0) {
+        [self.normalLobbyToast dismiss];
+    }
+}
+
+/// Show the bottom-left arrival toast when a new waiter appears — but only for
+/// moderators who can admit, and never while the Waiting Room panel is already
+/// open in front of the host (they're looking at it). Coalesces into one banner.
+- (void)presentLobbyToastForNewWaiter:(NSString *)displayName {
+    if (!self.moderationController || !self.normalLobbyToast) return;
+    BOOL canAdmit = [InterPermissionMatrix role:self.moderationController.localRole
+                                  hasPermission:(InterPermission)InterPermissionCanAdmitFromLobby];
+    if (!canAdmit) return;
+    if (self.normalLobbyWindow && self.normalLobbyWindow.isVisible) return;
+
+    NSUInteger count = self.moderationController.lobbyWaitingParticipants.count;
+    NSString *message;
+    if (count <= 1) {
+        NSString *name = (displayName.length > 0) ? displayName : @"Someone";
+        message = [NSString stringWithFormat:@"%@ is waiting to join", name];
+    } else {
+        message = [NSString stringWithFormat:@"%lu people are waiting to join", (unsigned long)count];
+    }
+    [self.normalLobbyToast showWithMessage:message];
+}
+
+/// Soft bottom-left toast notifying the host/co-host that a new in-call request
+/// arrived (raise hand, screen share, mic/camera unlock). Gated on moderator
+/// permission so non-moderators never see it. The "Open" action surfaces the
+/// consolidated Requests panel.
+- (void)notifyHostOfInCallRequest:(NSString *)message {
+    if (!self.normalRequestToast || message.length == 0) return;
+    BOOL canModerate = [InterPermissionMatrix role:self.moderationController.localRole
+                                    hasPermission:(InterPermission)InterPermissionCanMuteOthers];
+    if (!canModerate) return;
+    [self.normalRequestToast showWithMessage:message];
 }
 
 #pragma mark - Recording (Phase 10)
+
+/// Shared local-recording starter: presents the minimal layout choice (Automatic /
+/// Speaker view), seeds the participants already present so the composed recording
+/// engages gallery/grid correctly from the first frame, then starts local recording.
+- (void)beginNormalLocalRecordingWithTier:(NSString *)tier {
+    InterRecordingCoordinator *coordinator = self.normalRecordingCoordinator;
+    if (!coordinator || !self.normalMediaController || !self.normalSurfaceShareController) return;
+
+    // Minimal layout choice (default Automatic). Automatic = gallery for 3+, side-by-side
+    // for 2, full for 1; Speaker view keeps the active speaker prominent + local self-view.
+    NSAlert *viewAlert = [[NSAlert alloc] init];
+    viewAlert.messageText = @"Recording View";
+    viewAlert.informativeText = @"Automatic shows everyone (gallery for 3+ participants). "
+                                 @"Speaker view follows the active speaker.";
+    [viewAlert addButtonWithTitle:@"Automatic"];     // NSAlertFirstButtonReturn (default)
+    [viewAlert addButtonWithTitle:@"Speaker View"];  // NSAlertSecondButtonReturn
+    viewAlert.alertStyle = NSAlertStyleInformational;
+    NSModalResponse layoutResp = [viewAlert runModal];
+    coordinator.preferredLayout = (layoutResp == NSAlertSecondButtonReturn)
+        ? InterRecordingLayoutPreferenceSpeaker
+        : InterRecordingLayoutPreferenceAuto;
+
+    // Seed participants already present. Presence join callbacks only fire for
+    // participants who join AFTER recording starts, so existing ones must be seeded
+    // explicitly or grid/gallery would never engage for them (the freeze cause).
+    NSArray<NSString *> *seed = [self.roomController.subscriber recordingSeedParticipantIdentities] ?: @[];
+
+    [coordinator startLocalRecordingWithScreenShareSource:self.normalSurfaceShareController
+                                               subscriber:self.roomController.subscriber
+                                      localMediaController:self.normalMediaController
+                                                 userTier:tier
+                                     existingParticipants:seed];
+}
 
 - (void)handleRecordToggle {
     InterRecordingCoordinator *coordinator = self.normalRecordingCoordinator;
@@ -5908,10 +5817,7 @@ didRequestDeleteTeamId:(NSString *)teamId {
                 [blocked runModal];
                 return;
             }
-            [coordinator startLocalRecordingWithScreenShareSource:self.normalSurfaceShareController
-                                                       subscriber:self.roomController.subscriber
-                                              localMediaController:self.normalMediaController
-                                                         userTier:tier];
+            [self beginNormalLocalRecordingWithTier:tier];
             return;
         }
 
@@ -5937,10 +5843,7 @@ didRequestDeleteTeamId:(NSString *)teamId {
                 [blocked runModal];
                 return;
             }
-            [coordinator startLocalRecordingWithScreenShareSource:self.normalSurfaceShareController
-                                                       subscriber:self.roomController.subscriber
-                                              localMediaController:self.normalMediaController
-                                                         userTier:tier];
+            [self beginNormalLocalRecordingWithTier:tier];
         } else if (response == NSAlertSecondButtonReturn) {
             // Cloud recording via Egress
             NSString *serverURL = self.roomController.tokenServerURL;
@@ -6186,257 +6089,79 @@ didRequestDeleteTeamId:(NSString *)teamId {
     [self launchSetupUI];
 }
 
-#pragma mark - Diagnostics [3.4.5]
-
-/// [B1] Trampoline: gesture recognizer target must be self; forward to wiring controller.
-- (void)forwardDiagnosticTripleClick:(NSClickGestureRecognizer *)recognizer {
-#pragma unused(recognizer)
-    [self.normalMediaWiring handleDiagnosticTripleClick];
-}
-
 #pragma mark - Settings
 
 - (void)openSettingsWindow {
-    // Rebuild every time so calendar status is always fresh.
-    if (self.settingsWindow) {
-        [self.settingsWindow orderOut:nil];
-        self.settingsWindow = nil;
-        self.settingsGoogleButton = nil;
-        self.settingsOutlookButton = nil;
-        self.settingsGoogleStatusLabel = nil;
-        self.settingsOutlookStatusLabel = nil;
+    InterTokenService *ts = self.roomController.tokenService;
+    if (!self.settingsWindow) {
+        // Unified SwiftUI settings window (account + meetings + devices). Self-
+        // contained: it talks to the server through the token service directly.
+        self.settingsHostView =
+            [[InterSettingsHostView alloc] initWithFrame:NSMakeRect(0, 0, 820, 560)
+                                            tokenService:ts
+                                         mediaController:self.normalMediaController];
+
+        __weak typeof(self) weakSelf = self;
+        self.settingsHostView.onSignOut = ^{
+            [weakSelf.settingsWindow orderOut:nil];
+            [weakSelf handleLogout];
+        };
+        self.settingsHostView.onAccountDeleted = ^{
+            // Dismiss and navigate back to the login screen — same as sign-out.
+            [weakSelf.settingsWindow orderOut:nil];
+            [weakSelf handleLogout];
+        };
+        // Signed-out gate on the ACCOUNT tabs — route to the login window.
+        self.settingsHostView.onSignIn = ^{ [weakSelf handleSignIn]; };
+        self.settingsHostView.onSignUp = ^{ [weakSelf handleSignUp]; };
+
+        self.settingsWindow =
+            [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 820, 560)
+                                        styleMask:(NSWindowStyleMaskTitled |
+                                                   NSWindowStyleMaskClosable |
+                                                   NSWindowStyleMaskResizable)
+                                          backing:NSBackingStoreBuffered
+                                            defer:NO];
+        [self.settingsWindow setTitle:@"Settings"]; // Mission Control/⌘-Tab label; not drawn
+        [self.settingsWindow setMinSize:NSMakeSize(720, 480)];
+        [self.settingsWindow setSharingType:InterWindowSharingType()];
+        // Seamless chrome (canonical migrated-screen treatment).
+        [InterWindowChrome applySeamlessChromeTo:self.settingsWindow];
+        [self.settingsWindow setReleasedWhenClosed:NO];
+        [self.settingsWindow setContentView:self.settingsHostView];
+        [self.settingsWindow setDelegate:self];
+        self.settingsHostView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+        [self.settingsWindow center];
     }
 
-    self.settingsWindow =
-        [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 420, 470)
-                                    styleMask:(NSWindowStyleMaskTitled |
-                                               NSWindowStyleMaskClosable)
-                                      backing:NSBackingStoreBuffered
-                                        defer:NO];
-    [self.settingsWindow setTitle:@"Settings"];
-    [self.settingsWindow setSharingType:InterWindowSharingType()];
-    [self.settingsWindow setReleasedWhenClosed:NO];
-
-    NSView *cv = self.settingsWindow.contentView;
-    CGFloat w = 420.0;
-
-    // ---- Section: Meeting -------------------------------------------------
-    // (Lives in the extra headroom at the top; existing sections below are
-    //  anchored bottom-left and keep their positions unchanged.)
-    NSTextField *meetingHeader = [NSTextField labelWithString:@"Meeting"];
-    meetingHeader.frame = NSMakeRect(20, 438, 200, 20);
-    meetingHeader.font  = [NSFont boldSystemFontOfSize:13];
-    [cv addSubview:meetingHeader];
-
-    NSTextField *meetingSub = [NSTextField labelWithString:@"Defaults applied when you start a meeting"];
-    meetingSub.frame = NSMakeRect(20, 420, w - 40, 14);
-    meetingSub.font  = [NSFont systemFontOfSize:11];
-    meetingSub.textColor = [NSColor secondaryLabelColor];
-    [cv addSubview:meetingSub];
-
-    NSButton *defaultsButton = [[NSButton alloc] initWithFrame:NSMakeRect(w - 180, 408, 160, 28)];
-    [defaultsButton setTitle:@"Default Settings…"];
-    [defaultsButton setBezelStyle:NSBezelStyleRounded];
-    [defaultsButton setTarget:self];
-    [defaultsButton setAction:@selector(openMeetingDefaultsEditor)];
-    [cv addSubview:defaultsButton];
-
-    NSBox *meetingSep = [[NSBox alloc] initWithFrame:NSMakeRect(20, 398, w - 40, 1)];
-    meetingSep.boxType = NSBoxSeparator;
-    [cv addSubview:meetingSep];
-
-    // ---- Section: Account -------------------------------------------------
-    NSTextField *accountHeader = [NSTextField labelWithString:@"Account"];
-    accountHeader.frame = NSMakeRect(20, 350, 200, 20);
-    accountHeader.font  = [NSFont boldSystemFontOfSize:13];
-    [cv addSubview:accountHeader];
-
-    NSString *signedInEmail = self.roomController.tokenService.currentEmail ?: @"Not signed in";
-    NSTextField *emailLabel = [NSTextField labelWithString:signedInEmail];
-    emailLabel.frame = NSMakeRect(20, 328, w - 40, 16);
-    emailLabel.font  = [NSFont monospacedSystemFontOfSize:11 weight:NSFontWeightRegular];
-    emailLabel.textColor = [NSColor secondaryLabelColor];
-    emailLabel.lineBreakMode = NSLineBreakByTruncatingMiddle;
-    [cv addSubview:emailLabel];
-
-    NSButton *accountSettingsButton = [[NSButton alloc] initWithFrame:NSMakeRect(w - 160, 292, 140, 28)];
-    [accountSettingsButton setTitle:@"Account Settings\u2026"];
-    [accountSettingsButton setBezelStyle:NSBezelStyleRounded];
-    [accountSettingsButton setTarget:self];
-    [accountSettingsButton setAction:@selector(openAccountSettingsWindow)];
-    [cv addSubview:accountSettingsButton];
-
-    NSBox *accountSep = [[NSBox alloc] initWithFrame:NSMakeRect(20, 280, w - 40, 1)];
-    accountSep.boxType = NSBoxSeparator;
-    [cv addSubview:accountSep];
-
-    // ---- Section: Calendar Sync -------------------------------------------
-    NSTextField *calHeader = [NSTextField labelWithString:@"Calendar Sync"];
-    calHeader.frame = NSMakeRect(20, 250, 200, 20);
-    calHeader.font  = [NSFont boldSystemFontOfSize:13];
-    [cv addSubview:calHeader];
-
-    // Google row
-    NSTextField *googleLabel = [NSTextField labelWithString:@"Google Calendar"];
-    googleLabel.frame = NSMakeRect(20, 218, 160, 18);
-    googleLabel.font = [NSFont systemFontOfSize:12];
-    [cv addSubview:googleLabel];
-
-    self.settingsGoogleStatusLabel = [NSTextField labelWithString:@"Checking…"];
-    self.settingsGoogleStatusLabel.frame = NSMakeRect(20, 200, 200, 14);
-    self.settingsGoogleStatusLabel.font = [NSFont systemFontOfSize:11];
-    self.settingsGoogleStatusLabel.textColor = [NSColor secondaryLabelColor];
-    [cv addSubview:self.settingsGoogleStatusLabel];
-
-    self.settingsGoogleButton = [[NSButton alloc] initWithFrame:NSMakeRect(w - 120, 212, 100, 28)];
-    [self.settingsGoogleButton setTitle:@"Connect"];
-    [self.settingsGoogleButton setBezelStyle:NSBezelStyleRounded];
-    [self.settingsGoogleButton setTarget:self];
-    [self.settingsGoogleButton setAction:@selector(handleGoogleCalendarButtonTapped:)];
-    [cv addSubview:self.settingsGoogleButton];
-
-    // Separator
-    NSBox *calSep = [[NSBox alloc] initWithFrame:NSMakeRect(20, 194, w - 40, 1)];
-    calSep.boxType = NSBoxSeparator;
-    [cv addSubview:calSep];
-
-    // Outlook row
-    NSTextField *outlookLabel = [NSTextField labelWithString:@"Outlook Calendar"];
-    outlookLabel.frame = NSMakeRect(20, 170, 160, 18);
-    outlookLabel.font = [NSFont systemFontOfSize:12];
-    [cv addSubview:outlookLabel];
-
-    self.settingsOutlookStatusLabel = [NSTextField labelWithString:@"Checking…"];
-    self.settingsOutlookStatusLabel.frame = NSMakeRect(20, 152, 200, 14);
-    self.settingsOutlookStatusLabel.font = [NSFont systemFontOfSize:11];
-    self.settingsOutlookStatusLabel.textColor = [NSColor secondaryLabelColor];
-    [cv addSubview:self.settingsOutlookStatusLabel];
-
-    self.settingsOutlookButton = [[NSButton alloc] initWithFrame:NSMakeRect(w - 120, 164, 100, 28)];
-    [self.settingsOutlookButton setTitle:@"Connect"];
-    [self.settingsOutlookButton setBezelStyle:NSBezelStyleRounded];
-    [self.settingsOutlookButton setTarget:self];
-    [self.settingsOutlookButton setAction:@selector(handleOutlookCalendarButtonTapped:)];
-    [cv addSubview:self.settingsOutlookButton];
-
-    // ---- Section separator ------------------------------------------------
-    NSBox *teamsSep = [[NSBox alloc] initWithFrame:NSMakeRect(20, 142, w - 40, 1)];
-    teamsSep.boxType = NSBoxSeparator;
-    [cv addSubview:teamsSep];
-
-    // ---- Section: Teams ---------------------------------------------------
-    NSTextField *teamsHeader = [NSTextField labelWithString:@"Teams"];
-    teamsHeader.frame = NSMakeRect(20, 114, 200, 20);
-    teamsHeader.font  = [NSFont boldSystemFontOfSize:13];
-    [cv addSubview:teamsHeader];
-
-    NSButton *teamsButton = [[NSButton alloc] initWithFrame:NSMakeRect(w - 150, 108, 130, 28)];
-    [teamsButton setTitle:@"Manage Teams…"];
-    [teamsButton setBezelStyle:NSBezelStyleRounded];
-    [teamsButton setTarget:self];
-    [teamsButton setAction:@selector(openTeamsPanel:)];
-    [cv addSubview:teamsButton];
-
-    // ---- Close button -----------------------------------------------------
-    NSBox *bottomSep = [[NSBox alloc] initWithFrame:NSMakeRect(0, 56, w, 1)];
-    bottomSep.boxType = NSBoxSeparator;
-    [cv addSubview:bottomSep];
-
-    NSButton *closeButton = [[NSButton alloc] initWithFrame:NSMakeRect(w - 112, 16, 92, 34)];
-    [closeButton setTitle:@"Close"];
-    [closeButton setBezelStyle:NSBezelStyleRounded];
-    [closeButton setTarget:self];
-    [closeButton setAction:@selector(closeSettingsWindow)];
-    [cv addSubview:closeButton];
-
-    [self.settingsWindow center];
+    [self.settingsHostView setTier:ts.currentTier ?: @"free"];
+    [self.settingsHostView reload];
     [self.settingsWindow makeKeyAndOrderFront:nil];
     [NSApp activateIgnoringOtherApps:YES];
-
-    // Fetch live calendar connection status
-    [self refreshSettingsCalendarStatus];
-}
-
-- (void)refreshSettingsCalendarStatus {
-    InterTokenService *ts = self.roomController.tokenService;
-    if (!ts) return;
-    __weak typeof(self) weakSelf = self;
-    [ts fetchCalendarStatusWithCompletion:^(NSDictionary<NSString *, id> *status, NSError *error) {
-        __strong typeof(weakSelf) strongSelf = weakSelf;
-        if (!strongSelf || !status) return;
-        NSDictionary *google  = status[@"google"]  ?: @{};
-        NSDictionary *outlook = status[@"outlook"] ?: @{};
-        BOOL gConnected = [google[@"connected"] boolValue];
-        BOOL oConnected = [outlook[@"connected"] boolValue];
-        BOOL gReauth    = [google[@"reauthRequired"]  boolValue];
-        BOOL oReauth    = [outlook[@"reauthRequired"] boolValue];
-
-        NSString *gStatus = gConnected ? (gReauth ? @"Connected (re-auth required)" : @"Connected") : @"Not connected";
-        NSString *oStatus = oConnected ? (oReauth ? @"Connected (re-auth required)" : @"Connected") : @"Not connected";
-
-        strongSelf.settingsGoogleStatusLabel.stringValue  = gStatus;
-        strongSelf.settingsOutlookStatusLabel.stringValue = oStatus;
-        [strongSelf.settingsGoogleButton  setTitle:gConnected ? @"Disconnect" : @"Connect"];
-        [strongSelf.settingsOutlookButton setTitle:oConnected ? @"Disconnect" : @"Connect"];
-    }];
-}
-
-- (void)handleGoogleCalendarButtonTapped:(id)sender {
-#pragma unused(sender)
-    [self handleCalendarButtonTappedForProvider:@"google" button:self.settingsGoogleButton];
-}
-
-- (void)handleOutlookCalendarButtonTapped:(id)sender {
-#pragma unused(sender)
-    [self handleCalendarButtonTappedForProvider:@"outlook" button:self.settingsOutlookButton];
-}
-
-- (void)handleCalendarButtonTappedForProvider:(NSString *)provider button:(NSButton *)button {
-    InterTokenService *ts = self.roomController.tokenService;
-    if (!ts) return;
-
-    BOOL isDisconnect = [button.title isEqualToString:@"Disconnect"];
-    button.enabled = NO;
-
-    __weak typeof(self) weakSelf = self;
-
-    if (isDisconnect) {
-        [ts disconnectCalendarWithProvider:provider completion:^(BOOL success, NSError *error) {
-            __strong typeof(weakSelf) strongSelf = weakSelf;
-            button.enabled = YES;
-            if (success) {
-                [strongSelf refreshSettingsCalendarStatus];
-            } else {
-                NSLog(@"[Calendar] Disconnect failed for %@: %@", provider, error.localizedDescription);
-            }
-        }];
-    } else {
-        [ts requestCalendarConnectURLWithProvider:provider completion:^(NSString *authUrl, NSError *error) {
-            button.enabled = YES;
-            if (authUrl.length > 0) {
-                NSURL *url = [NSURL URLWithString:authUrl];
-                if (url) [[NSWorkspace sharedWorkspace] openURL:url];
-            } else {
-                NSLog(@"[Calendar] Failed to get connect URL for %@: %@", provider, error.localizedDescription);
-            }
-        }];
-    }
 }
 
 - (void)openTeamsPanel:(id)sender {
 #pragma unused(sender)
+    InterTokenService *ts = self.roomController.tokenService;
     if (!self.teamsWindow) {
-        self.teamsPanel = [[InterTeamsPanel alloc] initWithFrame:NSMakeRect(0, 0, 640, 460)];
-        self.teamsPanel.delegate = self;
+        // Self-contained SwiftUI Teams screen (Option A): the bridge builds its
+        // own data layer from the account token service. No data is pushed in
+        // and no delegate callbacks come out — it talks to the server directly.
+        self.teamsPanel = [[InterTeamsPanelBridge alloc] initWithFrame:NSMakeRect(0, 0, 760, 520)
+                                                          tokenService:ts];
 
-        self.teamsWindow = [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 640, 460)
+        self.teamsWindow = [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 760, 520)
                                                         styleMask:(NSWindowStyleMaskTitled |
                                                                    NSWindowStyleMaskClosable |
                                                                    NSWindowStyleMaskResizable)
                                                           backing:NSBackingStoreBuffered
                                                             defer:NO];
-        [self.teamsWindow setTitle:@"Teams"];
+        [self.teamsWindow setTitle:@"Teams"]; // Mission Control/⌘-Tab label; not drawn
+        [self.teamsWindow setMinSize:NSMakeSize(680.0, 440.0)];
         [self.teamsWindow setSharingType:InterWindowSharingType()];
+        // Seamless chrome: no title-bar band — content extends to the window top and
+        // the traffic lights float over the sidebar (canonical migrated-screen chrome).
+        [InterWindowChrome applySeamlessChromeTo:self.teamsWindow];
         [self.teamsWindow setReleasedWhenClosed:NO];
         [self.teamsWindow setContentView:self.teamsPanel];
         [self.teamsWindow setDelegate:self];
@@ -6445,25 +6170,8 @@ didRequestDeleteTeamId:(NSString *)teamId {
     [self.teamsWindow center];
     [self.teamsWindow makeKeyAndOrderFront:nil];
     [NSApp activateIgnoringOtherApps:YES];
-    // Initial load
-    [self reloadTeamsData];
-}
-
-- (void)reloadTeamsData {
-    InterTokenService *ts = self.roomController.tokenService;
-    if (!ts || !self.teamsPanel) return;
-    [self.teamsPanel setLoading:YES];
-    __weak typeof(self) weakSelf = self;
-    [ts fetchTeamsWithCompletion:^(NSArray<NSDictionary<NSString *, id> *> *teams, NSError *error) {
-        __strong typeof(weakSelf) strongSelf = weakSelf;
-        [strongSelf.teamsPanel setLoading:NO];
-        if (error) {
-            [strongSelf.teamsPanel setStatusText:@"Could not load teams. Please try again."];
-            return;
-        }
-        [strongSelf.teamsPanel setTeams:teams ?: @[]];
-        [strongSelf.teamsPanel setStatusText:@""];
-    }];
+    // Refresh the list each time the window is shown (fresh unread badges).
+    [self.teamsPanel reload];
 }
 
 // ---------------------------------------------------------------------------
@@ -6471,132 +6179,34 @@ didRequestDeleteTeamId:(NSString *)teamId {
 // ---------------------------------------------------------------------------
 
 - (void)openAccountSettingsWindow {
-    if (!self.accountWindow) {
-        self.accountPanel = [[InterAccountPanel alloc] initWithFrame:NSMakeRect(0, 0, 460, 600)];
-        self.accountPanel.delegate = self;
-        self.accountPanel.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
-
-        self.accountWindow = [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 460, 600)
-                                                          styleMask:(NSWindowStyleMaskTitled |
-                                                                     NSWindowStyleMaskClosable)
-                                                            backing:NSBackingStoreBuffered
-                                                              defer:NO];
-        [self.accountWindow setTitle:@"Account Settings"];
-        [self.accountWindow setSharingType:InterWindowSharingType()];
-        [self.accountWindow setReleasedWhenClosed:NO];
-        [self.accountWindow setContentView:self.accountPanel];
-        [self.accountWindow setDelegate:self];
-    }
-
-    // Refresh profile fields from the live session on every open.
-    InterTokenService *ts = self.roomController.tokenService;
-    [self.accountPanel setEmail:ts.currentEmail tier:ts.currentTier];
-
-    [self.accountWindow center];
-    [self.accountWindow makeKeyAndOrderFront:nil];
-    [NSApp activateIgnoringOtherApps:YES];
-
-    // Pre-load active sessions so the table is populated immediately.
-    [self accountPanelDidRequestLoadSessions:self.accountPanel
-                                  completion:^(NSArray<NSDictionary *> *sessions, NSError *error) {
-        if (error) {
-            [self.accountPanel showBannerError:error.localizedDescription];
-        } else {
-            [self.accountPanel setSessions:sessions];
-        }
-    }];
-}
-
-// ---------------------------------------------------------------------------
-// MARK: - InterAccountPanelDelegate
-// ---------------------------------------------------------------------------
-
-- (void)accountPanel:(InterAccountPanel *)panel
-  didRequestChangePassword:(NSString *)currentPassword
-             newPassword:(NSString *)newPassword
-              completion:(void (^)(NSError *_Nullable))completion {
-#pragma unused(panel)
-    InterTokenService *ts = self.roomController.tokenService;
-    if (!ts) {
-        if (completion) completion([NSError errorWithDomain:@"inter" code:-1
-                                                   userInfo:@{NSLocalizedDescriptionKey: @"Not connected."}]);
-        return;
-    }
-    [ts changePassword:currentPassword newPassword:newPassword completion:completion];
-}
-
-- (void)accountPanel:(InterAccountPanel *)panel
-   didRequestChangeEmail:(NSString *)password
-               newEmail:(NSString *)newEmail
-             completion:(void (^)(NSError *_Nullable))completion {
-#pragma unused(panel)
-    InterTokenService *ts = self.roomController.tokenService;
-    if (!ts) {
-        if (completion) completion([NSError errorWithDomain:@"inter" code:-1
-                                                   userInfo:@{NSLocalizedDescriptionKey: @"Not connected."}]);
-        return;
-    }
-    [ts changeEmail:password newEmail:newEmail completion:completion];
-}
-
-- (void)accountPanelDidRequestLoadSessions:(InterAccountPanel *)panel
-                                completion:(void (^)(NSArray<NSDictionary *> *_Nullable,
-                                                     NSError *_Nullable))completion {
-#pragma unused(panel)
-    InterTokenService *ts = self.roomController.tokenService;
-    if (!ts) {
-        if (completion) completion(@[], nil);
-        return;
-    }
-    [ts listSessionsWithCompletion:^(NSArray<NSDictionary *> *sessions, NSError *error) {
-        if (completion) completion(sessions, error);
-    }];
-}
-
-- (void)accountPanel:(InterAccountPanel *)panel
- didRequestRevokeSession:(NSString *)sessionId
-             completion:(void (^)(NSError *_Nullable))completion {
-#pragma unused(panel)
-    InterTokenService *ts = self.roomController.tokenService;
-    if (!ts) {
-        if (completion) completion([NSError errorWithDomain:@"inter" code:-1
-                                                   userInfo:@{NSLocalizedDescriptionKey: @"Not connected."}]);
-        return;
-    }
-    [ts revokeSession:sessionId completion:completion];
-}
-
-- (void)accountPanel:(InterAccountPanel *)panel
- didRequestDeleteAccount:(NSString *)password
-             completion:(void (^)(NSError *_Nullable))completion {
-#pragma unused(panel)
-    InterTokenService *ts = self.roomController.tokenService;
-    if (!ts) {
-        if (completion) completion([NSError errorWithDomain:@"inter" code:-1
-                                                   userInfo:@{NSLocalizedDescriptionKey: @"Not connected."}]);
-        return;
-    }
-    [ts deleteAccount:password completion:completion];
-}
-
-- (void)accountPanelDidDeleteAccount:(InterAccountPanel *)panel {
-#pragma unused(panel)
-    // Dismiss the account window.
-    [self.accountWindow orderOut:nil];
-    self.accountWindow = nil;
-    self.accountPanel  = nil;
-    // Navigate back to the login screen — same flow as manual sign-out.
-    [self handleLogout];
+    // Account settings live in the unified settings window now — deep-link to
+    // the Profile tab. (Selector preserved: the home avatar menu targets it.)
+    [self openSettingsWindow];
+    [self.settingsHostView selectAnchor:InterSettingsTabAnchorProfile];
 }
 
 - (void)closeSettingsWindow {
     [self.settingsWindow orderOut:nil];
 }
 
+/// Keep the home screen's events/history live: refresh whenever the setup
+/// window regains key (returning from a call, schedule window, etc.).
+- (void)windowDidBecomeKey:(NSNotification *)notification {
+    if (notification.object == self.setupWindow) {
+        [self.connectionPanel reloadMeetings];
+    }
+}
+
 - (BOOL)windowShouldClose:(NSWindow *)sender {
     if (sender == self.setupWindow && self.currentCallMode == InterCallModeNone) {
         InterTeardownSetupWindow(&_setupWindow, &_setupRenderView, &_connectionPanel);
         [NSApp terminate:nil];
+        return NO;
+    }
+
+    // Green room close button = cancel back to the setup screen.
+    if (sender == self.greenRoomWindow) {
+        [self cancelGreenRoom];
         return NO;
     }
 
@@ -6645,11 +6255,33 @@ didRequestDeleteTeamId:(NSString *)teamId {
     if (self.normalControlPanel) {
         self.normalControlPanel.cameraToggleHandler = nil;
         self.normalControlPanel.microphoneToggleHandler = nil;
+        self.normalControlPanel.speakerToggleHandler = nil;
         self.normalControlPanel.shareToggleHandler = nil;
-        self.normalControlPanel.shareModeChangedHandler = nil;
         self.normalControlPanel.screenShareModeChangedHandler = nil;
         self.normalControlPanel.audioInputSelectionChangedHandler = nil;
-        self.normalControlPanel.shareSystemAudioChangedHandler = nil;
+        self.normalControlPanel.chatToggleHandler = nil;
+        self.normalControlPanel.pollToggleHandler = nil;
+        self.normalControlPanel.qaToggleHandler = nil;
+        self.normalControlPanel.raiseHandToggleHandler = nil;
+        self.normalControlPanel.lobbyHandler = nil;
+        self.normalControlPanel.renameHandler = nil;
+        self.normalControlPanel.leaveHandler = nil;
+        self.normalControlPanel.requestApproveHandler = nil;
+        self.normalControlPanel.requestDenyHandler = nil;
+        self.normalControlPanel.moderationMenuWillOpenHandler = nil;
+        self.normalControlPanel.toggleMuteAllHandler = nil;
+        self.normalControlPanel.toggleAllCamerasHandler = nil;
+        self.normalControlPanel.stopAllSharesHandler = nil;
+        self.normalControlPanel.toggleChatDisabledHandler = nil;
+        self.normalControlPanel.toggleCoHostRecordingHandler = nil;
+        self.normalControlPanel.toggleLockHandler = nil;
+        self.normalControlPanel.passwordViewHandler = nil;
+        self.normalControlPanel.passwordChangeHandler = nil;
+        self.normalControlPanel.passwordRemoveHandler = nil;
+        self.normalControlPanel.shareConflictChangedHandler = nil;
+        self.normalControlPanel.participantsProvider = nil;
+        self.normalControlPanel.participantMuteHandler = nil;
+        self.normalControlPanel.participantUnmuteHandler = nil;
         [self.normalControlPanel setScreenSharePermissionMode:nil];
     }
 
@@ -6659,14 +6291,20 @@ didRequestDeleteTeamId:(NSString *)teamId {
     self.normalMediaController.audioInputOptionsChangedHandler = nil;
     [self.normalMediaController shutdown];
     self.normalMediaController = nil;
+    [self.normalLobbyToast dismiss];
+    self.normalLobbyToast.onOpen = nil;
+    self.normalLobbyToast = nil;
+    [self.normalRequestToast dismiss];
+    self.normalRequestToast.onOpen = nil;
+    self.normalRequestToast = nil;
+    // Reset local speaker-mute so it never persists into the next call.
+    [InterAudioEngineAccess setSpeakerMuted:NO];
     self.normalControlPanel = nil;
 
     // [Phase 8] Tear down chat and speaker queue UI
     [self.chatController detach];
     [self.speakerQueue reset];
     [self.screenShareQueue reset];
-    [self.normalScreenShareQueuePanel setEntries:@[]];
-    [self.normalScreenShareQueuePanel hidePanel];
     [self.hostMutedParticipants removeAllObjects];
     self.chatController.chatDelegate = nil;
     self.chatController.controlDelegate = nil;
@@ -6676,25 +6314,6 @@ didRequestDeleteTeamId:(NSString *)teamId {
         [self.normalChatPanel removeFromSuperview];
         self.normalChatPanel = nil;
     }
-    if (self.normalSpeakerQueuePanel) {
-        [self.normalSpeakerQueuePanel removeFromSuperview];
-        self.normalSpeakerQueuePanel = nil;
-    }
-    if (self.normalScreenShareQueuePanel) {
-        [self.normalScreenShareQueuePanel removeFromSuperview];
-        self.normalScreenShareQueuePanel = nil;
-    }
-    if (self.normalCameraUnlockQueuePanel) {
-        [self.normalCameraUnlockQueuePanel removeFromSuperview];
-        self.normalCameraUnlockQueuePanel = nil;
-    }
-    if (self.normalMicUnlockQueuePanel) {
-        [self.normalMicUnlockQueuePanel removeFromSuperview];
-        self.normalMicUnlockQueuePanel = nil;
-    }
-    self.normalChatToggleButton = nil;
-    self.normalHandRaiseButton = nil;
-    self.normalQueueToggleButton = nil;
 
     // [Phase 8.5] Tear down poll window
     if (self.normalPollWindow) {
@@ -6702,7 +6321,6 @@ didRequestDeleteTeamId:(NSString *)teamId {
         self.normalPollWindow = nil;
     }
     self.normalPollPanel = nil;
-    self.normalPollToggleButton = nil;
 
     // [Phase 8.6] Tear down Q&A window
     if (self.normalQAWindow) {
@@ -6710,7 +6328,6 @@ didRequestDeleteTeamId:(NSString *)teamId {
         self.normalQAWindow = nil;
     }
     self.normalQAPanel = nil;
-    self.normalQAToggleButton = nil;
 
     // [Phase 9] Tear down lobby window
     if (self.normalLobbyWindow) {
@@ -6718,13 +6335,6 @@ didRequestDeleteTeamId:(NSString *)teamId {
         self.normalLobbyWindow = nil;
     }
     self.normalLobbyPanel = nil;
-    self.normalLobbyToggleButton = nil;
-    // The moderate button is created lazily by _ensureModerationToolbarInView:
-    // behind a create-if-nil guard. launchNormalCallWindow strips all subviews on
-    // re-entry, so the property MUST be reset here too — otherwise it keeps pointing
-    // at the removed (orphaned) button and is never re-added to the fresh view,
-    // making the ⚙️ Moderate button disappear on the second and later call entries.
-    self.normalModerationButton = nil;
 
     // [Phase 9] Tear down lobby joining/waiting window (participant side)
     [self _dismissJoiningOverlay];
@@ -6963,7 +6573,7 @@ didRequestDeleteTeamId:(NSString *)teamId {
     NSLog(@"[Billing] User requested billing plans page");
     if (!self.roomController.tokenService) {
         NSLog(@"[Billing] tokenService is nil — cannot open plans");
-        self.billingStatusLabel.stringValue = @"Unable to open plans.";
+        [self.connectionPanel setBillingStatusText:@"Unable to open plans."];
         return;
     }
 
@@ -6972,11 +6582,8 @@ didRequestDeleteTeamId:(NSString *)teamId {
     // Unauthenticated: ask the server for the public plans page URL.
     // The server owns the canonical URL — the app never hardcodes it.
     if (!isAuth) {
-        if (self.upgradeButton) {
-            [self.upgradeButton setEnabled:NO];
-            [self.upgradeButton setTitle:@"Loading…"];
-        }
-        self.billingStatusLabel.stringValue = @"";
+        [self.connectionPanel setBillingActionEnabled:NO];
+        [self.connectionPanel setBillingStatusText:@""];
 
         __weak typeof(self) weakSelf = self;
         [self.roomController.tokenService requestPublicPlansURLWithCompletion:^(NSString *url) {
@@ -6989,27 +6596,21 @@ didRequestDeleteTeamId:(NSString *)teamId {
                     if (plansURL) {
                         [[NSWorkspace sharedWorkspace] openURL:plansURL];
                     } else {
-                        strongSelf.billingStatusLabel.stringValue = @"Unable to open plans.";
+                        [strongSelf.connectionPanel setBillingStatusText:@"Unable to open plans."];
                     }
                 } else {
-                    strongSelf.billingStatusLabel.stringValue = @"Unable to open plans. Try again.";
+                    [strongSelf.connectionPanel setBillingStatusText:@"Unable to open plans. Try again."];
                 }
 
-                if (strongSelf.upgradeButton) {
-                    [strongSelf.upgradeButton setEnabled:YES];
-                    [strongSelf.upgradeButton setTitle:@"View Plans"];
-                }
+                [strongSelf.connectionPanel setBillingActionEnabled:YES];
             });
         }];
         return;
     }
 
     // Authenticated: request a tokenized URL so the page shows the current plan.
-    if (self.upgradeButton) {
-        [self.upgradeButton setEnabled:NO];
-        [self.upgradeButton setTitle:@"Loading…"];
-    }
-    self.billingStatusLabel.stringValue = @"";
+    [self.connectionPanel setBillingActionEnabled:NO];
+    [self.connectionPanel setBillingStatusText:@""];
 
     __weak typeof(self) weakSelf = self;
     [self.roomController.tokenService requestBillingPageURLWithCompletion:^(NSString *url) {
@@ -7032,13 +6633,10 @@ didRequestDeleteTeamId:(NSString *)teamId {
                 }
             } else {
                 NSLog(@"[Billing] Failed to get billing plans URL");
-                strongSelf.billingStatusLabel.stringValue = @"Failed to open plans. Try again.";
+                [strongSelf.connectionPanel setBillingStatusText:@"Failed to open plans. Try again."];
             }
 
-            if (strongSelf.upgradeButton) {
-                [strongSelf.upgradeButton setEnabled:YES];
-                [strongSelf.upgradeButton setTitle:@"View Plans"];
-            }
+            [strongSelf.connectionPanel setBillingActionEnabled:YES];
         });
     }];
 }
@@ -7047,13 +6645,10 @@ didRequestDeleteTeamId:(NSString *)teamId {
     NSLog(@"[Billing] User requested subscription management");
     if (!self.roomController.tokenService) {
         NSLog(@"[Billing] tokenService is nil — cannot open portal");
-        self.billingStatusLabel.stringValue = @"Not signed in.";
+        [self.connectionPanel setBillingStatusText:@"Not signed in."];
         return;
     }
-    if (self.manageSubscriptionButton) {
-        [self.manageSubscriptionButton setEnabled:NO];
-        [self.manageSubscriptionButton setTitle:@"Loading…"];
-    }
+    [self.connectionPanel setBillingActionEnabled:NO];
 
     __weak typeof(self) weakSelf = self;
     [self.roomController.tokenService requestPortalURLWithCompletion:^(NSString *url) {
@@ -7076,13 +6671,10 @@ didRequestDeleteTeamId:(NSString *)teamId {
                 }
             } else {
                 NSLog(@"[Billing] Failed to get portal URL");
-                strongSelf.billingStatusLabel.stringValue = @"Failed to open subscription portal.";
+                [strongSelf.connectionPanel setBillingStatusText:@"Failed to open subscription portal."];
             }
 
-            if (strongSelf.manageSubscriptionButton) {
-                [strongSelf.manageSubscriptionButton setEnabled:YES];
-                [strongSelf.manageSubscriptionButton setTitle:@"Manage Subscription"];
-            }
+            [strongSelf.connectionPanel setBillingActionEnabled:YES];
         });
     }];
 }
@@ -7438,14 +7030,8 @@ static const NSTimeInterval kIdleTimeoutSeconds = 30 * 60; // 30 minutes
     }
     self.isBillingPollInProgress = YES;
 
-    self.billingStatusLabel.stringValue = @"Verifying your upgrade…";
-    if (self.upgradeButton) {
-        [self.upgradeButton setEnabled:NO];
-        [self.upgradeButton setTitle:@"Verifying…"];
-    }
-    if (self.manageSubscriptionButton) {
-        [self.manageSubscriptionButton setEnabled:NO];
-    }
+    [self.connectionPanel setBillingStatusText:@"Verifying your upgrade…"];
+    [self.connectionPanel setBillingActionEnabled:NO];
 
     NSString *previousTier = self.roomController.tokenService.currentTier ?: @"free";
     NSUInteger pollGen = self.billingPollGeneration;
@@ -7469,28 +7055,23 @@ static const NSTimeInterval kIdleTimeoutSeconds = 30 * 60; // 30 minutes
             if (newTier.length) {
                 NSLog(@"[Billing] Tier upgraded: %@ → %@", previousTier, newTier);
 
-                // Rebuild chrome to show "Manage Subscription" instead of "View Plans"
+                // Re-render chrome so the avatar menu offers "Manage Subscription"
                 [strongSelf refreshSetupChrome];
-                strongSelf.billingStatusLabel.stringValue =
-                    [NSString stringWithFormat:@"Upgraded to %@!", [newTier capitalizedString]];
+                [strongSelf.connectionPanel setBillingStatusText:
+                    [NSString stringWithFormat:@"Upgraded to %@!", [newTier capitalizedString]]];
+                [strongSelf.connectionPanel setBillingActionEnabled:YES];
 
                 // Clear the success message after a few seconds
                 dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5 * NSEC_PER_SEC)),
                                dispatch_get_main_queue(), ^{
-                    if ([strongSelf.billingStatusLabel.stringValue containsString:@"Upgraded"]) {
-                        strongSelf.billingStatusLabel.stringValue = @"";
+                    if ([strongSelf.connectionPanel.billingStatusText containsString:@"Upgraded"]) {
+                        [strongSelf.connectionPanel setBillingStatusText:@""];
                     }
                 });
             } else {
                 NSLog(@"[Billing] Tier poll timed out — tier unchanged from %@", previousTier);
-                strongSelf.billingStatusLabel.stringValue = @"Upgrade pending — it may take a moment.";
-                if (strongSelf.upgradeButton) {
-                    [strongSelf.upgradeButton setEnabled:YES];
-                    [strongSelf.upgradeButton setTitle:@"View Plans"];
-                }
-                if (strongSelf.manageSubscriptionButton) {
-                    [strongSelf.manageSubscriptionButton setEnabled:YES];
-                }
+                [strongSelf.connectionPanel setBillingStatusText:@"Upgrade pending — it may take a moment."];
+                [strongSelf.connectionPanel setBillingActionEnabled:YES];
             }
         });
     }];
@@ -7503,6 +7084,57 @@ static const NSTimeInterval kIdleTimeoutSeconds = 30 * 60; // 30 minutes
 
     // Bring app to front
     [NSApp activateIgnoringOtherApps:YES];
+
+    // Resolve the redemption server BEFORE prompting for a password — never ask the user
+    // to type a new password we already know we can't send anywhere.
+    // Redeem against the SAME server that ISSUED the link, from EXPLICIT sources only:
+    // the issuing URL persisted when the reset was requested, then the live auth server,
+    // then the configured default. We deliberately do NOT fall back to a hardcoded
+    // localhost — POSTing a reset token + new password to an implicit local server would
+    // leak credentials to an unintended backend for signed-out / custom-server users.
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    NSString *baseURL = [defaults stringForKey:@"InterPasswordResetIssuingServerURL"];
+    // Expire the stored issuer: server reset tokens live 1 hour, so an older stored URL can
+    // never redeem a valid token — it is pure staleness liability (it may point at a server
+    // the user no longer uses, e.g. an old custom/dev backend). Unknown age (no stamp,
+    // persisted by an older build) is treated as stale. Discard and resolve from the live
+    // sources below instead.
+    NSDate *issuerSetAt = [defaults objectForKey:@"InterPasswordResetIssuingServerSetAt"];
+    BOOL issuerStale = ![issuerSetAt isKindOfClass:[NSDate class]]
+        || [[NSDate date] timeIntervalSinceDate:issuerSetAt] > 3600.0;
+    if (baseURL.length && issuerStale) {
+        NSLog(@"[Auth] Stored password-reset issuer is stale — discarding it.");
+        [defaults removeObjectForKey:@"InterPasswordResetIssuingServerURL"];
+        [defaults removeObjectForKey:@"InterPasswordResetIssuingServerSetAt"];
+        baseURL = nil;
+    }
+    if (!baseURL.length) {
+        baseURL = self.roomController.tokenService.serverURL;
+    }
+    if (!baseURL.length) {
+        baseURL = [defaults stringForKey:@"InterDefaultTokenServerURL"];
+    }
+    // Fail closed: if no explicit issuing server can be resolved, abort rather than
+    // defaulting to localhost. The token + new password are never sent to an implicit server.
+    if (!baseURL.length) {
+        NSLog(@"[Auth] Password reset aborted — could not resolve the issuing server URL; "
+               "refusing to POST credentials to an implicit default.");
+        // User-facing framing: the only reliable recovery on an unconfigured Mac is the
+        // web form on the server's reset page (re-opening the email link always lands
+        // there, and viewing the page does not consume the token). Do NOT suggest the
+        // in-app "Forgot password" here — on a machine with no configured server that
+        // request can't reach a backend either, which would be a second dead end.
+        NSAlert *errAlert = [[NSAlert alloc] init];
+        errAlert.messageText = @"Finish Your Password Reset in the Browser";
+        errAlert.informativeText = @"The app on this Mac isn't connected to your account yet, "
+                                    "so it can't finish the reset here. Open the reset link "
+                                    "from your email in your browser and set your new password "
+                                    "using the form on that page.";
+        errAlert.alertStyle = NSAlertStyleInformational;
+        [errAlert addButtonWithTitle:@"OK"];
+        [errAlert runModal];
+        return;
+    }
 
     // Show a password reset alert with a secure text field
     NSAlert *alert = [[NSAlert alloc] init];
@@ -7530,8 +7162,8 @@ static const NSTimeInterval kIdleTimeoutSeconds = 30 * 60; // 30 minutes
         return;
     }
 
-    // POST to /auth/reset-password with the token and new password
-    NSString *baseURL = self.roomController.tokenService.serverURL ?: @"http://localhost:3000";
+    // POST to /auth/reset-password (on the server resolved above) with the token and
+    // new password.
     NSURL *url = [NSURL URLWithString:[NSString stringWithFormat:@"%@/auth/reset-password", baseURL]];
     NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:url];
     request.HTTPMethod = @"POST";
@@ -7558,6 +7190,12 @@ static const NSTimeInterval kIdleTimeoutSeconds = 30 * 60; // 30 minutes
             } else {
                 resultAlert.messageText = @"Password Updated";
                 resultAlert.informativeText = @"Your password has been reset. Please log in with your new password.";
+                // One-shot: the token is now redeemed (single-use server-side), so the stored
+                // issuing-server hint has served its purpose — clear it so it cannot steer
+                // any future, unrelated redemption.
+                NSUserDefaults *cleanupDefaults = [NSUserDefaults standardUserDefaults];
+                [cleanupDefaults removeObjectForKey:@"InterPasswordResetIssuingServerURL"];
+                [cleanupDefaults removeObjectForKey:@"InterPasswordResetIssuingServerSetAt"];
             }
             [resultAlert runModal];
         });

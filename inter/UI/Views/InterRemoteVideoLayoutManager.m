@@ -119,7 +119,7 @@ static NSString *const kInterPreferGridLayoutKey = @"InterPreferGridLayout";
 
     self.wantsLayer = YES;
     self.layer.backgroundColor = [InterDesignTokens tileGradientBottom].CGColor;
-    self.layer.cornerRadius = [InterDesignTokens tileCornerRadius];
+    self.layer.cornerRadius = [InterDesignTokens callTileCornerRadius];
     self.layer.masksToBounds = YES;
 
     // Diagonal stage-surface gradient (neutral-800 → neutral-900, top-left → bottom-right),
@@ -193,7 +193,7 @@ static NSString *const kInterPreferGridLayoutKey = @"InterPreferGridLayout";
     self.micCaptionLabel.drawsBackground = NO;
     self.micCaptionLabel.wantsLayer = YES;
     self.micCaptionLabel.layer.backgroundColor = [NSColor colorWithWhite:0.0 alpha:0.6].CGColor;
-    self.micCaptionLabel.layer.cornerRadius = 4.0;
+    self.micCaptionLabel.layer.cornerRadius = [InterDesignTokens callChromeCornerRadius];
     self.micCaptionLabel.hidden = YES;
     [self addSubview:self.micCaptionLabel];
 
@@ -209,7 +209,7 @@ static NSString *const kInterPreferGridLayoutKey = @"InterPreferGridLayout";
     self.camCaptionLabel.drawsBackground = NO;
     self.camCaptionLabel.wantsLayer = YES;
     self.camCaptionLabel.layer.backgroundColor = [NSColor colorWithWhite:0.0 alpha:0.6].CGColor;
-    self.camCaptionLabel.layer.cornerRadius = 4.0;
+    self.camCaptionLabel.layer.cornerRadius = [InterDesignTokens callChromeCornerRadius];
     self.camCaptionLabel.hidden = YES;
     [self addSubview:self.camCaptionLabel];
 
@@ -236,7 +236,7 @@ static NSString *const kInterPreferGridLayoutKey = @"InterPreferGridLayout";
     self.moderationMenuButton.bordered = NO;
     [self.moderationMenuButton setWantsLayer:YES];
     self.moderationMenuButton.layer.backgroundColor = [NSColor colorWithWhite:0.0 alpha:0.65].CGColor;
-    self.moderationMenuButton.layer.cornerRadius = 4.0;
+    self.moderationMenuButton.layer.cornerRadius = [InterDesignTokens callChromeCornerRadius];
     self.moderationMenuButton.contentTintColor = [NSColor whiteColor];
     [self.moderationMenuButton setTarget:self];
     [self.moderationMenuButton setAction:@selector(showModerationMenu:)];
@@ -633,8 +633,15 @@ static NSString *const kInterPreferGridLayoutKey = @"InterPreferGridLayout";
     // cameraOff = the participant's REAL camera state (roster snapshot); isHostCameraLocked
     // = the host's per-tile lock intent; globalCameraLockActive = a room-wide Lock-All.
     // So "Stop Video" only ever appears when the camera is actually on, never beside a
-    // locked/off caption. (pendingSelfAction/askPending hard-coded NO here for now — same
-    // deferred per-tile flag as the mic side; see the mic TODO above.)
+    // locked/off caption.
+    //
+    // TODO [migration — camPendingSelfAction caption; UI-coupled]: pendingSelfAction/askPending
+    // are hard-coded NO (here and in -updateCamCaption). To light up the "Off — can turn on" /
+    // "Asked to turn on" captions (the camera twin of the mic micPendingSelfAction), add a
+    // per-tile BOOL (e.g. tile.camAskPending) that AppDelegate sets when it sends
+    // askToTurnOnCamera / removeCameraLock against an off camera, and clears when cameraOff
+    // flips to NO or on re-lock / Lock-All. Then pass it here as pendingSelfAction: /
+    // askPending:. Mirror of the mic TODO above; do both in the UI redesign.
     InterCamTileState *camState =
         [InterModerationTileState deriveCameraWithCameraReallyOff:self.cameraOff
                                                        hostLocked:self.isHostCameraLocked
@@ -806,6 +813,13 @@ static NSString *const kInterPreferGridLayoutKey = @"InterPreferGridLayout";
 
 /// Set of participant IDs currently visible (for track visibility callbacks).
 @property (nonatomic, strong) NSMutableSet<NSString *> *visibleParticipantIds;
+/// Finding #9: participants the visibility seam has already emitted at least one
+/// event for. A participant joining while a HIDDEN grid page is showing is in
+/// neither the old nor the new visible set, so the plain diff stays silent and
+/// the SFU keeps streaming them at full rate. First grid encounter of an
+/// off-page participant emits a one-shot disable; membership here prevents
+/// re-emitting it every layout pass.
+@property (nonatomic, strong) NSMutableSet<NSString *> *everSeenByVisibilityIds;
 
 /// Tile recycling pool — reusable InterRemoteVideoView instances. [Phase 7.3.3]
 /// Kept for screen-share view recycling; camera tiles now use InterRemoteSampleBufferView.
@@ -863,11 +877,20 @@ static NSString *const kInterPreferGridLayoutKey = @"InterPreferGridLayout";
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
-static const CGFloat kFilmstripWidthFraction = 0.25;  // 25% of total width
-static const CGFloat kFilmstripMinWidth      = 160.0;
-static const CGFloat kFilmstripMaxWidth      = 280.0;
-static const CGFloat kFilmstripTileGap       = 8.0;
-static const CGFloat kFilmstripPadding       = 8.0;
+// ---------------------------------------------------------------------------
+// Call-layout UI metrics now live in the design system (InterCallLayout, via the
+// InterDesignTokens @objc facade) — the SAME single source of truth the SwiftUI
+// surface consumes. These macros bind the file's existing constant names to that
+// source, so changing a value in DesignTokens.swift reflects here automatically
+// with no per-call-site edits. Animation timing and pagination chrome stay local
+// below (they are behavioral, not theme metrics).
+// ---------------------------------------------------------------------------
+#define kFilmstripWidthFraction ([InterDesignTokens callFilmstripWidthFraction])
+#define kFilmstripMinWidth      ([InterDesignTokens callFilmstripMinWidth])
+#define kFilmstripMaxWidth      ([InterDesignTokens callFilmstripMaxWidth])
+#define kFilmstripTileGap       ([InterDesignTokens callFilmstripTileGap])
+#define kFilmstripPadding       ([InterDesignTokens callFilmstripPadding])
+
 static const CGFloat kAnimationDuration      = 0.3;
 static const NSUInteger kDefaultMaxTilesPerPage = 25;  // Phase 7: 5×5 grid max before pagination
 static const CGFloat kPageIndicatorHeight    = 30.0;
@@ -925,7 +948,7 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
     self.participantCountBadge.drawsBackground = YES;
     self.participantCountBadge.alignment = NSTextAlignmentCenter;
     self.participantCountBadge.wantsLayer = YES;
-    self.participantCountBadge.layer.cornerRadius = 10.0;
+    self.participantCountBadge.layer.cornerRadius = [InterDesignTokens callCountBadgeCornerRadius];
     self.participantCountBadge.layer.masksToBounds = YES;
     self.participantCountBadge.hidden = YES;
     [self addSubview:self.participantCountBadge];
@@ -934,6 +957,7 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
     self.maxTilesPerPage = kDefaultMaxTilesPerPage;
     self.currentGridPage = 0;
     self.visibleParticipantIds = [NSMutableSet set];
+    self.everSeenByVisibilityIds = [NSMutableSet set];
     self.recycledVideoViews = [NSMutableArray array];
     self.pendingFirstFrameIdentifiers = [NSMutableSet set];
     _pendingFirstFrameLock = OS_UNFAIR_LOCK_INIT;
@@ -941,7 +965,7 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
     self.pageIndicatorBar = [[NSView alloc] initWithFrame:NSZeroRect];
     self.pageIndicatorBar.wantsLayer = YES;
     self.pageIndicatorBar.layer.backgroundColor = [NSColor colorWithWhite:0.1 alpha:0.85].CGColor;
-    self.pageIndicatorBar.layer.cornerRadius = 6.0;
+    self.pageIndicatorBar.layer.cornerRadius = [InterDesignTokens callPageIndicatorCornerRadius];
     self.pageIndicatorBar.hidden = YES;
     [self addSubview:self.pageIndicatorBar];
 
@@ -1632,6 +1656,9 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
 
     // Remove from visible set
     [self.visibleParticipantIds removeObject:participantId];
+    // Finding #9: forget the one-shot marker — if the same identity rejoins,
+    // their fresh publication starts enabled and must be re-evaluated.
+    [self.everSeenByVisibilityIds removeObject:participantId];
 
     // If the removed camera was spotlighted, reset to auto and release any
     // user pin so the layout reverts to speaker-auto immediately.
@@ -1842,6 +1869,17 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
 
 #pragma mark - Layout Engine
 
+// Re-flow the entire scene whenever our own size changes (window live-resize,
+// split-view drag, sidebar show/hide). Tiles are positioned with absolute frames
+// and carry no autoresizing mask, so without this the grid/stage would not track
+// the window. Non-animated on purpose: resize must be immediate, not lag a frame
+// behind the drag. Mode-switch animations are unaffected — they animate subview
+// frames, not ours, so they never trigger this hook.
+- (void)resizeSubviewsWithOldSize:(NSSize)oldSize {
+    [super resizeSubviewsWithOldSize:oldSize];
+    [self updateLayoutAnimated:NO];
+}
+
 - (void)updateLayoutAnimated:(BOOL)animated {
     InterRemoteVideoLayoutMode newMode = [self computeLayoutMode];
     self.layoutMode = newMode;
@@ -1952,6 +1990,18 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
     self.filmstripScrollView.hidden = YES;
     [self.supplementalFilmstripView removeFromSuperview];
 
+    // Finding #1 mitigation (mode-switch stale disable): only the paginated
+    // grid hides tiles, and it reconciles its own per-page visibility inside
+    // arrangeCameraGridInRect:. EVERY other presentation (single camera,
+    // screen-share, stage+filmstrip, compact spotlight) renders ALL camera
+    // tiles, so any participant left disabled by a previous grid page MUST be
+    // re-enabled here — otherwise their tile stays black after a mode switch
+    // (e.g. someone starts sharing while page 2 was showing). Diff-based: only
+    // actual changes reach the delegate/SFU.
+    if (mode != InterRemoteVideoLayoutModeMultiCamera || self.compactPreviewMode) {
+        [self reconcileVisibilityToAllCameraParticipants];
+    }
+
     if (self.compactPreviewMode) {
         [self applyCompactSpotlightLayoutAnimated:animated];
         return;
@@ -1970,7 +2020,9 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
                 InterRemoteSampleBufferView *camView = self.remoteCameraViews[pid];
                 if (!camView) break;
 
-                camView.aspectFill = NO;
+                // Main full-view camera fills the area (aspect-fill, crop) — no
+                // letterbox bars on the primary view (matches Zoom/Meet main tile).
+                camView.aspectFill = YES;
                 InterRemoteVideoTileView *tile = [self tileForKey:pid videoView:camView];
                 tile.nameLabel.hidden = YES; // no label in full-view mode
                 tile.layer.cornerRadius = 0;
@@ -1993,6 +2045,9 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
                 if (!selfTile) break;
                 [self addSubview:selfTile positioned:NSWindowBelow relativeTo:self.participantOverlay];
                 selfTile.hidden = NO;
+                // Main full-view self-view fills the area (aspect-fill, crop) to
+                // match the single-camera remote main view above — no letterbox bars.
+                self.localPreviewLayer.videoGravity = AVLayerVideoGravityResizeAspectFill;
                 // The common tile's -layout sizes the preview (videoView) + name label.
                 if (animated) {
                     selfTile.animator.frame = NSMakeRect(0, 0, W, H);
@@ -2069,9 +2124,16 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
         return;
     }
 
+    // Compact spotlight is a single full-area main view → aspect-fill (crop) to match
+    // the stage spotlight. Screen-share keeps aspect-fit (never crop; not a sample-
+    // buffer view anyway).
+    if (![spotlightKey isEqualToString:kScreenShareTileKey]) {
+        ((InterRemoteSampleBufferView *)spotlightVideoView).aspectFill = YES;
+    }
+
     InterRemoteVideoTileView *tile = [self tileForKey:spotlightKey videoView:spotlightVideoView];
     tile.nameLabel.hidden = YES;
-    tile.layer.cornerRadius = 8.0;
+    tile.layer.cornerRadius = [InterDesignTokens callTileCornerRadius];
     if (![spotlightKey isEqualToString:kScreenShareTileKey]) {
         tile.isSpeaking = [spotlightKey isEqualToString:self.activeSpeakerIdentity];
     }
@@ -2116,7 +2178,7 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
     NSUInteger cols, rows;
     [self gridDimensionsForCount:count cols:&cols rows:&rows];
 
-    static const CGFloat kPinGap = 4.0;
+    CGFloat kPinGap = [InterDesignTokens callTilePinGap];
     CGFloat pinTileW = (stageFrame.size.width  - kPinGap * (cols + 1)) / cols;
     CGFloat pinTileH = (stageFrame.size.height - kPinGap * (rows + 1)) / rows;
 
@@ -2131,9 +2193,10 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
 
         InterRemoteSampleBufferView *videoView = self.remoteCameraViews[key];
         if (!videoView) continue;
+        videoView.aspectFill = NO; // pinned sub-grid behaves like the grid: aspect-fit
         InterRemoteVideoTileView *tile = [self tileForKey:key videoView:videoView];
         tile.nameLabel.hidden = NO;
-        tile.layer.cornerRadius = 8.0;
+        tile.layer.cornerRadius = [InterDesignTokens callTileCornerRadius];
         tile.isSpeaking = [key isEqualToString:self.activeSpeakerIdentity];
 
         // Set the correct frame BEFORE adding to the hierarchy.
@@ -2211,9 +2274,13 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
                                           : self.remoteCameraViews[key];
         if (!videoView) continue;
 
+        if (![key isEqualToString:kScreenShareTileKey]) {
+            ((InterRemoteSampleBufferView *)videoView).aspectFill = NO; // filmstrip thumbnail: aspect-fit
+        }
+
         InterRemoteVideoTileView *tile = [self tileForKey:key videoView:videoView];
         tile.nameLabel.hidden = NO;
-        tile.layer.cornerRadius = 8.0;
+        tile.layer.cornerRadius = [InterDesignTokens callTileCornerRadius];
         tile.hidden = NO;
         videoView.hidden = NO;
         if (![key isEqualToString:kScreenShareTileKey]) {
@@ -2281,6 +2348,9 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
         [self setupLocalSelfTileIfNeeded];
         NSView *selfTile = self.localSelfTileView;
         if (selfTile) {
+            // Spotlight self-view fills the stage (aspect-fill) to match the remote
+            // spotlight below — no letterbox bars on the primary stage view.
+            self.localPreviewLayer.videoGravity = AVLayerVideoGravityResizeAspectFill;
             [self addSubview:selfTile positioned:NSWindowBelow relativeTo:self.filmstripScrollView];
             selfTile.hidden = NO;
             if (animated) {
@@ -2298,9 +2368,15 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
         }
 
         if (spotlightVideoView) {
+            // Spotlight (main stage) camera fills the area (aspect-fill, crop) — no
+            // letterbox bars on the primary view. Screen-share must never crop, so it
+            // keeps aspect-fit (it is not an InterRemoteSampleBufferView anyway).
+            if (![spotlightKey isEqualToString:kScreenShareTileKey]) {
+                ((InterRemoteSampleBufferView *)spotlightVideoView).aspectFill = YES;
+            }
             InterRemoteVideoTileView *stageTile = [self tileForKey:spotlightKey videoView:spotlightVideoView];
             stageTile.nameLabel.hidden = NO;
-            stageTile.layer.cornerRadius = 8.0;
+            stageTile.layer.cornerRadius = [InterDesignTokens callTileCornerRadius];
             if (![spotlightKey isEqualToString:kScreenShareTileKey]) {
                 stageTile.isSpeaking = [spotlightKey isEqualToString:self.activeSpeakerIdentity];
             }
@@ -2372,6 +2448,9 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
             NSView *selfTile = self.localSelfTileView;
             if (!selfTile) continue;
             selfTile.hidden = NO;
+            // Filmstrip thumbnail: aspect-fit. Reset here in case this same preview
+            // layer was just the spotlight self-view (which uses aspect-fill).
+            self.localPreviewLayer.videoGravity = AVLayerVideoGravityResizeAspect;
             // The common tile's -layout sizes the preview (videoView) + name label.
             [self.filmstripContentView addSubview:selfTile];
             if (animated) {
@@ -2391,9 +2470,15 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
         }
         if (!videoView) continue;
 
+        // Filmstrip thumbnail: aspect-fit. Reset here because the shared remote view
+        // may carry aspect-fill from having just been the spotlight (which crops).
+        if (![key isEqualToString:kScreenShareTileKey]) {
+            ((InterRemoteSampleBufferView *)videoView).aspectFill = NO;
+        }
+
         InterRemoteVideoTileView *tile = [self tileForKey:key videoView:videoView];
         tile.nameLabel.hidden = NO;
-        tile.layer.cornerRadius = 8.0;
+        tile.layer.cornerRadius = [InterDesignTokens callTileCornerRadius];
         tile.hidden = NO;
         videoView.hidden = NO;
 
@@ -2517,6 +2602,21 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
     [self notifyVisibilityChangesFrom:self.visibleParticipantIds to:newVisibleSet];
     self.visibleParticipantIds = newVisibleSet;
 
+    // Finding #9: a participant who JOINS while a hidden page is showing is in
+    // neither diff set, so without this they would never receive a disable and
+    // would keep streaming at full rate while invisible. Emit a one-shot
+    // disable on their first off-page encounter (everSeen guards re-emission).
+    id<InterRemoteVideoLayoutManagerDelegate> visibilityDelegate = self.layoutDelegate;
+    for (NSString *pid in allParticipants) {
+        if ([pid isEqualToString:kLocalSelfTileKey]) continue;
+        if ([self.everSeenByVisibilityIds containsObject:pid]) continue;
+        [self.everSeenByVisibilityIds addObject:pid];
+        if (![newVisibleSet containsObject:pid] &&
+            [visibilityDelegate respondsToSelector:@selector(layoutManager:didChangeVisibility:forParticipant:source:)]) {
+            [visibilityDelegate layoutManager:self didChangeVisibility:NO forParticipant:pid source:0 /* camera */];
+        }
+    }
+
     // Reserve space for page indicator if paginated
     NSRect gridRect = rect;
     if (isPaginated) {
@@ -2531,7 +2631,7 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
     NSUInteger cols, rows;
     [self gridDimensionsForCount:count cols:&cols rows:&rows];
 
-    CGFloat gap = 6.0;
+    CGFloat gap = [InterDesignTokens callTileGap];
     CGFloat totalGapW = (cols > 0) ? (cols - 1) * gap : 0;
     CGFloat totalGapH = (rows > 0) ? (rows - 1) * gap : 0;
     CGFloat cellW = (gridRect.size.width - totalGapW) / MAX(cols, 1);
@@ -2580,6 +2680,10 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
             NSView *selfTile = self.localSelfTileView;
             if (!selfTile) continue;
 
+            // Grid thumbnail: aspect-fit. Reset here in case this same preview layer
+            // was just the single-camera/spotlight self-view (which uses aspect-fill).
+            self.localPreviewLayer.videoGravity = AVLayerVideoGravityResizeAspect;
+
             [self addSubview:selfTile positioned:NSWindowBelow relativeTo:self.participantOverlay];
             selfTile.hidden = NO;
 
@@ -2602,7 +2706,7 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
         view.aspectFill = NO; // aspect-fit: downscale 2x keeps compression artifacts invisible
         InterRemoteVideoTileView *tile = [self tileForKey:pid videoView:view];
         tile.nameLabel.hidden = NO;
-        tile.layer.cornerRadius = 8.0;
+        tile.layer.cornerRadius = [InterDesignTokens callTileCornerRadius];
         [self addSubview:tile positioned:NSWindowBelow relativeTo:self.participantOverlay];
         tile.hidden = NO;
         // Re-assert the authoritative camera-off state from cameraOffStates (owned by
@@ -2668,6 +2772,21 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
             }
         }
     }
+}
+
+/// Finding #1 mitigation: mark every camera participant visible, emitting
+/// diff-only enable events for any that a previous grid page had disabled.
+/// Called by every non-grid layout pass — those presentations render all
+/// tiles, so "all visible" is the authoritative state. Enabling is always the
+/// safe direction: worst case is bandwidth, never a black tile.
+- (void)reconcileVisibilityToAllCameraParticipants {
+    NSMutableSet<NSString *> *allVisible = [NSMutableSet setWithArray:self.cameraParticipantOrder];
+    // Everyone is rendered (and therefore enabled) in non-grid modes; mark them
+    // seen so the grid's Finding-#9 one-shot never re-fires for them.
+    [self.everSeenByVisibilityIds unionSet:allVisible];
+    if ([allVisible isEqualToSet:self.visibleParticipantIds]) return;
+    [self notifyVisibilityChangesFrom:self.visibleParticipantIds to:allVisible];
+    self.visibleParticipantIds = allVisible;
 }
 
 /// Notify delegate of preferred render dimensions for a participant's camera track.
@@ -2767,6 +2886,7 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
     }
     [self.recycledVideoViews removeAllObjects];
     [self.visibleParticipantIds removeAllObjects];
+    [self.everSeenByVisibilityIds removeAllObjects];
     self.currentGridPage = 0;
     self.pageIndicatorBar.hidden = YES;
     [self.autoSpotlightRevertTimer invalidate];

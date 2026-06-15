@@ -23,6 +23,7 @@
 
 @class InterLocalMediaController;
 @class InterLocalCallControlPanel;
+#import "InterCallMediaControlSurface.h"
 @class InterRoomController;
 @class InterRemoteVideoLayoutManager;
 @class InterNetworkStatusView;
@@ -64,7 +65,9 @@ NS_ASSUME_NONNULL_BEGIN
 
 /// All dependencies are weak to avoid retain cycles.
 @property (nonatomic, weak, nullable) InterLocalMediaController *mediaController;
-@property (nonatomic, weak, nullable) InterLocalCallControlPanel *controlPanel;
+/// The media-state surface (AppKit panel in secure mode, SwiftUI bar bridge in
+/// normal mode) — see InterCallMediaControlSurface.h.
+@property (nonatomic, weak, nullable) id<InterCallMediaControlSurface> controlPanel;
 @property (nonatomic, weak, nullable) InterRoomController *roomController;
 @property (nonatomic, weak, nullable) InterRemoteVideoLayoutManager *remoteLayout;
 @property (nonatomic, weak, nullable) InterNetworkStatusView *networkStatusView;
@@ -150,6 +153,15 @@ NS_ASSUME_NONNULL_BEGIN
 /// Toggle microphone on/off (local device only, no G2 network coordination).
 - (void)toggleMicrophone;
 
+/// Push the local participant's CURRENT camera/mic state into the roster so the
+/// self-tile badges (and the snapshot) match reality. Idempotent — the roster
+/// no-ops when values are unchanged. The mic-muted truth mirrors the control
+/// button's single source: while connected the LiveKit track mute is authoritative,
+/// before connection the capture-session mic enable state is. Call after local media
+/// starts and after join-time mute/camera-off settles (the device flags only become
+/// accurate then), and on connection-state changes.
+- (void)refreshLocalMediaStateInRoster;
+
 // -- Host Camera Lock ------------------------------------------------------
 
 /// Whether the host has individually locked this local participant's camera off.
@@ -228,9 +240,6 @@ NS_ASSUME_NONNULL_BEGIN
 - (void)teardownRoomControllerKVO;
 
 // -- Diagnostics -----------------------------------------------------------
-
-/// Copy diagnostic stats to the clipboard and flash "Diagnostic copied!" on the control panel.
-- (void)handleDiagnosticTripleClick;
 
 // -- Utility ---------------------------------------------------------------
 
