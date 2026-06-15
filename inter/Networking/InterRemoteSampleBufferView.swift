@@ -45,7 +45,7 @@ import CoreVideo
         wantsLayer = true
         layer = CALayer()
         displayLayer.videoGravity = .resizeAspect
-        displayLayer.frame = bounds
+        layoutDisplayLayer()
         layer?.addSublayer(displayLayer)
         layer?.backgroundColor = NSColor.black.cgColor
         applyMirror()
@@ -56,8 +56,23 @@ import CoreVideo
 
     public override func layout() {
         super.layout()
-        displayLayer.frame = bounds
+        layoutDisplayLayer()
         applyMirror()
+    }
+
+    /// Size and CENTER the display layer to our bounds using bounds+position rather
+    /// than `.frame`. The layer carries a mirror transform (scaleX:-1); setting
+    /// `.frame` on a transformed layer is undefined per CoreAnimation and leaves the
+    /// video visibly off-center after a window resize or a stage<->grid switch.
+    /// bounds+position (default anchorPoint 0.5,0.5) is transform-invariant for
+    /// centering. Implicit actions are disabled so live resize doesn't animate or
+    /// jitter the layer geometry frame-to-frame.
+    private func layoutDisplayLayer() {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        displayLayer.bounds = CGRect(origin: .zero, size: bounds.size)
+        displayLayer.position = CGPoint(x: bounds.midX, y: bounds.midY)
+        CATransaction.commit()
     }
 
     private func applyMirror() {

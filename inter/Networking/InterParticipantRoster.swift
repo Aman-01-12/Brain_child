@@ -83,6 +83,7 @@ import os.log
     @objc public func setLocalCameraOn(_ on: Bool) {
         runOnMain {
             guard var l = self.local else { return }
+            guard l.cameraOn != on else { return }   // no-op when unchanged (avoids snapshot churn)
             l.cameraOn = on
             self.local = l
             self.emitNow()
@@ -92,6 +93,7 @@ import os.log
     @objc public func setLocalMicMuted(_ muted: Bool) {
         runOnMain {
             guard var l = self.local else { return }
+            guard l.micMuted != muted else { return }  // no-op when unchanged (avoids snapshot churn)
             l.micMuted = muted
             self.local = l
             self.emitNow()
@@ -219,6 +221,15 @@ import os.log
     /// so late wiring or reconnect self-heals — this is the race fix.
     @objc public func resync() {
         runOnMain { self.emitNow() }
+    }
+
+    /// Snapshot of current remote participant identities, in join order.
+    /// Must be called on the main thread (all roster state is main-thread-confined).
+    @objc public func remoteIdentitiesSnapshot() -> [String] {
+        if Thread.isMainThread { return remoteOrder }
+        var result: [String] = []
+        DispatchQueue.main.sync { result = self.remoteOrder }
+        return result
     }
 
     /// Drop all remote participants (e.g. on disconnect). Keeps local.

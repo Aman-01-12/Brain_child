@@ -38,14 +38,19 @@ import CryptoKit
     /// Whether the authenticated caller is the host of this room. Server-authoritative;
     /// used by the scheduled-meeting path so the host's client shows host UI.
     @objc public let isHost: Bool
+    /// Meeting settings returned by /meetings/:id/start (nil for /room/create,
+    /// whose caller already holds the settings locally). Keys mirror the
+    /// /room/join settings block: meetingDisplayName, muteOnJoin, …
+    @objc public let roomSettings: [String: Any]?
 
-    @objc public init(roomCode: String, roomName: String, token: String, serverURL: String, roomType: String = "call", isHost: Bool = false) {
+    @objc public init(roomCode: String, roomName: String, token: String, serverURL: String, roomType: String = "call", isHost: Bool = false, roomSettings: [String: Any]? = nil) {
         self.roomCode = roomCode
         self.roomName = roomName
         self.token = token
         self.serverURL = serverURL
         self.roomType = roomType
         self.isHost = isHost
+        self.roomSettings = roomSettings
         super.init()
     }
 }
@@ -2066,6 +2071,7 @@ private struct TokenCacheEntry {
         hostTimezone: String,
         password: String?,
         lobbyEnabled: Bool,
+        settings: [String: Any]? = nil,
         completion: @escaping (_ meeting: [String: Any]?, _ error: NSError?) -> Void
     ) {
         guard let serverURL = authServerBaseURL,
@@ -2085,6 +2091,9 @@ private struct TokenCacheEntry {
         ]
         if let desc = description { body["description"] = desc }
         if let pw = password { body["password"] = pw }
+        // Meeting-settings snapshot (mute on join, chat permissions, …) stored
+        // with the meeting; /meetings/:id/start applies it to the room hash.
+        if let settings { body["settings"] = settings }
 
         performAuthHTTPRequest(
             url: "\(serverURL)/meetings/schedule",
@@ -2146,6 +2155,7 @@ private struct TokenCacheEntry {
         identity: String,
         displayName: String,
         password: String?,
+        settingsOverride: [String: Any]? = nil,
         completion: @escaping (InterCreateRoomResponse?, NSError?) -> Void
     ) {
         guard let accessToken = currentAccessToken else {
@@ -2164,6 +2174,11 @@ private struct TokenCacheEntry {
         // validate it. Empty is omitted so a non-protected meeting is unaffected.
         if let password = password, !password.isEmpty {
             body["password"] = password
+        }
+        // Host-edited settings from the green room — the server applies them
+        // over the schedule-time snapshot (host-only; ignored for invitees).
+        if let settingsOverride {
+            body["settings"] = settingsOverride
         }
 
         interLogInfo(InterLog.networking, "Token: starting scheduled meeting (id=***)")
@@ -2285,7 +2300,8 @@ private struct TokenCacheEntry {
                 token: token,
                 serverURL: wsURL,
                 roomType: responseRoomType,
-                isHost: responseIsHost
+                isHost: responseIsHost,
+                roomSettings: json["roomSettings"] as? [String: Any]
             )
             interLogInfo(InterLog.networking, "Token: scheduled meeting started (code=***)")
             self.completeOnMain { completion(response, nil) }
@@ -2791,6 +2807,102 @@ private struct TokenCacheEntry {
         }
     }
 
+    /// Fetch the full profile (fresh DB read, includes timezone/language prefs).
+    ///
+    /// Calls `GET /auth/profile`. The returned dict contains:
+    /// `{ userId, email, displayName, tier, timezone?, language? }`.
+    @objc public func fetchProfile(
+        completion: @escaping (_ profile: [String: Any]?, _ error: NSError?) -> Void
+    ) {
+        guard let serverURL = authServerBaseURL,
+              let accessToken = currentAccessToken else {
+            completeOnMain { completion(nil, InterNetworkErrorCode.authFailed.error(message: "Not authenticated")) }
+            return
+        }
+
+        performAuthHTTPRequest(
+            url: "\(serverURL)/auth/profile",
+            method: "GET",
+            body: nil,
+            bearerToken: accessToken,
+            retryCount: 0
+        ) { [weak self] data, httpResponse, error in
+            guard let self = self else { return }
+            if let error = error {
+                self.completeOnMain { completion(nil, error) }
+                return
+            }
+            guard let httpResponse = httpResponse, httpResponse.statusCode == 200,
+                  let json = data.flatMap({ self.parseJSON($0) }) else {
+                let msg = (data.flatMap { self.parseJSON($0) })?["error"] as? String
+                       ?? "Failed to load profile"
+                self.completeOnMain { completion(nil, InterNetworkErrorCode.authFailed.error(message: msg)) }
+                return
+            }
+            self.completeOnMain { completion(json, nil) }
+        }
+    }
+
+    /// Update profile preferences. Only non-nil parameters are sent (partial PATCH).
+    /// Pass an empty string for `timezone`/`language` to clear them back to
+    /// system-default (the server stores NULL).
+    ///
+    /// Calls `PATCH /auth/profile`. On a successful display-name change this
+    /// forces one coalesced token refresh so the rotated JWT (and
+    /// `currentDisplayName`) carry the new name immediately.
+    @objc(updateProfileWithDisplayName:timezone:language:completion:)
+    public func updateProfile(
+        displayName: String?,
+        timezone: String?,
+        language: String?,
+        completion: @escaping (_ profile: [String: Any]?, _ error: NSError?) -> Void
+    ) {
+        guard let serverURL = authServerBaseURL,
+              let accessToken = currentAccessToken else {
+            completeOnMain { completion(nil, InterNetworkErrorCode.authFailed.error(message: "Not authenticated")) }
+            return
+        }
+
+        var body: [String: Any] = [:]
+        if let displayName = displayName { body["displayName"] = displayName }
+        if let timezone = timezone { body["timezone"] = timezone }   // "" clears → NULL
+        if let language = language { body["language"] = language }   // "" clears → NULL
+        guard !body.isEmpty else {
+            completeOnMain { completion(nil, InterNetworkErrorCode.authFailed.error(message: "Nothing to update")) }
+            return
+        }
+
+        performAuthHTTPRequest(
+            url: "\(serverURL)/auth/profile",
+            method: "PATCH",
+            body: body,
+            bearerToken: accessToken,
+            retryCount: 0
+        ) { [weak self] data, httpResponse, error in
+            guard let self = self else { return }
+            if let error = error {
+                self.completeOnMain { completion(nil, error) }
+                return
+            }
+            guard let httpResponse = httpResponse, httpResponse.statusCode == 200,
+                  let json = data.flatMap({ self.parseJSON($0) }) else {
+                let msg = (data.flatMap { self.parseJSON($0) })?["error"] as? String
+                       ?? "Failed to update profile"
+                self.completeOnMain { completion(nil, InterNetworkErrorCode.authFailed.error(message: msg)) }
+                return
+            }
+            // Name lives in the JWT: rotate once (coalesced) so currentDisplayName
+            // and every future request carry the new name without waiting ≤15 min.
+            if displayName != nil {
+                self.refreshAccessToken { _ in
+                    self.completeOnMain { completion(json, nil) }
+                }
+            } else {
+                self.completeOnMain { completion(json, nil) }
+            }
+        }
+    }
+
     /// List all active sessions for the current user.
     ///
     /// Calls `GET /auth/sessions`. Each dict in the returned array contains:
@@ -2939,6 +3051,7 @@ private struct TokenCacheEntry {
         retryCount: Int,
         idempotencyKey: String? = nil,
         bearerToken: String? = nil,
+        authRefreshed: Bool = false,
         completion: @escaping (Result<Data, NSError>) -> Void
     ) {
         // T9: Circuit breaker — fail fast if server is confirmed unreachable.
@@ -2996,7 +3109,8 @@ private struct TokenCacheEntry {
                 if self.shouldRetry(statusCode: nil, nsError: nsError, retryCount: retryCount) {
                     interLogInfo(InterLog.networking, "Token: retrying after transport error (%{public}@)", nsError.localizedDescription)
                     self.performRequest(url: urlString, body: body, retryCount: retryCount + 1,
-                                        idempotencyKey: idempotencyKey, bearerToken: bearerToken, completion: completion)
+                                        idempotencyKey: idempotencyKey, bearerToken: bearerToken,
+                                        authRefreshed: authRefreshed, completion: completion)
                     return
                 }
                 let wrappedError = InterNetworkErrorCode.serverUnreachable.error(
@@ -3113,6 +3227,45 @@ private struct TokenCacheEntry {
                     completion(.failure(error))
                     return
                 }
+
+                // Authenticated request whose access token was rejected (expired/invalid).
+                // Recover by refreshing the access token ONCE via the coalesced refresh, then
+                // retrying the request a single time with the rotated token. This keeps
+                // short-lived-token endpoints (e.g. authenticated /room/create) usable when the
+                // proactive refresh hasn't fired yet — cold launch, wake-from-sleep, or a prior
+                // refresh failure. Guests (bearerToken == nil) skip this and fall through to the
+                // generic 4xx handler below. `authRefreshed` caps this at one attempt so a
+                // genuinely invalid session cannot loop.
+                if let staleToken = bearerToken, !staleToken.isEmpty, !authRefreshed {
+                    interLogInfo(InterLog.networking, "Token: 401 on authenticated request — refreshing token, retrying once")
+                    self.refreshAccessToken { [weak self] success in
+                        guard let self = self else {
+                            completion(.failure(InterNetworkErrorCode.sessionExpired.error(
+                                message: "Your session has expired. Please sign in again.")))
+                            return
+                        }
+                        // Read the rotated token and fire the retry on the main thread, where
+                        // currentAccessToken is committed by the refresh path — avoids observing
+                        // a stale value from the refresh's background commit.
+                        let resume = {
+                            guard success, let freshToken = self.currentAccessToken, !freshToken.isEmpty else {
+                                // Refresh failed; the refresh path already fired authSessionDidExpire
+                                // when the session was truly invalid. Surface a terminal re-login error.
+                                completion(.failure(InterNetworkErrorCode.sessionExpired.error(
+                                    message: "Your session has expired. Please sign in again.")))
+                                return
+                            }
+                            // Same idempotency key → a create/join that did commit server-side is
+                            // de-duplicated. requireAuth runs before the idempotency middleware, so a
+                            // 401 means the handler never ran and no state was created.
+                            self.performRequest(url: urlString, body: body, retryCount: retryCount,
+                                                idempotencyKey: idempotencyKey, bearerToken: freshToken,
+                                                authRefreshed: true, completion: completion)
+                        }
+                        if Thread.isMainThread { resume() } else { DispatchQueue.main.async(execute: resume) }
+                    }
+                    return
+                }
             }
 
             if (400..<500).contains(statusCode) {
@@ -3138,7 +3291,8 @@ private struct TokenCacheEntry {
             if self.shouldRetry(statusCode: statusCode, nsError: nil, retryCount: retryCount) {
                 interLogInfo(InterLog.networking, "Token: retrying after %{public}d", statusCode)
                 self.performRequest(url: urlString, body: body, retryCount: retryCount + 1,
-                                    idempotencyKey: idempotencyKey, bearerToken: bearerToken, completion: completion)
+                                    idempotencyKey: idempotencyKey, bearerToken: bearerToken,
+                                    authRefreshed: authRefreshed, completion: completion)
                 return
             }
 

@@ -160,6 +160,10 @@ enum InterMicrophoneNetworkAction {
     /// Scheduled meeting ID. When non-empty, InterRoomController calls
     /// POST /meetings/:id/start instead of /room/create or /room/join.
     @objc public var scheduledMeetingId: String
+    /// Host-edited meeting-settings override for a scheduled start (green room
+    /// "Meeting Settings" sheet). nil → the server applies the snapshot stored
+    /// at schedule time. Keys mirror the /room/create settings body.
+    @objc public var scheduledSettingsOverride: [String: Any]?
 
     // -----------------------------------------------------------------------
     // MARK: - Meeting settings (host-configured, broadcast to all participants)
@@ -250,6 +254,7 @@ enum InterMicrophoneNetworkAction {
             maxParticipants: maxParticipants
         )
         copy.scheduledMeetingId   = scheduledMeetingId
+        copy.scheduledSettingsOverride = scheduledSettingsOverride
         copy.meetingDisplayName   = meetingDisplayName
         copy.muteOnJoin           = muteOnJoin
         copy.cameraOffOnJoin      = cameraOffOnJoin

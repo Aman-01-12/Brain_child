@@ -32,6 +32,24 @@ import Foundation
 import os.log
 import LiveKit
 
+// MARK: - Audio input device matching (pure, unit-testable)
+
+/// Pure matcher for re-pointing the network mic. The in-app picker is AVCapture-based
+/// while LiveKit enumerates CoreAudio devices, so we match by deviceId first and fall
+/// back to the human-readable name. Returns nil when nothing matches (caller no-ops).
+enum InterAudioInputMatcher {
+    static func matchIndex(devices: [(id: String, name: String)],
+                           wantID: String?, wantName: String?) -> Int? {
+        if let w = wantID, !w.isEmpty, let i = devices.firstIndex(where: { $0.id == w }) {
+            return i
+        }
+        if let w = wantName, !w.isEmpty, let i = devices.firstIndex(where: { $0.name == w }) {
+            return i
+        }
+        return nil
+    }
+}
+
 // MARK: - InterRoomController
 
 @objc public class InterRoomController: NSObject {
@@ -103,6 +121,47 @@ import LiveKit
     @objc public var localParticipantName: String {
         return room?.localParticipant.name ?? "You"
     }
+
+    /// Re-point LiveKit's native audio capture (the ADM/voice-processing input) to a
+    /// specific input device, matched against `AudioManager.shared.inputDevices`.
+    ///
+    /// The in-app mic picker is built on AVCaptureDevice, whose `uniqueID` is not
+    /// guaranteed to equal LiveKit's `AudioDevice.deviceId`, so we match by deviceId
+    /// first and fall back to the human-readable name. Returns true iff a matching
+    /// device was found and selected. SAFE NO-OP (logs) when nothing matches — never
+    /// forces an invalid device. Skips a redundant switch to avoid thrashing the ADM.
+    @objc public func setNetworkAudioInput(deviceID: String?, name: String?) -> Bool {
+        #if os(macOS)
+        let devices = AudioManager.shared.inputDevices
+        let tuples = devices.map { (id: $0.deviceId, name: $0.name) }
+        guard let idx = InterAudioInputMatcher.matchIndex(devices: tuples,
+                                                          wantID: deviceID, wantName: name) else {
+            interLogInfo(InterLog.networking,
+                         "RoomController: in-call mic switch found no LiveKit input device (id=%{public}@ name=%{public}@)",
+                         deviceID ?? "", name ?? "")
+            return false
+        }
+        let target = devices[idx]
+        // Skip a redundant switch — re-selecting the current device would needlessly
+        // restart the audio device module.
+        if AudioManager.shared.inputDevice.deviceId == target.deviceId {
+            return true
+        }
+        AudioManager.shared.inputDevice = target
+        interLogInfo(InterLog.networking,
+                     "RoomController: network mic switched to %{public}@", target.name)
+        return true
+        #else
+        return false
+        #endif
+    }
+
+    // NOTE: `selectedNetworkAudioInput(optionIDs:optionNames:)` (the deferred "deeper"
+    // checkmark fix that read LiveKit's AudioManager.inputDevice while connected) was
+    // removed. It introduced a synchronous WebRTC blocking call into the route-change
+    // refresh path (UI freeze) and was reverted in full. The mic checkmark is now derived
+    // solely from the AVCapture-validated -selectedAudioInputDeviceID. See spec:
+    // audio-route-change-crash-fix.
 
     /// Whether the local participant is the host (room creator).
     @objc public var isHost: Bool {
@@ -270,16 +329,35 @@ import LiveKit
                 serverURL: configuration.tokenServerURL,
                 identity: configuration.participantIdentity,
                 displayName: configuration.participantName,
-                password: configuration.meetingPassword
+                password: configuration.meetingPassword,
+                settingsOverride: configuration.scheduledSettingsOverride
             ) { [weak self] response, error in
                 // The scheduled host is the same user who created the meeting, but the
                 // client cannot know that until the server confirms it. Propagate the
                 // server-authoritative isHost onto our stored configuration so
                 // `roomController.isHost` (and the moderation controller's localRole,
                 // derived from it in attach()) reflect host status and the host UI loads.
-                if let self = self, let r = response, error == nil, r.isHost {
+                if let self = self, let r = response, error == nil {
                     DispatchQueue.main.async {
-                        self.configuration?.isHost = true
+                        if r.isHost { self.configuration?.isHost = true }
+                        // Apply the meeting-settings snapshot the server stored at
+                        // schedule time (parity with the /room/join settings block).
+                        // Without this, scheduled meetings ran on server defaults
+                        // regardless of what the host configured when scheduling.
+                        if let s = r.roomSettings {
+                            self.activeMeetingDisplayName  = s["meetingDisplayName"] as? String ?? ""
+                            self.activeMuteOnJoin          = s["muteOnJoin"] as? Bool ?? false
+                            self.activeCameraOffOnJoin     = s["cameraOffOnJoin"] as? Bool ?? false
+                            self.activeJoinBeforeHost      = s["joinBeforeHost"] as? Bool ?? false
+                            self.activeAllowUnmuting       = s["allowUnmuting"] as? Bool ?? true
+                            self.activeChatPermissions     = s["chatPermissions"] as? String ?? "everyone"
+                            self.activeSharingPermissions  = s["sharingPermissions"] as? String ?? "hostOnly"
+                            self.activeShareConflictPolicy = s["shareConflictPolicy"] as? String ?? "oneattime"
+                            self.activeHasPassword         = s["hasPassword"] as? Bool ?? false
+                            // Without this the scheduled host's lobby UI never
+                            // enabled — participants waited in an invisible lobby.
+                            self.activeLobbyEnabled        = s["lobbyEnabled"] as? Bool ?? false
+                        }
                     }
                 }
                 self?.handleTokenResponse(
