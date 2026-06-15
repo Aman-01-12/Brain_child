@@ -18,6 +18,11 @@
 
 static const void *InterLocalMediaSessionQueueKey = &InterLocalMediaSessionQueueKey;
 
+// [Settings] Default-device preferences (chosen in the Settings window; applied
+// at session configuration time — not live reconfiguration).
+static NSString *const InterPreferredAudioDeviceKey = @"InterPreferredAudioDeviceID";
+static NSString *const InterPreferredVideoDeviceKey = @"InterPreferredVideoDeviceID";
+
 @implementation InterLocalMediaController {
     dispatch_queue_t _sessionQueue;
     AVCaptureSession *_session;
@@ -87,6 +92,10 @@ static const void *InterLocalMediaSessionQueueKey = &InterLocalMediaSessionQueue
     _cameraEnabled = NO;
     _microphoneEnabled = NO;
     _shuttingDown = NO;
+    // Seed the audio preference from the persisted Settings choice so the next
+    // session start honors it without any extra wiring.
+    _preferredAudioDeviceID = [[NSUserDefaults standardUserDefaults]
+                                  stringForKey:InterPreferredAudioDeviceKey] ?: @"";
     [self registerDeviceAvailabilityObservers];
     return self;
 }
@@ -416,27 +425,45 @@ static const void *InterLocalMediaSessionQueueKey = &InterLocalMediaSessionQueue
 - (nullable NSString *)selectedAudioInputDeviceID {
     __block NSString *selectedDeviceID = nil;
     [self performSynchronouslyOnSessionQueue:^{
-        if (self->_preferredAudioDeviceID.length > 0) {
-            AVCaptureDevice *preferredDevice = [AVCaptureDevice deviceWithUniqueID:self->_preferredAudioDeviceID];
-            if (preferredDevice && ![self isLikelyProblematicAudioDevice:preferredDevice]) {
-                selectedDeviceID = self->_preferredAudioDeviceID;
-                return;
+        // Build the set of currently-available (non-problematic) device IDs first, so we
+        // NEVER return an id that isn't in the picker list. Otherwise a preference (or a
+        // captured input) pointing at a just-unplugged device would yield an id that
+        // matches no menu item → the picker shows NO checkmark (the reported bug). The
+        // hot-unplug race in -deviceWithUniqueID: (which can still briefly return a dying
+        // device object) is also avoided by validating against the live discovery list.
+        NSMutableSet<NSString *> *available = [NSMutableSet set];
+        AVCaptureDeviceDiscoverySession *disc =
+            [AVCaptureDeviceDiscoverySession discoverySessionWithDeviceTypes:@[AVCaptureDeviceTypeMicrophone]
+                                                                  mediaType:AVMediaTypeAudio
+                                                                   position:AVCaptureDevicePositionUnspecified];
+        for (AVCaptureDevice *d in disc.devices) {
+            if (d.uniqueID.length > 0 && ![self isLikelyProblematicAudioDevice:d]) {
+                [available addObject:d.uniqueID];
             }
         }
 
-        if (self->_audioInput.device.uniqueID.length > 0 && ![self isLikelyProblematicAudioDevice:self->_audioInput.device]) {
+        if (self->_preferredAudioDeviceID.length > 0 &&
+            [available containsObject:self->_preferredAudioDeviceID]) {
+            selectedDeviceID = self->_preferredAudioDeviceID;
+            return;
+        }
+
+        if (self->_audioInput.device.uniqueID.length > 0 &&
+            [available containsObject:self->_audioInput.device.uniqueID]) {
             selectedDeviceID = self->_audioInput.device.uniqueID;
             return;
         }
 
         AVCaptureDevice *preferredDefault = [self preferredAudioDevice];
-        if (preferredDefault.uniqueID.length > 0) {
+        if (preferredDefault.uniqueID.length > 0 &&
+            [available containsObject:preferredDefault.uniqueID]) {
             selectedDeviceID = preferredDefault.uniqueID;
             return;
         }
 
         AVCaptureDevice *defaultDevice = [AVCaptureDevice defaultDeviceWithMediaType:AVMediaTypeAudio];
-        if (defaultDevice.uniqueID.length > 0 && ![self isLikelyProblematicAudioDevice:defaultDevice]) {
+        if (defaultDevice.uniqueID.length > 0 &&
+            [available containsObject:defaultDevice.uniqueID]) {
             selectedDeviceID = defaultDevice.uniqueID;
         }
     }];
@@ -481,6 +508,12 @@ static const void *InterLocalMediaSessionQueueKey = &InterLocalMediaSessionQueue
         }
 
         strongSelf->_preferredAudioDeviceID = normalizedID;
+        // [Settings] Persist so the preference survives relaunch.
+        if (normalizedID.length > 0) {
+            [[NSUserDefaults standardUserDefaults] setObject:normalizedID forKey:InterPreferredAudioDeviceKey];
+        } else {
+            [[NSUserDefaults standardUserDefaults] removeObjectForKey:InterPreferredAudioDeviceKey];
+        }
         BOOL shouldKeepMicEnabled = strongSelf.isMicrophoneEnabled;
 
         if (strongSelf->_audioInput) {
@@ -510,6 +543,12 @@ static const void *InterLocalMediaSessionQueueKey = &InterLocalMediaSessionQueue
         return;
     }
     NSString *normalizedID = deviceID.length > 0 ? [deviceID copy] : nil;
+    // [Settings] Persist so the preference survives relaunch.
+    if (normalizedID.length > 0) {
+        [[NSUserDefaults standardUserDefaults] setObject:normalizedID forKey:InterPreferredAudioDeviceKey];
+    } else {
+        [[NSUserDefaults standardUserDefaults] removeObjectForKey:InterPreferredAudioDeviceKey];
+    }
     dispatch_async(queue, ^{
         self->_preferredAudioDeviceID = normalizedID;
     });
@@ -928,6 +967,17 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
 }
 
 - (AVCaptureDevice *)preferredVideoDevice {
+    // [Settings] Honor the persisted default-camera preference when the device
+    // is still attached; otherwise fall through to the discovery heuristics.
+    NSString *storedID = [[NSUserDefaults standardUserDefaults]
+                             stringForKey:InterPreferredVideoDeviceKey];
+    if (storedID.length > 0) {
+        AVCaptureDevice *stored = [AVCaptureDevice deviceWithUniqueID:storedID];
+        if (stored && [stored hasMediaType:AVMediaTypeVideo]) {
+            return stored;
+        }
+    }
+
     NSMutableArray<AVCaptureDeviceType> *deviceTypes = [NSMutableArray arrayWithArray:@[
         AVCaptureDeviceTypeBuiltInWideAngleCamera,
         AVCaptureDeviceTypeExternal
