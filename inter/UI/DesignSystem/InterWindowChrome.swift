@@ -11,6 +11,7 @@
 //
 
 import AppKit
+import SwiftUI
 
 @objc public final class InterWindowChrome: NSObject {
 
@@ -54,5 +55,45 @@ import AppKit
         window.standardWindowButton(.closeButton)?.isHidden = true
         window.standardWindowButton(.miniaturizeButton)?.isHidden = true
         window.standardWindowButton(.zoomButton)?.isHidden = true
+    }
+
+    // MARK: - Seamless chrome (no title-bar band at all)
+
+    /// Seamless full-bleed chrome: the content extends into the title-bar area
+    /// (`fullSizeContentView`) and the traffic lights float over the screen's own
+    /// surface — there is no separate title-bar band at all. This is the canonical
+    /// treatment for migrated SwiftUI app windows (Teams, and every screen after it).
+    ///
+    /// Recipe for the hosted SwiftUI root:
+    ///   1. Apply this to the window (inserts `.fullSizeContentView`, transparent bar,
+    ///      hidden title text — keep a real `window.title` for Mission Control/⌘-Tab).
+    ///   2. `.ignoresSafeArea(.container, edges: .top)` on the root so surfaces paint
+    ///      to the very top.
+    ///   3. Add `.interTitlebarInset()` to whatever content sits top-LEFT so it clears
+    ///      the floating traffic lights (content elsewhere can use the full height).
+    @objc public static func applySeamlessChrome(to window: NSWindow) {
+        applySeamlessChrome(to: window, surface: InterColor.card)
+    }
+
+    /// As above, with an explicit surface colour (shows through during live resize).
+    @objc public static func applySeamlessChrome(to window: NSWindow, surface: NSColor) {
+        window.styleMask.insert(.fullSizeContentView)
+        window.titlebarAppearsTransparent = true
+        window.titleVisibility = .hidden
+        window.backgroundColor = surface
+        window.isMovableByWindowBackground = true
+    }
+
+    /// Height of the strip the floating traffic lights occupy in a seamless window.
+    /// Content in the window's top-left corner pads down by this much.
+    @objc public static let titlebarContentInset: CGFloat = 28
+}
+
+public extension View {
+    /// Pad the top by the seamless window's traffic-light strip so content placed in
+    /// the top-left corner clears the floating window buttons. Pairs with
+    /// `InterWindowChrome.applySeamlessChrome(to:)`.
+    func interTitlebarInset() -> some View {
+        padding(.top, InterWindowChrome.titlebarContentInset)
     }
 }

@@ -98,6 +98,12 @@ public enum InterColor {
     public static let stage         = NSColor(hex: 0x101012) // deepest chrome / rails / footers
     public static let stageSurface  = NSColor(hex: 0x18181B) // main video canvas / panels
     public static let stageElevated = NSColor(hex: 0x27272A) // menus / popovers on the stage
+
+    // Stage text — white-on-dark neutrals. The ONE place these are correct (spec §1.2):
+    // on the fixed-dark stage, text is white / light-neutral. Never use theme foreground here.
+    public static let stageText          = NSColor(hex: 0xFFFFFF) // primary — titles / emphasis
+    public static let stageTextSecondary = NSColor(hex: 0xE5E5E5) // body / names — neutral-200
+    public static let stageTextMuted     = NSColor(hex: 0xA3A3A3) // captions / empty / disabled — neutral-400
 }
 
 // Convenience: SwiftUI Color for every token.
@@ -122,6 +128,10 @@ public extension Color {
     static let interStage             = Color(nsColor: InterColor.stage)
     static let interStageSurface      = Color(nsColor: InterColor.stageSurface)
     static let interStageElevated     = Color(nsColor: InterColor.stageElevated)
+    // Stage text (white-on-dark scale)
+    static let interStageText          = Color(nsColor: InterColor.stageText)
+    static let interStageTextSecondary = Color(nsColor: InterColor.stageTextSecondary)
+    static let interStageTextMuted     = Color(nsColor: InterColor.stageTextMuted)
 }
 
 // MARK: - Status hues (semantic, same in both appearances)
@@ -160,13 +170,22 @@ public enum InterFont {
     }
 
     public static func swiftUI(_ size: CGFloat, _ weight: Font.Weight = .regular) -> Font {
-        Font.custom(family, size: size).weight(weight)
+        Font.custom(family, size: readable(size)).weight(weight)
     }
 
     public static func appKit(_ size: CGFloat, _ weight: NSFont.Weight = .regular) -> NSFont {
-        NSFont(name: family, size: size).map { base in
+        let adjusted = readable(size)
+        return NSFont(name: family, size: adjusted).map { base in
             NSFontManager.shared.convert(base, toHaveTrait: weight >= .semibold ? .boldFontMask : [])
-        } ?? NSFont.systemFont(ofSize: size, weight: weight)
+        } ?? NSFont.systemFont(ofSize: adjusted, weight: weight)
+    }
+
+    /// Readable-type policy: the catalogue's small reading sizes (≤13pt)
+    /// render one point larger app-wide — new users found the original scale
+    /// hard to scan. Display sizes (≥14pt) are untouched so headings keep
+    /// their mock proportions. Applies to every InterFont call site at once.
+    public static func readable(_ size: CGFloat) -> CGFloat {
+        size <= 13 ? size + 1 : size
     }
 
     /// CSS letter-spacing is in `em`; SwiftUI `.tracking()` wants POINTS.
@@ -215,15 +234,20 @@ public enum InterSpacing {
     public static let x8:   CGFloat = 32
 }
 
-// MARK: - Corner radius (base --radius = 10pt)
+// MARK: - Corner radius (native-feeling scale)
+//
+// 4 micro · 6 controls/rows/inputs · 8 bubbles · 10 cards & window-sized surfaces.
+// Capsule/pill is reserved for STATUS BADGES (and native switch tracks) only —
+// field-shaped controls use the 6pt rect, never a pill.
 
 public enum InterRadius {
-    public static let sm:  CGFloat = 6   // rounded-sm
-    public static let md:  CGFloat = 8   // rounded-md  — micro buttons, icon tiles
-    public static let lg:  CGFloat = 10  // rounded-lg  — buttons, inputs, rows
-    public static let xl:  CGFloat = 14  // rounded-xl  — cards, input groups
-    public static let xxl: CGFloat = 16  // rounded-2xl — modals, call window
-    // rounded-full → use Capsule() or Circle()
+    public static let sm:  CGFloat = 4   // micro — meters, tiny tile badges
+    public static let md:  CGFloat = 6   // controls — icon buttons, tiles, chips
+    public static let lg:  CGFloat = 6   // controls/rows/inputs (same tier as md)
+    public static let bubble: CGFloat = 8 // chat bubbles
+    public static let xl:  CGFloat = 10  // cards, panels, rows-as-cards
+    public static let xxl: CGFloat = 10  // modals / window-sized surfaces
+    // Capsule() / Circle() → status badges and avatars only
 }
 
 // MARK: - Control sizing (canonical — don't invent intermediate heights)
@@ -234,6 +258,47 @@ public enum InterControl {
     public static let inputHeight:     CGFloat = 36 // h-9
     public static let compactHeight:   CGFloat = 32 // h-8
     public static let toolbarHeight:   CGFloat = 28 // h-7
+
+    /// In-call bottom control bar (leave / mic / cam …). This is a LAYOUT metric,
+    /// not a button height — it is the single source of truth for both the bar's
+    /// frame and the bottom inset the video-tile layout reserves so tiles are
+    /// never occluded by the bar.
+    public static let callBarHeight:   CGFloat = 96
+}
+
+// MARK: - Call layout metrics (AppKit video-tile surface)
+//
+// Single source of truth for the in-call tile grid / stage+filmstrip geometry,
+// consumed by InterRemoteVideoLayoutManager.m via the InterDesignTokens @objc facade
+// (the same way the SwiftUI surface consumes the tokens above). Values preserve the
+// shipped look; gaps and radius map onto the shared spacing/radius scales so the call
+// surface stays in rhythm with the rest of the app. Change a value here once and it
+// reflects everywhere the token is read.
+public enum InterCallLayout {
+    /// Bottom control-bar height (mirrors InterControl.callBarHeight for the layout inset).
+    public static let controlBarHeight:      CGFloat = InterControl.callBarHeight   // 96
+    /// Gap between camera tiles in the grid.
+    public static let tileGap:               CGFloat = InterSpacing.x1_5            // 6
+    /// Gap between pinned tiles in the multi-pin stage sub-grid.
+    public static let tilePinGap:            CGFloat = InterSpacing.x1              // 4
+    /// Windowed tile corner radius (grid / stage / filmstrip tiles). Full-bleed
+    /// modes (single-camera / screen-share fill) intentionally use 0 — that's a
+    /// structural "edge-to-edge" choice, not a theme metric.
+    public static let tileCornerRadius:      CGFloat = InterRadius.bubble           // 8
+    /// Stage+filmstrip rail: width as a fraction of the container, then clamped.
+    public static let filmstripWidthFraction: CGFloat = 0.25
+    public static let filmstripMinWidth:     CGFloat = 160
+    public static let filmstripMaxWidth:     CGFloat = 280
+    public static let filmstripTileGap:      CGFloat = InterSpacing.x2              // 8
+    public static let filmstripPadding:      CGFloat = InterSpacing.x2              // 8
+
+    // ── In-call chrome radii (map onto the shared InterRadius scale) ─────────
+    /// Small stage chrome: host cause-caption pills + the tile hover-menu button.
+    public static let chromeCornerRadius:        CGFloat = InterRadius.sm           // 4
+    /// Participant-count badge.
+    public static let countBadgeCornerRadius:    CGFloat = InterRadius.xl           // 10
+    /// Paginated-grid page-indicator bar.
+    public static let pageIndicatorCornerRadius: CGFloat = InterRadius.md           // 6
 }
 
 // MARK: - Elevation (approximations of Tailwind shadow-*; tune visually)

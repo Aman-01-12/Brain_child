@@ -12,6 +12,7 @@
 //    .secondary     card fill + hairline border       (neutral actions, OAuth, "Leave")
 //    .danger        red fill, white text              (destructive, filled)
 //    .dangerOutline red text + red border, tint hover  (destructive, low-emphasis — "Deny")
+//    .success       emerald fill, white text           (positive confirm — poll "Submit Vote")
 //    .neutral       inverted near-black↔white CTA      (auth entry CTA, appearance-aware)
 //
 //  Sizes map to the canonical control heights (InterControl): regular 40 · medium 36 ·
@@ -22,7 +23,7 @@
 import SwiftUI
 
 public enum InterButtonVariant {
-    case primary, secondary, danger, dangerOutline, neutral
+    case primary, secondary, danger, dangerOutline, success, neutral
 }
 
 public enum InterButtonSize {
@@ -139,7 +140,7 @@ public struct InterButton<Leading: View>: View {
 
     private var foreground: Color {
         switch variant {
-        case .primary, .danger: return .white
+        case .primary, .danger, .success: return .white
         case .secondary:        return Color(nsColor: InterColor.foreground)
         case .dangerOutline:    return Color(nsColor: InterStatus.danger)
         case .neutral:          return invertedForeground
@@ -150,6 +151,7 @@ public struct InterButton<Leading: View>: View {
         switch variant {
         case .primary:       return Color(nsColor: InterColor.primary).opacity(hovering ? 0.85 : 1)
         case .danger:        return Color(nsColor: InterStatus.danger).opacity(hovering ? 0.85 : 1)
+        case .success:       return Color(nsColor: InterStatus.success).opacity(hovering ? 0.85 : 1)
         case .secondary:     return Color(nsColor: hovering ? InterColor.muted : InterColor.card)
         case .dangerOutline: return Color(nsColor: InterStatus.danger).opacity(hovering ? 0.12 : 0)
         case .neutral:       return invertedBackground

@@ -35,7 +35,28 @@ final class InterDesignTokensTests: XCTestCase {
     func testAccentsAreSourcedFromCanonicalStatusHues() {
         XCTAssertEqual(InterDesignTokens.accentDanger, InterStatus.danger)
         XCTAssertEqual(InterDesignTokens.accentGold, InterStatus.warning)
-        XCTAssertEqual(InterDesignTokens.badgeCornerRadius, InterRadius.md)
+        XCTAssertEqual(InterDesignTokens.accentSuccess, InterStatus.success)
+        XCTAssertEqual(InterDesignTokens.badgeCornerRadius, InterRadius.sm)
+    }
+
+    /// Stage TEXT tokens (added for call-surface AppKit panels) must come from the
+    /// canonical InterColor SSOT and be visually distinct (primary > secondary > muted).
+    func testStageTextTokensSourcedFromSSOT() {
+        XCTAssertEqual(InterDesignTokens.stageForeground, InterColor.stageText)
+        XCTAssertEqual(InterDesignTokens.stageForegroundSecondary, InterColor.stageTextSecondary)
+        XCTAssertEqual(InterDesignTokens.stageForegroundMuted, InterColor.stageTextMuted)
+        // Distinct tiers so the panel hierarchy (title / body / caption) reads.
+        XCTAssertNotEqual(InterDesignTokens.stageForeground, InterDesignTokens.stageForegroundSecondary)
+        XCTAssertNotEqual(InterDesignTokens.stageForegroundSecondary, InterDesignTokens.stageForegroundMuted)
+    }
+
+    /// Stage text is white-on-dark and FIXED — it must not change with appearance
+    /// (the call surface stays dark even in light mode).
+    func testStageTextIsAppearanceIndependent() {
+        for color in [InterColor.stageText, InterColor.stageTextSecondary, InterColor.stageTextMuted] {
+            XCTAssertEqual(resolve(color, .darkAqua), resolve(color, .aqua),
+                           "stage text must not change with appearance")
+        }
     }
 
     /// Stage surfaces must come from the canonical InterColor SSOT (no drift), and the
@@ -44,7 +65,7 @@ final class InterDesignTokensTests: XCTestCase {
         XCTAssertEqual(InterDesignTokens.stageBackground, InterColor.stage)
         XCTAssertEqual(InterDesignTokens.stageSurface, InterColor.stageSurface)
         XCTAssertEqual(InterDesignTokens.stageElevated, InterColor.stageElevated)
-        XCTAssertEqual(InterDesignTokens.tileCornerRadius, InterRadius.lg)
+        XCTAssertEqual(InterDesignTokens.tileCornerRadius, InterRadius.xl)
         XCTAssertNotEqual(InterDesignTokens.tileGradientTop, InterDesignTokens.tileGradientBottom)
     }
 
