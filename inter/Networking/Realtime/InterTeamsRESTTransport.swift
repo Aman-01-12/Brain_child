@@ -28,6 +28,9 @@ public final class InterTeamsRESTTransport: InterTeamsChatTransport {
         self.serverURL = serverURL.hasSuffix("/") ? String(serverURL.dropLast()) : serverURL
         self.tokenService = tokenService
         self.messagesPageLimit = messagesPageLimit
+        if InterAppConfig.isInsecureRemote(self.serverURL) {
+            NSLog("[Teams][security] Bearer tokens would be sent over cleartext to a non-loopback host: %@ — use https.", self.serverURL)
+        }
 
         let config = URLSessionConfiguration.default
         config.timeoutIntervalForRequest = 10.0
@@ -125,7 +128,11 @@ public final class InterTeamsRESTTransport: InterTeamsChatTransport {
         }
 
         session.dataTask(with: request) { [weak self] data, response, error in
-            guard let self = self else { return }
+            guard let self = self else {
+                completion(.failure(NSError(domain: "InterTeamsRESTTransport", code: -999,
+                    userInfo: [NSLocalizedDescriptionKey: "The request was cancelled."])))
+                return
+            }
             if let error = error { completion(.failure(error)); return }
             guard let http = response as? HTTPURLResponse else {
                 completion(.failure(self.makeError("No response from server"))); return

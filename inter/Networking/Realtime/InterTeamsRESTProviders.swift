@@ -18,7 +18,9 @@ import Foundation
 private let teamsJSONDecoder = JSONDecoder()
 
 private func encodePathComponent(_ s: String) -> String {
-    s.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? s
+    var allowed = CharacterSet.urlPathAllowed
+    allowed.remove(charactersIn: "/")   // never let an id segment inject a path separator
+    return s.addingPercentEncoding(withAllowedCharacters: allowed) ?? s
 }
 
 private func teamsError(_ message: String) -> NSError {

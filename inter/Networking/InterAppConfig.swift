@@ -34,6 +34,17 @@ public final class InterAppConfig: NSObject {
                 fallback: "http://localhost:3000")
     }
 
+    /// True if `urlString` would send credentials over cleartext to a NON-loopback host
+    /// (http/ws to a remote). Loopback (localhost/127.0.0.1/::1) is allowed for local dev.
+    /// Used to warn when Bearer tokens would leave the machine unencrypted.
+    @objc public static func isInsecureRemote(_ urlString: String) -> Bool {
+        guard let u = URL(string: urlString), let scheme = u.scheme?.lowercased() else { return false }
+        let host = (u.host ?? "").lowercased()
+        let isLoopback = (host == "localhost" || host == "127.0.0.1" || host == "::1")
+        let isCleartext = (scheme == "http" || scheme == "ws")
+        return isCleartext && !isLoopback
+    }
+
     private static func resolve(env: String, plist: String, fallback: String) -> String {
         if let value = ProcessInfo.processInfo.environment[env],
            !value.trimmingCharacters(in: .whitespaces).isEmpty {

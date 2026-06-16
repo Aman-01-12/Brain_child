@@ -74,6 +74,7 @@ public final class InterTeamsChatService: ObservableObject {
     private let realtime: InterRealtimeClient
     private let tokenProvider: () -> String?
     private let store = InterTeamMessageStore()
+    private var didStart = false
     private let iso: ISO8601DateFormatter
 
     public init(teamId: String,
@@ -93,6 +94,8 @@ public final class InterTeamsChatService: ObservableObject {
     /// fetch the latest history page. Live frames arriving during the fetch are
     /// merged + de-duplicated by id, so ordering is correct regardless of timing.
     public func start() {
+        guard !didStart else { return }   // idempotent: avoid duplicate live handlers on re-entry
+        didStart = true
         realtime.on("team:message") { [weak self] data in
             self?.handleLiveMessage(data)
         }
@@ -104,6 +107,7 @@ public final class InterTeamsChatService: ObservableObject {
     /// Tear down: leave the room and disconnect. The socket's own disconnect
     /// releases handlers (2C); we also clear the store.
     public func stop() {
+        didStart = false
         realtime.leave(room: teamId)
         realtime.disconnect()
         store.removeAll()

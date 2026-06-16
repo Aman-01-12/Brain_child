@@ -26,6 +26,9 @@ final class InterTeamsHTTPClient {
     init(serverURL: String, tokenService: InterTokenService) {
         self.serverURL = serverURL.hasSuffix("/") ? String(serverURL.dropLast()) : serverURL
         self.tokenService = tokenService
+        if InterAppConfig.isInsecureRemote(self.serverURL) {
+            NSLog("[Teams][security] Bearer tokens would be sent over cleartext to a non-loopback host: %@ — use https.", self.serverURL)
+        }
 
         let config = URLSessionConfiguration.default
         config.timeoutIntervalForRequest = 15.0
@@ -67,7 +70,12 @@ final class InterTeamsHTTPClient {
                     idempotencyKey: String,
                     completion: @escaping (Result<Data, Error>) -> Void) {
         let boundary = "Boundary-\(UUID().uuidString)"
-        let safeName = filename.replacingOccurrences(of: "\"", with: "")
+        // Strip control chars (CR/LF, etc.) AND quotes to prevent multipart header
+        // injection via a crafted filename, and cap length. The server re-derives the
+        // real name/type from magic bytes anyway.
+        let safeName = String(
+            filename.unicodeScalars.filter { !CharacterSet.controlCharacters.contains($0) }
+        ).replacingOccurrences(of: "\"", with: "").prefix(200)
         var bodyData = Data()
         let prefix = "--\(boundary)\r\n"
             + "Content-Disposition: form-data; name=\"file\"; filename=\"\(safeName)\"\r\n"
@@ -100,7 +108,11 @@ final class InterTeamsHTTPClient {
             completion(.failure(makeError("Invalid request"))); return
         }
         session.dataTask(with: request) { [weak self] data, response, error in
-            guard let self = self else { return }
+            guard let self = self else {
+                completion(.failure(NSError(domain: "InterTeamsHTTPClient", code: -999,
+                    userInfo: [NSLocalizedDescriptionKey: "The request was cancelled."])))
+                return
+            }
             if let error = error { completion(.failure(error)); return }
             guard let http = response as? HTTPURLResponse else {
                 completion(.failure(self.makeError("No response from server"))); return

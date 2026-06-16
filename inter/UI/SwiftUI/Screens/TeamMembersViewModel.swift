@@ -51,6 +51,7 @@ public final class TeamMembersViewModel: ObservableObject {
     public let teamName: String
     private let currentUserId: String?
     private let provider: InterTeamMembersProviding
+    private var removingMemberIds = Set<String>()
 
     public init(teamId: String, teamName: String, currentUserId: String?,
                 provider: InterTeamMembersProviding) {
@@ -124,9 +125,12 @@ public final class TeamMembersViewModel: ObservableObject {
     }
 
     public func removeMember(_ member: InterTeamMember) {
+        guard !removingMemberIds.contains(member.id) else { return }   // guard double-tap
+        removingMemberIds.insert(member.id)
         provider.removeMember(teamId: teamId, memberId: member.id) { [weak self] result in
             Task { @MainActor in
                 guard let self = self else { return }
+                self.removingMemberIds.remove(member.id)
                 switch result {
                 case .success:
                     self.members.removeAll { $0.id == member.id }
