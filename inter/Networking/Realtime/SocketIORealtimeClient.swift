@@ -25,14 +25,23 @@ import SocketIO
 public final class SocketIORealtimeClient: InterRealtimeClient {
 
     public weak var stateDelegate: InterRealtimeClientStateDelegate?
-    public private(set) var state: InterRealtimeConnectionState = .disconnected {
-        didSet {
-            guard oldValue != state else { return }
-            let snapshot = state
-            DispatchQueue.main.async { [weak self] in
-                guard let self = self else { return }
-                self.stateDelegate?.realtimeClient(self, didChange: snapshot)
-            }
+    private let stateLock = NSLock()
+    private var _state: InterRealtimeConnectionState = .disconnected
+    /// Thread-safe read of the last published connection state.
+    public var state: InterRealtimeConnectionState {
+        stateLock.lock(); defer { stateLock.unlock() }
+        return _state
+    }
+    /// Set the state from any thread; notifies the delegate on main only when it changes.
+    private func setState(_ newValue: InterRealtimeConnectionState) {
+        stateLock.lock()
+        let changed = (_state != newValue)
+        _state = newValue
+        stateLock.unlock()
+        guard changed else { return }
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            self.stateDelegate?.realtimeClient(self, didChange: newValue)
         }
     }
 
@@ -134,7 +143,7 @@ public final class SocketIORealtimeClient: InterRealtimeClient {
             self.joinedRooms.removeAll()
             self.router.removeAll()       // 2C: release every event handler
             self.tokenProvider = nil
-            self.state = .disconnected
+            self.setState(.disconnected)
         }
     }
 
@@ -143,11 +152,11 @@ public final class SocketIORealtimeClient: InterRealtimeClient {
     private func establishConnection() {
         guard let token = tokenProvider?(), !token.isEmpty else {
             // No valid session — abort; nothing to (re)connect with.
-            state = .disconnected
+            setState(.disconnected)
             return
         }
 
-        state = (reconnectAttempt == 0) ? .connecting : .reconnecting
+        setState(reconnectAttempt == 0 ? .connecting : .reconnecting)
 
         // Rebuild the manager/socket each attempt so a fresh CONNECT payload
         // (fresh token) is sent. forceWebsockets + reconnects(false): we own retries.
@@ -168,7 +177,7 @@ public final class SocketIORealtimeClient: InterRealtimeClient {
             self?.queue.async {
                 guard let self = self else { return }
                 self.reconnectAttempt = 0
-                self.state = .connected
+                self.setState(.connected)
                 // Replay room subscriptions on every (re)connect so membership
                 // survives drops — without this a reconnected client would stop
                 // receiving team messages until the next manual join.
@@ -196,7 +205,7 @@ public final class SocketIORealtimeClient: InterRealtimeClient {
         guard !intentionalDisconnect else { return }
         guard reconnectWorkItem == nil else { return }   // one pending attempt at a time
 
-        state = .reconnecting
+        setState(.reconnecting)
         reconnectAttempt += 1
         // Exponential backoff, capped.
         let delay = min(maxReconnectDelay, pow(2.0, Double(min(reconnectAttempt, 5))))

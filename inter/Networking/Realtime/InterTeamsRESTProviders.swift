@@ -147,11 +147,20 @@ final class InterTeamFilesRESTProvider {
         let originalName: String?
     }
 
+    /// Server hard cap (multer `TEAM_FILE_MAX_BYTES` in teams.js). Keep in sync.
+    private static let maxFileBytes = 25 * 1024 * 1024  // 25 MB
+
     /// Upload a file to the team. On success the server persists a file message
     /// and fans it out, so the open room renders it via realtime — we only need
     /// to know the upload succeeded (or surface the server's error string).
     func uploadFile(teamId: String, fileURL: URL,
                     completion: @escaping (Result<Void, Error>) -> Void) {
+        // Reject oversize files BEFORE reading bytes into memory (matches the server's
+        // 25 MB cap) so a too-large file fails fast — no memory spike, no doomed upload.
+        if let size = try? fileURL.resourceValues(forKeys: [.fileSizeKey]).fileSize,
+           size > Self.maxFileBytes {
+            completion(.failure(teamsError("That file is too large (max 25 MB)."))); return
+        }
         let data: Data
         do {
             data = try Data(contentsOf: fileURL)

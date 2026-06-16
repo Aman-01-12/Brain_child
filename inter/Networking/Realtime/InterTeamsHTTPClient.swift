@@ -38,6 +38,8 @@ final class InterTeamsHTTPClient {
         self.session = URLSession(configuration: config)
     }
 
+    deinit { session.invalidateAndCancel() }
+
     // MARK: - JSON
 
     func requestJSON(method: String, path: String, body: [String: Any]?,

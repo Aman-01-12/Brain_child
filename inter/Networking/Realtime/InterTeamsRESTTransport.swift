@@ -47,13 +47,13 @@ public final class InterTeamsRESTTransport: InterTeamsChatTransport {
         self.iso = f
     }
 
+    deinit { session.invalidateAndCancel() }
+
     // MARK: - InterTeamsChatTransport
 
     public func loadMessages(teamId: String, before: String?,
                              completion: @escaping (Result<[InterTeamMessage], Error>) -> Void) {
-        guard let escaped = teamId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) else {
-            completion(.failure(makeError("Invalid team id"))); return
-        }
+        let escaped = pathEscaped(teamId)
         var query = "?limit=\(messagesPageLimit)"
         if let before = before, !before.isEmpty,
            let beforeEscaped = before.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) {
@@ -77,9 +77,7 @@ public final class InterTeamsRESTTransport: InterTeamsChatTransport {
 
     public func sendMessage(teamId: String, body: String, idempotencyKey: String,
                             completion: @escaping (Result<InterTeamMessage, Error>) -> Void) {
-        guard let escaped = teamId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) else {
-            completion(.failure(makeError("Invalid team id"))); return
-        }
+        let escaped = pathEscaped(teamId)
         send(method: "POST", path: "/teams/\(escaped)/messages",
              body: ["body": body], idempotencyKey: idempotencyKey) { [weak self] result in
             guard let self = self else { return }
@@ -97,9 +95,7 @@ public final class InterTeamsRESTTransport: InterTeamsChatTransport {
 
     public func markRead(teamId: String, messageId: String,
                          completion: @escaping (Result<Void, Error>) -> Void) {
-        guard let escaped = teamId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) else {
-            completion(.failure(makeError("Invalid team id"))); return
-        }
+        let escaped = pathEscaped(teamId)
         send(method: "POST", path: "/teams/\(escaped)/read",
              body: ["messageId": messageId], idempotencyKey: nil) { result in
             completion(result.map { _ in () })
@@ -168,5 +164,13 @@ public final class InterTeamsRESTTransport: InterTeamsChatTransport {
     private func makeError(_ message: String, code: Int = -1) -> NSError {
         NSError(domain: "InterTeamsRESTTransport", code: code,
                 userInfo: [NSLocalizedDescriptionKey: message])
+    }
+
+    /// Percent-escape an id for use as a single path segment — `/` is escaped too,
+    /// so an id can never inject a path separator.
+    private func pathEscaped(_ s: String) -> String {
+        var allowed = CharacterSet.urlPathAllowed
+        allowed.remove(charactersIn: "/")
+        return s.addingPercentEncoding(withAllowedCharacters: allowed) ?? s
     }
 }
