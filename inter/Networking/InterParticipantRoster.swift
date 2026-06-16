@@ -128,7 +128,7 @@ import os.log
 
     @objc public func cameraSubscribed(_ identity: String) {
         mutateRemote(identity) {
-            print("[CB] ROSTER-CAM-SUBSCRIBED …\(identity.suffix(5))")
+            interLogInfo(InterLog.media, "Roster: camera subscribed …%{public}@", String(identity.suffix(5)))
             $0.subscribed = true
         }
     }
@@ -144,7 +144,9 @@ import os.log
     @objc public func cameraMuted(_ identity: String, muted: Bool) {
         mutateRemote(identity) {
             let suffix = String(identity.suffix(5))
-            print("[CB] CAM-MUTED …\(suffix) muted=\(muted ? 1 : 0) prev(cameraMuted=\($0.cameraMuted ? 1 : 0) firstFrameSeen=\($0.firstFrameSeen ? 1 : 0))")
+            interLogInfo(InterLog.media,
+                         "Roster: camera muted …%{public}@ muted=%d prev(cameraMuted=%d firstFrameSeen=%d)",
+                         suffix, muted ? 1 : 0, $0.cameraMuted ? 1 : 0, $0.firstFrameSeen ? 1 : 0)
             $0.cameraMuted = muted
             // Reset firstFrameSeen on BOTH mute and unmute. On mute it keeps camOn=false.
             // On unmute it forces us to wait for a genuinely fresh post-unmute frame before
@@ -167,7 +169,8 @@ import os.log
             s.firstFrameSeen = true
             self.remote[identity] = s
             let suffix = String(identity.suffix(5))
-            print("[CB] FIRST-FRAME …\(suffix) muted=\(s.cameraMuted ? 1 : 0)")
+            interLogInfo(InterLog.media, "Roster: first frame …%{public}@ muted=%d",
+                         suffix, s.cameraMuted ? 1 : 0)
             self.emitNow()
         }
     }
