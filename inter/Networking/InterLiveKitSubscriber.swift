@@ -137,9 +137,19 @@ import LiveKit
     /// Per-participant screen share video tracks keyed by participant identity.
     private var screenShareTracks: [String: RemoteVideoTrack] = [:]
 
+    /// Guards the four per-participant renderer/track dictionaries above (RC1).
+    /// They are touched from BOTH the LiveKit delegate queue (didSubscribeTrack /
+    /// didUnsubscribeTrack run off-main per the SDK's threading model) AND the main
+    /// thread (detach, the participantDidDisconnect main-hop, the scheduleSubscriptionCheck
+    /// timer, and activeScreenShareIdentities). Concurrent mutation of a non-thread-safe
+    /// Swift Dictionary can corrupt its store and crash, so every access takes this lock.
+    /// LiveKit `add/remove(videoRenderer:)` calls are made OUTSIDE the lock.
+    private let rendererLock = NSLock()
+
     /// Identities of remote participants who currently have an active screen share track.
-    /// Main-thread only — all mutations happen on the main thread via LiveKit callbacks.
     @objc public var activeScreenShareIdentities: [String] {
+        rendererLock.lock()
+        defer { rendererLock.unlock() }
         return Array(screenShareTracks.keys)
     }
 
@@ -292,11 +302,17 @@ import LiveKit
     @objc public func detach() {
         interLogInfo(InterLog.media, "Subscriber: detaching")
 
-        // Remove all per-participant renderers
-        for pid in Array(cameraTracks.keys) {
+        // Snapshot the participant ids under the lock, then clean up each outside
+        // the iteration so cleanUpTrack's own locking is never nested (RC1).
+        rendererLock.lock()
+        let cameraPids = Array(cameraTracks.keys)
+        let screenSharePids = Array(screenShareTracks.keys)
+        rendererLock.unlock()
+
+        for pid in cameraPids {
             cleanUpTrack(source: .camera, participantId: pid)
         }
-        for pid in Array(screenShareTracks.keys) {
+        for pid in screenSharePids {
             cleanUpTrack(source: .screenShareVideo, participantId: pid)
         }
 
@@ -313,19 +329,24 @@ import LiveKit
     private func cleanUpTrack(source: Track.Source, participantId: String) {
         switch source {
         case .camera:
-            if let renderer = cameraRenderers[participantId],
-               let track = cameraTracks[participantId] {
+            // Remove the dictionary entries under the lock, then detach the renderer
+            // from the LiveKit track OUTSIDE the lock (RC1: never hold the lock across
+            // a LiveKit call).
+            rendererLock.lock()
+            let renderer = cameraRenderers.removeValue(forKey: participantId)
+            let track = cameraTracks.removeValue(forKey: participantId)
+            rendererLock.unlock()
+            if let renderer = renderer, let track = track {
                 track.remove(videoRenderer: renderer)
             }
-            cameraRenderers.removeValue(forKey: participantId)
-            cameraTracks.removeValue(forKey: participantId)
         case .screenShareVideo:
-            if let renderer = screenShareRenderers[participantId],
-               let track = screenShareTracks[participantId] {
+            rendererLock.lock()
+            let renderer = screenShareRenderers.removeValue(forKey: participantId)
+            let track = screenShareTracks.removeValue(forKey: participantId)
+            rendererLock.unlock()
+            if let renderer = renderer, let track = track {
                 track.remove(videoRenderer: renderer)
             }
-            screenShareRenderers.removeValue(forKey: participantId)
-            screenShareTracks.removeValue(forKey: participantId)
         default:
             break
         }
@@ -345,7 +366,10 @@ extension InterLiveKitSubscriber {
         DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) { [weak self] in
             guard let self, let room = self.room else { return }
             // Renderer arrived between schedule and fire — we're done.
-            guard self.cameraRenderers[pid] == nil else { return }
+            self.rendererLock.lock()
+            let hasRenderer = self.cameraRenderers[pid] != nil
+            self.rendererLock.unlock()
+            guard !hasRenderer else { return }
             // Participant left — stop checking.
             guard room.remoteParticipants.values.contains(where: { $0.identity?.stringValue == pid }) else { return }
 
@@ -358,7 +382,10 @@ extension InterLiveKitSubscriber {
                     // A renderer may have just been created by didSubscribeTrack (which
                     // runs on LiveKit's delegate thread) since the guard above. Re-check
                     // and bail so we never tear down a subscription that just succeeded.
-                    if self.cameraRenderers[pid] != nil { break }
+                    self.rendererLock.lock()
+                    let nowHasRenderer = self.cameraRenderers[pid] != nil
+                    self.rendererLock.unlock()
+                    if nowHasRenderer { break }
                     let subscribed = rp.isSubscribed
                     // Only force off→on when the publication is genuinely NOT subscribed
                     // (normal rejoin recovery), OR it claims subscribed but produced no
@@ -366,17 +393,23 @@ extension InterLiveKitSubscriber {
                     // a freshly-subscribed publication on the first tick can cancel an
                     // in-flight didSubscribeTrack and leave the host stuck on the avatar.
                     if !subscribed || attempt >= 2 {
-                        print("[CB] RESUBSCRIBE-TOGGLE …\(pid.suffix(5)) attempt=\(attempt + 1) isSubscribed=\(subscribed ? 1 : 0)")
+                        interLogInfo(InterLog.media,
+                                     "Subscriber: resubscribe-toggle …%{public}@ attempt=%d isSubscribed=%d",
+                                     String(pid.suffix(5)), attempt + 1, subscribed ? 1 : 0)
                         Task {
                             try? await rp.set(subscribed: false)
                             try? await rp.set(subscribed: true)
                         }
                     } else {
-                        print("[CB] RESUBSCRIBE-DEFER …\(pid.suffix(5)) attempt=\(attempt + 1) isSubscribed=1 — waiting for didSubscribeTrack")
+                        interLogInfo(InterLog.media,
+                                     "Subscriber: resubscribe-defer …%{public}@ attempt=%d (isSubscribed=1, waiting for didSubscribeTrack)",
+                                     String(pid.suffix(5)), attempt + 1)
                     }
                 }
                 if !foundCamPub {
-                    print("[CB] RESUBSCRIBE-WAIT …\(pid.suffix(5)) attempt=\(attempt + 1) — no cam publication yet")
+                    interLogInfo(InterLog.media,
+                                 "Subscriber: resubscribe-wait …%{public}@ attempt=%d (no cam publication yet)",
+                                 String(pid.suffix(5)), attempt + 1)
                 }
                 break
             }
@@ -444,7 +477,8 @@ extension InterLiveKitSubscriber: RoomDelegate {
             interLogError(InterLog.media, "Subscriber: didSubscribe but track is nil (sid=%{public}@)",
                           publication.sid.stringValue)
             let pid = participant.identity?.stringValue ?? "?"
-            print("[CB] SUBSCRIBED-NIL-TRACK …\(pid.suffix(5)) source=\(publication.source.rawValue)")
+            interLogInfo(InterLog.media, "Subscriber: subscribed but nil track …%{public}@ source=%d",
+                         String(pid.suffix(5)), publication.source.rawValue)
             return
         }
 
@@ -467,7 +501,8 @@ extension InterLiveKitSubscriber: RoomDelegate {
             case .camera:
                 // Clean up previous renderer for this participant if any
                 cleanUpTrack(source: .camera, participantId: participantId)
-                print("[CB] SUBSCRIBED-CAM …\(participantId.suffix(5)) isMuted=\(publication.isMuted ? 1 : 0)")
+                interLogInfo(InterLog.media, "Subscriber: subscribed camera …%{public}@ isMuted=%d",
+                             String(participantId.suffix(5)), publication.isMuted ? 1 : 0)
 
                 let renderer = RemoteFrameRenderer(kind: .camera) { [weak self] pixelBuffer, format in
                     if self?.detectedCameraFormat == 0 {
@@ -486,8 +521,10 @@ extension InterLiveKitSubscriber: RoomDelegate {
                     // Signal first frame to roster so cameraOn flips in the snapshot.
                     self?.roster.cameraFirstFrame(participantId)
                 }
+                self.rendererLock.lock()
                 self.cameraRenderers[participantId] = renderer
                 self.cameraTracks[participantId] = videoTrack
+                self.rendererLock.unlock()
                 videoTrack.add(videoRenderer: renderer)
                 // Seed the roster for this camera subscription.
                 roster.participantJoined(participantId, displayName: participantName)
@@ -514,8 +551,10 @@ extension InterLiveKitSubscriber: RoomDelegate {
                     // Room/Track. See `forwardRemoteScreenShareFrame`.
                     self?.forwardRemoteScreenShareFrame(pixelBuffer, fromParticipant: participantId)
                 }
+                self.rendererLock.lock()
                 self.screenShareRenderers[participantId] = renderer
                 self.screenShareTracks[participantId] = videoTrack
+                self.rendererLock.unlock()
                 videoTrack.add(videoRenderer: renderer)
                 roster.screenSharing(participantId, sharing: true)
 
