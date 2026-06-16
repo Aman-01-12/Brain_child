@@ -8,6 +8,8 @@ token-server/.env
 /tools
 /.venv
 /.github
+.review
 
 # Scratch crash-dump / scratch notes (not for VCS)
 temp_test
+alternative_review.md
