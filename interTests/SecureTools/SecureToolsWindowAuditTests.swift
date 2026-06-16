@@ -248,6 +248,13 @@ final class SecureToolsWindowAuditTests: XCTestCase {
         // `Menu(` only when not preceded by an identifier char, so the required
         // AppKit `NSMenu(` is allowed but a SwiftUI `Menu(` is caught.
         let swiftUIMenuRegex = try NSRegularExpression(pattern: "(?<![A-Za-z0-9_])Menu\\(")
+        // W1 regression guard: a raw SwiftUI `TextField` on macOS edits through the
+        // window field editor, whose right-click menu opens Spelling / Substitutions
+        // NSPanels out of the captured surface. Text entry MUST go through the hardened
+        // SecureWhiteboardTextField / SecureCodeTextView representable. Match `TextField(`
+        // only when NOT preceded by an identifier char, so the hardened wrapper
+        // `SecureWhiteboardTextField(` is allowed but a bare SwiftUI `TextField(` is caught.
+        let swiftUITextFieldRegex = try NSRegularExpression(pattern: "(?<![A-Za-z0-9_])TextField\\(")
 
         var scannedFileCount = 0
         for case let fileURL as URL in enumerator where fileURL.pathExtension == "swift" {
@@ -268,6 +275,13 @@ final class SecureToolsWindowAuditTests: XCTestCase {
                 menuMatches, 0,
                 "Forbidden SwiftUI `Menu(` usage found in \(fileURL.lastPathComponent) "
                 + "(S-A6: R10.5, R10.6)")
+
+            let textFieldMatches = swiftUITextFieldRegex.numberOfMatches(
+                in: code, range: NSRange(code.startIndex..., in: code))
+            XCTAssertEqual(
+                textFieldMatches, 0,
+                "Forbidden SwiftUI `TextField(` usage found in \(fileURL.lastPathComponent); "
+                + "use the hardened SecureWhiteboardTextField instead (W1 / S-A6: R10.5, R10.6)")
         }
 
         XCTAssertGreaterThan(

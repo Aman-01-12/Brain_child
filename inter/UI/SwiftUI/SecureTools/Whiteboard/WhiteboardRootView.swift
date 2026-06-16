@@ -229,8 +229,11 @@ struct WhiteboardRootView: View {
                 case .shape:
                     viewModel.commitShapeDrag(at: point)
                 case .eraser:
-                    // Handle a tap (no drag) as well as the end of a drag.
-                    viewModel.eraseAt(point)
+                    // No erase here: `onChanged` already fires on touch-down (the
+                    // gesture's minimumDistance is 0), so a tap erases exactly once
+                    // and a drag erases along its path. Erasing again on `onEnded`
+                    // would remove a SECOND stacked element on a single tap (W2).
+                    break
                 case .text:
                     // Show the in-window text-entry overlay at the tap location;
                     // the actual element is created on confirm (R8.5).
@@ -401,23 +404,24 @@ struct WhiteboardRootView: View {
     // MARK: Text-entry overlay (H2)
 
     private var textEntryOverlay: some View {
-        // H2 hardening: autocorrection / spell-check / substitutions are disabled
-        // so the typed text is stored literally and no spelling/substitutions
-        // NSPanel can open from this field (S-A6). No Menu/.popover/.sheet here.
+        // H2 / W1 hardening: the entry field is a hardened NSViewRepresentable
+        // (SecureWhiteboardTextField) reusing the code editor's SecureCodeTextView,
+        // so its right-click menu is restricted to Cut/Copy/Paste/Select All and
+        // Services is refused — no spelling/substitutions NSPanel can open from it
+        // (S-A6). All substitution disables are applied so text is stored literally.
+        // No Menu/.popover/.sheet here.
         VStack(spacing: 8) {
-            TextField("Text", text: cappedTextBinding)
-                .textFieldStyle(.plain)
-                .font(.system(size: 13, design: .monospaced))
-                .foregroundColor(.white)
-                .autocorrectionDisabled(true)          // H2: no autocorrect/substitution
-                .disableAutocorrection(true)           // H2: belt-and-suspenders on older SDKs
-                .frame(width: 200)
-                .padding(8)
-                .background(
-                    RoundedRectangle(cornerRadius: 6, style: .continuous)
-                        .fill(Color(white: 0.16))
-                )
-                .onSubmit { confirmTextEntry() }
+            SecureWhiteboardTextField(
+                text: $textEntryValue,
+                characterLimit: WhiteboardViewModel.maxTextLength,   // R8.7
+                onSubmit: { confirmTextEntry() }
+            )
+            .frame(width: 200, height: 20)
+            .padding(8)
+            .background(
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .fill(Color(white: 0.16))
+            )
             HStack(spacing: 8) {
                 controlButton("Add") { confirmTextEntry() }
                 controlButton("Cancel") { cancelTextEntry() }
@@ -425,15 +429,6 @@ struct WhiteboardRootView: View {
         }
         .padding(10)
         .background(overlayBackground)
-    }
-
-    /// A binding that caps text entry at the model's 256-character limit (R8.7)
-    /// as the candidate types, without relying on a version-specific `onChange`.
-    private var cappedTextBinding: Binding<String> {
-        Binding(
-            get: { textEntryValue },
-            set: { textEntryValue = viewModel.limitTextInput($0) }
-        )
     }
 
     private func confirmTextEntry() {
