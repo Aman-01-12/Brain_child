@@ -39,8 +39,8 @@ public enum InterButtonSize {
     }
     var radius: CGFloat {
         switch self {
-        case .regular, .medium: return InterRadius.lg  // 10
-        case .compact, .small:  return InterRadius.md  // 8
+        case .regular, .medium: return InterRadius.lg  // 6
+        case .compact, .small:  return InterRadius.md  // 6
         }
     }
     var font: Font {
@@ -131,7 +131,7 @@ public struct InterButton<Leading: View>: View {
         }
         .buttonStyle(.plain)
         .handCursor()
-        .onHover { hovering = $0 }
+        .onHover { hovering = (enabled && !isLoading) ? $0 : false }
         .disabled(isLoading || !enabled)
         .opacity(enabled ? 1 : 0.55)
     }
@@ -207,10 +207,12 @@ public extension InterButton where Leading == Image {
          variant: InterButtonVariant = .primary,
          size: InterButtonSize = .regular,
          fullWidth: Bool = false,
+         isLoading: Bool = false,
+         loadingTitle: String? = nil,
          enabled: Bool = true,
          action: @escaping () -> Void) {
         self.init(title, variant: variant, size: size, fullWidth: fullWidth,
-                  isLoading: false, loadingTitle: nil, enabled: enabled,
+                  isLoading: isLoading, loadingTitle: loadingTitle, enabled: enabled,
                   action: action,
                   leading: { Image(systemName: systemImage) })
     }

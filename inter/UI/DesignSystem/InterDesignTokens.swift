@@ -12,7 +12,7 @@
 //  Design alignment (DESIGN-SPEC §7.5 "Full-stage / call surface"):
 //    • raise-hand badge = amber (InterStatus.warning) top-left
 //    • mic-muted badge  = danger (InterStatus.danger) bottom-right
-//    • small badges use rounded-md (InterRadius.md = 8pt)
+//    • small badges use rounded-sm (InterRadius.sm = 4pt)
 //    • stage menu/hover border = white/10
 //
 
@@ -24,7 +24,7 @@ import AppKit
 
     // MARK: Metrics
     @objc public static let badgeSize: CGFloat = 22.0
-    /// Small badges use the catalogue's `rounded-md`.
+    /// Small badges use the catalogue's `rounded-sm`.
     @objc public static let badgeCornerRadius: CGFloat = InterRadius.sm
     @objc public static let badgeSymbolPointSize: CGFloat = 12.0
 

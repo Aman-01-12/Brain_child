@@ -175,9 +175,16 @@ public enum InterFont {
 
     public static func appKit(_ size: CGFloat, _ weight: NSFont.Weight = .regular) -> NSFont {
         let adjusted = readable(size)
-        return NSFont(name: family, size: adjusted).map { base in
-            NSFontManager.shared.convert(base, toHaveTrait: weight >= .semibold ? .boldFontMask : [])
-        } ?? NSFont.systemFont(ofSize: adjusted, weight: weight)
+        guard let base = NSFont(name: family, size: adjusted) else {
+            return NSFont.systemFont(ofSize: adjusted, weight: weight)
+        }
+        // Apply the requested weight via the normalized font-weight trait so
+        // intermediate weights (.light/.medium/.semibold/.bold) render correctly —
+        // NSFontManager's boldFontMask only toggled bold and dropped the rest.
+        let descriptor = base.fontDescriptor.addingAttributes([
+            .traits: [NSFontDescriptor.TraitKey.weight: weight.rawValue]
+        ])
+        return NSFont(descriptor: descriptor, size: adjusted) ?? base
     }
 
     /// Readable-type policy: the catalogue's small reading sizes (≤13pt)

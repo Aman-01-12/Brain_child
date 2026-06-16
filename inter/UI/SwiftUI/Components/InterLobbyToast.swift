@@ -91,6 +91,10 @@ public final class InterLobbyToastPresenter: NSObject {
     private var hostingView: NSHostingView<LobbyToastView>?
     private var dismissWorkItem: DispatchWorkItem?
     private let barInset: CGFloat
+    /// True while the dismiss fade-out is in flight, so a `show(message:)` racing the
+    /// 0.2s animation cancels the teardown and restores the existing toast instead of
+    /// creating a second overlapping one (the "coalesce into a single banner" contract).
+    private var isDismissing = false
 
     /// Invoked when the host taps "Open". The toast dismisses itself afterward.
     @objc public var onOpen: (() -> Void)?
@@ -109,7 +113,14 @@ public final class InterLobbyToastPresenter: NSObject {
         guard let parent = parentView else { return }
         model.message = message
 
-        if hostingView == nil {
+        if let host = hostingView {
+            // Existing toast (possibly mid-dismiss): cancel the fade-out and restore it
+            // so rapid arrivals coalesce into one banner instead of overlapping.
+            dismissWorkItem?.cancel()
+            dismissWorkItem = nil
+            isDismissing = false
+            host.animator().alphaValue = 1
+        } else {
             let host = NSHostingView(rootView: LobbyToastView(
                 model: model,
                 onOpen: { [weak self] in self?.handleOpen() },
@@ -134,13 +145,18 @@ public final class InterLobbyToastPresenter: NSObject {
     @objc public func dismiss() {
         dismissWorkItem?.cancel()
         dismissWorkItem = nil
-        guard let host = hostingView else { return }
-        hostingView = nil
+        guard let host = hostingView, !isDismissing else { return }
+        isDismissing = true
         NSAnimationContext.runAnimationGroup({ ctx in
             ctx.duration = 0.2
             host.animator().alphaValue = 0
-        }, completionHandler: {
+        }, completionHandler: { [weak self] in
+            // If a show() cancelled the dismiss mid-flight, the toast was restored —
+            // don't tear it down.
+            guard let self, self.isDismissing else { return }
             host.removeFromSuperview()
+            self.hostingView = nil
+            self.isDismissing = false
         })
     }
 
