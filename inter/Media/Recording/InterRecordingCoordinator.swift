@@ -83,10 +83,12 @@ enum InterRecordingLayoutLogic {
     /// Which 2-slot position the LOCAL participant occupies.
     enum Slot: Equatable { case primary, secondary }
 
-    /// Grid (gallery) engages for 3+ participants in `auto`; never in `speaker`.
+    /// Grid (gallery) engages for 2+ participants in `auto` (so a camera-off / audio-only
+    /// remote always gets a placeholder tile, not just at 3+); never in `speaker`.
+    /// `participantCount` includes the local participant, so 2 = host + one remote.
     static func useGrid(participantCount: Int, preference: InterRecordingLayoutPreference) -> Bool {
         if preference == .speaker { return false }
-        return participantCount >= 3
+        return participantCount >= 2
     }
 
     /// The local participant is NEVER subject to active-speaker selection. It takes the
@@ -273,6 +275,11 @@ enum InterRecordingLayoutLogic {
     /// over the control DataChannel for consent notification.
     @objc public weak var chatController: InterChatController?
 
+    /// [recording-safe-speaker-mute] Remote-audio controller. Notified on recording
+    /// start/stop so it reconciles per-track recording sinks; it calls back
+    /// `addRemoteAudioTrack`/`removeRemoteAudioTrack` for the current track set. Weak [G8].
+    @objc public weak var remoteAudioController: InterRemoteAudioController?
+
     /// [Phase 10] The local participant's identity string. Set by AppDelegate
     /// after room connect so the coordinator knows which active speaker is local.
     @objc public var localParticipantIdentity: String? {
@@ -416,6 +423,23 @@ enum InterRecordingLayoutLogic {
     @objc public func stopRecording() {
         coordinatorQueue.async { [weak self] in
             self?._stopRecording()
+        }
+    }
+
+    // MARK: - Remote audio sink bridge (recording-safe speaker mute)
+
+    /// Attach a per-track recording sink for a remote audio track (pre-volume capture).
+    /// Driven by `InterRemoteAudioController.reconcile()`. Runs on coordinatorQueue.
+    public func addRemoteAudioTrack(_ track: RemoteAudioTrack, sid: String) {
+        coordinatorQueue.async { [weak self] in
+            self?.audioCapture.addRemoteTrack(track, sid: sid)
+        }
+    }
+
+    /// Detach a remote track's recording sink. Runs on coordinatorQueue.
+    public func removeRemoteAudioTrack(sid: String) {
+        coordinatorQueue.async { [weak self] in
+            self?.audioCapture.removeRemoteTrack(sid: sid)
         }
     }
 
@@ -940,6 +964,12 @@ enum InterRecordingLayoutLogic {
         }
         audioCapture.start()
 
+        // [recording-safe-speaker-mute] Tell the controller recording is active so it
+        // reconciles per-track sinks for ALL currently-subscribed remotes (covers
+        // "recording started after participants joined"). Controller is main-confined.
+        let racStart = remoteAudioController
+        DispatchQueue.main.async { racStart?.setRecordingActive(true) }
+
         // 11. Start 30fps render timer
         _startRenderTimer()
 
@@ -1030,6 +1060,11 @@ enum InterRecordingLayoutLogic {
 
         // 2. Remove audio capture (extracted subsystem — Gap #14)
         audioCapture.stop()
+
+        // [recording-safe-speaker-mute] Recording no longer active → controller removes
+        // all per-track recording sinks on reconcile. Controller is main-confined.
+        let racStop = remoteAudioController
+        DispatchQueue.main.async { racStop?.setRecordingActive(false) }
 
         // 3. Remove local camera observer
         _removeLocalCameraObserver()
@@ -1865,6 +1900,9 @@ extension InterRecordingCoordinator: InterRecordingEngineDelegate {
             self.durationTimer?.cancel()
             self.durationTimer = nil
             self.audioCapture.stop()
+            // [recording-safe-speaker-mute] Engine failed → recording inactive.
+            let racFail = self.remoteAudioController
+            DispatchQueue.main.async { racFail?.setRecordingActive(false) }
 
             if let sink = self.recordingSink {
                 self.surfaceShareController?.removeLive(sink)
@@ -1995,11 +2033,72 @@ final class InterAudioEngineAccess: NSObject, AudioEngineObserver {
 
     // MARK: - Public API
 
+    /// [EXPERIMENT 2026-06-16] Switch LiveKit's audio device module to WebRTC's
+    /// platform-default (HAL-based on macOS) instead of the AVAudioEngine ADM.
+    ///
+    /// This puts WebRTC's full Audio Processing Module (AEC3 + noise suppression +
+    /// AGC) in charge of capture 3A — the same "proven" stack Chrome/Electron use —
+    /// and structurally avoids the AVAudioEngine teardown path (the original
+    /// EXC_BAD_ACCESS lived in `AVAudioEngine dealloc → AudioComponentInstanceDispose`).
+    ///
+    /// MUST be called once at startup, BEFORE any `Room`/peer-connection is created:
+    /// the SDK throws if the peer-connection factory is already initialised.
+    ///
+    /// NOTE: on this path the AVAudioEngine-based features are inert —
+    /// `AudioEngineObserver` callbacks don't fire (so the AGC-off hook and
+    /// always-prepared mode become no-ops) and speaker-mute via `mixer.outputVolume`
+    /// won't take effect (rework deferred).
+    @objc static func useWebRTCPlatformAudioModule() {
+        do {
+            try AudioManager.set(audioDeviceModuleType: .platformDefault)
+            interLogInfo(InterLog.media,
+                         "AudioEngineAccess: audio device module set to .platformDefault (WebRTC APM)")
+        } catch {
+            interLogError(InterLog.media,
+                          "AudioEngineAccess: failed to set .platformDefault ADM: %{public}@",
+                          String(describing: error))
+        }
+    }
+
     /// Register as head of the AudioManager engine-observer chain.
     /// Must be called once at app startup before any room connection.
     @objc static func register() {
         shared.next = AudioManager.shared.mixer
         AudioManager.shared.set(engineObservers: [shared])
+
+        // ⚠️ ADM NOTE (2026-06-17): the app now runs the `.platformDefault` (WebRTC HAL)
+        // ADM, which has NO AVAudioEngine — so the `AudioEngineObserver` callbacks below
+        // never fire and `setRecordingAlwaysPreparedMode` is INERT (throws, caught). They
+        // are retained only for a potential revert to the `.audioEngine` ADM. On
+        // `.platformDefault` the route-change crash mitigation rests on the m144 WebRTC
+        // (no AVAudioEngine teardown) + off-main ADM access, and capture 3A is handled by
+        // the WebRTC APM (not the VPIO AGC-off below).
+
+        // [Audio route-change hardening] Keep LiveKit's recording (capture) path always
+        // prepared. A/B test (2026-06-16): with always-prepared OFF, the capture path had
+        // a rough on-demand startup — continuous full-scale noise at the start of the call
+        // even with no remote audio present (run 4TCJEK: speech -16 dBFS, 100% active,
+        // 0.106% clipping) vs a clean start with it ON (run WAFV3A: -27..-36 dBFS). It did
+        // NOT shorten the post-unplug echo burst. So always-prepared stays ON: cleaner
+        // startup, and it still reduces the teardown/re-init churn that races CoreAudio's
+        // route-change listener (the EXC_BAD_ACCESS in audio-route-change-crash-fix).
+        // `setRecordingAlwaysPreparedMode` is `async throws`; fire-and-forget on a detached
+        // Task — a failure here is non-fatal (fall back to on-demand preparation).
+        //
+        // KNOWN TRADEOFF (accepted): the capture graph stays live even while muted, which
+        // can keep the macOS mic-active (orange) indicator lit. No audio is transmitted
+        // while muted (publish/mute state still gates it).
+        Task.detached {
+            do {
+                try await AudioManager.shared.setRecordingAlwaysPreparedMode(true)
+                interLogInfo(InterLog.media,
+                             "AudioEngineAccess: recording-always-prepared mode enabled")
+            } catch {
+                interLogError(InterLog.media,
+                              "AudioEngineAccess: failed to enable recording-always-prepared mode: %{public}@",
+                              String(describing: error))
+            }
+        }
     }
 
     /// Returns the main mixer node of LiveKit's running AVAudioEngine, or nil if unavailable.
@@ -2022,30 +2121,20 @@ final class InterAudioEngineAccess: NSObject, AudioEngineObserver {
     /// Whether we saw an engine stop without a subsequent start yet.
     private var _awaitingRestart = false
 
-    // MARK: - Speaker mute (local remote-audio playout)
+    // MARK: - Speaker mute (local remote-audio playout) — recording-safe-speaker-mute
 
-    /// When true, the engine's output mixer is muted so the local user hears no
-    /// remote audio — WITHOUT muting the mic, changing OS volume, or affecting the
-    /// recording (which taps remote audio PRE-mix via renderPreProcessing). Mirrors
-    /// the Android SDK's `setSpeakerMute` semantics (data is still received).
-    private var _speakerMuted = false
+    /// Speaker-mute is owned by `InterRemoteAudioController` (per-track
+    /// `RemoteAudioTrack.volume`), which works on the `.platformDefault` ADM and is
+    /// recording-safe (recording taps each track PRE-volume). The old
+    /// `AudioManager.shared.mixer.outputVolume` path was inert on `.platformDefault`
+    /// (no AVAudioEngine) and is removed. These static shims forward to the controller
+    /// so existing call sites (AppDelegate control bar + teardown reset) are unchanged.
+    @objc public static weak var remoteAudioController: InterRemoteAudioController?
 
-    @objc static var isSpeakerMuted: Bool { shared._speakerMuted }
+    @objc static var isSpeakerMuted: Bool { remoteAudioController?.isSpeakerMuted ?? false }
 
-    /// Toggle local remote-audio playout. Routes through LiveKit's MixerEngineObserver
-    /// (`AudioManager.shared.mixer.outputVolume`) — the SUPPORTED, thread-safe way to
-    /// set the engine output level: it is lock-guarded, nil-safe, and LiveKit stores the
-    /// value and RE-APPLIES it on every engine (re)start internally (so it survives
-    /// device-route changes and reconnects with no work from us).
-    ///
-    /// Do NOT poke `engine.mainMixerNode.outputVolume` directly: LiveKit's mixer owns
-    /// that node and overwrites it, and racing it from the audio thread during a
-    /// device-route change (e.g. unplugging earphones) caused an EXC_BAD_ACCESS crash.
-    /// Recording-safe (recording taps remote audio pre-mix) and covers all current +
-    /// future participants (single output node).
     @objc static func setSpeakerMuted(_ muted: Bool) {
-        shared._speakerMuted = muted
-        AudioManager.shared.mixer.outputVolume = muted ? 0.0 : 1.0
+        remoteAudioController?.setSpeakerMuted(muted)
     }
 
     // MARK: - AudioEngineObserver (only the lifecycle callbacks that need engine capture)
@@ -2053,6 +2142,8 @@ final class InterAudioEngineAccess: NSObject, AudioEngineObserver {
     func engineWillStart(_ engine: AVAudioEngine, isPlayoutEnabled: Bool, isRecordingEnabled: Bool) -> Int {
         _engine = engine
 
+        // NOTE: inert on the `.platformDefault` ADM — this callback never fires (no
+        // AVAudioEngine). Retained for a potential `.audioEngine` revert. See register().
         // [Audio quality] Voice-Processing AGC stays DISABLED. A/B test (build "sdtzv5",
         // AGC ON) was worse on BOTH axes: AGC drove speech to ~-15 dBFS with peaks at
         // full scale (harsh / over-amplified, and it re-loudens the room AC between

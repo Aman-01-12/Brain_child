@@ -110,6 +110,11 @@ import LiveKit
     /// Used by the recording coordinator to feed frames to the composed renderer.
     @objc public weak var recordingFrameDelegate: InterRemoteTrackRenderer?
 
+    /// [recording-safe-speaker-mute] Remote-audio controller. On audio track
+    /// subscribe/unsubscribe we register/unregister the `RemoteAudioTrack` so the
+    /// controller can apply per-track playout mute and drive recording sinks. Weak [G8].
+    @objc public weak var remoteAudioController: InterRemoteAudioController?
+
     /// Current remote participant identities (presence-driven), for seeding the
     /// recording coordinator with participants already present when recording starts.
     /// Call on the main thread.
@@ -573,9 +578,15 @@ extension InterLiveKitSubscriber: RoomDelegate {
         // "muted" on the host. (Mirrors the camera branch's roster.cameraMuted seed.)
         // A mute-on-join participant publishes NO audio track, so this never fires for
         // them and they correctly remain muted — which is exactly the headline fix.
-        if track is RemoteAudioTrack {
+        if let audioTrack = track as? RemoteAudioTrack {
             roster.participantJoined(participantId, displayName: participantName)
             roster.micMuted(participantId, muted: publication.isMuted)
+            // [recording-safe-speaker-mute] Register the track so the controller applies
+            // the current speaker-mute volume and (when recording) installs a pre-volume
+            // recording sink. Controller is main-confined.
+            let sid = publication.sid.stringValue
+            let rac = remoteAudioController
+            DispatchQueue.main.async { rac?.registerRemoteAudioTrack(audioTrack, sid: sid) }
             interLogInfo(InterLog.media, "Subscriber: remote audio subscribed, seeded micMuted=%d for %{public}@",
                          publication.isMuted ? 1 : 0, participantId)
         }
@@ -604,6 +615,12 @@ extension InterLiveKitSubscriber: RoomDelegate {
             trackRenderer?.remoteTrackDidEnd(.screenShare, forParticipant: participantId)
             recordingFrameDelegate?.remoteTrackDidEnd(.screenShare, forParticipant: participantId)
             roster.screenSharing(participantId, sharing: false)
+        case .microphone:
+            // [recording-safe-speaker-mute] Drop the track from the controller (removes
+            // its recording sink on reconcile). Keyed by the same publication sid.
+            let sid = publication.sid.stringValue
+            let rac = remoteAudioController
+            DispatchQueue.main.async { rac?.unregisterRemoteAudioTrack(sid: sid) }
         default:
             break
         }

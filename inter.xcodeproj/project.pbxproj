@@ -459,7 +459,7 @@
 			repositoryURL = "https://github.com/livekit/client-sdk-swift";
 			requirement = {
 				kind = exactVersion;
-				version = 2.12.1;
+				version = 2.15.0;
 			};
 		};
 		04500C0A2F00000A00000001 /* XCRemoteSwiftPackageReference "socket" */ = {

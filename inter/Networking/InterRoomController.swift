@@ -92,6 +92,15 @@ enum InterAudioInputMatcher {
     /// Subscriber: manages remote track subscription.
     @objc public let subscriber = InterLiveKitSubscriber()
 
+    /// Dedicated serial queue for LiveKit Audio Device Module (ADM) mutations.
+    /// `AudioManager.shared.inputDevices` / `.inputDevice` getters and the
+    /// `.inputDevice` setter are synchronous WebRTC `Thread::BlockingCall`s; running
+    /// them on the main thread during an audio route change blocked the UI (video
+    /// freeze) and raced CoreAudio's route-change listener. We serialize all ADM
+    /// switches here so concurrent mic-switch requests cannot interleave and thrash
+    /// the device module. [NW1]
+    private let admQueue = DispatchQueue(label: "inter.adm", qos: .userInitiated)
+
     /// Token service: JWT fetch/cache/refresh.
     @objc public let tokenService = InterTokenService()
 
@@ -127,11 +136,35 @@ enum InterAudioInputMatcher {
     ///
     /// The in-app mic picker is built on AVCaptureDevice, whose `uniqueID` is not
     /// guaranteed to equal LiveKit's `AudioDevice.deviceId`, so we match by deviceId
-    /// first and fall back to the human-readable name. Returns true iff a matching
-    /// device was found and selected. SAFE NO-OP (logs) when nothing matches — never
-    /// forces an invalid device. Skips a redundant switch to avoid thrashing the ADM.
-    @objc public func setNetworkAudioInput(deviceID: String?, name: String?) -> Bool {
+    /// first and fall back to the human-readable name. `completion` is invoked with
+    /// true iff a matching device was found and selected. SAFE NO-OP (logs) when
+    /// nothing matches — never forces an invalid device. Skips a redundant switch to
+    /// avoid thrashing the ADM.
+    ///
+    /// [NW1] All ADM access (the `inputDevices` enumeration, the `inputDevice` getter
+    /// used for the redundant-switch check, and the `inputDevice` setter) runs on the
+    /// dedicated serial `admQueue`, NEVER the calling (main) thread. `completion` is
+    /// always delivered back on the main queue.
+    @objc public func setNetworkAudioInput(deviceID: String?, name: String?,
+                                           completion: ((Bool) -> Void)?) {
         #if os(macOS)
+        admQueue.async {
+            let result = InterRoomController.performNetworkAudioInputSwitch(deviceID: deviceID, name: name)
+            if let completion = completion {
+                DispatchQueue.main.async { completion(result) }
+            }
+        }
+        #else
+        if let completion = completion {
+            DispatchQueue.main.async { completion(false) }
+        }
+        #endif
+    }
+
+    #if os(macOS)
+    /// Performs the actual ADM device match + switch. MUST be called on `admQueue`
+    /// (off the main thread) — every line here is a blocking WebRTC ADM call.
+    private static func performNetworkAudioInputSwitch(deviceID: String?, name: String?) -> Bool {
         let devices = AudioManager.shared.inputDevices
         let tuples = devices.map { (id: $0.deviceId, name: $0.name) }
         guard let idx = InterAudioInputMatcher.matchIndex(devices: tuples,
@@ -151,10 +184,8 @@ enum InterAudioInputMatcher {
         interLogInfo(InterLog.networking,
                      "RoomController: network mic switched to %{public}@", target.name)
         return true
-        #else
-        return false
-        #endif
     }
+    #endif
 
     // NOTE: `selectedNetworkAudioInput(optionIDs:optionNames:)` (the deferred "deeper"
     // checkmark fix that read LiveKit's AudioManager.inputDevice while connected) was

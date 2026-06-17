@@ -19,11 +19,12 @@ import XCTest
 
 final class InterRecordingLayoutLogicTests: XCTestCase {
 
-    // #3 — grid (gallery) engages for 3+ participants in auto mode; not for 1–2.
+    // #3 — grid (gallery) engages for 2+ participants in auto mode (count includes local,
+    // so 2 = host + one remote → grid, giving camera-off/audio-only remotes a tile); not solo.
     func testAutoGridThreshold() {
         XCTAssertFalse(InterRecordingLayoutLogic.useGrid(participantCount: 0, preference: .auto))
         XCTAssertFalse(InterRecordingLayoutLogic.useGrid(participantCount: 1, preference: .auto))
-        XCTAssertFalse(InterRecordingLayoutLogic.useGrid(participantCount: 2, preference: .auto))
+        XCTAssertTrue(InterRecordingLayoutLogic.useGrid(participantCount: 2, preference: .auto))
         XCTAssertTrue(InterRecordingLayoutLogic.useGrid(participantCount: 3, preference: .auto))
         XCTAssertTrue(InterRecordingLayoutLogic.useGrid(participantCount: 8, preference: .auto))
     }
@@ -209,11 +210,11 @@ final class InterRecordingLayoutLogicTests: XCTestCase {
         for i in 0..<iterations {
             let count = Int.random(in: 0...64, using: &rng)
 
-            // auto: grid iff 3+
+            // auto: grid iff 2+ (count includes local → host + one remote grids)
             XCTAssertEqual(
                 InterRecordingLayoutLogic.useGrid(participantCount: count, preference: .auto),
-                count >= 3,
-                "iter \(i): useGrid(.auto, count: \(count)) must be (count >= 3) — grid-at-3+ contract")
+                count >= 2,
+                "iter \(i): useGrid(.auto, count: \(count)) must be (count >= 2) — grid-at-2+ contract")
 
             // speaker: never grids (mirrors testSpeakerViewNeverGrids across random counts)
             XCTAssertFalse(

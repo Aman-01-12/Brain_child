@@ -489,7 +489,7 @@ static const CGFloat InterSecureBottomWorkspaceMargin = 100.0;
             NSString *prefMicID = [weakSelf.localMediaController selectedAudioInputDeviceID];
             if (prefMicID.length > 0) {
                 NSString *prefMicName = [AVCaptureDevice deviceWithUniqueID:prefMicID].localizedName;
-                [weakSelf.roomController setNetworkAudioInputWithDeviceID:prefMicID name:prefMicName];
+                [weakSelf.roomController setNetworkAudioInputWithDeviceID:prefMicID name:prefMicName completion:nil];
             }
             [weakSelf refreshSecureAudioInputOptions];
         });
@@ -663,11 +663,16 @@ static const CGFloat InterSecureBottomWorkspaceMargin = 100.0;
         if (deviceID.length > 0) {
             deviceName = [AVCaptureDevice deviceWithUniqueID:deviceID].localizedName;
         }
-        BOOL switched = [rc setNetworkAudioInputWithDeviceID:deviceID name:deviceName];
-        if (!switched) {
-            [self.controlPanel setMediaStatusText:@"Couldn't switch microphone for the call."];
-        }
-        [self refreshSecureAudioInputOptions];
+        // [NW1] The switch now runs off-main on the room controller's serial ADM queue;
+        // the completion is delivered back on the main thread, so updating the panel and
+        // refreshing the menu here is main-thread safe.
+        __weak typeof(self) weakSelf = self;
+        [rc setNetworkAudioInputWithDeviceID:deviceID name:deviceName completion:^(BOOL switched) {
+            if (!switched) {
+                [weakSelf.controlPanel setMediaStatusText:@"Couldn't switch microphone for the call."];
+            }
+            [weakSelf refreshSecureAudioInputOptions];
+        }];
         return;
     }
 

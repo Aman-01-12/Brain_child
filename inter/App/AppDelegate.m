@@ -115,6 +115,9 @@
 
 // [Phase 10] Recording
 @property (nonatomic, strong, nullable) InterRecordingCoordinator *normalRecordingCoordinator;
+// [recording-safe-speaker-mute] Owns speaker-mute (per-track playout volume) + drives
+// per-track recording sinks. Shared across normal + secure modes (single subscriber/recorder).
+@property (nonatomic, strong, nullable) InterRemoteAudioController *remoteAudioController;
 @property (nonatomic, strong, nullable) InterRecordingIndicatorView *normalRecordingIndicatorView;
 @property (nonatomic, strong, nullable) InterRecordingListPanel *normalRecordingListPanel;
 @property (nonatomic, strong, nullable) NSWindow *normalRecordingListWindow;
@@ -245,6 +248,13 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
     // `--component-gallery` (or INTER_COMPONENT_GALLERY=1). No-op in normal runs.
     [ComponentGallery presentIfLaunchFlagPresent];
 
+    // [EXPERIMENT 2026-06-16] Switch LiveKit to WebRTC's platform-default (HAL) audio
+    // device module so the full WebRTC APM (AEC3 + NS + AGC) handles capture 3A — the
+    // proven Chrome/Electron stack — and the AVAudioEngine teardown crash path is avoided.
+    // MUST run before any room/peer-connection is created. NOTE: speaker-mute + the
+    // always-prepared/AGC-off hooks are inert on this path (rework deferred).
+    [InterAudioEngineAccess useWebRTCPlatformAudioModule];
+
     // [Finding 11] Register InterAudioEngineAccess as the head of LiveKit's engine-observer
     // chain BEFORE any room connects so engineWillStart fires and the engine ref is captured.
     [InterAudioEngineAccess register];
@@ -296,6 +306,15 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
         self.roomController.qaController = self.qaController;
         // [Phase 10] Wire recording coordinator for room disconnect auto-stop
         self.roomController.recordingCoordinator = self.normalRecordingCoordinator;
+        // [recording-safe-speaker-mute] Create + wire the remote-audio controller: it
+        // owns speaker-mute (per-track playout volume) and drives recording-safe per-track
+        // sinks. Wired to the shared subscriber (track events), the recording coordinator
+        // (sink bridge), and InterAudioEngineAccess (the UI's setSpeakerMuted entry point).
+        self.remoteAudioController = [[InterRemoteAudioController alloc] init];
+        self.remoteAudioController.recordingCoordinator = self.normalRecordingCoordinator;
+        self.normalRecordingCoordinator.remoteAudioController = self.remoteAudioController;
+        self.roomController.subscriber.remoteAudioController = self.remoteAudioController;
+        [InterAudioEngineAccess setRemoteAudioController:self.remoteAudioController];
         // Wire moderation controller into chat controller for Phase 9 signal forwarding
         self.chatController.moderationController = self.moderationController;
     }
@@ -3076,7 +3095,7 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
             NSString *prefMicID = [weakSelf.normalMediaController selectedAudioInputDeviceID];
             if (prefMicID.length > 0) {
                 NSString *prefMicName = [AVCaptureDevice deviceWithUniqueID:prefMicID].localizedName;
-                [weakSelf.roomController setNetworkAudioInputWithDeviceID:prefMicID name:prefMicName];
+                [weakSelf.roomController setNetworkAudioInputWithDeviceID:prefMicID name:prefMicName completion:nil];
             }
             [weakSelf refreshNormalAudioInputOptions];
         });
@@ -3149,11 +3168,16 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
             AVCaptureDevice *dev = [AVCaptureDevice deviceWithUniqueID:deviceID];
             deviceName = dev.localizedName;
         }
-        BOOL switched = [rc setNetworkAudioInputWithDeviceID:deviceID name:deviceName];
-        if (!switched) {
-            [self.normalControlPanel setMediaStatusText:@"Couldn't switch microphone for the call."];
-        }
-        [self refreshNormalAudioInputOptions];
+        // [NW1] The switch now runs off-main on the room controller's serial ADM queue;
+        // the completion is delivered back on the main thread, so updating the panel and
+        // refreshing the menu here is main-thread safe.
+        __weak typeof(self) weakSelf = self;
+        [rc setNetworkAudioInputWithDeviceID:deviceID name:deviceName completion:^(BOOL switched) {
+            if (!switched) {
+                [weakSelf.normalControlPanel setMediaStatusText:@"Couldn't switch microphone for the call."];
+            }
+            [weakSelf refreshNormalAudioInputOptions];
+        }];
         return;
     }
 
@@ -6299,6 +6323,10 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
     self.normalRequestToast = nil;
     // Reset local speaker-mute so it never persists into the next call.
     [InterAudioEngineAccess setSpeakerMuted:NO];
+    // [recording-safe-speaker-mute] Fully reset the remote-audio controller so no remote
+    // track refs / recording sinks linger into the next call (covers room-disconnect paths
+    // where per-track didUnsubscribeTrack may not fire).
+    [self.remoteAudioController reset];
     self.normalControlPanel = nil;
 
     // [Phase 8] Tear down chat and speaker queue UI
