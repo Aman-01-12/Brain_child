@@ -210,6 +210,10 @@
 
 static NSString *const InterScreenCaptureStartupPromptedKey = @"InterScreenCaptureStartupPrompted";
 
+/// KVO context for observing InterRoomController.activeLobbyEnabled (the server-authoritative
+/// waiting-room flag), used to keep the in-call lobby toggle in sync.
+static void *InterActiveLobbyEnabledKVOContext = &InterActiveLobbyEnabledKVOContext;
+
 static BOOL InterShouldEnforceInterviewExternalDisplayPolicy(void) {
     // Temporary testing bypass:
     // Secure interview mode normally blocks multiple displays for the interviewee path.
@@ -317,6 +321,15 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
         [InterAudioEngineAccess setRemoteAudioController:self.remoteAudioController];
         // Wire moderation controller into chat controller for Phase 9 signal forwarding
         self.chatController.moderationController = self.moderationController;
+
+        // Observe the server-authoritative lobby flag so any open lobby panel toggle
+        // converges live when a moderator (here or remote) enables/disables the waiting
+        // room. roomController is app-lifetime, so this observer is registered once and
+        // removed in applicationWillTerminate — no per-panel add/remove churn.
+        [self.roomController addObserver:self
+                              forKeyPath:@"activeLobbyEnabled"
+                                 options:NSKeyValueObservingOptionNew
+                                 context:InterActiveLobbyEnabledKVOContext];
     }
 
     // [Phase B.4d] Wire auth delegate and attempt session restore before showing setup UI.
@@ -409,6 +422,13 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
     self.normalRecordingCoordinator = nil;
 
     if (self.roomController) {
+        @try {
+            [self.roomController removeObserver:self
+                                    forKeyPath:@"activeLobbyEnabled"
+                                       context:InterActiveLobbyEnabledKVOContext];
+        } @catch (NSException *exception) {
+            // Observer was never registered (local-only launch) — safe to ignore.
+        }
         [self.roomController disconnect];
         self.roomController = nil;
     }
@@ -4154,8 +4174,26 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
 
 // MARK: - Phase 9 — Lobby Panel
 
-- (void)toggleNormalLobbyPanel {
-    if (!self.normalLobbyWindow) {
+/// KVO: the server-authoritative lobby flag changed (local toggle confirmed, or a remote
+/// moderator's `.lobbyStateChanged` broadcast). Reflect it on the open lobby panel toggle.
+/// The panel's programmatic setter does not re-invoke the toggle callback, so this cannot loop.
+- (void)observeValueForKeyPath:(NSString *)keyPath
+                      ofObject:(id)object
+                        change:(NSDictionary<NSKeyValueChangeKey,id> *)change
+                       context:(void *)context {
+    if (context == InterActiveLobbyEnabledKVOContext) {
+        BOOL enabled = self.roomController.activeLobbyEnabled;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (self.normalLobbyPanel) {
+                self.normalLobbyPanel.lobbyEnabled = enabled;
+            }
+        });
+        return;
+    }
+    [super observeValueForKeyPath:keyPath ofObject:object change:change context:context];
+}
+
+- (void)toggleNormalLobbyPanel {    if (!self.normalLobbyWindow) {
         // Create lobby panel next to the control bar. Sized to comfortably fit the SwiftUI
         // content (header actions + rows) so labels don't truncate/wrap; minSize keeps it
         // usable when the host resizes it down.
@@ -4166,8 +4204,9 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
         CGFloat y = windowFrame.origin.y + 100;
         self.normalLobbyPanel = [[InterLobbyPanel alloc] initWithFrame:NSMakeRect(0, 0, panelWidth, panelHeight)];
         self.normalLobbyPanel.delegate = self;
-        // Co-hosts can admit/deny but cannot toggle the waiting room on/off — host-only.
-        [self.normalLobbyPanel setLobbyToggleEnabled:self.roomController.isHost];
+        // Host and co-hosts can toggle the waiting room on/off (server enforces the
+        // moderator role via validateModerator); other roles get a read-only toggle.
+        [self.normalLobbyPanel setLobbyToggleEnabled:self.moderationController.localRoleInfo.isModerator];
         // Initialise the checkbox from the actual lobby state (host-configured in the
         // pre-meeting settings) so it reflects reality — otherwise it starts unchecked
         // and the host's first toggle would DISABLE an already-enabled waiting room.
@@ -4266,7 +4305,11 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
         [self.moderationController enableLobbyWithCompletion:^(BOOL success, NSError *error) {
             __strong typeof(weakSelf) strongSelf = weakSelf;
             if (!strongSelf) return;
-            if (!success) {
+            if (success) {
+                // Keep activeLobbyEnabled (the KVO source of truth) in sync with the
+                // server-confirmed change; the moderation controller broadcasts to peers.
+                [strongSelf.roomController updateLobbyEnabled:YES];
+            } else {
                 NSLog(@"[Phase 9] Enable lobby failed: %@", error.localizedDescription);
                 strongSelf.normalLobbyPanel.lobbyEnabled = NO;
             }
@@ -4275,7 +4318,9 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
         [self.moderationController disableLobbyWithCompletion:^(BOOL success, NSError *error) {
             __strong typeof(weakSelf) strongSelf = weakSelf;
             if (!strongSelf) return;
-            if (!success) {
+            if (success) {
+                [strongSelf.roomController updateLobbyEnabled:NO];
+            } else {
                 NSLog(@"[Phase 9] Disable lobby failed: %@", error.localizedDescription);
                 strongSelf.normalLobbyPanel.lobbyEnabled = YES;
             }
@@ -5355,6 +5400,14 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
     [self.roomController updateShareConflictPolicy:policy];
 }
 
+/// Another moderator enabled/disabled the waiting room. Sync the source-of-truth flag;
+/// the KVO observer updates any open lobby panel toggle.
+- (void)moderationController:(InterModerationController *)controller
+      receivedLobbyStateChange:(BOOL)enabled {
+#pragma unused(controller)
+    [self.roomController updateLobbyEnabled:enabled];
+}
+
 // MARK: - Camera Mute Delegate (Camera Mute feature)
 
 - (void)moderationControllerReceivedCameraMuteOne:(InterModerationController *)controller {
@@ -5612,7 +5665,7 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
         [self.normalControlPanel setRenameVisible:(!nowCoHostOrHost &&
             [self.moderationController canLocalParticipantSelfRename])];
         if (self.normalLobbyPanel) {
-            [self.normalLobbyPanel setLobbyToggleEnabled:self.roomController.isHost];
+            [self.normalLobbyPanel setLobbyToggleEnabled:nowCoHostOrHost];
         }
         // Re-evaluate chat enabled state whenever local role changes.
         // Promotions: a co-host must always have chat enabled regardless of the

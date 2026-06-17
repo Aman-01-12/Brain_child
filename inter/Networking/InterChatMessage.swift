@@ -171,6 +171,11 @@ import Foundation
     /// Every participant that is currently sharing stops locally. One-shot — new
     /// shares afterwards are still governed by shareConflictPolicy.
     case stopScreenShareAll = 51
+
+    /// Host/co-host enabled or disabled the waiting room mid-meeting.
+    /// extraData["enabled"] = "1" (lobby on) or "0" (lobby off). Broadcast to all —
+    /// other moderators sync their in-call lobby toggle so two moderators stay in agreement.
+    case lobbyStateChanged = 52
 }
 
 // MARK: - Chat Message

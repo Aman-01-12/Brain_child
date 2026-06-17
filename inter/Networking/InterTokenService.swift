@@ -77,6 +77,9 @@ import CryptoKit
     @objc public let autoTranscript: Bool
     /// Share-conflict policy returned by the server (host-configured).
     @objc public let shareConflictPolicy: String
+    /// Whether the waiting room is enabled for this meeting (server-authoritative). Lets a
+    /// joiner who is (or becomes) a moderator render the in-call lobby toggle correctly.
+    @objc public let lobbyEnabled: Bool
     /// Whether the server restored this caller as the room host (e.g. the original
     /// host rejoining after leaving). Drives host UI on the client.
     @objc public let isHost: Bool
@@ -98,6 +101,7 @@ import CryptoKit
                       autoRecord: Bool = false,
                       autoTranscript: Bool = false,
                       shareConflictPolicy: String = "oneattime",
+                      lobbyEnabled: Bool = false,
                       isHost: Bool = false,
                       hasPassword: Bool = false) {
         self.roomName             = roomName
@@ -114,6 +118,7 @@ import CryptoKit
         self.autoRecord           = autoRecord
         self.autoTranscript       = autoTranscript
         self.shareConflictPolicy  = shareConflictPolicy
+        self.lobbyEnabled         = lobbyEnabled
         self.isHost               = isHost
         self.hasPassword          = hasPassword
         super.init()
@@ -1106,6 +1111,7 @@ private struct TokenCacheEntry {
                 let autoRecord          = json["autoRecord"] as? Bool ?? false
                 let autoTranscript      = json["autoTranscript"] as? Bool ?? false
                 let shareConflictPolicy = json["shareConflictPolicy"] as? String ?? "oneattime"
+                let lobbyEnabled        = json["lobbyEnabled"] as? Bool ?? false
                 let isHost              = json["isHost"] as? Bool ?? false
                 let hasPassword         = json["hasPassword"] as? Bool ?? false
 
@@ -1124,6 +1130,7 @@ private struct TokenCacheEntry {
                     autoRecord: autoRecord,
                     autoTranscript: autoTranscript,
                     shareConflictPolicy: shareConflictPolicy,
+                    lobbyEnabled: lobbyEnabled,
                     isHost: isHost,
                     hasPassword: hasPassword
                 )

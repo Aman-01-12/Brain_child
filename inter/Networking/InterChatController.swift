@@ -667,7 +667,7 @@ import LiveKit
              .requestCameraUnlock, .approveCameraUnlock, .denyCameraUnlock,
              .requestMicUnlock, .approveMicUnlock, .denyMicUnlock,
              .stopScreenShare, .stopScreenShareAll, .shareConflictPolicyChanged,
-             .renameParticipant, .allowCoHostLocalRecording:
+             .renameParticipant, .allowCoHostLocalRecording, .lobbyStateChanged:
             guard signal.senderIdentity != localIdentity else { return }
             moderationController?.handleControlSignal(signal)
 

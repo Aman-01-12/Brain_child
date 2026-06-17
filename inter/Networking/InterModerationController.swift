@@ -174,6 +174,11 @@ import LiveKit
     @objc optional func moderationController(_ controller: InterModerationController,
                                              receivedShareConflictPolicyChange policy: String)
 
+    /// A moderator (host or co-host) enabled/disabled the waiting room mid-meeting.
+    /// Other moderators receive this to sync their in-call lobby toggle.
+    @objc optional func moderationController(_ controller: InterModerationController,
+                                             receivedLobbyStateChange enabled: Bool)
+
     /// A host/co-host (or a participant with sufficient policy rights) is asking the
     /// local participant to stop their active screen share.
     /// The local participant should stop sharing and show a dismissible notice.
@@ -1356,6 +1361,8 @@ import LiveKit
             guard let self = self else { return }
             switch result {
             case .success:
+                // Broadcast so other moderators' in-call lobby toggles converge.
+                self.sendControlSignal(type: .lobbyStateChanged, extraData: ["enabled": "1"])
                 self.completeOnMain { completion(true, nil) }
             case .failure(let error):
                 self.completeOnMain { completion(false, error) }
@@ -1379,6 +1386,8 @@ import LiveKit
             guard let self = self else { return }
             switch result {
             case .success:
+                // Broadcast so other moderators' in-call lobby toggles converge.
+                self.sendControlSignal(type: .lobbyStateChanged, extraData: ["enabled": "0"])
                 self.completeOnMain { completion(true, nil) }
             case .failure(let error):
                 self.completeOnMain { completion(false, error) }
@@ -1464,6 +1473,7 @@ import LiveKit
         .requestMuteCameraOne, .requestMuteCameraAll,
         .liftCameraLockOne, .liftCameraLockAll,
         .screenshareModeChanged,
+        .lobbyStateChanged,
     ]
 
     public func handleControlSignal(_ signal: InterControlSignal) {
@@ -1845,6 +1855,17 @@ import LiveKit
                         policy, senderIdentity)
                     delegate?.moderationController?(self, receivedShareConflictPolicyChange: policy)
                 }
+            }
+
+        case .lobbyStateChanged:
+            // A moderator enabled/disabled the waiting room. The generic hostOnlySignalTypes
+            // gate above already discarded unprivileged senders, so we can apply directly.
+            if !senderIsLocal, let raw = signal.extraData?["enabled"] {
+                let enabled = (raw == "1")
+                interLogInfo(InterLog.room,
+                    "ModerationController: lobby %{public}@ by %{private}@",
+                    enabled ? "enabled" : "disabled", signal.senderIdentity)
+                delegate?.moderationController?(self, receivedLobbyStateChange: enabled)
             }
 
         case .stopScreenShare:

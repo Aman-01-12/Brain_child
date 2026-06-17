@@ -2658,6 +2658,9 @@ app.post('/room/join', async (req, res) => {
       shareConflictPolicy: roomData.shareConflictPolicy || 'oneattime',
       autoRecord:          roomData.autoRecord          === 'true',
       autoTranscript:      roomData.autoTranscript      === 'true',
+      // Whether the waiting room is enabled. Lets a co-host (or rejoining host) render
+      // the in-call lobby toggle in its true state, and toggle it from the right baseline.
+      lobbyEnabled:        roomData.lobbyEnabled        === 'true',
       // True when the server restored this caller as the room host (original host rejoining).
       isHost:              isReturningHost,
       // Whether a meeting password is set (presence of the bcrypt hash; the plaintext is
@@ -3594,6 +3597,9 @@ app.get('/room/lobby-status/:code/:identity', async (req, res) => {
       sharingPermissions:  roomData?.sharingPermissions  || 'hostOnly',
       autoRecord:          roomData?.autoRecord          === 'true',
       autoTranscript:      roomData?.autoTranscript      === 'true',
+      // Whether the waiting room is enabled (so a participant promoted to co-host
+      // after lobby admission sees the lobby toggle in its true state).
+      lobbyEnabled:        roomData?.lobbyEnabled        === 'true',
       // Presence of a meeting password (bcrypt hash only; plaintext never returned).
       hasPassword:         !!roomData?.passwordHash,
     });

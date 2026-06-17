@@ -76,7 +76,6 @@ final class LobbyHostViewModelTests: XCTestCase {
 }
 
 final class LobbyWaitingViewModelTests: XCTestCase {
-
     func testJoiningPresentation() {
         let vm = LobbyWaitingViewModel(); vm.state = .joining
         XCTAssertEqual(vm.title, "Joining Meeting")
@@ -124,5 +123,38 @@ final class LobbyWaitingViewModelTests: XCTestCase {
         XCTAssertFalse(vm.showsPosition)
         vm.state = .waiting
         XCTAssertTrue(vm.showsPosition)
+    }
+}
+
+// MARK: - Lobby state source-of-truth (in-call toggle sync)
+
+/// Covers the in-call lobby-state mechanism that keeps the host AND co-host lobby
+/// toggles in agreement: `activeLobbyEnabled` is the single source of truth, updated on
+/// a confirmed local toggle and on a remote moderator's `.lobbyStateChanged` signal, and
+/// it is KVO-observable so any open lobby panel converges. If `updateLobbyEnabled` stopped
+/// writing the flag (or the property lost `dynamic`), these tests fail.
+final class InterRoomControllerLobbyStateTests: XCTestCase {
+
+    func testUpdateLobbyEnabledSetsActiveFlag() {
+        let rc = InterRoomController()
+        XCTAssertFalse(rc.activeLobbyEnabled, "expected lobby to default to disabled")
+        rc.updateLobbyEnabled(true)
+        XCTAssertTrue(rc.activeLobbyEnabled)
+        rc.updateLobbyEnabled(false)
+        XCTAssertFalse(rc.activeLobbyEnabled)
+    }
+
+    func testActiveLobbyEnabledIsKVOObservable() {
+        let rc = InterRoomController()
+        let exp = expectation(description: "KVO fires for activeLobbyEnabled")
+        var observed: Bool?
+        let token = rc.observe(\.activeLobbyEnabled, options: [.new]) { _, change in
+            observed = change.newValue
+            exp.fulfill()
+        }
+        rc.updateLobbyEnabled(true)
+        wait(for: [exp], timeout: 1.0)
+        XCTAssertEqual(observed, true)
+        token.invalidate()
     }
 }

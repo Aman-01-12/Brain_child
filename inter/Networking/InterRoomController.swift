@@ -252,6 +252,7 @@ enum InterAudioInputMatcher {
         activeAutoRecord         = dict["autoRecord"]         as? Bool ?? false
         activeAutoTranscript     = dict["autoTranscript"]     as? Bool ?? false
         activeHasPassword        = dict["hasPassword"]        as? Bool ?? false
+        activeLobbyEnabled       = dict["lobbyEnabled"]       as? Bool ?? false
     }
 
     /// Update the active "meeting has a password" flag mid-session. Called after the host
@@ -259,6 +260,14 @@ enum InterAudioInputMatcher {
     /// stays in sync with the server.
     @objc public func updateHasMeetingPassword(_ hasPassword: Bool) {
         activeHasPassword = hasPassword
+    }
+
+    /// Update the active waiting-room (lobby) flag mid-session. Called after THIS client
+    /// successfully toggles the lobby, and when a `.lobbyStateChanged` signal is received
+    /// from another moderator, so `activeLobbyEnabled` stays the single source of truth.
+    /// Being KVO-observable, this drives any open lobby panel to converge.
+    @objc public func updateLobbyEnabled(_ enabled: Bool) {
+        activeLobbyEnabled = enabled
     }
 
     /// Update the active share-conflict policy mid-meeting.
@@ -455,6 +464,10 @@ enum InterAudioInputMatcher {
                         self.activeAutoRecord          = r.autoRecord
                         self.activeAutoTranscript      = r.autoTranscript
                         self.activeHasPassword         = r.hasPassword
+                        // Reflect the server-authoritative lobby state so a joiner who is
+                        // (or is promoted to) a moderator renders the in-call lobby toggle
+                        // correctly and toggles it from the right baseline.
+                        self.activeLobbyEnabled        = r.lobbyEnabled
                         // The server restores host status when the original host
                         // rejoins (matched by authenticated userId). Reflect it so the
                         // returning host's client shows host UI again.
