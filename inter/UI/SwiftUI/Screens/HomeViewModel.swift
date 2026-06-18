@@ -92,17 +92,55 @@ public final class HomeViewModel: ObservableObject {
     @Published public var displayName: String = ""
     @Published public var tier: String = "free"
     @Published public var interviewRequiresPro: Bool = false
-    @Published public var statusText: String = ""
-    @Published public var indicator: Int = 0           // InterConnectionIndicatorState raw
+    @Published public var statusText: String = "" {
+        didSet { armErrorAutoDismissIfNeeded() }
+    }
+    @Published public var indicator: Int = 0 {         // InterConnectionIndicatorState raw
+        didSet { armErrorAutoDismissIfNeeded() }
+    }
     @Published public var hostedRoomCode: String = ""
     @Published public var actionsEnabled: Bool = true
     @Published public var billingStatusText: String = ""
     @Published public var billingActionEnabled: Bool = true
 
+    // MARK: - Transient error auto-dismiss
+
+    /// How long an error banner stays before auto-clearing. Errors previously persisted
+    /// until the next attempt or an app restart; transient errors should fade on their own
+    /// (design-handoff principle). Overridable for tests.
+    public var errorAutoDismissSeconds: Double = 6.0
+
+    /// InterConnectionIndicatorStateError raw value (Idle=0, Connecting=1, Connected=2, Error=3).
+    private static let errorIndicator = 3
+
+    private var errorDismissTask: Task<Void, Never>?
+
+    /// (Re)arm the auto-dismiss timer on every status change. Only an *error* status is
+    /// auto-cleared; progress/idle statuses are left to be replaced by the next update.
+    /// A newer status cancels and (if itself an error) re-arms the timer.
+    private func armErrorAutoDismissIfNeeded() {
+        errorDismissTask?.cancel()
+        guard indicator == Self.errorIndicator, !statusText.isEmpty else { return }
+        let delay = errorAutoDismissSeconds
+        errorDismissTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(max(0, delay) * 1_000_000_000))
+            guard let self, !Task.isCancelled else { return }
+            // Only clear if it is still the same error (a newer status would have re-armed).
+            if self.indicator == Self.errorIndicator {
+                self.clearTransientStatus()
+            }
+        }
+    }
+
+    /// Clear a transient status/error banner (back to idle). Safe to call anytime.
+    public func clearTransientStatus() {
+        statusText = ""
+        indicator = 0
+    }
+
     // MARK: - Local state
 
-    @Published public var joinCode: String = "" {
-        didSet {
+    @Published public var joinCode: String = "" {        didSet {
             let cleaned = HomeViewModel.sanitizeRoomCode(joinCode)
             if cleaned != joinCode { joinCode = cleaned }
         }

@@ -182,4 +182,49 @@ final class HomeViewModelTests: XCTestCase {
         XCTAssertFalse(vm.historyLoaded)
         XCTAssertTrue(vm.history.isEmpty)
     }
+
+    // MARK: - Transient error auto-dismiss
+
+    func testErrorStatusAutoDismisses() async {
+        let vm = HomeViewModel()
+        vm.errorAutoDismissSeconds = 0.05
+        vm.statusText = "Call server unavailable. Please try again."
+        vm.indicator = 3 // InterConnectionIndicatorStateError
+        XCTAssertFalse(vm.statusText.isEmpty)
+        try? await Task.sleep(nanoseconds: 250_000_000) // 0.25s >> 0.05s
+        XCTAssertEqual(vm.statusText, "", "error banner should auto-clear after the delay")
+        XCTAssertEqual(vm.indicator, 0, "indicator returns to idle")
+    }
+
+    func testProgressStatusIsNotAutoDismissed() async {
+        let vm = HomeViewModel()
+        vm.errorAutoDismissSeconds = 0.05
+        vm.statusText = "Connecting…"
+        vm.indicator = 1 // connecting
+        try? await Task.sleep(nanoseconds: 250_000_000)
+        XCTAssertEqual(vm.statusText, "Connecting…", "non-error progress status must not auto-clear")
+        XCTAssertEqual(vm.indicator, 1)
+    }
+
+    func testNewStatusCancelsPendingErrorDismiss() async {
+        let vm = HomeViewModel()
+        vm.errorAutoDismissSeconds = 0.05
+        vm.statusText = "Room is full"
+        vm.indicator = 3
+        // A new attempt replaces the error before the timer fires.
+        vm.statusText = "Creating room…"
+        vm.indicator = 1
+        try? await Task.sleep(nanoseconds: 250_000_000)
+        XCTAssertEqual(vm.statusText, "Creating room…", "the replacing status must survive")
+        XCTAssertEqual(vm.indicator, 1)
+    }
+
+    func testClearTransientStatusResetsToIdle() {
+        let vm = HomeViewModel()
+        vm.statusText = "Something went wrong."
+        vm.indicator = 3
+        vm.clearTransientStatus()
+        XCTAssertEqual(vm.statusText, "")
+        XCTAssertEqual(vm.indicator, 0)
+    }
 }

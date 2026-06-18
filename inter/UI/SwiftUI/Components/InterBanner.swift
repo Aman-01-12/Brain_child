@@ -5,7 +5,9 @@
 //  Canonical inline status banner (icon + centered message) for form-level / panel-level
 //  messages, extracted from auth's error/info banners. Per-variant status colour; the icon
 //  flows inline with the text so the whole banner centers as one unit. `tinted` adds a
-//  subtle background fill (default on); auth's error banner opts out for a quieter look.
+//  subtle background fill — but per the design-handoff principle, ERROR banners are never
+//  filled (outline + coloured text only, matching the auth treatment), regardless of the
+//  `tinted` argument. success/info/warning still honour `tinted` (default on).
 //
 
 import SwiftUI
@@ -54,6 +56,9 @@ public struct InterBanner: View {
         let color = Color(nsColor: variant.color)
         let symbol = systemImage ?? variant.defaultSymbol
         let shape = RoundedRectangle(cornerRadius: InterRadius.lg, style: .continuous)
+        // Design principle: error messages carry no fill — only an outline + coloured text,
+        // matching auth. success/info/warning keep their subtle tint when requested.
+        let effectiveTinted = tinted && variant != .error
 
         (Text(Image(systemName: symbol)) + Text("  ") + Text(message))
             .font(InterFont.swiftUI(InterFont.Size.secondary))
@@ -62,7 +67,7 @@ public struct InterBanner: View {
             .frame(maxWidth: .infinity, alignment: centered ? .center : .leading)
             .padding(.horizontal, InterSpacing.x3)
             .padding(.vertical, InterSpacing.x2)
-            .background(tinted ? color.opacity(0.12) : Color.clear)
+            .background(effectiveTinted ? color.opacity(0.12) : Color.clear)
             .overlay(shape.strokeBorder(color.opacity(0.3), lineWidth: 1))
             .clipShape(shape)
     }
