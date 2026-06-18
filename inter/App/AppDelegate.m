@@ -330,6 +330,23 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
                               forKeyPath:@"activeLobbyEnabled"
                                  options:NSKeyValueObservingOptionNew
                                  context:InterActiveLobbyEnabledKVOContext];
+
+        // Pre-connect consent gate: an interviewee joining an interview room must confirm
+        // the secure-interview restrictions BEFORE the LiveKit connection is established.
+        // A declining candidate therefore never gains presence, never auto-subscribes to
+        // the interviewer's media, and never enters a recording. All other connects (host,
+        // normal calls, returning interview host) proceed immediately. Invoked on main.
+        __weak typeof(self) gateWeakSelf = self;
+        self.roomController.preConnectConsentGate =
+            ^(NSString *roomType, BOOL isHost, void (^decide)(BOOL)) {
+            __strong typeof(gateWeakSelf) gateSelf = gateWeakSelf;
+            if (!gateSelf) { decide(YES); return; }
+            BOOL intervieweeJoiningInterview = [roomType isEqualToString:@"interview"] && !isHost;
+            if (!intervieweeJoiningInterview) { decide(YES); return; }
+            [gateSelf showIntervieweeConfirmationWithCompletion:^(BOOL accepted) {
+                decide(accepted);
+            }];
+        };
     }
 
     // [Phase B.4d] Wire auth delegate and attempt session restore before showing setup UI.
@@ -1307,6 +1324,11 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
                 }
 
                 [p setActionsEnabled:YES];
+                if (error.code == 1020) { // consentDeclined — candidate cancelled the interview gate (benign)
+                    [p setIndicatorState:InterConnectionIndicatorStateIdle];
+                    [p setStatusText:@"Declined interview session."];
+                    return;
+                }
                 [p setIndicatorState:InterConnectionIndicatorStateError];
                 [p setStatusText:[strongSelf userFacingMessageForError:error]];
                 return;
@@ -1326,15 +1348,9 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
                     // The candidate consent dialog applies only to interviewees.
                     [strongSelf enterMode:InterCallModeInterview role:InterInterviewRoleInterviewer];
                 } else {
-                    [strongSelf showIntervieweeConfirmationWithCompletion:^(BOOL accepted) {
-                        if (accepted) {
-                            [strongSelf enterMode:InterCallModeInterview role:InterInterviewRoleInterviewee];
-                        } else {
-                            [rc disconnect];
-                            [p setIndicatorState:InterConnectionIndicatorStateIdle];
-                            [p setStatusText:@"Disconnected — declined interview session."];
-                        }
-                    }];
+                    // Consent is enforced PRE-CONNECT by the room controller's consent
+                    // gate, so reaching a successful connect means the candidate accepted.
+                    [strongSelf enterMode:InterCallModeInterview role:InterInterviewRoleInterviewee];
                 }
             } else {
                 [strongSelf enterMode:InterCallModeNormal role:InterInterviewRoleNone];
@@ -2203,6 +2219,11 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
 
                 [strongSelf _dismissJoiningOverlay];
                 [panel setActionsEnabled:YES];
+                if (error.code == 1020) { // consentDeclined — candidate cancelled the interview gate (benign)
+                    [panel setIndicatorState:InterConnectionIndicatorStateIdle];
+                    [panel setStatusText:@"Declined interview session."];
+                    return;
+                }
                 [panel setIndicatorState:InterConnectionIndicatorStateError];
                 [panel setStatusText:[strongSelf userFacingMessageForError:error]];
                 return;
@@ -2228,18 +2249,10 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
                     [strongSelf enterMode:InterCallModeInterview
                                      role:InterInterviewRoleInterviewer];
                 } else {
-                    // Show confirmation before entering secure interviewee mode
-                    [strongSelf showIntervieweeConfirmationWithCompletion:^(BOOL accepted) {
-                        if (accepted) {
-                            [strongSelf enterMode:InterCallModeInterview
-                                             role:InterInterviewRoleInterviewee];
-                        } else {
-                            // User declined — disconnect and return to setup
-                            [rc disconnect];
-                            [panel setIndicatorState:InterConnectionIndicatorStateIdle];
-                            [panel setStatusText:@"Disconnected — declined interview session."];
-                        }
-                    }];
+                    // Consent is enforced PRE-CONNECT by the room controller's consent
+                    // gate, so reaching a successful connect means the candidate accepted.
+                    [strongSelf enterMode:InterCallModeInterview
+                                     role:InterInterviewRoleInterviewee];
                 }
             } else {
                 // Normal call
@@ -4471,6 +4484,10 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
             if (!strongSelf) return;
 
             if (error) {
+                if (error.code == 1020) { // consentDeclined — candidate cancelled the interview gate
+                    NSLog(@"[Phase 9] Lobby-admitted candidate declined the interview session.");
+                    return;
+                }
                 NSLog(@"[Phase 9] Lobby admitted but connect failed: %@", error.localizedDescription);
                 NSAlert *alert = [[NSAlert alloc] init];
                 alert.messageText = @"Connection Failed";
@@ -4482,13 +4499,8 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
 
             BOOL isInterview = [roomType isEqualToString:@"interview"];
             if (isInterview) {
-                [strongSelf showIntervieweeConfirmationWithCompletion:^(BOOL accepted) {
-                    if (accepted) {
-                        [strongSelf enterMode:InterCallModeInterview role:InterInterviewRoleInterviewee];
-                    } else {
-                        [rc disconnect];
-                    }
-                }];
+                // Consent is enforced PRE-CONNECT by the room controller's consent gate.
+                [strongSelf enterMode:InterCallModeInterview role:InterInterviewRoleInterviewee];
             } else {
                 [strongSelf enterMode:InterCallModeNormal role:InterInterviewRoleNone];
             }

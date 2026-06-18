@@ -324,6 +324,16 @@ enum InterAudioInputMatcher {
     /// Session start timestamp (for disconnect duration logging).
     private var sessionStartTime: CFAbsoluteTime = 0
 
+    /// Optional pre-connect consent gate. Invoked on the main queue AFTER the token and
+    /// roomType are known but BEFORE any LiveKit connection is established. The gate calls
+    /// `decide(true)` to proceed or `decide(false)` to abort. When nil (default), the
+    /// connection proceeds immediately (unchanged behaviour).
+    ///
+    /// SECURITY (consent-before-connect): a declined gate means `room.connect()` is never
+    /// called, so the user never gains presence, never auto-subscribes to remote media, and
+    /// never enters an active recording — consent is a true precondition, not an afterthought.
+    @objc public var preConnectConsentGate: ((_ roomType: String, _ isHost: Bool, _ decide: @escaping (Bool) -> Void) -> Void)?
+
     // MARK: - Connect
 
     /// Connect to a LiveKit room.
@@ -405,6 +415,7 @@ enum InterAudioInputMatcher {
                     serverURL: response?.serverURL ?? configuration.serverURL,
                     roomCode: response?.roomCode,
                     roomType: response?.roomType ?? "call",
+                    isHost: response?.isHost ?? false,
                     error: error,
                     completion: completion
                 )
@@ -438,6 +449,7 @@ enum InterAudioInputMatcher {
                     serverURL: response?.serverURL ?? configuration.serverURL,
                     roomCode: response?.roomCode,
                     roomType: response?.roomType ?? "call",
+                    isHost: true,
                     error: error,
                     completion: completion
                 )
@@ -479,6 +491,7 @@ enum InterAudioInputMatcher {
                     serverURL: response?.serverURL ?? configuration.serverURL,
                     roomCode: configuration.roomCode,
                     roomType: response?.roomType ?? "call",
+                    isHost: response?.isHost ?? false,
                     error: error,
                     completion: completion
                 )
@@ -518,6 +531,7 @@ enum InterAudioInputMatcher {
             serverURL: serverURL,
             roomCode: configuration.roomCode,
             roomType: configuration.roomType.isEmpty ? "call" : configuration.roomType,
+            isHost: configuration.isHost,
             error: nil,
             completion: completion
         )
@@ -529,6 +543,7 @@ enum InterAudioInputMatcher {
         serverURL: String,
         roomCode: String?,
         roomType: String,
+        isHost: Bool,
         error: NSError?,
         completion: @escaping (NSError?) -> Void
     ) {
@@ -573,6 +588,52 @@ enum InterAudioInputMatcher {
             }
         }
 
+        // PRE-CONNECT CONSENT GATE: give the caller a chance to confirm BEFORE any LiveKit
+        // connection. A declined gate means we never connect — no presence, no autoSubscribe,
+        // no recording exposure. `isHost` is the server-authoritative value (threaded in by
+        // the caller), so a returning interview host correctly bypasses the interviewee gate.
+        if let gate = self.preConnectConsentGate {
+            let proceed: (Bool) -> Void = { [weak self] accepted in
+                guard let self = self else { return }
+                if accepted {
+                    self.performLiveKitConnect(serverURL: serverURL, token: token, completion: completion)
+                } else {
+                    self.handleConsentDeclined(completion: completion)
+                }
+            }
+            DispatchQueue.main.async {
+                gate(roomType, isHost, proceed)
+            }
+            return
+        }
+
+        // No gate installed — connect immediately (unchanged behaviour).
+        performLiveKitConnect(serverURL: serverURL, token: token, completion: completion)
+    }
+
+    /// Abort a connection the user declined at the pre-connect gate. Releases the
+    /// server-side slot reserved by token issuance (the user never actually connected to
+    /// LiveKit), resets connect state, and reports a clean `.consentDeclined` rejection so
+    /// the UI shows a normal "declined" message rather than a connection error.
+    private func handleConsentDeclined(completion: @escaping (NSError?) -> Void) {
+        interLogInfo(InterLog.networking, "RoomController: connection declined at consent gate — releasing slot")
+        let code = self.roomCode.isEmpty ? (self.configuration?.roomCode ?? "") : self.roomCode
+        if let config = self.configuration, !code.isEmpty {
+            tokenService.leaveRoom(
+                serverURL: config.tokenServerURL,
+                roomCode: code,
+                identity: config.participantIdentity
+            )
+        }
+        isConnecting = false
+        setConnectionState(.disconnected)
+        let err = InterNetworkErrorCode.consentDeclined.error(message: "Interview session declined")
+        DispatchQueue.main.async { completion(err) }
+    }
+
+    /// Create the LiveKit Room and connect. Extracted from `handleTokenResponse` so the
+    /// pre-connect consent gate can defer (or veto) the actual connection.
+    private func performLiveKitConnect(serverURL: String, token: String, completion: @escaping (NSError?) -> Void) {
         // Step 2: Create and connect the LiveKit Room
         let connectOptions = ConnectOptions(
             autoSubscribe: true,

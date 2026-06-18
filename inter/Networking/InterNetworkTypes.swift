@@ -367,6 +367,11 @@ public let InterNetworkErrorDomain = "com.secure.inter.network"
     case callServerUnavailable = 1018
     /// Too many password attempts — brute-force lockout (429 from token server).
     case tooManyAttempts = 1019
+
+    /// The user declined the pre-connect consent gate (e.g. an interviewee who cancelled
+    /// the secure-interview confirmation). A clean, expected rejection — the client never
+    /// connected to the room, so it must NOT surface the mid-call "Connection Lost" alert.
+    case consentDeclined = 1020
 }
 
 // MARK: - Error Helpers
@@ -392,7 +397,7 @@ extension InterNetworkErrorCode {
         switch self {
         case .roomCodeInvalid, .roomCodeExpired, .roomFull, .meetingLocked,
              .lobbyWaiting, .passwordRequired, .passwordIncorrect,
-             .roomBanned, .hostNotPresent:
+             .roomBanned, .hostNotPresent, .consentDeclined:
             return true
         default:
             return false

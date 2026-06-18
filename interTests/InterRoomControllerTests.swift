@@ -302,4 +302,50 @@ final class InterRoomControllerTests: XCTestCase {
         XCTAssertEqual(error.code, InterNetworkErrorCode.tokenFetchFailed.rawValue)
         XCTAssertNotNil(error.userInfo[NSUnderlyingErrorKey])
     }
+
+    // MARK: - Pre-Connect Consent Gate (consent-before-connect)
+
+    /// SECURITY: an interviewee who declines the secure-interview consent must NEVER
+    /// reach the LiveKit connection — no presence, no autoSubscribe, no recording. The
+    /// gate runs before `room.connect()`, so a decline returns the clean `.consentDeclined`
+    /// rejection and leaves the controller disconnected. If the gate were removed/bypassed,
+    /// the controller would proceed to connect and this test would fail (no 1020, state
+    /// would not be .disconnected after the gate).
+    func testConsentGate_declined_abortsBeforeConnect() {
+        let config = InterRoomConfiguration(
+            serverURL: "ws://127.0.0.1:1",
+            tokenServerURL: "http://127.0.0.1:1",
+            roomCode: "ABC123",
+            participantIdentity: "cand-1",
+            participantName: "Candidate",
+            isHost: false,
+            roomType: "interview"
+        )
+
+        var observedRoomType: String?
+        var observedIsHost = true
+        controller.preConnectConsentGate = { roomType, isHost, decide in
+            observedRoomType = roomType
+            observedIsHost = isHost
+            decide(false) // candidate declines the interview gate
+        }
+
+        let exp = expectation(description: "declined completion")
+        var completionError: NSError?
+        controller.connect(withToken: "faketoken",
+                           serverURL: "ws://127.0.0.1:1",
+                           configuration: config) { error in
+            completionError = error as NSError?
+            exp.fulfill()
+        }
+        waitForExpectations(timeout: 5)
+
+        // The gate saw the interview-interviewee context …
+        XCTAssertEqual(observedRoomType, "interview")
+        XCTAssertFalse(observedIsHost)
+        // … the decline produced the clean consentDeclined (1020) rejection …
+        XCTAssertEqual(completionError?.code, InterNetworkErrorCode.consentDeclined.rawValue)
+        // … and crucially the room was NEVER connected.
+        XCTAssertEqual(controller.connectionState, .disconnected)
+    }
 }
