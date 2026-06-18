@@ -180,6 +180,22 @@ final class CodeEditorDocument {
     func clearSizeLimitFlag() {
         didHitSizeLimit = false
     }
+
+    /// `true` when the document holds no elements at all (not even tombstones).
+    /// Used by the controller to decide whether a freshly-mounted / reconnected
+    /// replica should request an authoritative snapshot (R4.1, R4.2). A document
+    /// with only tombstones is NOT empty — its element ids must stay consistent.
+    var isEmpty: Bool { elements.isEmpty }
+
+    /// The number of inserts currently buffered awaiting an `originLeft` that
+    /// has not yet been integrated (causal-readiness backlog). The controller
+    /// watches this to self-heal: an origin that never resolves within a bounded
+    /// window triggers a snapshot request (R8.4). Pure read of internal state.
+    var pendingInsertCount: Int { pendingInserts.count }
+
+    /// `true` when at least one insert is buffered awaiting an unresolved
+    /// `originLeft`.
+    var hasUnresolvedInserts: Bool { !pendingInserts.isEmpty }
 }
 
 // MARK: - Rendered text & cursor anchoring (R2.5, R2.6)
