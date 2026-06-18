@@ -54,6 +54,11 @@ static os_log_t InterRecordingEngineLog(void) {
     // _engineLock so recordedDuration can read it safely from any thread.
     CMTime _lastVideoPTSSnapshot;
 
+    // Source-time of the first written frame (the value passed to
+    // startSessionAtSourceTime). recordedDuration is measured RELATIVE to this so it
+    // starts at 0, not at the capture clock's absolute value. Guarded by _engineLock.
+    CMTime _sessionStartPTS;
+
     // Monotonic PTS enforcement — only accessed on _recordingQueue.
     CMTime _lastVideoPTS;
     CMTime _lastAudioPTS;
@@ -95,6 +100,7 @@ static os_log_t InterRecordingEngineLog(void) {
     _lastVideoPTS = kCMTimeInvalid;
     _lastAudioPTS = kCMTimeInvalid;
     _lastVideoPTSSnapshot = kCMTimeInvalid;
+    _sessionStartPTS = kCMTimeInvalid;
 
     _droppedVideoFrames = 0;
     _droppedAudioSamples = 0;
@@ -126,14 +132,17 @@ static os_log_t InterRecordingEngineLog(void) {
     os_unfair_lock_lock(&_engineLock);
     // _lastVideoPTS is _recordingQueue-confined; read the lock-guarded snapshot instead.
     CMTime lastPTS = _lastVideoPTSSnapshot;
-    CMTime pauseDuration = _totalPauseDuration;
+    CMTime startPTS = _sessionStartPTS;
     os_unfair_lock_unlock(&_engineLock);
 
-    if (!CMTIME_IS_VALID(lastPTS)) {
+    if (!CMTIME_IS_VALID(lastPTS) || !CMTIME_IS_VALID(startPTS)) {
         return kCMTimeZero;
     }
-    CMTime duration = CMTimeSubtract(lastPTS, pauseDuration);
-    return CMTIME_IS_VALID(duration) ? duration : kCMTimeZero;
+    // Elapsed = lastPTS - sessionStart. adjustedPTS already removes paused intervals,
+    // so this is the gap-free recorded duration measured from zero (NOT the capture
+    // clock's absolute value, which previously made the timer start at ~22s).
+    CMTime duration = CMTimeSubtract(lastPTS, startPTS);
+    return (CMTIME_IS_VALID(duration) && CMTimeCompare(duration, kCMTimeZero) > 0) ? duration : kCMTimeZero;
 }
 
 - (NSUInteger)droppedVideoFrameCount {
@@ -177,6 +186,8 @@ static os_log_t InterRecordingEngineLog(void) {
             self->_sessionStarted      = NO;
             os_unfair_lock_lock(&self->_engineLock);
             self->_isActive = NO;
+            self->_sessionStartPTS = kCMTimeInvalid;
+            self->_lastVideoPTSSnapshot = kCMTimeInvalid;
             os_unfair_lock_unlock(&self->_engineLock);
         };
 
@@ -330,6 +341,10 @@ static os_log_t InterRecordingEngineLog(void) {
     if (!_sessionStarted) {
         [_assetWriter startSessionAtSourceTime:originalPTS];
         _sessionStarted = YES;
+        // Baseline for recordedDuration (measured from zero, not the capture clock).
+        os_unfair_lock_lock(&_engineLock);
+        _sessionStartPTS = originalPTS;
+        os_unfair_lock_unlock(&_engineLock);
     }
 
     // Adjust PTS to remove paused intervals.
@@ -411,6 +426,10 @@ static os_log_t InterRecordingEngineLog(void) {
     if (!_sessionStarted) {
         [_assetWriter startSessionAtSourceTime:originalPTS];
         _sessionStarted = YES;
+        // Baseline for recordedDuration (measured from zero, not the capture clock).
+        os_unfair_lock_lock(&_engineLock);
+        _sessionStartPTS = originalPTS;
+        os_unfair_lock_unlock(&_engineLock);
     }
 
     CMTime adjustedPTS = CMTimeSubtract(originalPTS, pauseOffset);
