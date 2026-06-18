@@ -191,10 +191,10 @@ enum InterMicrophoneNetworkAction {
     /// Screen sharing permission: "hostOnly" | "everyone" | "request". Default "hostOnly".
     @objc public var sharingPermissions: String
 
-    /// Whether cloud recording auto-starts when the host joins (pro+ only). Default false.
+    /// Whether cloud recording auto-starts when the host joins (pro/hiring only). Default false.
     @objc public var autoRecord: Bool
 
-    /// Whether AI transcription auto-starts when the host joins (pro+ only). Default false.
+    /// Whether AI transcription auto-starts when the host joins (pro/hiring only). Default false.
     @objc public var autoTranscript: Bool
 
     /// Whether the waiting room / lobby is enabled. Default false.

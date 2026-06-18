@@ -55,8 +55,8 @@ const BILLING_PLANS = [
     ],
   },
   {
-    tier: 'pro+',
-    name: 'Pro+',
+    tier: 'hiring',
+    name: 'Hiring',
     price: 2000,
     currency: 'INR',
     interval: 'month',
@@ -79,7 +79,7 @@ const BILLING_PLANS = [
 // ---------------------------------------------------------------------------
 // Tier ordering — used to determine whether a plan is an upgrade path
 // ---------------------------------------------------------------------------
-const TIER_ORDER = { free: 0, pro: 1, 'pro+': 2 };
+const TIER_ORDER = { free: 0, pro: 1, hiring: 2 };
 
 // ---------------------------------------------------------------------------
 // renderPricingPage
@@ -113,7 +113,7 @@ function renderPricingPage(plans, currentTier, token) {
 
     // Unauthenticated visitor — show disabled prompt button
     if (!isAuthenticated) {
-      const label = plan.tier === 'pro+' ? 'Get Pro+' : `Get ${escHtml(plan.name)}`;
+      const label = plan.tier === 'hiring' ? 'Get Hiring' : `Get ${escHtml(plan.name)}`;
       return `<button class="btn btn-signin" disabled>${label} — Sign in first</button>`;
     }
 
@@ -128,7 +128,7 @@ function renderPricingPage(plans, currentTier, token) {
     }
 
     // Upgrade path — hidden form POST (no JS required)
-    const label = plan.tier === 'pro+' ? 'Upgrade to Pro+' : `Upgrade to ${escHtml(plan.name)}`;
+    const label = plan.tier === 'hiring' ? 'Upgrade to Hiring' : `Upgrade to ${escHtml(plan.name)}`;
     return `
       <form method="POST" action="/billing/checkout-redirect">
         <input type="hidden" name="token" value="${escAttr(token)}">

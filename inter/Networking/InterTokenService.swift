@@ -498,7 +498,7 @@ private struct TokenCacheEntry {
 
     // MARK: - Tier Validation
 
-    private static let knownTiers: Set<String> = ["free", "pro", "pro+"]
+    private static let knownTiers: Set<String> = ["free", "pro", "hiring"]
 
     /// Returns a validated tier string, or `nil` if the input is empty or unrecognised.
     private func validatedTier(_ raw: String?) -> String? {

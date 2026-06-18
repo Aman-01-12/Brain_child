@@ -57,9 +57,9 @@ extern NSString *const InterSharingConflictAnyCanPreempt;
 /// Share-conflict policy: one of the InterSharingConflict* constants.
 /// Controls what happens when a participant tries to share while someone else is sharing.
 @property (nonatomic, copy)   NSString *shareConflictPolicy;
-/// Auto-start cloud recording when host joins (pro+ only).
+/// Auto-start cloud recording when host joins (pro/hiring only).
 @property (nonatomic, assign) BOOL autoRecord;
-/// Auto-start AI transcription when host joins (pro+ only).
+/// Auto-start AI transcription when host joins (pro/hiring only).
 @property (nonatomic, assign) BOOL autoTranscript;
 /// Allow co-hosts to record locally to their own machine (disabled by default; pro-gated; host controls).
 @property (nonatomic, assign) BOOL allowCoHostLocalRecording;
@@ -144,7 +144,7 @@ extern NSString *const InterSharingConflictAnyCanPreempt;
 - (void)setMeetingPassword:(NSString *)meetingPassword;
 
 /// Gates the pro-only toggles (Auto-Record, Auto-Transcript).
-/// Pass the user's tier string: "free", "pro", "pro+", or "hiring".
+/// Pass the user's tier string: "free", "pro", or "hiring".
 - (void)setUserTier:(NSString *)tier;
 
 /// Reconfigures the (full) panel as a defaults editor: the action button becomes

@@ -39,17 +39,19 @@ static NSDictionary<NSNumber *, NSString *> *sDisplayName;
     sTierRanks = @{
         @"free":    @0,
         @"pro":     @1,
-        @"pro+":    @2,
-        @"hiring":  @3,
+        @"hiring":  @2,
     };
 
     // ── Feature minimum tier ranks ─────────────────────────────────────────
-    // Change @1 → @2 to require pro+, @3 to require hiring, etc.
+    // Change @1 → @2 to require hiring instead of pro, etc. Mirrors
+    // token-server/tiers.js — keep the two in sync.
     sTierMinRank = @{
-        @(InterFeatureHostInterview):     @1,  // pro
-        @(InterFeatureCloudRecording):    @1,  // pro
-        @(InterFeatureScheduledMeetings): @1,  // pro
-        @(InterFeatureChatExport):          @1,  // pro
+        @(InterFeatureHostInterview):            @2,  // hiring
+        @(InterFeatureCloudRecording):           @1,  // pro
+        @(InterFeatureScheduledMeetings):        @1,  // pro
+        @(InterFeatureChatExport):               @1,  // pro
+        @(InterFeatureCollaborativeCodeEditor):  @2,  // hiring (interview tool)
+        @(InterFeatureCollaborativeWhiteboard):  @2,  // hiring (interview tool)
     };
 
     // Derive sMinTierName from sTierMinRank so the two cannot drift.
@@ -57,8 +59,7 @@ static NSDictionary<NSNumber *, NSString *> *sDisplayName;
     NSDictionary<NSNumber *, NSString *> *rankToName = @{
         @0: @"free",
         @1: @"pro",
-        @2: @"pro+",
-        @3: @"hiring",
+        @2: @"hiring",
     };
     NSMutableDictionary<NSNumber *, NSString *> *minTierName = [NSMutableDictionary dictionaryWithCapacity:sTierMinRank.count];
     for (NSNumber *featureKey in sTierMinRank) {
@@ -67,10 +68,12 @@ static NSDictionary<NSNumber *, NSString *> *sDisplayName;
     sMinTierName = [minTierName copy];
 
     sDisplayName = @{
-        @(InterFeatureHostInterview):     @"Interview Mode",
-        @(InterFeatureCloudRecording):    @"Cloud Recording",
-        @(InterFeatureScheduledMeetings): @"Scheduled Meetings",
-        @(InterFeatureChatExport):          @"Chat Export",
+        @(InterFeatureHostInterview):            @"Interview Mode",
+        @(InterFeatureCloudRecording):           @"Cloud Recording",
+        @(InterFeatureScheduledMeetings):        @"Scheduled Meetings",
+        @(InterFeatureChatExport):               @"Chat Export",
+        @(InterFeatureCollaborativeCodeEditor):  @"Collaborative Code Editor",
+        @(InterFeatureCollaborativeWhiteboard):  @"Collaborative Whiteboard",
     };
 }
 

@@ -20,6 +20,7 @@ const bcrypt  = require('bcryptjs');
 const db      = require('./db');
 const auth    = require('./auth');
 const redis   = require('./redis');
+const tiers   = require('./tiers');
 const { AccessToken, RoomServiceClient } = require('livekit-server-sdk');
 const { requireIdempotencyKey } = require('./idempotency');
 
@@ -159,6 +160,19 @@ router.post('/schedule', auth.requireAuth, requireIdempotencyKey, async (req, re
     }
 
     const type = roomType === 'interview' ? 'interview' : 'call';
+
+    // Server-side gate: scheduling an INTERVIEW requires the hiring tier (parity with
+    // /room/create). Enforced authoritatively here, not just in the client.
+    if (type === 'interview' &&
+        !tiers.isFeatureAllowed(req.user && req.user.tier, tiers.FEATURES.HOST_INTERVIEW)) {
+      return res.status(403).json({
+        error: 'Scheduling an interview requires a hiring plan.',
+        code: 'INSUFFICIENT_TIER',
+        currentTier: (req.user && req.user.tier) || 'free',
+        requiredTier: tiers.minTierForFeature(tiers.FEATURES.HOST_INTERVIEW),
+      });
+    }
+
     const roomCode = generateRoomCode();
 
     // Meeting-settings snapshot (mirrors /room/create validation). Stored with

@@ -95,9 +95,9 @@ public final class PreMeetingViewModel: ObservableObject {
         meetingName = "\(displayName)'s Meeting"
     }
 
-    /// Gate pro toggles. "pro" / "pro+" / "hiring" unlock (legacy setUserTier:).
+    /// Gate pro toggles. "pro" / "hiring" unlock (legacy setUserTier:).
     public func setUserTier(_ tier: String) {
-        isPro = ["pro", "pro+", "hiring"].contains(tier)
+        isPro = ["pro", "hiring"].contains(tier)
         if !isPro {
             autoRecord = false
             autoTranscript = false

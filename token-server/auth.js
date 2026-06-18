@@ -20,6 +20,7 @@ const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
 const https = require('https');
 const db = require('./db');
+const tiers = require('./tiers');
 
 // ---------------------------------------------------------------------------
 // Secret validation — crash at startup rather than run with a weak secret.
@@ -52,7 +53,6 @@ const BCRYPT_ROUNDS = 12;
 const MAX_SESSIONS_BY_TIER = {
   free:   2,
   pro:    3,
-  'pro+': 3,
   hiring: 3,
 };
 
@@ -534,7 +534,7 @@ function requireAuth(req, res, next) {
 // ---------------------------------------------------------------------------
 // Middleware Factory: requireTier(minTier)
 //
-// Checks the user's effective tier against a tier hierarchy: free < pro < pro+ < hiring.
+// Checks the user's effective tier against a tier hierarchy: free < pro < hiring.
 // Also checks subscription_status from DB (fresh read) — rejects users whose
 // subscription is inactive (unpaid/expired/paused) unless in grace period.
 //
@@ -545,7 +545,7 @@ function requireAuth(req, res, next) {
 // Trial users (on_trial) get pro-equivalent access via TRIAL_GRANTS_TIER.
 // Phase C — Gap G15 (P0)
 // ---------------------------------------------------------------------------
-const TIER_LEVELS = { free: 0, pro: 1, 'pro+': 2, hiring: 3 };
+const TIER_LEVELS = tiers.TIER_RANKS;  // single source of truth (free < pro < hiring)
 const INACTIVE_STATUSES = new Set(['unpaid', 'expired', 'paused']);
 const TRIAL_GRANTS_TIER = { on_trial: 'pro' };
 

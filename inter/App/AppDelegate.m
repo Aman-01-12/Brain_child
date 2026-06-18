@@ -2706,7 +2706,7 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
 }
 
 /// Triggers automatic cloud recording when the host has configured autoRecord.
-/// Only fires for Pro/Pro+ tier users who have cloud recording enabled.
+/// Only fires for Pro/Hiring tier users who have cloud recording enabled.
 - (void)handleAutoRecordIfNeeded {
     InterRecordingCoordinator *coordinator = self.normalRecordingCoordinator;
     if (!coordinator) return;
@@ -5916,7 +5916,7 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
             return;
         }
 
-        // Paid tiers (pro / pro+ / hiring): present mode selection
+        // Paid tiers (pro / hiring): present mode selection
         NSAlert *modeAlert = [[NSAlert alloc] init];
         modeAlert.messageText = @"Recording Mode";
         modeAlert.informativeText = @"Choose where to save the recording.\n\nLocal: saved to your Mac.\nCloud: recorded server-side and available for download.";

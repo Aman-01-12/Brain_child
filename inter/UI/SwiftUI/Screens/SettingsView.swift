@@ -560,7 +560,7 @@ struct SettingsView: View {
 
             sectionLabel("Recording (Pro)")
             if !defaults.isPaidTier {
-                Text("✦ Requires a Pro or Pro+ subscription")
+                Text("✦ Requires a Pro or Hiring subscription")
                     .font(InterFont.swiftUI(11))
                     .foregroundColor(Color(nsColor: InterStatus.warning))
                     .padding(.horizontal, InterSpacing.x3)

@@ -113,10 +113,10 @@ struct HomeView: View {
                          hint: viewModel.isSignedIn ? nil : "Sign in to use Teams",
                          action: { viewModel.onTeams?() })
                 HomeTile(icon: "briefcase.fill", label: "Host Interview", style: .amber,
-                         badge: viewModel.interviewRequiresPro ? "PRO" : nil,
+                         badge: viewModel.interviewRequiresPro ? "HIRING" : nil,
                          enabled: viewModel.canUseAuthenticatedActions,
                          hint: viewModel.interviewRequiresPro
-                             ? "Host Interview — Pro plan required"
+                             ? "Host Interview — Hiring plan required"
                              : (viewModel.isSignedIn ? nil : "Sign in to host interviews"),
                          action: { viewModel.onHostInterview?() })
             }

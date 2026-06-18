@@ -296,7 +296,7 @@ struct PreMeetingView: View {
 
     private var proCallout: some View {
         VStack(alignment: .leading, spacing: 2) {
-            Text("✦ Requires Pro or Pro+ subscription")
+            Text("✦ Requires Pro or Hiring subscription")
                 .font(InterFont.swiftUI(InterFont.Size.caption, .semibold))
                 .foregroundColor(Color(nsColor: InterStatus.warning))
             Text("Upgrade to unlock cloud recording and transcription.")

@@ -199,7 +199,7 @@ public final class HomeViewModel: ObservableObject {
     }
 
     public var isPaidTier: Bool {
-        tier == "pro" || tier == "pro+"
+        tier == "pro" || tier == "hiring"
     }
 
     public var greeting: String {

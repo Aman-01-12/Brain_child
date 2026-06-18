@@ -76,7 +76,7 @@ final class PreMeetingViewModelTests: XCTestCase {
 
     func testProTiersUnlockAndFreeTierClearsToggles() {
         let vm = PreMeetingViewModel(mode: .fullSetup)
-        for tier in ["pro", "pro+", "hiring"] {
+        for tier in ["pro", "hiring"] {
             vm.setUserTier(tier)
             XCTAssertTrue(vm.isPro, tier)
         }

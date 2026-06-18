@@ -7,7 +7,7 @@
 //  flow and the schedule screen's inline section read. Editing here is the
 //  full-list defaults editor that used to be the AppKit defaults-editor window.
 //
-//  Recording auto-start toggles are tier-gated (pro+): shown but disabled with
+//  Recording auto-start toggles are tier-gated (pro/hiring): shown but disabled with
 //  an upgrade note for free users — matching the pre-meeting panel's gating.
 //
 
@@ -48,7 +48,7 @@ public final class MeetingDefaultsViewModel: ObservableObject {
         allowCoHostLocalRecording = s.allowCoHostLocalRecording
     }
 
-    public var isPaidTier: Bool { tier == "pro" || tier == "pro+" }
+    public var isPaidTier: Bool { tier == "pro" || tier == "hiring" }
 
     /// Persist to the shared store (also marks hasConfiguredDefaults).
     public func save() {

@@ -80,6 +80,7 @@ const { requireIdempotencyKey } = require('./idempotency');
 const { createReconcileEmptyRoom } = require('./roomReconcile');
 const { createJoinCapGuard } = require('./joinGuards');
 const { createOverdueRecordingSweeper } = require('./recordingQuota');
+const tiers = require('./tiers');
 
 const app = express();
 
@@ -1297,7 +1298,9 @@ const msJwks = jwksClient({
 
 // In-memory PKCE/nonce store (use Redis for multi-instance prod deployments)
 const oauthSessions = new Map();
-setInterval(() => {
+// .unref() so this maintenance timer never keeps the event loop alive on its
+// own (matters when index.js is imported in tests — the process must exit).
+const _oauthCleanupTimer = setInterval(() => {
   const cutoff = Date.now() - 10 * 60 * 1000;
   for (const [key, val] of oauthSessions) {
     if (val.createdAt < cutoff) oauthSessions.delete(key);
@@ -1311,6 +1314,7 @@ setInterval(() => {
   db.query(`DELETE FROM password_reset_tokens WHERE expires_at < NOW() - INTERVAL '1 hour'`)
     .catch(err => console.error('[auth] reset-token cleanup failed:', err.message));
 }, 5 * 60 * 1000);
+if (typeof _oauthCleanupTimer.unref === 'function') _oauthCleanupTimer.unref();
 
 const OAUTH_PROVIDERS = new Set(['google', 'microsoft']);
 
@@ -2378,6 +2382,20 @@ app.post('/room/create', auth.requireAuth, requireIdempotencyKey, async (req, re
 
   // Normalize roomType — default to "call" for backward compatibility
   const roomType = (rawRoomType === 'interview') ? 'interview' : 'call';
+
+  // Server-side gate: hosting an INTERVIEW requires the hiring tier. The client
+  // also gates this (InterFeatureGate), but enforce it authoritatively here so a
+  // patched client cannot create an interview room below the required tier.
+  // req.user.tier is the server-signed JWT tier — unforgeable by the client.
+  if (roomType === 'interview' &&
+      !tiers.isFeatureAllowed(req.user && req.user.tier, tiers.FEATURES.HOST_INTERVIEW)) {
+    return res.status(403).json({
+      error: 'Hosting an interview requires a hiring plan.',
+      code: 'INSUFFICIENT_TIER',
+      currentTier: (req.user && req.user.tier) || 'free',
+      requiredTier: tiers.minTierForFeature(tiers.FEATURES.HOST_INTERVIEW),
+    });
+  }
 
   // Validate enum fields
   const VALID_CHAT_PERMS    = ['everyone', 'hostOnly', 'disabled'];
@@ -3902,13 +3920,12 @@ app.post('/room/record/start', auth.requireAuth, rateLimitRoomAction('record-sta
   // Use the room's creation-time tier for feature gating. This ensures that
   // a host who was Pro when the meeting started retains Pro features for the
   // entire meeting duration, even if their account tier changes mid-session.
-  const TIER_LEVELS = { free: 0, pro: 1, hiring: 2 };
   const roomTier = roomData.hostTier || 'free';
-  if ((TIER_LEVELS[roomTier] ?? 0) < (TIER_LEVELS['pro'] ?? 0)) {
+  if (!tiers.isFeatureAllowed(roomTier, tiers.FEATURES.CLOUD_RECORDING)) {
     return res.status(403).json({
       error: 'This feature requires a pro plan or higher',
       currentTier: roomTier,
-      requiredTier: 'pro',
+      requiredTier: tiers.minTierForFeature(tiers.FEATURES.CLOUD_RECORDING),
     });
   }
 
@@ -3955,9 +3972,8 @@ app.post('/room/record/start', auth.requireAuth, rateLimitRoomAction('record-sta
     const hostTierFromDb = hostRows[0].tier || 'free';
     // Use the room snapshot tier for feature-availability gating (stable, set at room creation).
     const roomHostTier = roomData.hostTier || 'free';
-    const TIER_LEVELS_CHECK = { free: 0, pro: 1, hiring: 2 };
-    if ((TIER_LEVELS_CHECK[roomHostTier] ?? 0) < (TIER_LEVELS_CHECK['pro'] ?? 0)) {
-      return res.status(403).json({ error: "Host's account does not support cloud recording.", requiredTier: 'pro' });
+    if (!tiers.isFeatureAllowed(roomHostTier, tiers.FEATURES.CLOUD_RECORDING)) {
+      return res.status(403).json({ error: "Host's account does not support cloud recording.", requiredTier: tiers.minTierForFeature(tiers.FEATURES.CLOUD_RECORDING) });
     }
     recordingUserId = hostNumericId;
     // Use the live DB tier for quota enforcement so downgrades take effect immediately.
@@ -5340,7 +5356,7 @@ async function deleteRoomFiles(code) {
 // Handles crash-recovery cases where deleteRoomFiles was never called.
 // ---------------------------------------------------------------------------
 const CHAT_FILE_MAX_AGE_MS = 25 * 60 * 60 * 1000;
-setInterval(() => {
+const _chatFileTtlTimer = setInterval(() => {
   try {
     const files = fs.readdirSync(CHAT_UPLOAD_DIR);
     const now   = Date.now();
@@ -5357,6 +5373,9 @@ setInterval(() => {
     console.error(`[file-share] TTL scan error: ${err.message}`);
   }
 }, 60 * 60 * 1000); // every hour
+// .unref() so this hourly scan never keeps the event loop alive on its own
+// (so importing index.js in tests does not hang the process).
+if (typeof _chatFileTtlTimer.unref === 'function') _chatFileTtlTimer.unref();
 
 // Global error handler — MUST be the last app.use() before app.listen
 // Catches any error thrown from route handlers (throw err pattern above).
@@ -5717,21 +5736,32 @@ io.on('connection', (socket) => {
 
 // ---------------------------------------------------------------------------
 // Startup
+//
+// Guarded behind `require.main === module` so the server only binds the port +
+// starts background sweepers when run directly (`node index.js`). When index.js
+// is imported (e.g. by integration tests that mount `app`), no port is bound
+// and no workers start — the test harness calls app.listen(0) on its own.
 // ---------------------------------------------------------------------------
-httpServer.listen(PORT, () => {
-  console.log(`[token-server] Running on http://localhost:${PORT}`);
-  // NOTE: API key intentionally NOT logged — would persist in log aggregators
-  console.log(`[token-server] Redis: ${process.env.REDIS_URL || 'redis://localhost:6379'}`);
-  console.log(`[token-server] Endpoints: POST /room/create, /room/join, /token/refresh, /auth/register, /auth/login | GET /room/info/:code, /auth/me, /health`);
-  markPhantomMeetingsFailed();
+if (require.main === module) {
+  httpServer.listen(PORT, () => {
+    console.log(`[token-server] Running on http://localhost:${PORT}`);
+    // NOTE: API key intentionally NOT logged — would persist in log aggregators
+    console.log(`[token-server] Redis: ${process.env.REDIS_URL || 'redis://localhost:6379'}`);
+    console.log(`[token-server] Endpoints: POST /room/create, /room/join, /token/refresh, /auth/register, /auth/login | GET /room/info/:code, /auth/me, /health`);
+    markPhantomMeetingsFailed();
 
-  // F1: periodically stop cloud recordings that exceed their per-recording quota cap.
-  // 60s cadence is well under any realistic quota (minutes), bounding overrun to <=1 min.
-  const RECORDING_SWEEP_INTERVAL_MS = 60 * 1000;
-  const recordingSweepTimer = setInterval(() => {
-    sweepOverdueRecordings().catch((err) =>
-      console.error('[quota-sweeper] sweep failed:', err.message));
-  }, RECORDING_SWEEP_INTERVAL_MS);
-  // Don't keep the event loop alive solely for the sweeper.
-  if (typeof recordingSweepTimer.unref === 'function') recordingSweepTimer.unref();
-});
+    // F1: periodically stop cloud recordings that exceed their per-recording quota cap.
+    // 60s cadence is well under any realistic quota (minutes), bounding overrun to <=1 min.
+    const RECORDING_SWEEP_INTERVAL_MS = 60 * 1000;
+    const recordingSweepTimer = setInterval(() => {
+      sweepOverdueRecordings().catch((err) =>
+        console.error('[quota-sweeper] sweep failed:', err.message));
+    }, RECORDING_SWEEP_INTERVAL_MS);
+    // Don't keep the event loop alive solely for the sweeper.
+    if (typeof recordingSweepTimer.unref === 'function') recordingSweepTimer.unref();
+  });
+}
+
+// Export the Express app (and HTTP server) for integration tests. Requiring this
+// module has no network side effects thanks to the require.main guard above.
+module.exports = { app, httpServer };
