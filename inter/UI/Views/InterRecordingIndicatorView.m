@@ -38,6 +38,7 @@ static const CGFloat kRecViewHeight = 28.0;
 
     _indicatorActive = NO;
     _indicatorPaused = NO;
+    _showsElapsedTime = NO;
     self.hidden = YES;
 
     return self;
@@ -97,10 +98,16 @@ static const CGFloat kRecViewHeight = 28.0;
     _recLabel.frame = NSMakeRect(x, midY - recSize.height / 2.0, recSize.width, recSize.height);
     x += recSize.width + kRecItemSpacing;
 
-    // Time label
-    NSSize timeSize = _timeLabel.fittingSize;
-    _timeLabel.frame = NSMakeRect(x, midY - timeSize.height / 2.0, timeSize.width, timeSize.height);
-    x += timeSize.width + kRecHorizontalPadding;
+    // Time label — omitted entirely (no reserved space) when not shown, so a
+    // non-recording participant sees a snug "● REC" badge, not a gap.
+    if (_showsElapsedTime) {
+        NSSize timeSize = _timeLabel.fittingSize;
+        _timeLabel.frame = NSMakeRect(x, midY - timeSize.height / 2.0, timeSize.width, timeSize.height);
+        x += timeSize.width + kRecHorizontalPadding;
+    } else {
+        // Trailing padding after the REC label (replaces the inter-item spacing added above).
+        x += kRecHorizontalPadding - kRecItemSpacing;
+    }
 
     // Set own intrinsic size and notify Auto Layout of the change so parent
     // views update their constraints (e.g. when the label switches "REC"↔"PAUSED").
@@ -110,8 +117,12 @@ static const CGFloat kRecViewHeight = 28.0;
 
 - (NSSize)intrinsicContentSize {
     CGFloat width = kRecHorizontalPadding + kRecDotSize + kRecItemSpacing;
-    width += _recLabel.fittingSize.width + kRecItemSpacing;
-    width += _timeLabel.fittingSize.width + kRecHorizontalPadding;
+    width += _recLabel.fittingSize.width;
+    if (_showsElapsedTime) {
+        width += kRecItemSpacing + _timeLabel.fittingSize.width + kRecHorizontalPadding;
+    } else {
+        width += kRecHorizontalPadding;
+    }
     return NSMakeSize(width, kRecViewHeight);
 }
 
@@ -156,7 +167,15 @@ static const CGFloat kRecViewHeight = 28.0;
     [self _layoutSubviews];
 }
 
+- (void)setShowsElapsedTime:(BOOL)showsElapsedTime {
+    _showsElapsedTime = showsElapsedTime;
+    _timeLabel.hidden = !showsElapsedTime;
+    [self _layoutSubviews];
+}
+
 - (void)setElapsedDuration:(NSTimeInterval)duration {
+    // Guard against negative/NaN inputs producing a garbled label.
+    if (!isfinite(duration) || duration < 0) duration = 0;
     NSInteger totalSeconds = (NSInteger)duration;
     NSInteger hours = totalSeconds / 3600;
     NSInteger minutes = (totalSeconds % 3600) / 60;

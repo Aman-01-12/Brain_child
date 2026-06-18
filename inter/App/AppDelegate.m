@@ -5992,6 +5992,8 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
     self.normalRecordingIndicatorView.indicatorActive = (active || paused);
     self.normalRecordingIndicatorView.indicatorPaused = paused;
     if (state == InterRecordingStateIdle || state == InterRecordingStateFinalized) {
+        // No active local timer — collapse back to a plain "● REC" badge.
+        self.normalRecordingIndicatorView.showsElapsedTime = NO;
         [self.normalRecordingIndicatorView setElapsedDuration:0];
     }
 }
@@ -6008,6 +6010,9 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
 }
 
 - (void)recordingDurationDidUpdate:(NSTimeInterval)duration {
+    // A live duration tick means THIS client owns the recording timer — reveal the
+    // counter (non-recording participants never get here, so they stay "● REC").
+    self.normalRecordingIndicatorView.showsElapsedTime = YES;
     [self.normalRecordingIndicatorView setElapsedDuration:duration];
 }
 
@@ -6035,6 +6040,7 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
 
 - (void)recordingDidStop {
     self.normalRecordingIndicatorView.indicatorActive = NO;
+    self.normalRecordingIndicatorView.showsElapsedTime = NO;
     [self.normalRecordingIndicatorView setElapsedDuration:0];
     // [F2] Clear the secure interview badge too.
     [self.secureController setRecordingIndicatorActive:NO];

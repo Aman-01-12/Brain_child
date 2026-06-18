@@ -17,6 +17,12 @@ NS_ASSUME_NONNULL_BEGIN
 /// Whether recording is paused (shows "PAUSED" instead of pulsing dot).
 @property (nonatomic, getter=isIndicatorPaused) BOOL indicatorPaused;
 
+/// Whether the elapsed-time counter is shown. Default is NO — only a client that
+/// receives live duration updates (the recorder) shows the counter; everyone else
+/// (non-recording participants, the secure interviewee, cloud-only hosts without a
+/// local timer) shows a plain "● REC" badge instead of a misleading frozen "00:00:00".
+@property (nonatomic) BOOL showsElapsedTime;
+
 /// Update the elapsed time display.
 /// @param duration  Elapsed recording time in seconds (excluding paused intervals).
 - (void)setElapsedDuration:(NSTimeInterval)duration;
