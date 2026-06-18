@@ -117,6 +117,13 @@ enum InterAudioInputMatcher {
     /// [Phase 8.6] Q&A controller. Wired in by the caller before connect.
     @objc public weak var qaController: InterQAController?
 
+    /// [Collaborative Code Editor] Owned by `InterSecureToolsBridge` for the
+    /// session and wired in when the editor mounts. The room controller forwards
+    /// DataChannel data on the `codeEditor` topic to it (mirrors poll/Q&A). Held
+    /// `weak`: the bridge owns the controller and clears this reference at
+    /// teardown so it never dangles (R8.1).
+    @objc public weak var codeEditorController: InterCodeEditorController?
+
     /// [Phase 10] Recording coordinator. Wired in by the caller before connect.
     /// Room controller forwards disconnect events so recording can auto-stop.
     @objc public weak var recordingCoordinator: InterRecordingCoordinator?
@@ -129,6 +136,19 @@ enum InterAudioInputMatcher {
     /// The local participant's display name (ObjC-safe accessor).
     @objc public var localParticipantName: String {
         return room?.localParticipant.name ?? "You"
+    }
+
+    /// The server-signed `tools` entitlement for the LOCAL participant, read from
+    /// this client's own LiveKit JWT metadata (R9.2). The token server derives it
+    /// from the room's snapshotted host tier, so it is granted to both the
+    /// interviewer and the candidate of a Hiring host's room regardless of the
+    /// candidate's own tier (R7.2), and cannot be forged by a client (R9.1).
+    ///
+    /// Reads ONLY the local participant's metadata — never a peer's self-reported
+    /// claim (R9.5). Fail-closed: returns `false` when disconnected or the flag is
+    /// absent/malformed.
+    @objc public var localParticipantHasToolsEntitlement: Bool {
+        return InterParticipantMetadata.parseToolsEntitlement(from: room?.localParticipant.metadata)
     }
 
     /// Re-point LiveKit's native audio capture (the ADM/voice-processing input) to a
@@ -1301,6 +1321,8 @@ extension InterRoomController: RoomDelegate {
                 self.pollController?.handleReceivedData(data, senderIdentity: senderIdentity)
             case "qa":
                 self.qaController?.handleReceivedData(data, senderIdentity: senderIdentity)
+            case "codeEditor":
+                self.codeEditorController?.handleReceivedData(data, senderIdentity: senderIdentity)
             default:
                 self.chatController?.handleReceivedData(data, topic: topic, participant: senderIdentity)
             }

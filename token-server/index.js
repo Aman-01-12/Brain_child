@@ -453,6 +453,18 @@ async function createToken(identity, displayName, roomName, isHost, metadata = n
   return await token.toJwt();
 }
 
+// ---------------------------------------------------------------------------
+// toolsEntitlement — server-signed collaborative-tools (interview code editor /
+// whiteboard) entitlement stamped into the JWT metadata. Keyed on the room's
+// snapshotted HOST tier (unforgeable), NOT the joining user's tier, so BOTH the
+// interviewer and the candidate of a hiring host's room are entitled regardless
+// of the candidate's own plan (R7.2, R7.3, R9.1). Mirrors the HOST_INTERVIEW cap
+// in tiers.js so the SSOT cannot drift — true exactly when hostTier >= hiring.
+// ---------------------------------------------------------------------------
+function toolsEntitlement(hostTier) {
+  return tiers.isFeatureAllowed(hostTier, tiers.FEATURES.HOST_INTERVIEW);
+}
+
 // ===========================================================================
 // AUTH ENDPOINTS
 // ===========================================================================
@@ -2317,8 +2329,10 @@ async function admitAllFromLobby(code, roomData) {
       // Store identity → displayName for token refresh
       await redis.hset(roomNamesKey(code), memberIdentity, memberDisplayName);
 
-      // Generate token
-      const metadata = { role: 'participant' };
+      // Generate token. Stamp the server-signed tools entitlement from the
+      // room's snapshotted hostTier (NOT the joiner's tier) so a lobby-admitted
+      // candidate of a hiring host's room is entitled too (R7.2, R9.1).
+      const metadata = { role: 'participant', tools: toolsEntitlement(roomData.hostTier) };
       const jwt = await createToken(memberIdentity, memberDisplayName, roomData.roomName, false, metadata);
 
       // Store admit status for polling
@@ -2474,7 +2488,7 @@ app.post('/room/create', auth.requireAuth, requireIdempotencyKey, async (req, re
   try {
     // Host metadata includes role — always include it for Phase 9 role enforcement.
     const hostRole = (roomType === 'interview') ? 'interviewer' : 'host';
-    const metadata = { role: hostRole };
+    const metadata = { role: hostRole, tools: toolsEntitlement(hostTier) };
     const jwt = await createToken(identity, displayName, roomName, true, metadata);
     console.log(`[audit] Room created: code=${roomCode} type=${roomType} host=${identity}`);
 
@@ -2726,7 +2740,7 @@ app.post('/room/join', rateLimitJoin, async (req, res) => {
     const joinerRole = isReturningHost
       ? ((roomData.roomType === 'interview') ? 'interviewer' : 'host')
       : ((roomData.roomType === 'interview') ? 'interviewee' : 'participant');
-    const metadata = { role: joinerRole };
+    const metadata = { role: joinerRole, tools: toolsEntitlement(roomData.hostTier) };
     const jwt = await createToken(identity, displayName, roomData.roomName, isReturningHost, metadata);
     await addParticipant(code, identity);
 
@@ -3578,7 +3592,10 @@ app.post('/room/admit', auth.requireAuth, rateLimitRoomAction('admit'), async (r
   const displayName = targetDisplayName || targetIdentity;
   // Store identity → displayName for token refresh
   await redis.hset(roomNamesKey(code), targetIdentity, displayName);
-  const metadata = { role: 'participant' };
+  // Stamp the server-signed tools entitlement from the room's snapshotted
+  // hostTier (NOT the admitting moderator's or joiner's tier) so a lobby-admitted
+  // candidate of a hiring host's room is entitled too (R7.2, R9.1).
+  const metadata = { role: 'participant', tools: toolsEntitlement(roomData.hostTier) };
   const jwt = await createToken(targetIdentity, displayName, roomData.roomName, false, metadata);
 
   // Store admit status for lobby polling
@@ -5764,4 +5781,4 @@ if (require.main === module) {
 
 // Export the Express app (and HTTP server) for integration tests. Requiring this
 // module has no network side effects thanks to the require.main guard above.
-module.exports = { app, httpServer };
+module.exports = { app, httpServer, createToken, toolsEntitlement };

@@ -14,6 +14,7 @@
 #import "InterViewSnapshotVideoSource.h"
 #import "InterChatPanel.h"
 #import "InterRecordingIndicatorView.h"
+#import "InterFeatureGate.h"
 #import <objc/runtime.h>
 
 // [2.6] Swift module import for networking layer
@@ -103,6 +104,17 @@ static const CGFloat InterSecureBottomWorkspaceMargin = 100.0;
     // existing networking and overlay wiring can remain explicit.
     self.toolHostView = self.stageView.toolCaptureHostView;
     self.remoteLayout = self.stageView.remoteLayoutManager;
+
+    // [Collaborative Code Editor] Wire the editor's DataChannel transport to the
+    // room here — the same way chat/poll/Q&A controllers are attached — now that
+    // the room is connected and the local attested identity is available. The
+    // tool host forwards to its session-owned InterSecureToolsBridge, which
+    // builds the shared document + controller, registers it on the room's
+    // dispatcher, and configures the editor surface. Teardown is handled when the
+    // host view deallocs (-[InterSecureToolsBridge invalidateHandlers]).
+    if (self.roomController) {
+        [self.toolHostView configureCollaborationWithRoomController:self.roomController];
+    }
 
     [self attachControlPanelInView:view];
     [self startLocalMediaFlow];
@@ -602,8 +614,60 @@ static const CGFloat InterSecureBottomWorkspaceMargin = 100.0;
     [self.controlPanel setAudioInputOptions:options selectedDeviceID:selectedDeviceID];
 }
 
+// Maps an interview tool kind to its centralized InterFeatureGate feature entry.
+// Tier literals live ONLY in InterFeatureGate / token-server tiers.js — never here.
+- (InterFeature)featureForToolKind:(InterInterviewToolKind)toolKind {
+    switch (toolKind) {
+        case InterInterviewToolKindWhiteboard:
+            return InterFeatureCollaborativeWhiteboard;
+        case InterInterviewToolKindCodeEditor:
+        default:
+            return InterFeatureCollaborativeCodeEditor;
+    }
+}
+
+// Combined entitlement check for a collaborative interview tool (R9.2).
+// Both must hold:
+//   1. The server-signed `tools` flag in the LOCAL participant's JWT metadata
+//      (unforgeable, granted to both interviewer and candidate of a Hiring host's
+//      room — R7.2, R9.1, R9.5). Read only from our own participant, never a peer.
+//   2. The centralized client-side InterFeatureGate tier check (defense-in-depth,
+//      R7.5) against the LOCAL effective tier.
+- (BOOL)isCollaborativeToolEntitled:(InterInterviewToolKind)toolKind {
+    if (toolKind == InterInterviewToolKindNone) {
+        return YES;  // clearing the tool is never gated
+    }
+
+    BOOL serverEntitled = self.roomController.localParticipantHasToolsEntitlement;
+
+    NSString *tier = self.roomController.tokenService.effectiveTier ?: @"free";
+    BOOL tierAllows = [InterFeatureGate isFeature:[self featureForToolKind:toolKind]
+                                 availableForTier:tier];
+
+    return serverEntitled && tierAllows;
+}
+
 - (void)handleInterviewToolSelection:(InterInterviewToolKind)toolKind {
     if (!self.stageView || !self.controlPanel) {
+        return;
+    }
+
+    // Tier + server-entitlement gate for the collaborative interview tools
+    // (R7.1, R7.5, R9.2, R9.5). Selecting a real tool is enabled only when BOTH
+    // the LOCAL participant's server-signed `tools` JWT-metadata flag is true AND
+    // the centralized InterFeatureGate tier check passes. We never trust a
+    // peer-reported entitlement. Selecting "None" just clears and is never gated.
+    if (toolKind != InterInterviewToolKindNone &&
+        ![self isCollaborativeToolEntitled:toolKind]) {
+        InterFeature feature = [self featureForToolKind:toolKind];
+        NSString *minTier = [InterFeatureGate minimumTierForFeature:feature];
+        NSString *displayName = [InterFeatureGate displayNameForFeature:feature];
+        // Keep the currently active surface intact (never blank it) and reflect
+        // the unchanged selection back into the chrome, plus a clear in-app
+        // indication of the required tier (R7.1).
+        [self.controlPanel setSelectedInterviewToolKind:self.stageView.activeToolKind];
+        [self.controlPanel setShareStatusText:
+            [NSString stringWithFormat:@"%@ requires the %@ plan.", displayName, minTier]];
         return;
     }
 

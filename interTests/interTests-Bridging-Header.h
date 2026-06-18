@@ -18,3 +18,9 @@
 // the Swift test target. Pulling in AppKit via this header is fine — the
 // bridging header already imports an AppKit NSView header above.
 #import "../inter/UI/Views/InterSecureInterviewStageView.h"
+
+// Task 9 (collaborative-code-editor): expose the ObjC tier-gate to the Swift
+// test target so the combined entitlement-gate tests can call
+// `InterFeatureGate.isFeature(.collaborativeCodeEditor, availableForTier:)`.
+#import "../inter/Networking/InterFeatureGate.h"
+

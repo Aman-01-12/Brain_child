@@ -65,17 +65,19 @@ function _constantTimeStrEqual(a, b) {
 // Single shared client — avoids constructing a new instance per request.
 const _roomSvc = new RoomServiceClient(_LIVEKIT_HTTP_URL, _LIVEKIT_API_KEY, _LIVEKIT_API_SECRET);
 
-async function _createLiveKitToken(identity, displayName, roomName, isHost, role = null) {
+async function _createLiveKitToken(identity, displayName, roomName, isHost, role = null, tools = false) {
   const tokenOpts = {
     identity,
     name: displayName,
     ttl: _TOKEN_TTL_SECONDS,
   };
-  // Stamp the participant role into the JWT metadata (mirrors index.js createToken),
-  // so LiveKit delivers it to all participants and the client can reconcile the
-  // local role from authoritative server state.
+  // Stamp the participant role + server-signed collaborative-tools entitlement into
+  // the JWT metadata (mirrors index.js createToken), so LiveKit delivers it to all
+  // participants and the client can reconcile the local role + tool gate from
+  // authoritative server state. `tools` is keyed on the room's snapshotted hostTier
+  // (unforgeable), NOT the joining user's tier (R9.1, R7.3).
   if (role) {
-    tokenOpts.metadata = JSON.stringify({ role });
+    tokenOpts.metadata = JSON.stringify({ role, tools: !!tools });
   }
   const lvToken = new AccessToken(_LIVEKIT_API_KEY, _LIVEKIT_API_SECRET, tokenOpts);
   lvToken.addGrant({
@@ -814,19 +816,25 @@ router.post('/:id/start', auth.requireAuth, async (req, res) => {
       await redis.hset(_rKey(roomCode), 'hostIdentity', identity);
     }
 
+    // Room settings + entitlement basis — read back from the room hash (the
+    // authoritative copy, whether this call created it or an earlier one did)
+    // so every starter/joiner applies the same host-configured behaviour and the
+    // SAME server-snapshotted hostTier. Shape mirrors /room/join's settings block.
+    const roomData = await redis.hgetall(_rKey(roomCode));
+
+    // Server-signed collaborative-tools entitlement, derived from the room's
+    // snapshotted HOST tier (the same basis as cloud recording), NOT the joining
+    // user's tier — so BOTH the interviewer and the candidate of a hiring host's
+    // room are entitled regardless of the candidate's own plan (R9.1, R7.2, R7.3).
+    const tools = tiers.isFeatureAllowed(roomData.hostTier, tiers.FEATURES.HOST_INTERVIEW);
+
     // Role for the JWT metadata (authoritative; the client reconciles local role from it).
     const tokenRole = isHost
       ? ((roomType === 'interview') ? 'interviewer' : 'host')
       : ((roomType === 'interview') ? 'interviewee' : 'participant');
-    const jwt = await _createLiveKitToken(identity, displayName, roomName, isHost, tokenRole);
+    const jwt = await _createLiveKitToken(identity, displayName, roomName, isHost, tokenRole, tools);
 
     console.log(`[audit] Scheduled meeting started: meeting=${id} code=${roomCode} isHost=${isHost}`);
-
-    // Room settings for the caller — read back from the room hash (the
-    // authoritative copy, whether this call created it or an earlier one did)
-    // so every starter/joiner applies the same host-configured behaviour.
-    // Shape mirrors /room/join's settings block.
-    const roomData = await redis.hgetall(_rKey(roomCode));
 
     res.json({
       roomCode,
@@ -955,5 +963,9 @@ async function registerScheduledRoom(meeting, { hostIdentity = '', hostTier = 'f
 }
 
 router.registerScheduledRoom = registerScheduledRoom;
+// Exposed for integration tests (mirrors index.js `createToken`): lets the
+// tier-gate suite decode a scheduled-meeting LiveKit token and assert the
+// server-signed `tools` entitlement is stamped from the room's hostTier.
+router._createLiveKitToken = _createLiveKitToken;
 
 module.exports = router;

@@ -44,6 +44,16 @@
     [_toolsBridge invalidateHandlers];
 }
 
+- (void)configureCollaborationWithRoomController:(InterRoomController *)roomController {
+    // Forward to the session-owned bridge, which constructs the shared
+    // CodeEditorDocument + InterCodeEditorController, registers the controller on
+    // the room's DataChannel dispatcher, and configures the vended view model.
+    if (!roomController) {
+        return;
+    }
+    [self.toolsBridge configureCollaborationWithRoomController:roomController];
+}
+
 - (void)layout {
     [super layout];
 

@@ -53,31 +53,70 @@ struct CodeEditorRootView: View {
     private let placeholderText =
         "Open the secure editor and type here. Only this editor surface is shared in interview mode."
 
-    var body: some View {
-        ZStack {
-            // Text area inset 18pt on all edges over a white @ 0.10 background.
-            // The surrounding chrome (white @ 0.08) shows through the inset via
-            // the .background modifier below.
-            ZStack {
-                textAreaBackgroundColor
-                    .clipShape(RoundedRectangle(cornerRadius: textAreaCornerRadius, style: .continuous))
+    /// Native language selector (R1.3). A `.menu`-style `Picker` renders as an
+    /// AppKit pop-up button — a transient NSMenu, never a separate capturable
+    /// NSWindow/NSPanel (consistent with the H1 sanitized-menu posture). The
+    /// selection is routed through `setLanguage(_:)` so the change advances the
+    /// shared Lamport register and re-highlights, rather than writing the
+    /// published property directly.
+    private var languageBar: some View {
+        HStack(spacing: 8.0) {
+            Text("Language")
+                .font(.system(size: 11.0, weight: .medium))
+                .foregroundColor(placeholderColor)
 
-                CodeEditorTextView(viewModel: viewModel)
-
-                // Placeholder shown WHILE the editor is empty, hidden once any
-                // text is present. Driven by @Published text.
-                if viewModel.text.isEmpty {
-                    Text(placeholderText)
-                        .font(.system(size: 14.0, weight: .regular))
-                        .foregroundColor(placeholderColor)
-                        .multilineTextAlignment(.leading)
-                        .fixedSize(horizontal: false, vertical: true)
-                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-                        .padding(placeholderInset)
-                        .allowsHitTesting(false)
+            Picker("Language", selection: Binding(
+                get: { viewModel.language },
+                set: { viewModel.setLanguage($0) }
+            )) {
+                ForEach(CodeLanguage.allCases) { language in
+                    Text(language.displayName).tag(language.displayName)
                 }
             }
-            .padding(contentInset)
+            .labelsHidden()
+            .pickerStyle(.menu)
+            .frame(maxWidth: 170.0)
+
+            Spacer(minLength: 0)
+        }
+    }
+
+    var body: some View {
+        ZStack {
+            VStack(spacing: 0) {
+                // Language selector chrome (R1.3): a native pop-up offering the
+                // supported languages, wired to the view model's LWW language
+                // register via setLanguage(_:).
+                languageBar
+                    .padding(.horizontal, contentInset)
+                    .padding(.top, contentInset)
+                    .padding(.bottom, 10.0)
+
+                // Text area inset over a white @ 0.10 background. The surrounding
+                // chrome (white @ 0.08) shows through the inset via the
+                // .background modifier below.
+                ZStack {
+                    textAreaBackgroundColor
+                        .clipShape(RoundedRectangle(cornerRadius: textAreaCornerRadius, style: .continuous))
+
+                    CodeEditorTextView(viewModel: viewModel)
+
+                    // Placeholder shown WHILE the editor is empty, hidden once any
+                    // text is present. Driven by @Published text.
+                    if viewModel.text.isEmpty {
+                        Text(placeholderText)
+                            .font(.system(size: 14.0, weight: .regular))
+                            .foregroundColor(placeholderColor)
+                            .multilineTextAlignment(.leading)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                            .padding(placeholderInset)
+                            .allowsHitTesting(false)
+                    }
+                }
+                .padding(.horizontal, contentInset)
+                .padding(.bottom, contentInset)
+            }
         }
         .background(
             RoundedRectangle(cornerRadius: chromeCornerRadius, style: .continuous)

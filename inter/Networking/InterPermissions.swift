@@ -288,6 +288,38 @@ import os.log
         return InterParticipantRole.from(string: roleStr)
     }
 
+    /// Parse the server-signed `tools` entitlement flag from a LiveKit metadata
+    /// JSON string.
+    ///
+    /// The token server stamps `{"role": "...", "tools": true|false}` into the
+    /// participant's signed JWT metadata, where `tools` is `true` only when the
+    /// room's snapshotted host tier is at or above Hiring (the same `hostTier`
+    /// basis used to gate cloud recording). Because the JWT is server-signed,
+    /// this flag cannot be forged by editing a client value (R9.1).
+    ///
+    /// Callers MUST read the LOCAL participant's own metadata — never a peer's
+    /// self-reported value (R9.5).
+    ///
+    /// Fail-closed: returns `false` when the metadata is nil, empty, malformed,
+    /// or the `tools` field is absent or is not a JSON boolean.
+    @objc public static func parseToolsEntitlement(from metadata: String?) -> Bool {
+        guard let metadata = metadata, !metadata.isEmpty,
+              let data = metadata.data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return false
+        }
+        // Accept ONLY a genuine JSON boolean. NOTE: `json["tools"] as? Bool`
+        // is NOT sufficient — JSONSerialization decodes numbers as NSNumber, and
+        // `NSNumber(value: 1) as? Bool` succeeds (returns true). A forged
+        // `{"tools": 1}` must fail closed, so verify the value is a CFBoolean
+        // before reading it (R9.5 / R12.4 — never trust malformed metadata).
+        guard let toolsValue = json["tools"] as? NSNumber,
+              CFGetTypeID(toolsValue) == CFBooleanGetTypeID() else {
+            return false
+        }
+        return toolsValue.boolValue
+    }
+
     /// Create metadata JSON string with the given role.
     /// Used when promoting a participant (server-side, but useful for local preview).
     @objc public static func metadataJSON(forRole role: InterParticipantRole) -> String {
