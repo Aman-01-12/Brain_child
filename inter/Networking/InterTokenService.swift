@@ -1038,6 +1038,11 @@ private struct TokenCacheEntry {
         if !password.isEmpty {
             body["password"] = password
         }
+        // Device id (stable hardware UUID) — a secondary, defense-in-depth signal the
+        // server uses to throttle join floods. Best-effort: omitted if unavailable.
+        if let hwUUID = getHardwareUUID() {
+            body["clientId"] = hwUUID
+        }
 
         interLogInfo(InterLog.networking, "Token: joining room (code=***, identity=%{private}@)", identity)
 

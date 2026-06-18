@@ -78,6 +78,7 @@ const db = require('./db');
 const auth = require('./auth');
 const { requireIdempotencyKey } = require('./idempotency');
 const { createReconcileEmptyRoom } = require('./roomReconcile');
+const { createJoinCapGuard } = require('./joinGuards');
 
 const app = express();
 
@@ -159,6 +160,21 @@ const PORT = process.env.PORT || 3000;
 const TOKEN_TTL_SECONDS = 6 * 60 * 60; // 6 hours
 const ROOM_CODE_EXPIRY_SECONDS = 24 * 60 * 60; // 24 hours (Redis TTL in seconds)
 const MAX_PARTICIPANTS_PER_ROOM = 50; // Phase 7: scaled from 4 to 50
+
+// Waiting-room hard cap. The lobby sorted set is unbounded by default; an attacker
+// holding a room code (lobby on) could rotate the client-supplied identity to flood it
+// via /room/join, growing Redis and burying the host's lobby list. Cap it generously
+// (well above any real meeting's waiting crowd) and reject further waiters at the door.
+const MAX_LOBBY_WAITERS = 200;
+
+// Per-source rate limit for the OPEN /room/join endpoint. The body `identity` is
+// client-rotatable, so the existing per-identity checkRateLimit is trivially bypassed;
+// additionally throttle by source IP (and, defense-in-depth, by the client-supplied
+// device id). Kept generous so a corporate NAT (many real users behind one IP) is not
+// blocked — the authoritative participant cap (LiveKit occupancy) is the real backstop.
+const JOIN_RL_WINDOW_SECONDS = 60;
+const JOIN_RL_MAX_PER_IP     = 60;
+const JOIN_RL_MAX_PER_DEVICE = 30;
 
 // ---------------------------------------------------------------------------
 // LiveKit Room Service Client — for server-side moderation (Phase 9)
@@ -292,6 +308,41 @@ async function checkRateLimit(identity) {
     await redis.expire(key, RATE_LIMIT_WINDOW_SECONDS);
   }
   return count <= RATE_LIMIT_MAX;
+}
+
+/// Per-source flood limiter for the OPEN /room/join endpoint. The body `identity`
+/// is client-rotatable (so the per-identity checkRateLimit is bypassable by rotation);
+/// throttle additionally by source IP, and — defense-in-depth only — by the client-
+/// supplied device id (hardware UUID). NOTE: a script that bypasses our app can forge
+/// both the IP (VPN/proxy rotation) and the device id, so this is a cost-raiser, not a
+/// hard control; the authoritative participant cap (LiveKit occupancy) and the lobby
+/// cap are the real backstops. Fails OPEN on Redis error (never blocks a real join).
+/// Generous per-IP budget so a corporate NAT (many users, one egress IP) is not locked out.
+async function rateLimitJoin(req, res, next) {
+  const ip = req.ip || 'unknown';
+  const rawDevice = req.body && typeof req.body.clientId === 'string' ? req.body.clientId : null;
+  // Bound the device key length so a crafted oversized value can't bloat Redis keys.
+  const device = rawDevice && rawDevice.length > 0 && rawDevice.length <= 128 ? rawDevice : null;
+
+  const checks = [
+    { key: `ratelimit:join-ip:${ip}`, max: JOIN_RL_MAX_PER_IP },
+  ];
+  if (device) checks.push({ key: `ratelimit:join-dev:${device}`, max: JOIN_RL_MAX_PER_DEVICE });
+
+  try {
+    for (const { key, max } of checks) {
+      const count = await redis.incr(key);
+      if (count === 1) await redis.expire(key, JOIN_RL_WINDOW_SECONDS);
+      if (count > max) {
+        console.log(`[audit] Join rate-limited: key=${key}`);
+        return res.status(429).json({ error: 'Too many join attempts. Please wait a moment and try again.' });
+      }
+    }
+  } catch (err) {
+    console.error('[join rate limit] Redis error:', err.message);
+    // Fail open — a Redis blip must not block legitimate joins.
+  }
+  next();
 }
 
 /// Per-principal flood limiter for room action endpoints (moderation, lobby, media-lock,
@@ -2173,6 +2224,14 @@ const reconcileEmptyRoom = createReconcileEmptyRoom({
   },
 });
 
+// Authoritative participant-cap check for /room/join: when Redis claims the room is
+// full, cross-check LiveKit's real occupancy so HTTP-only "ghost" joins (added to the
+// Redis set but never connected) cannot lock out real users. See joinGuards.js.
+const isJoinWithinCap = createJoinCapGuard({
+  roomService,
+  maxParticipants: MAX_PARTICIPANTS_PER_ROOM,
+});
+
 /// Admit all lobby members for a room: generate tokens, add as participants,
 /// store polling status, then clear lobby keys. Returns the count admitted.
 /// Enforces MAX_PARTICIPANTS_PER_ROOM — excess members get status 'room_full'.
@@ -2420,7 +2479,7 @@ app.post('/room/create', auth.requireAuth, requireIdempotencyKey, async (req, re
 // Body: { roomCode, identity, displayName }
 // Returns: { roomName, token, serverURL, roomType }
 // ---------------------------------------------------------------------------
-app.post('/room/join', async (req, res) => {
+app.post('/room/join', rateLimitJoin, async (req, res) => {
   const { roomCode, identity, displayName } = req.body;
 
   if (!roomCode || !identity || !displayName) {
@@ -2531,6 +2590,19 @@ app.post('/room/join', async (req, res) => {
     // Check if this participant is already admitted (reconnecting)
     const alreadyAdmitted = await isParticipant(code, identity);
     if (!alreadyAdmitted) {
+      // Lobby flood cap: the waiting set is otherwise unbounded, and join is rate-limited
+      // only by a rotatable identity, so an attacker with the code could bury the host's
+      // lobby list and grow Redis. Reject new waiters past the cap (existing waiters and
+      // already-admitted reconnects are unaffected). Counted via zcard before the add.
+      const lobbySize = await redis.zcard(roomLobbyKey(code));
+      const alreadyWaiting = (await redis.zscore(roomLobbyKey(code), identity)) !== null;
+      if (!alreadyWaiting && lobbySize >= MAX_LOBBY_WAITERS) {
+        console.log(`[audit] Lobby full: code=${code} rejected=${identity} (${lobbySize}/${MAX_LOBBY_WAITERS})`);
+        return res.status(503).json({
+          error: 'The waiting room is full. Please try again in a little while.',
+          lobbyFull: true,
+        });
+      }
       // Add to lobby waiting room
       const score = Date.now();
       await redis.zadd(roomLobbyKey(code), score, identity);
@@ -2569,12 +2641,20 @@ app.post('/room/join', async (req, res) => {
   }
 
   if (!alreadyIn && participantCount >= MAX_PARTICIPANTS_PER_ROOM) {
-    console.log(`[audit] Room full: code=${code} rejected=${identity} (${participantCount}/${MAX_PARTICIPANTS_PER_ROOM})`);
-    return res.status(403).json({
-      error: 'Room is full',
-      maxParticipants: MAX_PARTICIPANTS_PER_ROOM,
-      participantCount,
-    });
+    // Redis says full — but an HTTP-only join inflates the participant set (sadd) before
+    // any LiveKit connection, so a code-holder rotating identity could fill it with ghosts
+    // and lock out real users. Cross-check LiveKit's authoritative, unspoofable occupancy:
+    // only reject when LiveKit ALSO confirms the room is genuinely full. (Fails safe to a
+    // reject if LiveKit is unreachable, matching the prior behaviour.)
+    const cap = await isJoinWithinCap({ roomName: roomData.roomName, redisCount: participantCount, alreadyIn });
+    if (!cap.allowed) {
+      console.log(`[audit] Room full: code=${code} rejected=${identity} (redis=${participantCount} live=${cap.liveCount}/${MAX_PARTICIPANTS_PER_ROOM})`);
+      return res.status(403).json({
+        error: 'Room is full',
+        maxParticipants: MAX_PARTICIPANTS_PER_ROOM,
+        participantCount: cap.liveCount != null ? cap.liveCount : participantCount,
+      });
+    }
   }
 
   try {
