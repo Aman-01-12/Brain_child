@@ -13,6 +13,7 @@
 #import "InterSecureInterviewStageView.h"
 #import "InterViewSnapshotVideoSource.h"
 #import "InterChatPanel.h"
+#import "InterRecordingIndicatorView.h"
 #import <objc/runtime.h>
 
 // [2.6] Swift module import for networking layer
@@ -45,6 +46,11 @@ static const CGFloat InterSecureBottomWorkspaceMargin = 100.0;
 // Chat overlay (floating panel window sitting above the secure window)
 @property (nonatomic, strong, nullable) NSPanel *chatOverlayWindow;
 @property (nonatomic, strong, nullable) InterChatPanel *secureChatPanel;
+// [F2] Persistent recording badge so the interviewee always sees when the session is
+// being recorded. `pendingRecordingActive` holds the desired state if set before the
+// window exists (e.g. a late-joiner status poll resolving during window construction).
+@property (nonatomic, strong, nullable) InterRecordingIndicatorView *recordingIndicatorView;
+@property (nonatomic, assign) BOOL pendingRecordingActive;
 @end
 
 @implementation SecureWindowController
@@ -103,8 +109,24 @@ static const CGFloat InterSecureBottomWorkspaceMargin = 100.0;
     [self updateSecureWorkspacePresentationAnimated:NO];
     [self.stageView layoutSubtreeIfNeeded];
 
+    // [F2] Persistent REC badge, top-centre, above the stage. Stays centred + pinned to
+    // the top on resize. Reflects any state requested before the window existed.
+    CGFloat badgeW = 132.0, badgeH = 28.0;
+    self.recordingIndicatorView = [[InterRecordingIndicatorView alloc] initWithFrame:
+        NSMakeRect((view.bounds.size.width - badgeW) / 2.0, view.bounds.size.height - badgeH - 10.0, badgeW, badgeH)];
+    self.recordingIndicatorView.autoresizingMask = NSViewMinXMargin | NSViewMaxXMargin | NSViewMinYMargin;
+    self.recordingIndicatorView.indicatorActive = self.pendingRecordingActive;
+    [view addSubview:self.recordingIndicatorView positioned:NSWindowAbove relativeTo:nil];
+
     [self setupChatOverlayWindow];
     [self.secureWindow makeKeyAndOrderFront:nil];
+}
+
+// [F2] Drive the persistent recording badge. Tolerates being called before the window
+// exists (stores the desired state, applied on creation).
+- (void)setRecordingIndicatorActive:(BOOL)active {
+    self.pendingRecordingActive = active;
+    self.recordingIndicatorView.indicatorActive = active;
 }
 
 - (void)setupChatOverlayWindow {

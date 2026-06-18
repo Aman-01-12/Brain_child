@@ -3814,8 +3814,7 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
 /// [2A] Fetch the room's recording status on (re)connect. If a recording is active
 /// and we are not the host, present the consent overlay (once per recording session).
 - (void)fetchRecordingStatus {
-    if (self.roomController.isHost) return;            // host initiated it; no consent needed
-    if (self.normalRecordingConsentHandled) return;     // already handled this session
+    if (self.roomController.isHost) return;            // host initiated it; drives its own badge
     NSString *roomCode = self.roomController.roomCode;
     NSString *serverURL = self.roomController.tokenServerURL;
     if (!roomCode.length || !serverURL.length) return;
@@ -3846,10 +3845,17 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
             if (!strongSelf) return;
             // Re-check guards on the main thread (state may have changed during the fetch).
             if (strongSelf.roomController.isHost) return;
-            if (strongSelf.normalRecordingConsentHandled) return;
             if (strongSelf.currentCallMode == InterCallModeNone) return;
-            [strongSelf showRecordingConsentOverlayForRemoteRecordingWithMode:mode];
-            strongSelf.normalRecordingConsentHandled = YES;
+            // [F2] Persistent REC badge for the whole time recording is active — covers
+            // late joiners who missed the one-time recordingStarted signal, in BOTH normal
+            // and secure (interview) windows.
+            strongSelf.normalRecordingIndicatorView.indicatorActive = YES;
+            [strongSelf.secureController setRecordingIndicatorActive:YES];
+            // Consent overlay (normal mode) is shown once per recording session.
+            if (!strongSelf.normalRecordingConsentHandled) {
+                [strongSelf showRecordingConsentOverlayForRemoteRecordingWithMode:mode];
+                strongSelf.normalRecordingConsentHandled = YES;
+            }
         });
     }] resume];
 }
@@ -6010,6 +6016,8 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
 - (void)recordingDidStart {
     self.normalRecordingIndicatorView.indicatorActive = YES;
     self.normalRecordingIndicatorView.indicatorPaused = NO;
+    // [F2] Mirror to the secure interview window so the interviewee sees the REC badge.
+    [self.secureController setRecordingIndicatorActive:YES];
     // [Phase 10 R3] Show consent to non-host participants when remote recording starts
     if (!self.roomController.isHost) {
         [self showRecordingConsentOverlayForRemoteRecording];
@@ -6028,6 +6036,8 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
 - (void)recordingDidStop {
     self.normalRecordingIndicatorView.indicatorActive = NO;
     [self.normalRecordingIndicatorView setElapsedDuration:0];
+    // [F2] Clear the secure interview badge too.
+    [self.secureController setRecordingIndicatorActive:NO];
     // Allow consent to be shown again if a new recording starts this session.
     self.normalRecordingConsentHandled = NO;
 }

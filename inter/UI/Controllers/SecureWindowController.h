@@ -28,6 +28,11 @@ NS_ASSUME_NONNULL_BEGIN
 - (void)createSecureWindow;
 - (void)destroySecureWindow;
 
+/// Show/hide the persistent "REC" badge in the secure interview window so the
+/// interviewee always knows the session is being recorded (F2). Safe to call before
+/// the window exists (the desired state is applied when the window is created).
+- (void)setRecordingIndicatorActive:(BOOL)active;
+
 /// Immediately hide the secure window without tearing down room/media objects.
 - (void)hideSecureWindow;
 

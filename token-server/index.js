@@ -79,6 +79,7 @@ const auth = require('./auth');
 const { requireIdempotencyKey } = require('./idempotency');
 const { createReconcileEmptyRoom } = require('./roomReconcile');
 const { createJoinCapGuard } = require('./joinGuards');
+const { createOverdueRecordingSweeper } = require('./recordingQuota');
 
 const app = express();
 
@@ -175,6 +176,13 @@ const MAX_LOBBY_WAITERS = 200;
 const JOIN_RL_WINDOW_SECONDS = 60;
 const JOIN_RL_MAX_PER_IP     = 60;
 const JOIN_RL_MAX_PER_DEVICE = 30;
+
+// Per-IP limiter for the UNAUTHENTICATED lobby poll/leave endpoints. Real disclosure is
+// already gated by the per-join pollToken secret; this only caps anonymous request
+// amplification. Generous because legitimate waiters poll every few seconds and a corporate
+// NAT may have many waiters behind one egress IP.
+const LOBBY_POLL_RL_WINDOW_SECONDS = 60;
+const LOBBY_POLL_RL_MAX_PER_IP     = 240;
 
 // ---------------------------------------------------------------------------
 // LiveKit Room Service Client — for server-side moderation (Phase 9)
@@ -345,6 +353,23 @@ async function rateLimitJoin(req, res, next) {
   next();
 }
 
+/// Per-IP limiter for the unauthenticated lobby poll/leave endpoints (F3). Fails OPEN on
+/// Redis error so a blip never blocks a waiter polling for admission.
+async function rateLimitLobbyPoll(req, res, next) {
+  const ip = req.ip || 'unknown';
+  try {
+    const key = `ratelimit:lobby-poll:${ip}`;
+    const count = await redis.incr(key);
+    if (count === 1) await redis.expire(key, LOBBY_POLL_RL_WINDOW_SECONDS);
+    if (count > LOBBY_POLL_RL_MAX_PER_IP) {
+      return res.status(429).json({ error: 'Too many requests. Please slow down and try again.' });
+    }
+  } catch (err) {
+    console.error('[lobby poll rate limit] Redis error:', err.message);
+  }
+  next();
+}
+
 /// Per-principal flood limiter for room action endpoints (moderation, lobby, media-lock,
 /// recording control, etc.). These mutate room state and/or call LiveKit (which broadcasts
 /// to every participant), so an un-throttled client could amplify load across the whole
@@ -390,8 +415,17 @@ function generateRoomCode() {
 // ---------------------------------------------------------------------------
 // Token generation
 // ---------------------------------------------------------------------------
-async function createToken(identity, displayName, roomName, isHost, metadata = null) {
-  const tokenOpts = {
+
+// Constant-time string comparison. Hashing both inputs to fixed-length digests makes
+// crypto.timingSafeEqual length-safe (it throws on unequal lengths), so neither the
+// content nor the length of a secret (e.g. a lobby pollToken) leaks via timing.
+function constantTimeEqual(a, b) {
+  const ha = crypto.createHash('sha256').update(String(a)).digest();
+  const hb = crypto.createHash('sha256').update(String(b)).digest();
+  return crypto.timingSafeEqual(ha, hb);
+}
+
+async function createToken(identity, displayName, roomName, isHost, metadata = null) {  const tokenOpts = {
     identity,
     name: displayName,
     ttl: TOKEN_TTL_SECONDS,
@@ -2232,6 +2266,16 @@ const isJoinWithinCap = createJoinCapGuard({
   maxParticipants: MAX_PARTICIPANTS_PER_ROOM,
 });
 
+// Periodically stops cloud recordings that exceed their per-recording cap (set at start
+// from the account's remaining quota), preventing quota/cost overrun from an under-reported
+// estimate. See recordingQuota.js. (F1)
+const sweepOverdueRecordings = createOverdueRecordingSweeper({
+  db,
+  egressClient,
+  redis,
+  roomKey,
+});
+
 /// Admit all lobby members for a room: generate tokens, add as participants,
 /// store polling status, then clear lobby keys. Returns the count admitted.
 /// Enforces MAX_PARTICIPANTS_PER_ROOM — excess members get status 'room_full'.
@@ -3633,7 +3677,7 @@ app.get('/room/lobby/list/:code', auth.requireAuth, async (req, res) => {
 // GET /room/lobby-status/:code/:identity — Check lobby status (polling)
 // Returns: { status: "waiting"|"admitted"|"denied", position?, token?, serverURL? }
 // ---------------------------------------------------------------------------
-app.get('/room/lobby-status/:code/:identity', async (req, res) => {
+app.get('/room/lobby-status/:code/:identity', rateLimitLobbyPoll, async (req, res) => {
   const code = req.params.code.toUpperCase();
   const identity = req.params.identity;
 
@@ -3643,7 +3687,7 @@ app.get('/room/lobby-status/:code/:identity', async (req, res) => {
     return res.status(401).json({ error: 'pollToken is required' });
   }
   const storedPollToken = await redis.get(`room:${code}:lobby:${identity}:pollToken`);
-  if (!storedPollToken || storedPollToken !== pollToken) {
+  if (!storedPollToken || !constantTimeEqual(storedPollToken, pollToken)) {
     return res.status(403).json({ error: 'Invalid pollToken' });
   }
 
@@ -3718,7 +3762,7 @@ app.get('/room/lobby-status/:code/:identity', async (req, res) => {
 // Returns { success: true } even if they were already gone (left twice, admitted/denied,
 // or the room expired), so the client can fire-and-forget without special-casing races.
 // ---------------------------------------------------------------------------
-app.post('/room/lobby/leave', async (req, res) => {
+app.post('/room/lobby/leave', rateLimitLobbyPoll, async (req, res) => {
   const code = String(req.body?.roomCode || '').toUpperCase();
   const identity = req.body?.identity;
   const pollToken = req.headers['x-poll-token'] || req.body?.pollToken;
@@ -3734,7 +3778,7 @@ app.post('/room/lobby/leave', async (req, res) => {
   // admit/deny that consumed it, or expiry), treat as success — the slot is no longer theirs
   // to hold and there is nothing left to leak.
   const storedPollToken = await redis.get(`room:${code}:lobby:${identity}:pollToken`);
-  if (storedPollToken && storedPollToken !== pollToken) {
+  if (storedPollToken && !constantTimeEqual(storedPollToken, pollToken)) {
     return res.status(403).json({ error: 'Invalid pollToken' });
   }
 
@@ -3888,6 +3932,9 @@ app.post('/room/record/start', auth.requireAuth, rateLimitRoomAction('record-sta
   // If a co-host initiated the recording, resolve the host's userId and run
   // quota checks against the host — so recordings land in the host's library.
   let recordingUserId = req.user.userId;
+  // The hard cap (seconds) for this recording = the recording account's remaining quota
+  // at start. Persisted on the session so the sweeper can stop an over-cap egress. (F1)
+  let recordingCapMinutes = 0;
   const isCallerHost = roomData.hostIdentity === callerIdentity;
   if (!isCallerHost) {
     // validateModerator above allows 'host', 'co-host', and 'interviewer'.
@@ -3924,6 +3971,7 @@ app.post('/room/record/start', auth.requireAuth, rateLimitRoomAction('record-sta
         quota: hostQuotaCheck,
       });
     }
+    recordingCapMinutes = hostQuotaCheck.remainingMinutes;
   } else {
     // Caller is the host — use normal quota check
     const quotaCheck = await checkRecordingQuota(req.user.userId, roomTier);
@@ -3936,6 +3984,7 @@ app.post('/room/record/start', auth.requireAuth, rateLimitRoomAction('record-sta
         quota: quotaCheck,
       });
     }
+    recordingCapMinutes = quotaCheck.remainingMinutes;
   }
 
   // Check for existing active recording in this room (prevent double-start)
@@ -4039,10 +4088,11 @@ app.post('/room/record/start', auth.requireAuth, rateLimitRoomAction('record-sta
     let sessionId;
     try {
       const sessionResult = await db.query(
-        `INSERT INTO recording_sessions (user_id, room_name, room_code, egress_id, recording_mode, watermarked, status)
-         VALUES ($1, $2, $3, $4, $5, $6, 'active')
+        `INSERT INTO recording_sessions (user_id, room_name, room_code, egress_id, recording_mode, watermarked, status, max_duration_seconds)
+         VALUES ($1, $2, $3, $4, $5, $6, 'active', $7)
          RETURNING id`,
-        [recordingUserId, roomData.roomName, code, egressInfo.egressId, recordingMode, validatedTier === 'free']
+        [recordingUserId, roomData.roomName, code, egressInfo.egressId, recordingMode, validatedTier === 'free',
+         recordingCapMinutes > 0 ? recordingCapMinutes * 60 : null]
       );
       sessionId = sessionResult.rows[0].id;
 
@@ -4215,10 +4265,11 @@ app.get('/room/record/status/:code', async (req, res) => {
   res.json({
     recording: session.status === 'active',
     mode: session.recording_mode,
-    egressId: session.egress_id,
-    sessionId: session.id,
     startedAt: session.started_at,
     status: session.status,
+    // NOTE: internal egressId/sessionId are intentionally NOT exposed on this
+    // unauthenticated endpoint (F2). Participants only need to know THAT recording
+    // is active (driven into the persistent REC badge), not internal identifiers.
   });
 });
 
@@ -5673,4 +5724,14 @@ httpServer.listen(PORT, () => {
   console.log(`[token-server] Redis: ${process.env.REDIS_URL || 'redis://localhost:6379'}`);
   console.log(`[token-server] Endpoints: POST /room/create, /room/join, /token/refresh, /auth/register, /auth/login | GET /room/info/:code, /auth/me, /health`);
   markPhantomMeetingsFailed();
+
+  // F1: periodically stop cloud recordings that exceed their per-recording quota cap.
+  // 60s cadence is well under any realistic quota (minutes), bounding overrun to <=1 min.
+  const RECORDING_SWEEP_INTERVAL_MS = 60 * 1000;
+  const recordingSweepTimer = setInterval(() => {
+    sweepOverdueRecordings().catch((err) =>
+      console.error('[quota-sweeper] sweep failed:', err.message));
+  }, RECORDING_SWEEP_INTERVAL_MS);
+  // Don't keep the event loop alive solely for the sweeper.
+  if (typeof recordingSweepTimer.unref === 'function') recordingSweepTimer.unref();
 });
