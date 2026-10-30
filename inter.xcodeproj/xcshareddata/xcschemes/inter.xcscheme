@@ -67,7 +67,7 @@
       <CommandLineArguments>
          <CommandLineArgument
             argument = "--disable-capture-protection"
-            isEnabled = "YES">
+            isEnabled = "NO">
          </CommandLineArgument>
       </CommandLineArguments>
    </LaunchAction>

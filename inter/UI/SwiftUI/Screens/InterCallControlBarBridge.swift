@@ -69,6 +69,8 @@ public final class InterCallControlBarBridge: NSView, InterCallMediaControlSurfa
     @objc public var requestApproveHandler: ((String, String) -> Void)?
     /// Deny a request.
     @objc public var requestDenyHandler: ((String, String) -> Void)?
+    /// Interviewer Code/Board tool selection (carries the `InterInterviewToolKind` raw value).
+    @objc public var interviewToolChangedHandler: ((Int) -> Void)?
 
     @objc public override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -84,6 +86,7 @@ public final class InterCallControlBarBridge: NSView, InterCallMediaControlSurfa
         viewModel.onToggleSpeaker = { [weak self] in self?.speakerToggleHandler?() }
         viewModel.onSelectAudioInput = { [weak self] id in self?.audioInputSelectionChangedHandler?(id) }
         viewModel.onShare = { [weak self] in self?.shareToggleHandler?() }
+        viewModel.onSelectTool = { [weak self] kind in self?.interviewToolChangedHandler?(kind) }
         viewModel.onToggleChat = { [weak self] in self?.chatToggleHandler?() }
         viewModel.onTogglePoll = { [weak self] in self?.pollToggleHandler?() }
         viewModel.onToggleQA = { [weak self] in self?.qaToggleHandler?() }
@@ -358,6 +361,20 @@ public final class InterCallControlBarBridge: NSView, InterCallMediaControlSurfa
 
     @objc public func setHandRaised(_ raised: Bool) {
         MainActor.assumeIsolated { viewModel.handRaised = raised }
+    }
+
+    // MARK: - Interview tools (Code/Board) state (AppDelegate drives these)
+
+    @objc public func setInterviewToolsVisible(_ visible: Bool) {
+        MainActor.assumeIsolated { viewModel.interviewToolsVisible = visible }
+    }
+
+    @objc public func setSelectedInterviewToolKind(_ kind: Int) {
+        MainActor.assumeIsolated { viewModel.selectedToolKind = kind }
+    }
+
+    @objc public func setToolBadge(_ hasActivity: Bool) {
+        MainActor.assumeIsolated { viewModel.toolBadgeActive = hasActivity }
     }
 
     // MARK: - Moderation menu state (pushed by the host before the menu opens)

@@ -112,6 +112,25 @@ final class InterComposedRendererTests: XCTestCase {
         XCTAssertEqual(renderer.currentLayout, .cameraSideBySide)
     }
 
+    /// [candidate-tool-share-tile] Regression guard: two GRID participants (no screen
+    /// share) must resolve to `.grid`. The recording coordinator routes a 2-person
+    /// interview's camera frames into grid storage (useGrid == participantCount >= 2);
+    /// the renderer must agree and select `.grid` at >= 2, otherwise the stored frames
+    /// fall through to `.idle` and never composite (the "candidate camera only appears
+    /// when they share" bug). A 2-count grid is a 2x1 layout.
+    func testGrid_twoGridParticipants_selectsGrid() {
+        guard renderer != nil else { return }
+        guard let pb = makePixelBuffer() else { return XCTFail("makePixelBuffer") }
+        renderer.setParticipantOrder(["host", "candidate"])
+        renderer.updateParticipantFrame(pb, identity: "host")
+        renderer.updateParticipantFrame(pb, identity: "candidate")
+
+        _ = renderer.renderComposedFrame()
+        XCTAssertEqual(renderer.currentLayout, .grid,
+                       "Two grid participants must select .grid (matches the coordinator's "
+                       + "useGrid >= 2 routing), got \(renderer.currentLayout)")
+    }
+
     func testClearScreenShare_returnsToCamera() {
         guard renderer != nil else { return }
         guard let pb = makePixelBuffer() else { return XCTFail("makePixelBuffer") }
@@ -293,7 +312,7 @@ final class InterComposedRendererTests: XCTestCase {
                                        hasSecondaryCamera: Bool) -> InterComposedLayout {
         if hasScreen && gridCount > 0 { return .screenShareFilmstrip }
         if hasScreen { return .screenShareOnly }
-        if gridCount >= 3 { return .grid }
+        if gridCount >= 2 { return .grid }
         if hasPrimaryCamera && hasSecondaryCamera { return .cameraSideBySide }
         if hasPrimaryCamera { return .cameraOnlyFull }
         return .idle
@@ -418,7 +437,7 @@ final class InterComposedRendererTests: XCTestCase {
                                          hasSecondaryCamera: Bool) -> InterComposedLayout {
         if hasScreen && gridCount > 0 { return .screenShareFilmstrip }
         if hasScreen { return .screenShareOnly }          // gridCount == 0 && !hasPrimaryCamera here
-        if gridCount >= 3 { return .grid }
+        if gridCount >= 2 { return .grid }
         if hasPrimaryCamera && hasSecondaryCamera { return .cameraSideBySide }
         if hasPrimaryCamera { return .cameraOnlyFull }
         return .idle

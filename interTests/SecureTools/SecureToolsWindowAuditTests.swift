@@ -139,12 +139,11 @@ final class SecureToolsWindowAuditTests: XCTestCase {
         viewModel.selectTool(.freehand)
         viewModel.selectColor(.blue)
         viewModel.selectTool(.text)
-        viewModel.placeText("overlay interaction", at: CGPoint(x: 24, y: 24))
-        viewModel.selectTool(.shape)
-        viewModel.selectShapeKind(.ellipse)
-        viewModel.beginShapeDrag(at: CGPoint(x: 0, y: 0))
-        viewModel.updateShapeDrag(to: CGPoint(x: 60, y: 60))
-        viewModel.commitShapeDrag(at: CGPoint(x: 60, y: 60))
+        viewModel.commitText("overlay interaction", atWorld: CGPoint(x: 24, y: 24), editing: nil)
+        viewModel.selectTool(.ellipse)
+        viewModel.pointerDown(atScreen: CGPoint(x: 0, y: 0), additive: false)
+        viewModel.pointerDragged(toScreen: CGPoint(x: 60, y: 60))
+        viewModel.pointerUp(atScreen: CGPoint(x: 60, y: 60))
 
         if let textView = firstTextView(in: editor) {
             let menu = textView.menu(for: try rightClick(at: NSPoint(x: 10, y: 10)))

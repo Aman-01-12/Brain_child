@@ -1015,7 +1015,7 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
 - (void)setIsHostMode:(BOOL)isHostMode {
     _isHostMode = isHostMode;
     __weak InterRemoteVideoLayoutManager *weakSelf = self;
-    // Update all existing remote tiles — screen share tile never gets the menu
+    // Update all existing remote tiles — screen share never gets the menu
     for (NSString *key in self.tileViews) {
         InterRemoteVideoTileView *tile = self.tileViews[key];
         BOOL eligible = isHostMode && ![key isEqualToString:kScreenShareTileKey];
@@ -1081,6 +1081,8 @@ static const CGFloat kPageIndicatorPadding   = 8.0;
     [self updateLayoutToggleButton];
     [self updateLayoutAnimated:YES];
 }
+
+#pragma mark - Local capture
 
 /// Custom setter: creates the AVCaptureVideoPreviewLayer immediately so it
 /// attaches to the session once, before any layout pass. Creating it lazily

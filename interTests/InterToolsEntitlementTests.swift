@@ -80,38 +80,46 @@ final class InterToolsEntitlementTests: XCTestCase {
                        "Adding the tools field must not disturb existing role parsing.")
     }
 
-    // MARK: - Combined gate: tools flag AND tier both required (R9.2)
+    // MARK: - In-room tool gate follows the server `tools` flag, NOT local tier (R7.2, R9.1)
 
-    func testCombinedGateRequiresBothToolsAndTier() {
-        // Hiring tier passes the centralized feature check.
+    func testInRoomToolGateFollowsServerFlagNotLocalParticipantTier() {
+        // The InterFeatureGate tier table is unchanged — it still governs where
+        // the LOCAL tier IS the basis (a host creating/hosting an interview).
         XCTAssertTrue(
             InterFeatureGate.isFeature(.collaborativeCodeEditor, availableForTier: "hiring"),
-            "Hiring is the minimum tier for the collaborative code editor.")
+            "Hiring is the minimum tier for hosting the collaborative code editor.")
         XCTAssertFalse(
             InterFeatureGate.isFeature(.collaborativeCodeEditor, availableForTier: "pro"),
             "Pro is below the collaborative code editor's minimum tier.")
-        XCTAssertFalse(
-            InterFeatureGate.isFeature(.collaborativeCodeEditor, availableForTier: "free"),
-            "Free is below the collaborative code editor's minimum tier.")
 
-        // The effective client-side decision is the AND of the server-signed
-        // tools flag and the tier check. Model that combination explicitly.
-        func available(tier: String, toolsMetadata: String?) -> Bool {
-            let tools = InterParticipantMetadata.parseToolsEntitlement(from: toolsMetadata)
-            let tierOK = InterFeatureGate.isFeature(.collaborativeCodeEditor, availableForTier: tier)
-            return tools && tierOK
+        // The IN-ROOM tool-selection gate (SecureWindowController
+        // `isCollaborativeToolEntitled:`) is keyed on the ROOM CREATOR's tier,
+        // delivered as the server-signed `tools` flag in the LOCAL participant's
+        // JWT metadata. It is INDEPENDENT of the joining participant's own tier:
+        // whoever created the room defines tool availability for everyone in it.
+        // Model that decision (server flag alone — never the local tier).
+        func inRoomToolAvailable(localTier: String, toolsMetadata: String?) -> Bool {
+            return InterParticipantMetadata.parseToolsEntitlement(from: toolsMetadata)
         }
 
-        let hiringMeta = "{\"role\": \"host\", \"tools\": true}"
-        let noToolsMeta = "{\"role\": \"host\", \"tools\": false}"
+        let toolsOn  = "{\"role\": \"interviewee\", \"tools\": true}"
+        let toolsOff = "{\"role\": \"interviewee\", \"tools\": false}"
 
-        XCTAssertTrue(available(tier: "hiring", toolsMetadata: hiringMeta),
-                      "Hiring tier + server-signed tools:true → available.")
-        XCTAssertFalse(available(tier: "hiring", toolsMetadata: noToolsMeta),
-                       "Server-signed tools:false denies even at hiring tier (R9.2).")
-        XCTAssertFalse(available(tier: "pro", toolsMetadata: hiringMeta),
-                       "Below-hiring tier denies even with tools:true (defense-in-depth, R7.5).")
-        XCTAssertFalse(available(tier: "free", toolsMetadata: nil),
-                       "No tier + no metadata → fail closed.")
+        // Regression (the candidate bug): an ANONYMOUS / free candidate — whose
+        // own tier resolves to "free" — in a hiring host's room (tools:true) IS
+        // entitled. The old `tools && tierOK` gate wrongly blocked this.
+        XCTAssertTrue(inRoomToolAvailable(localTier: "free", toolsMetadata: toolsOn),
+                      "A free/anonymous candidate of a hiring host's room must be entitled (server tools flag).")
+        XCTAssertTrue(inRoomToolAvailable(localTier: "pro", toolsMetadata: toolsOn),
+                      "A pro candidate of a hiring host's room must be entitled too.")
+        XCTAssertTrue(inRoomToolAvailable(localTier: "hiring", toolsMetadata: toolsOn),
+                      "A hiring participant is of course entitled.")
+
+        // The server flag remains authoritative for DENY: a non-hiring host's
+        // room stamps tools:false, which denies regardless of the joiner's tier.
+        XCTAssertFalse(inRoomToolAvailable(localTier: "hiring", toolsMetadata: toolsOff),
+                       "Server-signed tools:false denies even a hiring-tier participant.")
+        XCTAssertFalse(inRoomToolAvailable(localTier: "free", toolsMetadata: nil),
+                       "No metadata (e.g. disconnected) → fail closed.")
     }
 }

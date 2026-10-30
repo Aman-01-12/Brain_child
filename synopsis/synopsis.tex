@@ -1,0 +1,365 @@
+% =====================================================================
+%  Synopsis Report  —  "KioMeet: A Secure Native Interview & Conferencing Platform"
+%  Formatting per guidelines:
+%    - Printed one side only
+%    - 1.5 line spacing
+%    - Margins: left 2.5cm, top 2.5cm, right 1.25cm, bottom 1.25cm
+% =====================================================================
+% NOTE: compile with XeLaTeX (uses the real macOS system fonts):
+%   xelatex synopsis.tex
+\documentclass[12pt,oneside,a4paper]{article}
+
+% ---- Page geometry (margins per guideline) --------------------------
+\usepackage[a4paper,left=2.5cm,top=2.5cm,right=1.25cm,bottom=1.25cm]{geometry}
+
+% ---- Core packages --------------------------------------------------
+\usepackage{setspace}        % line spacing
+\usepackage{graphicx}        % figures / logo
+\usepackage{array}           % table column tuning
+\usepackage{xcolor}
+\usepackage[hidelinks]{hyperref}
+
+% Name the auto-generated bibliography heading to match the other sections.
+\renewcommand{\refname}{REFERENCES}
+
+% ---- Fonts (match the reference report) -----------------------------
+% The sample report's body is an Arial/Helvetica-style sans-serif, with the
+% main title and the degree block in a Times-style serif. Using fontspec we
+% load the real system fonts: Arial for the body, Times New Roman for the
+% serif title-page lines (via \titleserif).
+\usepackage{fontspec}
+\setmainfont{Arial}
+\newfontfamily\titleserif{Times New Roman}
+
+% ---- 1.5 line spacing ----------------------------------------------
+\onehalfspacing
+
+% ---- Paragraph spacing (parskip-style) -----------------------------
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{6pt plus 2pt minus 1pt}
+
+% Note: \section* in the article class already renders as a bold,
+% large, upright heading, which matches the sample report.
+
+\begin{document}
+
+% =====================================================================
+%  TITLE PAGE
+% =====================================================================
+\begin{titlepage}
+\begin{singlespace}
+\centering
+\vspace*{0.3cm}
+{\titleserif\Huge\bfseries Synopsis Report\par}
+\vspace{1.0cm}
+
+{\large\itshape ``KioMeet --- A Secure Native Interview \&\\[2pt]
+Video Conferencing Platform''\par}
+\vspace{0.4cm}
+
+{\large\itshape by\par}
+\vspace{0.25cm}
+{\large\itshape Aman Verma\par}
+{\large\itshape 23bcs012\par}
+\vspace{0.1cm}
+{\large\itshape Ankit Kashyap\par}
+{\large\itshape 23bcs017\par}
+\vspace{0.1cm}
+{\large\itshape Amrit Kashyap\par}
+{\large\itshape 23bcs014\par}
+
+\vspace{0.8cm}
+{\large\itshape\underline{Under the guidance of Dr. Manoj Gupta}\par}
+
+\vspace{0.8cm}
+{\titleserif\large Submitted in partial fulfilment of the requirements for the\\
+award of the degree\par}
+
+\vspace{0.7cm}
+{\titleserif\large BACHELOR OF TECHNOLOGY\par}
+{\titleserif\large in\par}
+{\titleserif\large COMPUTER SCIENCE \& ENGINEERING\par}
+
+\vspace{0.7cm}
+\IfFileExists{logo.png}{\includegraphics[width=3.0cm]{logo.png}\par}{}
+
+\vfill
+{\large SHRI MATA VAISHNO DEVI UNIVERSITY, KATRA\par}
+{\large (School of Computer Science \& Engineering)\par}
+{\large JAMMU \& KASHMIR -- 182 320\par}
+{\large Session 2026--27 (Odd)\par}
+\vspace{0.4cm}
+\end{singlespace}
+\end{titlepage}
+
+% =====================================================================
+%  INTRODUCTION
+% =====================================================================
+\section*{INTRODUCTION}
+\addcontentsline{toc}{section}{Introduction}
+
+Remote hiring and distributed teamwork have made video conferencing a daily
+necessity. Yet most general-purpose meeting tools are browser- or
+Electron-based, which limits access to native operating-system capabilities,
+adds overhead, and --- critically for technical hiring --- offers no reliable
+way to stop private interviewer material from leaking into the shared video
+stream.
+
+This project proposes \textbf{KioMeet}, a native cross-platform video
+conferencing application for \textbf{Windows and macOS}, built specifically for
+teams and technical interviews. KioMeet runs as a native desktop application on
+each platform (Objective-C and Swift on macOS; C++/.NET on Windows) with no
+browser or Electron layer, pairing a GPU-accelerated media pipeline with a
+dedicated Node.js backend for room management, authentication, scheduling,
+recording, and team collaboration.
+
+KioMeet's distinguishing feature is a dedicated \textbf{secure interview mode}.
+In this mode the interviewer's own screen is rendered inside a hardened window
+whose contents are never captured into the outgoing stream; only the content
+of designated tool surfaces (code editor, whiteboard) is shared with the
+candidate. This guarantees that private questions, notes, browser tabs, or
+other application windows never bleed into the call, preserving interview
+integrity while keeping the experience fast and natural.
+
+\subsection*{System Overview}
+KioMeet is organised in three cooperating layers. The \emph{native desktop
+client} (Windows and macOS) owns media capture, GPU rendering (Metal on macOS,
+Direct3D on Windows), the secure window, and the user interface. The
+\emph{real-time media layer} uses a LiveKit-compatible WebRTC
+server~\cite{webrtc,livekit} to publish and subscribe audio, video, and
+screen-share tracks. The
+\emph{backend token server} (Node.js + Express) issues short-lived access
+tokens, manages rooms, enforces user tiers, schedules meetings, syncs
+calendars, and tracks recordings, backed by PostgreSQL for persistent data and
+Redis for ephemeral room state.
+
+% =====================================================================
+%  LITERATURE SURVEY
+% =====================================================================
+\section*{LITERATURE SURVEY}
+\addcontentsline{toc}{section}{Literature Survey}
+
+\subsection*{1. WebRTC and the LiveKit SFU model}
+WebRTC is the open standard for browser- and application-based real-time
+communication~\cite{webrtc,rfc8825}. At scale, mesh topologies become
+impractical, so modern platforms adopt a Selective Forwarding Unit (SFU) such
+as LiveKit~\cite{livekit}, which routes media without transcoding and supports
+adaptive simulcast. This body of work
+shows that an SFU is the appropriate architecture for rooms of up to tens of
+participants while keeping client CPU and bandwidth bounded.
+
+\subsection*{2. Native screen-capture APIs (Windows \& macOS)}
+Both desktop platforms expose modern, permission-gated screen-capture APIs:
+Apple's ScreenCaptureKit on macOS~\cite{screencapturekit} and the Windows
+Graphics Capture API on Windows~\cite{wgc}, each supporting display and
+individual-window capture with live thumbnails and system-audio capture. Compared with legacy capture paths they
+offer lower latency, finer-grained window selection, and explicit user consent.
+This establishes that native frameworks on each OS can deliver screen sharing
+that is both higher quality and more privacy-respecting than cross-platform
+wrappers.
+
+\subsection*{3. Secure window composition and content isolation}
+Research and platform documentation on window-server
+composition~\cite{screencapturekit,wgc} show that an application can place a
+window above the normal layer order and selectively exclude surfaces from
+capture. Applied to interviewing, this means the
+interviewer's private material can be isolated from the shared stream at the
+compositor level, so only explicitly designated tool surfaces are ever
+transmitted --- a stronger guarantee than hiding windows in software alone.
+
+\subsection*{4. Token-based authentication and tiered access}
+Established security practice favours a short-lived JWT access
+token~\cite{jwt} paired with a rotating, hashed refresh token, with the user's
+service tier re-read from the
+database on every refresh rather than trusted from the client. This literature
+underpins KioMeet's auth model and its fail-closed, event-driven billing and tier
+enforcement.
+
+\subsection*{SUMMARY OF LITERATURE SURVEY}
+\begin{enumerate}
+  \item A native client built on an SFU (LiveKit) and each platform's modern
+        frameworks (ScreenCaptureKit/Metal on macOS, Windows Graphics
+        Capture/Direct3D on Windows) delivers lower-latency, higher-quality
+        conferencing than browser or Electron alternatives.
+  \item Content isolation for interviews is best enforced at the window-server
+        / capture-path level, not by hiding windows in application code.
+  \item A short-lived access token plus rotating refresh token, with tier always
+        re-read server-side, is the accepted pattern for secure, tier-gated
+        access.
+\end{enumerate}
+
+% =====================================================================
+%  PROBLEM STATEMENT
+% =====================================================================
+\section*{PROBLEM STATEMENT}
+\addcontentsline{toc}{section}{Problem Statement}
+
+To design and build a native cross-platform (Windows and macOS) video
+conferencing platform that supports both standard team calls and technical
+interviews, in which the interviewer's
+private material is provably isolated from the shared video stream, while
+delivering reliable multi-participant audio/video, screen sharing, recording,
+scheduling, and moderation through a secure, tier-gated backend --- without the
+overhead and capability limits of browser- or Electron-based solutions.
+
+% =====================================================================
+%  OBJECTIVES
+% =====================================================================
+\section*{OBJECTIVES}
+\addcontentsline{toc}{section}{Objectives}
+
+The specific objectives of this project are as follows:
+\begin{enumerate}
+  \item To build native desktop clients for \textbf{Windows and macOS}
+        (Objective-C/Swift on macOS; C++/.NET on Windows) that capture camera,
+        microphone, and screen content and render remote participants on the
+        GPU (Metal on macOS, Direct3D on Windows), scaling the layout adaptively
+        up to 50 participants.
+  \item To implement a \emph{secure interview mode} in which the interviewer's
+        screen is composed into a hardened window and only designated tool
+        surfaces (code editor, whiteboard) are streamed to the candidate,
+        preventing any content leakage.
+  \item To integrate a LiveKit-compatible WebRTC server for publishing and
+        subscribing audio, video, and screen-share tracks, with decoupled
+        audio/video paths so a microphone toggle never interrupts the camera.
+  \item To develop a Node.js backend that issues short-lived JWT access tokens
+        with rotating refresh tokens, manages rooms (Redis, 24-hour TTL), and
+        stores persistent data in PostgreSQL.
+  \item To provide meeting features --- public and direct chat, raise-hand and
+        speaker queue, live polls, a Q\&A board, role-based moderation, a
+        lobby/waiting room, and local, cloud, and multi-track recording.
+  \item To support scheduling with email invitations (\texttt{.ics}) and
+        Apple, Google, and Outlook calendar sync, and tier-gated access (free,
+        pro, hiring) that is enforced server-side and fail-closed.
+\end{enumerate}
+
+% =====================================================================
+%  METHODOLOGY
+% =====================================================================
+\section*{METHODOLOGY}
+\addcontentsline{toc}{section}{Methodology}
+
+\subsection*{1. Requirement Analysis}
+\begin{itemize}
+  \item Identify needs for team calls and technical interviews (isolation,
+        recording, moderation, scheduling).
+  \item Study existing platforms (Zoom, Google Meet, native WebRTC apps) and
+        the LiveKit SFU model.
+\end{itemize}
+
+\subsection*{2. System Design}
+\begin{itemize}
+  \item \textbf{Native clients (Windows \& macOS)} --- media capture, GPU
+        rendering (Metal/Direct3D), secure window, and UI panels.
+  \item \textbf{Media layer} --- LiveKit publisher/subscriber bridging local
+        and remote tracks.
+  \item \textbf{Backend} --- Express token server with PostgreSQL (persistent)
+        and Redis (ephemeral room state).
+\end{itemize}
+
+\subsection*{3. Core Client Development (Windows \& macOS)}
+\begin{itemize}
+  \item Camera and microphone capture with two-phase toggles that eliminate
+        frozen/black frames on mute.
+  \item Screen and window sharing via each platform's native capture API
+        (ScreenCaptureKit on macOS, Windows Graphics Capture on Windows) with a
+        live-thumbnail picker and optional system-audio capture.
+  \item Secure interview mode: interviewer content composed into a hardened
+        window; only designated tool surfaces are published to the candidate.
+  \item Adaptive grid, stage + filmstrip, and spotlight layouts; active-speaker
+        highlighting and auto-spotlight.
+\end{itemize}
+
+\subsection*{4. Backend \& Real-Time Services}
+\begin{itemize}
+  \item JWT access tokens (short TTL) with rotating, hashed refresh tokens and
+        family-based theft detection.
+  \item Room creation and 6-character join codes with 24-hour expiry in Redis.
+  \item Scheduling with \texttt{.ics} email invites and Google/Outlook OAuth
+        calendar sync; team management with role-based permissions.
+  \item Local, cloud (S3 egress), and multi-track recording with a composed
+        renderer and disk-space safeguards.
+\end{itemize}
+
+\subsection*{5. Testing, Deployment \& Verification}
+\begin{itemize}
+  \item Unit and integration tests on each platform (XCTest on macOS and the
+        equivalent on Windows) covering tokens, media bridges, room lifecycle,
+        isolation invariants, and recording.
+  \item Health-checked backend deployment (PostgreSQL + Redis) and end-to-end
+        verification between live Windows and macOS clients.
+\end{itemize}
+
+% =====================================================================
+%  EXPECTED RESULTS
+% =====================================================================
+\section*{EXPECTED RESULTS}
+\addcontentsline{toc}{section}{Expected Results}
+
+\begin{enumerate}
+  \item \textbf{Reliable native conferencing} --- smooth multi-participant
+        audio/video with GPU rendering and adaptive layouts, outperforming
+        browser/Electron alternatives in latency and resource use.
+  \item \textbf{Guaranteed interview isolation} --- in secure interview mode,
+        only designated tool surfaces reach the candidate; the interviewer's
+        other windows and material never appear in the stream.
+  \item \textbf{Full collaboration suite} --- chat, polls, Q\&A, raise-hand
+        queue, moderation, lobby, scheduling with calendar sync, teams, and
+        local/cloud/multi-track recording working end-to-end.
+  \item \textbf{Secure, tier-gated backend} --- short-lived tokens, rotating
+        refresh tokens, and fail-closed tier enforcement protecting all
+        features and data.
+\end{enumerate}
+
+% =====================================================================
+%  TIME SCHEDULE
+% =====================================================================
+\section*{TIME SCHEDULE}
+\addcontentsline{toc}{section}{Time Schedule}
+
+\renewcommand{\arraystretch}{1.5}
+\noindent
+\begin{tabular}{|p{5.6cm}|p{2.6cm}|p{4.6cm}|}
+\hline
+\textbf{Phase} & \textbf{Duration} & \textbf{Timeline} \\ \hline
+Phase 1: Literature Review \& Requirements & 2 weeks & 1 Sept -- 14 Sept 2026 \\ \hline
+Phase 2: System Design & 2 weeks & 15 Sept -- 28 Sept 2026 \\ \hline
+Phase 3: Client \& Backend Implementation & 4 weeks & 29 Sept -- 26 Oct 2026 \\ \hline
+Phase 4: Integration (media, secure mode) & 2 weeks & 27 Oct -- 9 Nov 2026 \\ \hline
+Phase 5: Testing \& Debugging & 2 weeks & 10 Nov -- 23 Nov 2026 \\ \hline
+Phase 6: Documentation \& Finalization & 1 week & 24 Nov -- 30 Nov 2026 \\ \hline
+\textbf{Total Project Duration} & \textbf{13 weeks} & \textbf{1 Sept -- 30 Nov 2026} \\ \hline
+\end{tabular}
+
+% =====================================================================
+%  REFERENCES
+% =====================================================================
+\addcontentsline{toc}{section}{References}
+\begin{thebibliography}{9}
+  \bibitem{webrtc} WebRTC --- Official Project Documentation. \url{https://webrtc.org}
+  \bibitem{livekit} LiveKit --- Open-Source WebRTC SFU Documentation. \url{https://docs.livekit.io}
+  \bibitem{screencapturekit} Apple Developer Documentation --- ScreenCaptureKit \& Metal (macOS). \url{https://developer.apple.com/documentation/screencapturekit}
+  \bibitem{wgc} Microsoft Documentation --- Windows Graphics Capture \& Direct3D (Windows). \url{https://learn.microsoft.com/windows/uwp/audio-video-camera/screen-capture}
+  \bibitem{rfc8825} IETF RFC 8825 --- Overview: Real-Time Protocols for Browser-Based Applications (WebRTC).
+  \bibitem{jwt} IETF RFC 7519 --- JSON Web Token (JWT).
+\end{thebibliography}
+
+% =====================================================================
+%  SIGNATURES
+% =====================================================================
+\vspace{1.4cm}
+\noindent
+\begin{minipage}[t]{0.5\textwidth}
+\textbf{Student Sign}
+\begin{enumerate}
+  \item Aman Verma
+  \item Ankit Kashyap
+  \item Amrit Kashyap
+\end{enumerate}
+\end{minipage}%
+\begin{minipage}[t]{0.5\textwidth}
+\raggedleft
+\textbf{Guide Sign}
+\end{minipage}
+
+\end{document}

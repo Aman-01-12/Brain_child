@@ -232,8 +232,32 @@ enum InterRecordingLayoutLogic {
     private var _hostIdentity: String?
 
     /// Identity of the participant currently screen sharing in the recording.
-    /// Tracked for host-priority screen share switching.
+    /// Tracked for host-priority screen share switching. Retained as the IDENTITY
+    /// record for host-priority arbitration; the actual screen-share-slot WRITE is
+    /// single-sourced through `_setSlotOccupant(_:)` (task 6.4 / Requirement 11.4).
     private var _activeScreenShareIdentity: String?
+
+    // -----------------------------------------------------------------------
+    // MARK: - Single-sourced screen-share-slot ownership (task 6.4)
+    // -----------------------------------------------------------------------
+    // The local recording has exactly ONE screen-share slot (the renderer's
+    // `updateScreenShareFrame:` entry point). It is driven by a genuine remote
+    // screen share (a `screenShare(identity)` occupant, fed by
+    // `screenShareDidChange` / `didReceiveRemoteScreenShareFrame`). To uphold
+    // Requirements 11.1/11.2/11.4 the slot has a single owner of record
+    // (`_slotOccupant`) mutated ONLY through `_setSlotOccupant(_:)`, which clears
+    // the vacated slot whenever the occupant changes.
+
+    /// Who currently owns the single screen-share slot. `coordinatorQueue`-confined;
+    /// mutated only through `_setSlotOccupant(_:)`.
+    private enum SlotOccupant: Equatable {
+        case none
+        case screenShare(identity: String)
+    }
+
+    /// The single owner of record for the screen-share slot (Requirement 11.1).
+    /// coordinatorQueue-confined; mutated only through `_setSlotOccupant(_:)`.
+    private var _slotOccupant: SlotOccupant = .none
 
     /// Weak reference to the surface share controller for sink insertion/removal.
     private weak var surfaceShareController: InterSurfaceShareController?
@@ -571,13 +595,17 @@ enum InterRecordingLayoutLogic {
                 }
             }
 
-            // If the leaving participant was screen sharing, clear it.
+            // If the leaving participant was screen sharing, clear it through the
+            // single-sourced slot helper (task 6.4) so the vacated slot is cleared
+            // exactly once.
             if self._activeScreenShareIdentity == participantId {
                 self._activeScreenShareIdentity = nil
                 if let sink = self.recordingSink {
                     self.surfaceShareController?.removeLive(sink)
                 }
-                self.composedRenderer?.updateScreenShareFrame(nil)
+                if case .screenShare = self._slotOccupant {
+                    self._setSlotOccupant(.none)
+                }
             }
         }
     }
@@ -608,14 +636,20 @@ enum InterRecordingLayoutLogic {
                    currentShareId != hostId {
                     interLogInfo(InterRecordingCoordinator.log,
                                  "Recording: switching to host screen share (host priority)")
-                    // Remove the current non-host share sink; it will be replaced.
+                    // Remove the current non-host share sink; it will be replaced. The
+                    // slot clear is single-sourced via `_setSlotOccupant` below (the
+                    // occupant identity changes from the non-host to the host share).
                     if let sink = self.recordingSink {
                         self.surfaceShareController?.removeLive(sink)
                     }
-                    self.composedRenderer?.updateScreenShareFrame(nil)
                 }
 
                 self._activeScreenShareIdentity = participantId
+                // Single-source the slot write (task 6.4 / Requirement 11.4): a genuine
+                // remote screen share requests the `screenShare` occupant; the helper
+                // clears any vacated occupant (a prior non-host share) before this share
+                // owns the slot.
+                self._setSlotOccupant(.screenShare(identity: participantId ?? ""))
 
                 // Recording sink will be added when sinks dispatch frames.
                 if let sink = self.recordingSink {
@@ -625,11 +659,15 @@ enum InterRecordingLayoutLogic {
                 // Only clear if the stopping participant is the one currently sharing.
                 if participantId == nil || participantId == self._activeScreenShareIdentity {
                     self._activeScreenShareIdentity = nil
-                    // Screen share stopped — remove recording sink and clear source
+                    // Screen share stopped — remove recording sink and clear the slot
+                    // through the single-sourced helper, but only when a genuine screen
+                    // share actually owns it.
                     if let sink = self.recordingSink {
                         self.surfaceShareController?.removeLive(sink)
                     }
-                    self.composedRenderer?.updateScreenShareFrame(nil)
+                    if case .screenShare = self._slotOccupant {
+                        self._setSlotOccupant(.none)
+                    }
                 }
             }
         }
@@ -639,6 +677,38 @@ enum InterRecordingLayoutLogic {
     @objc public func screenShareDidChange(isActive: Bool) {
         screenShareDidChange(isActive: isActive, participantId: nil)
     }
+
+    // -----------------------------------------------------------------------
+    // MARK: - Single-sourced screen-share slot helper (task 6.4)
+    // -----------------------------------------------------------------------
+
+    /// THE single mutation point for screen-share-slot occupancy (Requirement 11.1).
+    /// Every code path that changes who owns the screen-share slot — `screenShareDidChange`,
+    /// `participantDidLeave`, and the remote-frame paths — funnels through here so the slot
+    /// is never written by two independent paths (Requirement 11.4).
+    ///
+    /// When the occupant changes, the vacated slot is CLEARED (`updateScreenShareFrame:`
+    /// with a nil frame) so no stale frozen frame remains (Requirement 11.2). A genuine
+    /// remote screen share requests `.screenShare(identity)`.
+    ///
+    /// Returns `true` when the occupant actually changed (and the vacated slot was
+    /// cleared), `false` on a no-op repeat. Runs on `coordinatorQueue`.
+    @discardableResult
+    private func _setSlotOccupant(_ newOccupant: SlotOccupant) -> Bool {
+        dispatchPrecondition(condition: .onQueue(coordinatorQueue))
+
+        guard newOccupant != _slotOccupant else { return false }
+        let previous = _slotOccupant
+        _slotOccupant = newOccupant
+
+        // Clear the vacated slot whenever a previous occupant (a genuine remote share) is
+        // being replaced, so the incoming occupant never composites on a stale frame.
+        if previous != .none {
+            composedRenderer?.updateScreenShareFrame(nil)
+        }
+        return true
+    }
+
 
     // -----------------------------------------------------------------------
     // MARK: - Remote Frame Forwarding
@@ -1143,6 +1213,9 @@ enum InterRecordingLayoutLogic {
         _identitiesWithLiveFrame.removeAll()
         _useGridLayout = false
         _activeScreenShareIdentity = nil
+        // Reset the single-sourced screen-share-slot owner so a fresh recording starts
+        // with an empty slot (task 6.4).
+        _slotOccupant = .none
 
         surfaceShareController = nil
         subscriber = nil
@@ -1949,17 +2022,21 @@ extension InterRecordingCoordinator: InterRemoteTrackRenderer {
             // this is the currently tracked screen sharer.
             let accept = (_activeScreenShareIdentity == nil ||
                           _activeScreenShareIdentity == participantId)
+            if accept {
+                // Track the active screen share identity if not yet set, and single-source
+                // the slot ownership (task 6.4 / Requirement 11.4): a genuine remote share
+                // owns the `screenShare` occupant. `_setSlotOccupant` clears the vacated
+                // slot on a real change and is a no-op on repeat frames (same occupant),
+                // so it never spuriously clears mid-stream.
+                if _activeScreenShareIdentity == nil {
+                    _activeScreenShareIdentity = participantId
+                }
+                _setSlotOccupant(.screenShare(identity: participantId))
+            }
             return (renderer, accept)
         }
         guard let (renderer, shouldAccept) = snapshot, shouldAccept else { return }
         renderer.updateScreenShareFrame(pixelBuffer)
-        // Track the active screen share identity if not yet set.
-        if _activeScreenShareIdentity == nil {
-            coordinatorQueue.async { [weak self] in
-                guard let self = self, self._activeScreenShareIdentity == nil else { return }
-                self._activeScreenShareIdentity = participantId
-            }
-        }
     }
 
     public func remoteTrackDidMute(_ kind: InterTrackKind, forParticipant participantId: String) {
@@ -2180,3 +2257,54 @@ final class InterAudioEngineAccess: NSObject, AudioEngineObserver {
 // Opt-out of strict Sendable checking: _engine is only written on the LiveKit audio thread
 // via the observer callbacks, which LiveKit serialises internally.
 extension InterAudioEngineAccess: @unchecked Sendable {}
+
+// ============================================================================
+// MARK: - Test-visibility seam
+// ============================================================================
+//
+// These `internal` members exist ONLY to make the screen-share-slot entry
+// points deterministically testable with a mock `InterComposedRenderer`,
+// WITHOUT standing up the real Metal compositor + AVAssetWriter pipeline
+// (`_startLocalRecording`). They are consumed by the slot-arbitration unit
+// tests.
+//
+// Design constraints honored:
+//  • Every mutation/invocation runs SYNCHRONOUSLY on `coordinatorQueue`, the
+//    exact same serialization the production paths rely on — no new concurrency
+//    seam is introduced and `coordinatorQueue` stays the single writer.
+//  • Nothing here is reachable from a production code path — the default
+//    `startLocalRecording(...)` flow is completely unchanged.
+extension InterRecordingCoordinator {
+
+    /// test-visibility
+    /// Inject a (mock) renderer in place of the real Metal compositor so the
+    /// slot entry-point calls can be recorded without the GPU pipeline.
+    func test_injectRenderer(_ renderer: InterComposedRenderer?) {
+        coordinatorQueue.sync { self.composedRenderer = renderer }
+    }
+
+    /// test-visibility
+    /// Force the recording state so the per-frame routing guard
+    /// (`_state == .recording || .paused`) is satisfied without a live recording.
+    func test_setRecordingState(_ newState: InterRecordingState) {
+        coordinatorQueue.sync {
+            os_unfair_lock_lock(&self._stateLock)
+            self._state = newState
+            os_unfair_lock_unlock(&self._stateLock)
+        }
+    }
+
+    /// test-visibility
+    /// Read the current single-sourced screen-share-slot occupant (task 6.4) as a stable
+    /// string — "none" | "screenShare:<identity>" — so slot-arbitration tests can assert
+    /// EXACTLY ONE occupant without exposing the private `SlotOccupant` enum. Read
+    /// synchronously on the coordinator's serial queue.
+    func test_slotOccupant() -> String {
+        coordinatorQueue.sync {
+            switch self._slotOccupant {
+            case .none:                      return "none"
+            case .screenShare(let identity): return "screenShare:\(identity)"
+            }
+        }
+    }
+}

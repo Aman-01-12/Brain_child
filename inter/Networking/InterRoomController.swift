@@ -117,13 +117,6 @@ enum InterAudioInputMatcher {
     /// [Phase 8.6] Q&A controller. Wired in by the caller before connect.
     @objc public weak var qaController: InterQAController?
 
-    /// [Collaborative Code Editor] Owned by `InterSecureToolsBridge` for the
-    /// session and wired in when the editor mounts. The room controller forwards
-    /// DataChannel data on the `codeEditor` topic to it (mirrors poll/Q&A). Held
-    /// `weak`: the bridge owns the controller and clears this reference at
-    /// teardown so it never dangles (R8.1).
-    @objc public weak var codeEditorController: InterCodeEditorController?
-
     /// [Phase 10] Recording coordinator. Wired in by the caller before connect.
     /// Room controller forwards disconnect events so recording can auto-stop.
     @objc public weak var recordingCoordinator: InterRecordingCoordinator?
@@ -1321,8 +1314,6 @@ extension InterRoomController: RoomDelegate {
                 self.pollController?.handleReceivedData(data, senderIdentity: senderIdentity)
             case "qa":
                 self.qaController?.handleReceivedData(data, senderIdentity: senderIdentity)
-            case "codeEditor":
-                self.codeEditorController?.handleReceivedData(data, senderIdentity: senderIdentity)
             default:
                 self.chatController?.handleReceivedData(data, topic: topic, participant: senderIdentity)
             }

@@ -16,20 +16,13 @@
 //  Substitutions, Font, Services, or Look Up item can open an NSPanel/NSWindow
 //  from inside the secure capture surface (H1 / S-A6 — R10.1, R10.5).
 //
-//  Native premium surface (collaborative-code-editor R1, R2.4):
+//  Native premium surface (local single-user editor):
 //    - An NSRulerView line-number gutter draws 1-based line numbers in the
 //      monospaced theme font (R1.1).
 //    - A native, no-web syntax highlighter (CodeSyntaxHighlighter) applies
 //      colour ATTRIBUTES over the existing NSTextStorage — re-run on the changed
 //      paragraph on edit and over the whole buffer on a language change; it
 //      never mutates characters (R1.2, R1.4, R5.1, R5.3).
-//    - A labelled remote-cursor/selection overlay maps the peer's element-id
-//      anchors to live offsets and draws a coloured caret + selection rect,
-//      snapping to the nearest live neighbour when an anchor is tombstoned
-//      (R2.4). It is drawn with AppKit (no `.drawingGroup()`), preserving the
-//      capture pipeline (R5.2).
-//    - The coordinator reports local caret/selection changes back to the view
-//      model so the peer can render this client's cursor (R2.6).
 //
 
 import AppKit
@@ -180,148 +173,6 @@ final class LineNumberRulerView: NSRulerView {
     }
 }
 
-// MARK: - Remote cursor / selection overlay (R2.4)
-
-/// A transparent overlay, hosted as a subview of the text view, that draws each
-/// remote participant's selection rectangle, caret, and a small labelled pill.
-/// Hit-testing is disabled so it never intercepts editing. Pure AppKit drawing
-/// (no `.drawingGroup()`), so it does not break the capture pipeline (R5.2).
-final class RemoteCursorOverlayView: NSView {
-
-    /// A resolved remote marker: the live UTF-16 range, a label, and a colour.
-    struct Marker {
-        let label: String
-        let range: NSRange
-        let color: NSColor
-    }
-
-    weak var codeTextView: NSTextView?
-    private var markers: [Marker] = []
-
-    override var isFlipped: Bool { true }
-
-    // Pass every click through to the text view beneath.
-    override func hitTest(_ point: NSPoint) -> NSView? { nil }
-
-    func update(markers: [Marker]) {
-        self.markers = markers
-        needsDisplay = true
-    }
-
-    /// Deterministic per-identity colour so each peer keeps a stable hue for the
-    /// session.
-    static func color(forIdentity identity: String) -> NSColor {
-        var hash: UInt64 = 1_469_598_103_934_665_603
-        for byte in identity.utf8 {
-            hash = (hash ^ UInt64(byte)) &* 1_099_511_628_211
-        }
-        let hue = CGFloat(hash % 360) / 360.0
-        return NSColor(hue: hue, saturation: 0.65, brightness: 0.95, alpha: 1.0)
-    }
-
-    override func draw(_ dirtyRect: NSRect) {
-        guard let textView = codeTextView,
-              let layoutManager = textView.layoutManager,
-              let container = textView.textContainer else { return }
-
-        let inset = textView.textContainerInset
-        let length = (textView.string as NSString).length
-
-        for marker in markers {
-            // Clamp into the live document so a stale offset can never crash.
-            let loc = min(max(marker.range.location, 0), length)
-            let len = min(marker.range.length, length - loc)
-            let range = NSRange(location: loc, length: max(0, len))
-
-            // Selection rectangles, drawn per visual line.
-            if range.length > 0 {
-                let glyphRange = layoutManager.glyphRange(forCharacterRange: range,
-                                                          actualCharacterRange: nil)
-                marker.color.withAlphaComponent(0.22).setFill()
-                layoutManager.enumerateLineFragments(forGlyphRange: glyphRange) {
-                    _, _, _, lineGlyphRange, _ in
-                    let intersection = NSIntersectionRange(glyphRange, lineGlyphRange)
-                    guard intersection.length > 0 else { return }
-                    var r = layoutManager.boundingRect(forGlyphRange: intersection, in: container)
-                    r.origin.x += inset.width
-                    r.origin.y += inset.height
-                    NSBezierPath(rect: r).fill()
-                }
-            }
-
-            // Caret at the head end of the selection.
-            let caret = caretRect(atCharIndex: range.location + range.length,
-                                  textView: textView,
-                                  layoutManager: layoutManager,
-                                  container: container,
-                                  inset: inset)
-            marker.color.setFill()
-            NSBezierPath(rect: caret).fill()
-
-            drawLabel(marker.label, color: marker.color, near: caret)
-        }
-    }
-
-    private func caretRect(atCharIndex index: Int,
-                           textView: NSTextView,
-                           layoutManager: NSLayoutManager,
-                           container: NSTextContainer,
-                           inset: NSSize) -> NSRect {
-        let content = textView.string as NSString
-        let length = content.length
-        let font = textView.font ?? NSFont.monospacedSystemFont(ofSize: 13.0, weight: .regular)
-        let lineHeight = layoutManager.defaultLineHeight(for: font)
-
-        guard length > 0 else {
-            return NSRect(x: inset.width, y: inset.height, width: 2, height: lineHeight)
-        }
-
-        let safe = min(max(index, 0), length)
-        if safe >= length {
-            // End of document.
-            let lastGlyph = max(0, layoutManager.numberOfGlyphs - 1)
-            var effective = NSRange()
-            let lineRect = layoutManager.lineFragmentRect(forGlyphAt: lastGlyph,
-                                                          effectiveRange: &effective)
-            if content.character(at: length - 1) == 0x0A {
-                let extra = layoutManager.extraLineFragmentRect
-                let r = extra.height > 0 ? extra : lineRect
-                return NSRect(x: inset.width + r.minX, y: inset.height + r.minY,
-                              width: 2, height: r.height)
-            }
-            let used = layoutManager.boundingRect(forGlyphRange: NSRange(location: lastGlyph, length: 1),
-                                                  in: container)
-            return NSRect(x: inset.width + used.maxX, y: inset.height + lineRect.minY,
-                          width: 2, height: lineRect.height)
-        }
-
-        let glyphIndex = layoutManager.glyphIndexForCharacter(at: safe)
-        var effective = NSRange()
-        let lineRect = layoutManager.lineFragmentRect(forGlyphAt: glyphIndex, effectiveRange: &effective)
-        let location = layoutManager.location(forGlyphAt: glyphIndex)
-        return NSRect(x: inset.width + lineRect.minX + location.x, y: inset.height + lineRect.minY,
-                      width: 2, height: lineRect.height)
-    }
-
-    private func drawLabel(_ text: String, color: NSColor, near caret: NSRect) {
-        guard !text.isEmpty else { return }
-        let attrs: [NSAttributedString.Key: Any] = [
-            .font: NSFont.systemFont(ofSize: 9.0, weight: .semibold),
-            .foregroundColor: NSColor.white,
-        ]
-        let label = text as NSString
-        let textSize = label.size(withAttributes: attrs)
-        let padding: CGFloat = 3.0
-        let pill = NSRect(x: caret.minX,
-                          y: max(0, caret.minY - (textSize.height + 2 * padding)),
-                          width: textSize.width + 2 * padding,
-                          height: textSize.height + 2 * padding)
-        color.setFill()
-        NSBezierPath(roundedRect: pill, xRadius: 3.0, yRadius: 3.0).fill()
-        label.draw(at: NSPoint(x: pill.minX + padding, y: pill.minY + padding), withAttributes: attrs)
-    }
-}
-
 // MARK: - Representable
 
 /// Wraps the hardened NSTextView in an NSScrollView and bridges edits back into
@@ -383,22 +234,15 @@ struct CodeEditorTextView: NSViewRepresentable {
         scrollView.verticalRulerView = ruler
         scrollView.rulersVisible = true
 
-        // Remote cursor / selection overlay (R2.4).
-        let overlay = RemoteCursorOverlayView(frame: textView.bounds)
-        overlay.autoresizingMask = [.width, .height]
-        overlay.codeTextView = textView
-        textView.addSubview(overlay)
-
         // Register the text view with the model for focus activation / teardown.
         viewModel.attach(textView: textView)
 
-        // Wire the coordinator and run an initial highlight pass over whatever
-        // content the model seeded (late-join documents are non-empty).
+        // Wire the coordinator and run an initial highlight pass over the
+        // editor's content.
         context.coordinator.bind(scrollView: scrollView, textView: textView,
-                                 ruler: ruler, overlay: overlay)
+                                 ruler: ruler)
         context.coordinator.highlightWholeBuffer()
         context.coordinator.refreshGutter()
-        context.coordinator.refreshRemoteCursors()
 
         return scrollView
     }
@@ -421,11 +265,6 @@ struct CodeEditorTextView: NSViewRepresentable {
             coordinator.highlightChangedRange()
             coordinator.refreshGutter()
         }
-
-        // Keep the overlay sized to the (vertically growing) text view and
-        // re-resolve remote cursor anchors against the current document (R2.4).
-        coordinator.overlay?.frame = textView.bounds
-        coordinator.refreshRemoteCursors()
     }
 
     /// Applies the exact secure NSTextView configuration of the current AppKit
@@ -465,8 +304,8 @@ struct CodeEditorTextView: NSViewRepresentable {
 
     /// Main-actor isolated: every entry point (NSViewRepresentable make/update on
     /// main, NSTextViewDelegate callbacks on main) runs on the main thread, and
-    /// the coordinator reads @MainActor view-model/document state (language,
-    /// document, remoteCursors). Isolating the whole coordinator keeps that
+    /// the coordinator reads @MainActor view-model state (language). Isolating
+    /// the whole coordinator keeps that
     /// access sound without scattering `MainActor.assumeIsolated` across every
     /// helper. (Swift 5 mode: a @MainActor class may satisfy the nonisolated
     /// NSTextViewDelegate requirements.)
@@ -478,7 +317,6 @@ struct CodeEditorTextView: NSViewRepresentable {
         private(set) weak var scrollView: NSScrollView?
         private(set) weak var textView: NSTextView?
         private weak var ruler: LineNumberRulerView?
-        weak var overlay: RemoteCursorOverlayView?
 
         /// The language last applied to the buffer, so updateNSView can detect a
         /// change and re-highlight (R1.4).
@@ -495,11 +333,10 @@ struct CodeEditorTextView: NSViewRepresentable {
         }
 
         func bind(scrollView: NSScrollView, textView: NSTextView,
-                  ruler: LineNumberRulerView, overlay: RemoteCursorOverlayView) {
+                  ruler: LineNumberRulerView) {
             self.scrollView = scrollView
             self.textView = textView
             self.ruler = ruler
-            self.overlay = overlay
             self.lastLanguage = viewModel.language
             self.previousText = textView.string
         }
@@ -515,19 +352,86 @@ struct CodeEditorTextView: NSViewRepresentable {
                 viewModel.text = string
                 highlightChangedRange()
                 refreshGutter()
-                refreshRemoteCursors()
             }
         }
 
-        /// Report the local caret/selection so the peer can render this client's
-        /// remote cursor (R2.6). The view model maps the UTF-16 NSRange to stable
-        /// element ids; in non-collaborative mode it is a no-op.
-        func textViewDidChangeSelection(_ notification: Notification) {
-            guard let textView = notification.object as? NSTextView else { return }
-            let range = textView.selectedRange()
-            MainActor.assumeIsolated {
-                viewModel.reportLocalSelection(range)
+        // MARK: Auto-closing brackets (R2.1–R2.6)
+
+        /// CodeMirror `closeBrackets` pairs: opener → closer. Symmetric quotes
+        /// map to themselves.
+        private static let bracketPairs: [Character: Character] =
+            ["(": ")", "[": "]", "{": "}", "\"": "\"", "'": "'"]
+
+        /// The set of closing characters (mirror of `bracketPairs` values) used
+        /// for the skip-over check.
+        private static let closers = Set([")", "]", "}", "\"", "'"].map { Character($0) })
+
+        /// The opener whose pair closes with `closer`, or nil if `closer` is not
+        /// a recognized closing character.
+        private static func openerFor(closer: Character) -> Character? {
+            bracketPairs.first(where: { $0.value == closer })?.key
+        }
+
+        /// Implements CodeMirror `closeBrackets` semantics — auto-close insert,
+        /// skip-over, delete-pair, and the quote guard — for typed input.
+        ///
+        /// Every branch either returns `true` (the edit proceeds through the
+        /// normal AppKit edit machinery and `textDidChange` fires) or performs
+        /// `insertText(_:replacementRange:)` / `setSelectedRange(_:)` and returns
+        /// `false`. The `insertText` calls are ordinary text-view edits, so
+        /// `textDidChange` still runs and `viewModel.text = textView.string`
+        /// derives the CRDT ops uniformly — there is NO path that mutates the
+        /// text-view string while bypassing the local edit path. A bare caret
+        /// move (skip-over) intentionally changes no characters, producing no op.
+        func textView(_ textView: NSTextView,
+                      shouldChangeTextIn affectedRange: NSRange,
+                      replacementString: String?) -> Bool {
+            guard let replacement = replacementString else { return true }   // nil = attribute-only
+            let ns = textView.string as NSString
+
+            // --- Type a single character into a caret (no selection). ---
+            if replacement.count == 1, affectedRange.length == 0, let ch = replacement.first {
+                let nextChar: Character? = affectedRange.location < ns.length
+                    ? Character(ns.substring(with: NSRange(location: affectedRange.location, length: 1)))
+                    : nil
+
+                // (a) Skip-over: typing a closer when the next char is that same closer.
+                if Self.closers.contains(ch), nextChar == ch {
+                    textView.setSelectedRange(NSRange(location: affectedRange.location + 1, length: 0))
+                    return false   // consume; no insertion
+                }
+
+                // (b) Auto-close: typing an opener inserts opener+closer, caret between.
+                if let closer = Self.bracketPairs[ch] {
+                    // Quote guard: do not double-insert when already against an
+                    // identical quote (the skip-over above covers moving past it).
+                    let isQuote = (ch == "\"" || ch == "'")
+                    if !(isQuote && nextChar == ch) {
+                        textView.insertText(String(ch) + String(closer),
+                                            replacementRange: affectedRange)
+                        textView.setSelectedRange(NSRange(location: affectedRange.location + 1, length: 0))
+                        return false
+                    }
+                }
             }
+
+            // --- Backspace inside an empty pair deletes BOTH chars. ---
+            if replacement.isEmpty, affectedRange.length == 1 {
+                let loc = affectedRange.location
+                if loc < ns.length {
+                    let deleted = Character(ns.substring(with: NSRange(location: loc, length: 1)))
+                    let after = loc + 1 < ns.length
+                        ? Character(ns.substring(with: NSRange(location: loc + 1, length: 1)))
+                        : nil
+                    if let opener = Self.openerFor(closer: after ?? " "), opener == deleted,
+                       let closer = Self.bracketPairs[deleted], closer == after {
+                        textView.insertText("", replacementRange: NSRange(location: loc, length: 2))
+                        return false
+                    }
+                }
+            }
+
+            return true   // all other edits proceed normally
         }
 
         // MARK: Highlighting (R1.2, R1.4)
@@ -566,65 +470,6 @@ struct CodeEditorTextView: NSViewRepresentable {
             guard let ruler = ruler, let textView = textView else { return }
             ruler.recomputeThickness(for: textView.string)
             ruler.needsDisplay = true
-        }
-
-        // MARK: Remote cursors (R2.4)
-
-        func refreshRemoteCursors() {
-            guard let overlay = overlay, let textView = textView else { return }
-            guard let document = viewModel.document, !viewModel.remoteCursors.isEmpty else {
-                overlay.update(markers: [])
-                return
-            }
-
-            let text = textView.string
-            var markers: [RemoteCursorOverlayView.Marker] = []
-            for (identity, cursor) in viewModel.remoteCursors {
-                guard let anchorOffset = liveCharOffset(for: cursor.anchor, in: document),
-                      let headOffset = liveCharOffset(for: cursor.head, in: document) else { continue }
-                let lo = min(anchorOffset, headOffset)
-                let hi = max(anchorOffset, headOffset)
-                let u16lo = Self.utf16Offset(forCharacterOffset: lo, in: text)
-                let u16hi = Self.utf16Offset(forCharacterOffset: hi, in: text)
-                markers.append(.init(
-                    label: Self.shortLabel(for: identity),
-                    range: NSRange(location: u16lo, length: max(0, u16hi - u16lo)),
-                    color: RemoteCursorOverlayView.color(forIdentity: identity)))
-            }
-            overlay.update(markers: markers)
-        }
-
-        /// Resolve an element id to a live character offset, snapping to the
-        /// nearest live neighbour when the anchor element is tombstoned (R2.4).
-        private func liveCharOffset(for id: ElementID, in document: CodeEditorDocument) -> Int? {
-            if let offset = document.offset(of: id) { return offset }
-            guard let arrayIndex = document.elements.firstIndex(where: { $0.id == id }) else { return nil }
-
-            // Nearest live element to the right anchors at its own offset.
-            var i = arrayIndex
-            while i < document.elements.count {
-                if !document.elements[i].deleted {
-                    return document.offset(of: document.elements[i].id)
-                }
-                i += 1
-            }
-            // Otherwise the nearest live element to the left, anchoring just
-            // after it.
-            i = arrayIndex - 1
-            while i >= 0 {
-                if !document.elements[i].deleted,
-                   let offset = document.offset(of: document.elements[i].id) {
-                    return offset + 1
-                }
-                i -= 1
-            }
-            return 0
-        }
-
-        /// A compact label for the cursor pill (first segment of the identity).
-        private static func shortLabel(for identity: String) -> String {
-            let trimmed = identity.split(separator: "-").first.map(String.init) ?? identity
-            return String(trimmed.prefix(12))
         }
 
         // MARK: Offset helpers

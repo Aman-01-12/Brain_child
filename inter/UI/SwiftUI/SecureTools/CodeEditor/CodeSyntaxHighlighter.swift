@@ -31,6 +31,10 @@ enum CodeTokenType: Equatable {
     case string
     case comment
     case number
+    /// An identifier immediately followed by `(` (skipping spaces/tabs) — a call site.
+    case functionCall
+    /// Brackets and common operator characters ( ) [ ] { } and + - * / % = < > etc.
+    case punctuation
 }
 
 /// The languages offered by the editor's selector (R1.3). `rawValue` is stable
@@ -108,6 +112,8 @@ enum CodeSyntaxHighlighter {
     private static let stringColor  = NSColor(srgbRed: 0.81, green: 0.57, blue: 0.47, alpha: 1.0)
     private static let commentColor = NSColor(srgbRed: 0.42, green: 0.60, blue: 0.33, alpha: 1.0)
     private static let numberColor  = NSColor(srgbRed: 0.71, green: 0.81, blue: 0.66, alpha: 1.0)
+    private static let functionCallColor = NSColor(srgbRed: 0.86, green: 0.80, blue: 0.46, alpha: 1.0)
+    private static let punctuationColor  = NSColor(srgbRed: 0.66, green: 0.66, blue: 0.66, alpha: 1.0)
 
     static func color(for token: CodeTokenType) -> NSColor {
         switch token {
@@ -116,6 +122,8 @@ enum CodeSyntaxHighlighter {
         case .string: return stringColor
         case .comment: return commentColor
         case .number: return numberColor
+        case .functionCall: return functionCallColor
+        case .punctuation: return punctuationColor
         }
     }
 
@@ -265,7 +273,29 @@ enum CodeSyntaxHighlighter {
                 } else if grammar.types.contains(word)
                             || (grammar.uppercaseIsType && (word.first?.isUppercase ?? false)) {
                     result.append((rangeFor(start, i), .type))
+                } else {
+                    // Function-call heuristic: an identifier (that is neither a
+                    // keyword nor a type) immediately followed by `(`, skipping
+                    // intervening spaces/tabs, is a call site. The look-ahead only
+                    // *reads* the `(`; it is still emitted as `.punctuation` when
+                    // the scanner reaches it below.
+                    var j = i
+                    while j < n && (chars[j] == " " || chars[j] == "\t") { j += 1 }
+                    if j < n && chars[j] == "(" {
+                        result.append((rangeFor(start, i), .functionCall))
+                    }
                 }
+                continue
+            }
+
+            // Punctuation: brackets and common operator characters. This branch
+            // MUST come after the comment / string / number / identifier branches
+            // so a `/` opening a comment, a `.` inside a numeric literal, and any
+            // bracket/operator inside a string or comment are consumed by those
+            // branches first and never double-classified here.
+            if "()[]{}".contains(c) || "+-*/%=<>!&|^~?:.,;".contains(c) {
+                result.append((rangeFor(i, i + 1), .punctuation))
+                i += 1
                 continue
             }
 

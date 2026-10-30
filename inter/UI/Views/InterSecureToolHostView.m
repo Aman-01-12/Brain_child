@@ -44,22 +44,12 @@
     [_toolsBridge invalidateHandlers];
 }
 
-- (void)configureCollaborationWithRoomController:(InterRoomController *)roomController {
-    // Forward to the session-owned bridge, which constructs the shared
-    // CodeEditorDocument + InterCodeEditorController, registers the controller on
-    // the room's DataChannel dispatcher, and configures the vended view model.
-    if (!roomController) {
-        return;
-    }
-    [self.toolsBridge configureCollaborationWithRoomController:roomController];
-}
-
 - (void)layout {
     [super layout];
 
-    NSRect contentBounds = NSInsetRect(self.bounds, 18.0, 18.0);
-    self.placeholderLabel.frame = NSInsetRect(contentBounds, 18.0, 18.0);
-    self.activeToolView.frame = contentBounds;
+    // Tool view fills the host edge-to-edge (single tile owned by the SwiftUI root).
+    self.placeholderLabel.frame = NSInsetRect(self.bounds, 24.0, 24.0);
+    self.activeToolView.frame = self.bounds;
 }
 
 - (void)setActiveToolKind:(InterInterviewToolKind)toolKind {
@@ -87,7 +77,7 @@
     self.activeToolView = nextToolView;
 
     if (self.activeToolView) {
-        self.activeToolView.frame = NSInsetRect(self.bounds, 18.0, 18.0);
+        self.activeToolView.frame = self.bounds;
         self.activeToolView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
         [self addSubview:self.activeToolView positioned:NSWindowBelow relativeTo:self.placeholderLabel];
     }
@@ -122,11 +112,15 @@
     self.wantsLayer = YES;
     self.canDrawSubviewsIntoLayer = YES;
     self.layerContentsRedrawPolicy = NSViewLayerContentsRedrawDuringViewResize;
+    // [candidate-tool-share-tile] The host is an INVISIBLE, edge-to-edge container — it
+    // no longer draws its own rounded border / corner radius. Previously it painted a
+    // rounded 20pt border with an 18pt inset around the tool, which — stacked on top of
+    // the SwiftUI tool view's OWN rounded chrome — produced a visible "tile inside a tile".
+    // The single tool tile is now owned by the SwiftUI root (code editor / whiteboard),
+    // which fills the host edge-to-edge. A dark fill is kept only as a fallback behind the
+    // placeholder before a tool is mounted.
     self.layer.backgroundColor = [NSColor colorWithCalibratedWhite:0.04 alpha:1.0].CGColor;
-    self.layer.cornerRadius = 20.0;
     self.layer.masksToBounds = YES;
-    self.layer.borderWidth = 1.0;
-    self.layer.borderColor = [NSColor colorWithCalibratedWhite:1.0 alpha:0.08].CGColor;
 
     // The Tool_Bridge owns the two SwiftUI-hosted leaf views for the session.
     self.toolsBridge = [[InterSecureToolsBridge alloc] init];

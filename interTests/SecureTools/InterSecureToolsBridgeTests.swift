@@ -91,27 +91,23 @@ final class InterSecureToolsBridgeTests: XCTestCase {
         }
 
         // Drive the whiteboard to a non-empty state through the view model's
-        // real creation path (text placement adds exactly one element).
-        viewModel.selectTool(.text)
-        viewModel.placeText("solution sketch", at: CGPoint(x: 12, y: 12))
-        viewModel.selectTool(.shape)
-        viewModel.beginShapeDrag(at: CGPoint(x: 0, y: 0))
-        viewModel.commitShapeDrag(at: CGPoint(x: 40, y: 40))
-        XCTAssertGreaterThan(viewModel.model.elements.count, 0,
+        // real creation path (text placement + a shape drag add elements).
+        viewModel.commitText("solution sketch", atWorld: CGPoint(x: 12, y: 12), editing: nil)
+        viewModel.selectTool(.rectangle)
+        viewModel.pointerDown(atScreen: CGPoint(x: 0, y: 0), additive: false)
+        viewModel.pointerDragged(toScreen: CGPoint(x: 40, y: 40))
+        viewModel.pointerUp(atScreen: CGPoint(x: 40, y: 40))
+        XCTAssertGreaterThan(viewModel.renderedElements.count, 0,
                              "precondition: the whiteboard should hold at least one element")
 
-        // The bridge clear must empty the model so the next capture is blank.
+        // The bridge clear must empty the board so the next capture is blank.
         bridge.clearWhiteboard()
-        XCTAssertTrue(viewModel.model.elements.isEmpty,
-                      "clearWhiteboard must empty the stroke model (R3.5)")
-        XCTAssertTrue(viewModel.model.undoStack.isEmpty,
-                      "clearWhiteboard must reset the undo history (R3.5, R9.5)")
-        XCTAssertTrue(viewModel.model.redoStack.isEmpty,
-                      "clearWhiteboard must reset the redo history (R3.5, R9.5)")
+        XCTAssertTrue(viewModel.renderedElements.isEmpty,
+                      "clearWhiteboard must empty the board document (R3.5)")
 
         // Idempotent: clearing an already-empty board stays empty and does not crash.
         bridge.clearWhiteboard()
-        XCTAssertTrue(viewModel.model.elements.isEmpty,
+        XCTAssertTrue(viewModel.renderedElements.isEmpty,
                       "clearWhiteboard must be idempotent on an already-empty board (R3.5)")
     }
 

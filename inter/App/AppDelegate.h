@@ -1,5 +1,7 @@
 #import <Cocoa/Cocoa.h>
 
+#import "InterInterviewToolTypes.h"
+
 typedef NS_ENUM(NSUInteger, InterCallMode) {
     InterCallModeNone = 0,
     InterCallModeNormal,

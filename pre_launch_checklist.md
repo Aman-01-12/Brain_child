@@ -104,11 +104,19 @@ the apps with each provider, generating credentials, and uncommenting them in `.
 
 ---
 
-## 3. Account Management UI — Endpoints Built, No Client Screens Yet
+## 3. Account Management UI — ✅ DONE
 
-🟠 **Status:** All five backend endpoints are live and tested. The macOS app has no UI surfaces for them yet. Users cannot access these features.
+✅ **Status (updated):** Account Management UI is now implemented in the macOS app. All five
+backend endpoints are wired to client screens (Change Password, Change Email, Active Sessions,
+Delete Account, plus profile). The subsections below are retained as the original spec / a
+verification reference — confirm each flow once against production before launch.
 
-**Suggested approach:** A single "Account Settings" window accessible from the app menu bar (e.g. `Inter → Account Settings…`), with three sections: **Profile**, **Security**, and **Danger Zone**.
+**Implemented approach:** An "Account Settings" surface (Profile / Security / Danger Zone)
+backed by the endpoints listed below.
+
+**Pre-launch verification (light):** smoke-test change-password (other sessions revoked,
+current stays alive), change-email verification deep link, session list + revoke, and delete
+account (Keychain cleared, returns to login). These are checks, not build work.
 
 ### 3.1 Change Password Screen
 
@@ -579,3 +587,81 @@ Currently, the interview host is always the interviewer and the joiner is always
 | 12 | Wire RecordingConsentPanel on participant join (R3) | 2 hours | Recording compliance |
 | 13 | App icon + Info.plist usage strings | 1 hour | App Store submission |
 | 14 | App notarization setup | 1 hour | Direct download distribution |
+
+
+---
+
+## 13. Interview Anti-Cheat / Capture-Protection Controls (macOS) — Status & Roadmap
+
+> Added 21 June 2026. This section maps the cross-platform anti-cheat control matrix
+> (authored against the Windows API set) to the **macOS** implementation and tracks status.
+> The public website will NOT disclose per-platform mechanisms — this is engineering truth.
+>
+> **Legend:** ✅ Implemented · 🟠 In progress / next · 🟢 Planned · ⚪ Out of scope (software)
+
+### 13.0 Correction — screen-capture exclusion DOES work in production
+
+🟢→✅ **Clarification (owner-confirmed, 21 June 2026):** The secure-window screen-capture
+exclusion (`setSharingType:NSWindowSharingNone`, the macOS analog of Windows
+`SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)`) **is effective in production.** It was only
+**disabled in the dev environment** to make the secure UI visible while building/testing it.
+Earlier research notes that hedged on this should be read in that light: against third-party
+capture/streaming/screenshot tools (OBS, Zoom, Meet, Bandicam, screenshot utilities) the
+exclusion works. (macOS's own privileged recorder remains the documented, accepted residual.)
+- **Action before launch:** confirm the production build ships with the exclusion ENABLED
+  (i.e. the dev-only disable flag is off in Release config) and add a release-gate check.
+
+### 13.1 macOS control matrix (mapped from the Windows matrix)
+
+| # | Cheating vector | Windows mechanism (reference) | macOS mechanism | Status |
+|---|---|---|---|---|
+| 1 | Software screen capture | `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)` | `setSharingType:NSWindowSharingNone` on every secure/call window | ✅ Implemented (prod-on; dev-off) |
+| 1b | **Native OS screen recorder** (Cmd-Shift-5 / `screencapture`) — the one path window-exclusion can't block | (n/a — Windows analog via PrintScreen/snipping handling) | **Native screen-capture shortcut blocked for the duration of the session** (+ kiosk lockdown limits other launch routes) | ✅ **Implemented (in production)** |
+| 2 | AI overlay window (Interview Coder, Cluely) | `HWND_TOPMOST` + foreground loop | `NSScreenSaverWindowLevel` elevated level + kiosk presentation lockdown + borderless/non-movable | ✅ Implemented (conditions neutralized; not absolute) |
+| 3 | App-switching / nav shortcuts (⌘-Tab, etc.) | Low-level keyboard hook | `[NSApp setPresentationOptions:]` — DisableProcessSwitching, HideDock, HideMenuBar, DisableForceQuit, DisableSessionTermination | ✅ Implemented (presentation options; no per-key NSEvent hook) |
+| 4 | **Audio loopback / app-audio capture (ParakeetAI, Cluely audio)** | WASAPI session monitor (`IAudioSessionManager2`) | **Core Audio monitor: enumerate devices + detect process taps / virtual + aggregate devices consuming our output during session** | 🟠 **In progress / next** |
+| 5 | Renamed capture process | DXGI handle scanner (TypeIndex) | Largely **pre-empted by #1** (capture is excluded regardless of process name). Optional: ScreenCaptureKit-stream / screen-recording-TCC awareness, known-binary scan | 🟢 Planned (lower priority — #1 covers the payload) |
+| 6 | Capture DLL in renamed process | Module enumeration | Not directly applicable on macOS; dylib-injection hardening + #1 exclusion | 🟢 Planned / mitigated by #1 |
+| 7 | Second monitor connected after preflight | `EnumDisplayMonitors` polling | Continuous `NSScreen` monitoring — single-display policy for interviewee, enforced at runtime (not one-time preflight) | ✅ Implemented |
+| 8 | VM — hypervisor presence | `CPUID` ECX[31] | `sysctl kern.hv_vmm_present` (Apple-DTS-endorsed; true under VMware Fusion / QEMU / Apple Virtualization) + CPUID VMM bit | 🟠 **In progress / next** |
+| 9 | VM — guest driver artifacts | `SetupDiGetClassDevs` | IOKit / `ioreg` scan for VM device nodes (VMware SVGA, Parallels, VirtualBox, QEMU) | 🟢 Planned (layer 2) |
+| 10 | VM — ACPI/firmware fingerprint | `GetSystemFirmwareTable` | `ioreg` / `system_profiler` model & platform identifiers; reject VM model IDs | 🟢 Planned (layer 3) |
+| 11 | Hardware capture card — known brands | USB/UVC descriptor scan | IOKit USB device enumeration, keyword match (Elgato, Magewell, AVerMedia, Hauppauge) | 🟢 Planned |
+| 12 | Hardware HDMI capture card — generic/PCIe | None (below OS) | None (below OS) | ⚪ Out of scope — interviewer observation |
+| 13 | Second physical device (phone camera) | None (analog hole) | None (analog hole) | ⚪ Out of scope — interviewer observation |
+
+### 13.2 Next-up implementation notes
+
+**Audio-capture monitoring (#4) — the ParakeetAI defense.**
+- Threat: tools transcribe the **interviewer's voice coming out of our app** by tapping the
+  app/system audio directly — they do **not** rely on the speaker→mic acoustic path, so muting
+  speakers / using headphones does not stop them.
+- macOS has **no per-app "exclude my audio from capture"** API (no audio analog of
+  `NSWindowSharingNone`), so the approach is **detect + flag** (mirrors the Windows WASAPI
+  loopback monitor):
+  1. Enumerate Core Audio devices (`kAudioHardwarePropertyDevices`); flag known virtual /
+     loopback drivers (BlackHole, Soundflower, Loopback, VB-Cable) and **Aggregate / Multi-Output**
+     devices, especially if the active output device is one of them.
+  2. Watch for **new aggregate/tap devices appearing mid-session** — Core Audio process taps
+     (`AudioHardwareCreateProcessTap`, macOS 14.4+) surface as device objects; their appearance
+     during an interview is a strong signal.
+  3. Optional: scan running processes for known assistant binaries/bundle IDs.
+- Output is an **alert to the interviewer panel for human review** (not an auto-block), exactly
+  like the Windows matrix row — avoids false-positive lockouts from legit system audio services.
+
+**VM detection (#8–#10) — three-layer, any-one-blocks.**
+- Layer 1 (primary): `sysctl kern.hv_vmm_present == 1`. Cheap, ring-3, Apple-endorsed.
+- Layer 2: IOKit/`ioreg` VM device artifacts. Layer 3: model/platform identifier rejection.
+- Caveat (same as Windows): paravirt-hardened/researcher VMs can mask layer 1; layered checks
+  raise the bar. Decide policy: block-on-detect vs. flag-to-interviewer (recommend block for
+  interviewee secure mode, consistent with single-display enforcement).
+
+### 13.3 Status rollup for launch
+- ✅ Shipping now: capture exclusion (third-party tools), **native OS screen-recorder shortcut
+  blocked during session**, overlay-condition lockdown (kiosk + window level),
+  app-switch lockdown, runtime single-display policy.
+- 🟠 Targeted next (pre- or fast-follow launch): audio-capture monitoring, VM hypervisor check.
+- 🟢 Later layers: VM driver/firmware fingerprinting, capture-card detection, capture-process
+  awareness.
+- ⚪ Permanently out of software scope: hardware HDMI capture, phone-camera analog hole →
+  covered by interviewer-observation policy + candidate agreement.

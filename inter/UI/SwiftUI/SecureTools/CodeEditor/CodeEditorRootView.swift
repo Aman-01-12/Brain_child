@@ -89,16 +89,13 @@ struct CodeEditorRootView: View {
                 // register via setLanguage(_:).
                 languageBar
                     .padding(.horizontal, contentInset)
-                    .padding(.top, contentInset)
-                    .padding(.bottom, 10.0)
+                    .padding(.top, 12.0)
+                    .padding(.bottom, 8.0)
 
-                // Text area inset over a white @ 0.10 background. The surrounding
-                // chrome (white @ 0.08) shows through the inset via the
-                // .background modifier below.
+                // [candidate-tool-share-tile] Single, plain editing area — no nested
+                // rounded "card inside a card". The editor sits directly on the single
+                // tile background and fills the whole surface below the language bar.
                 ZStack {
-                    textAreaBackgroundColor
-                        .clipShape(RoundedRectangle(cornerRadius: textAreaCornerRadius, style: .continuous))
-
                     CodeEditorTextView(viewModel: viewModel)
 
                     // Placeholder shown WHILE the editor is empty, hidden once any
@@ -110,22 +107,13 @@ struct CodeEditorRootView: View {
                             .multilineTextAlignment(.leading)
                             .fixedSize(horizontal: false, vertical: true)
                             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-                            .padding(placeholderInset)
+                            .padding(.horizontal, contentInset)
                             .allowsHitTesting(false)
                     }
                 }
-                .padding(.horizontal, contentInset)
-                .padding(.bottom, contentInset)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
-        .background(
-            RoundedRectangle(cornerRadius: chromeCornerRadius, style: .continuous)
-                .fill(chromeBackgroundColor)
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: chromeCornerRadius, style: .continuous)
-                .strokeBorder(borderColor, lineWidth: borderWidth)
-        )
-        .clipShape(RoundedRectangle(cornerRadius: chromeCornerRadius, style: .continuous))
+        .background(chromeBackgroundColor)
     }
 }

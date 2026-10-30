@@ -41,7 +41,14 @@ static InterComposedLayout InterComposedSelectLayout(BOOL hasScreen,
     if (hasScreen && gridCount > 0) return InterComposedLayoutScreenShareFilmstrip;  // grid+share (preserved)
     if (hasScreen && hasPrimaryCamera) return InterComposedLayoutScreenSharePiP;      // [B4] new: host PiP during non-grid share
     if (hasScreen) return InterComposedLayoutScreenShareOnly;                         // share, no camera (preserved)
-    if (gridCount >= 3) return InterComposedLayoutGrid;
+    // [candidate-tool-share-tile] Engage the grid at >=2 to MATCH the coordinator's
+    // grid-routing threshold (InterRecordingLayoutLogic.useGrid == participantCount >= 2).
+    // Previously this was >=3 while the coordinator routed 2-person frames into grid
+    // storage, so a 2-person recording fell through to Idle (the stored grid frames were
+    // never drawn) and the candidate only appeared once a screen share flipped the layout
+    // to ScreenShareFilmstrip. A 2-person call now records as a 2x1 grid (InterGridDimensions
+    // maps count 2 → 2 cols x 1 row), and camera-off participants get a placeholder tile.
+    if (gridCount >= 2) return InterComposedLayoutGrid;
     if (hasPrimaryCamera && hasSecondaryCamera) return InterComposedLayoutCameraSideBySide;
     if (hasPrimaryCamera) return InterComposedLayoutCameraOnlyFull;
     return InterComposedLayoutIdle;

@@ -125,10 +125,21 @@ public final class CallControlBarViewModel: ObservableObject {
     /// Ephemeral "not available yet" feedback for the React menu item.
     @Published public var showReactComingSoon = false
 
-    // NOTE: No interview-tools control here. Tools are candidate-driven: the
-    // secure window selects and captures them (InterShareModeThisApp); the
-    // interviewer just receives the share track. Re-add only if interviewer
-    // remote tool control ships (DataChannel signal + candidate consent).
+    // MARK: - Interview tools (Code/Board) — interviewer-side control
+
+    // Interviewer tool control is added per the interviewer-collaborative-tools
+    // spec. The interviewer now mounts the native tool host and edits the same
+    // CRDT document as the candidate, so the normal-mode bar exposes a Code/Board
+    // segmented control. Visibility is gated (interview mode + interviewer role +
+    // server-signed tools entitlement) and defaults FAIL-CLOSED.
+
+    /// Gated visibility of the Code/Board control (interview mode + interviewer
+    /// role + `localParticipantHasToolsEntitlement`). Fail-closed default.
+    @Published public var interviewToolsVisible = false
+    /// Selected tool kind (`InterInterviewToolKind` raw): 0 None / 1 Code / 2 Board.
+    @Published public var selectedToolKind = 0
+    /// Peer-activity awareness dot on the Code/Board button (never auto-opens).
+    @Published public var toolBadgeActive = false
 
     // MARK: - Action callbacks (shell → AppDelegate handlers)
 
@@ -149,6 +160,11 @@ public final class CallControlBarViewModel: ObservableObject {
     public var onOpenLobby: (() -> Void)?
     public var onRename: (() -> Void)?
     public var onLeave: (() -> Void)?
+
+    /// Routes a Code/Board tool selection to the bridge handler (interviewer
+    /// tool control, interviewer-collaborative-tools spec). Carries the
+    /// `InterInterviewToolKind` raw value.
+    public var onSelectTool: ((Int) -> Void)?
 
     // Moderation actions (route to the existing AppDelegate selectors).
     public var onModerationWillOpen: (() -> Void)?     // pull fresh state
@@ -203,6 +219,13 @@ public final class CallControlBarViewModel: ObservableObject {
     public func selectAudioInput(_ id: String?) {
         selectedAudioInputID = id
         onSelectAudioInput?(id)
+    }
+
+    /// Selects a Code/Board interview tool: records the chosen
+    /// `InterInterviewToolKind` raw value and routes it to the bridge handler.
+    public func selectTool(_ kind: Int) {
+        selectedToolKind = kind
+        onSelectTool?(kind)
     }
 
     public func react() {

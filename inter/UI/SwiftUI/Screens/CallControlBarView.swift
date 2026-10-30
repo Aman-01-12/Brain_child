@@ -67,6 +67,22 @@ struct CallControlBarView: View {
                               active: viewModel.sharingActive,
                               enabled: viewModel.canShare,
                               action: { viewModel.onShare?() })
+                    if viewModel.interviewToolsVisible {
+                        // Interviewer-collaborative-tools: Code/Board controls.
+                        // Visible only when entitled (interview mode + interviewer
+                        // role + tools entitlement). The peer-activity dot is
+                        // awareness only — it NEVER auto-opens a tool.
+                        barButton(icon: "chevron.left.forward.slash.chevron.right",
+                                  label: "Code",
+                                  dot: viewModel.toolBadgeActive,
+                                  active: viewModel.selectedToolKind == 1,
+                                  action: { viewModel.selectTool(1) })
+                        barButton(icon: "pencil.and.outline",
+                                  label: "Board",
+                                  dot: viewModel.toolBadgeActive,
+                                  active: viewModel.selectedToolKind == 2,
+                                  action: { viewModel.selectTool(2) })
+                    }
                     participantsButton
                     barButton(icon: viewModel.handRaised ? "hand.raised.fill" : "hand.raised",
                               label: viewModel.handRaised ? "Lower Hand" : "Raise Hand",

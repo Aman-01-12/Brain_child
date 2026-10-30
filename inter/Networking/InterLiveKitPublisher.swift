@@ -350,9 +350,16 @@ import LiveKit
         enqueueScreenSharePublishCompletion(completion)
 
         let options = VideoPublishOptions(
-            screenShareEncoding: VideoEncoding(maxBitrate: 4_500_000, maxFps: 15),
+            // [candidate-tool-share-tile] The shared surface is a code editor / whiteboard —
+            // i.e. mostly static, fine-detail TEXT. Two encoder choices keep that text crisp:
+            //   • degradationPreference = .maintainResolution — under bandwidth/CPU pressure the
+            //     encoder drops FRAMES, never RESOLUTION (the default `.auto` downscales, which
+            //     smears small text into a blur). Resolution is what matters for readable code.
+            //   • a higher screen-share bitrate (8 Mbps) so 1080p text has the bits to stay sharp.
+            screenShareEncoding: VideoEncoding(maxBitrate: 8_000_000, maxFps: 15),
             simulcast: false,
-            preferredCodec: .h264
+            preferredCodec: .h264,
+            degradationPreference: .maintainResolution
         )
 
         Task {

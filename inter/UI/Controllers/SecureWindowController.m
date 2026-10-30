@@ -15,6 +15,7 @@
 #import "InterChatPanel.h"
 #import "InterRecordingIndicatorView.h"
 #import "InterFeatureGate.h"
+#import "AppDelegate.h"
 #import <objc/runtime.h>
 
 // [2.6] Swift module import for networking layer
@@ -112,9 +113,20 @@ static const CGFloat InterSecureBottomWorkspaceMargin = 100.0;
     // builds the shared document + controller, registers it on the room's
     // dispatcher, and configures the editor surface. Teardown is handled when the
     // host view deallocs (-[InterSecureToolsBridge invalidateHandlers]).
-    if (self.roomController) {
-        [self.toolHostView configureCollaborationWithRoomController:self.roomController];
-    }
+    // [candidate-tool-share-tile Phase 1] REVERSIBLE DISABLE — do NOT wire CRDT
+    // collaboration for the candidate tool surface. The new one-way model keeps
+    // the candidate code editor / whiteboard LOCAL (in-memory `text` mode): the
+    // surface is published only as a screen-share track on an explicit Share tap.
+    // Guarding this single call site is sufficient — it is the ONLY entry point
+    // that reaches `InterSecureToolsBridge.configureCollaboration` (and hence
+    // `CodeEditorViewModel.configure(document:controller:)` and the remote-cursor
+    // overlay population); the bridge's deterministic KVO re-invoke only arms
+    // *inside* `configureCollaborationWithRoomController:`, so not calling it here
+    // means `configure` is never invoked and `remoteCursors` stays empty (no
+    // overlay markers render). Phase 2 deletes this block and the CRDT path.
+    // if (self.roomController) {
+    //     [self.toolHostView configureCollaborationWithRoomController:self.roomController];
+    // }
 
     [self attachControlPanelInView:view];
     [self startLocalMediaFlow];
@@ -626,25 +638,32 @@ static const CGFloat InterSecureBottomWorkspaceMargin = 100.0;
     }
 }
 
-// Combined entitlement check for a collaborative interview tool (R9.2).
-// Both must hold:
-//   1. The server-signed `tools` flag in the LOCAL participant's JWT metadata
-//      (unforgeable, granted to both interviewer and candidate of a Hiring host's
-//      room — R7.2, R9.1, R9.5). Read only from our own participant, never a peer.
-//   2. The centralized client-side InterFeatureGate tier check (defense-in-depth,
-//      R7.5) against the LOCAL effective tier.
+// Entitlement check for a collaborative interview tool (R7.2, R9.1, R9.2).
+//
+// Tool availability is keyed on the ROOM CREATOR's tier, delivered as the
+// server-signed, unforgeable `tools` flag in the LOCAL participant's JWT
+// metadata (derived from the room's snapshotted hostTier — see token-server
+// `toolsEntitlement(hostTier)`). Whoever created the room defines tool
+// availability for EVERYONE in it: a candidate — even anonymous or on a lower
+// plan — is entitled exactly when the room's host tier grants it. This is the
+// design that also lets the tools later appear in NORMAL meetings, where the
+// `tools` flag distinguishes a pro-created from a hiring-created room.
+//
+// We therefore gate SOLELY on the server-signed flag (read only from our OWN
+// participant, never a peer — R9.5) and DO NOT additionally check the local
+// participant's own tier. The local tier is NOT the entitlement basis; checking
+// it wrongly blocked legitimate candidates (e.g. an anonymous candidate, whose
+// tier resolves to "free", in a hiring host's room). The JWT flag is the
+// security boundary — it is server-signed and cannot be forged by a patched
+// client (which could bypass any client-side tier check anyway). Per-tier
+// availability is enforced where the LOCAL tier genuinely IS the basis — a host
+// CREATING/hosting an interview — via InterFeatureGate at that call site.
 - (BOOL)isCollaborativeToolEntitled:(InterInterviewToolKind)toolKind {
     if (toolKind == InterInterviewToolKindNone) {
         return YES;  // clearing the tool is never gated
     }
 
-    BOOL serverEntitled = self.roomController.localParticipantHasToolsEntitlement;
-
-    NSString *tier = self.roomController.tokenService.effectiveTier ?: @"free";
-    BOOL tierAllows = [InterFeatureGate isFeature:[self featureForToolKind:toolKind]
-                                 availableForTier:tier];
-
-    return serverEntitled && tierAllows;
+    return self.roomController.localParticipantHasToolsEntitlement;
 }
 
 - (void)handleInterviewToolSelection:(InterInterviewToolKind)toolKind {

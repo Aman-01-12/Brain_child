@@ -2499,6 +2499,10 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
 
     [self attachNormalCallControlsInView:view];
 
+    // [candidate-tool-share-tile] One-way model: the interviewer never authors a tool, so the
+    // Code/Board control is always hidden.
+    [self.normalControlPanel setInterviewToolsVisible:NO];
+
     // [B1] Wire shared media wiring controller — properties that exist now
     self.normalMediaWiring.controlPanel = self.normalControlPanel;
     self.normalMediaWiring.remoteLayout = self.normalRemoteLayout;
@@ -2952,8 +2956,6 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
     [self pushModerationStateToBar];
 }
 
-/// Push the moderation controller's current state into the SwiftUI bar so the
-/// Moderation menu renders fresh labels (Mute All vs Unmute All, …). Called
 /// before the menu opens and after every menu action.
 - (void)pushModerationStateToBar {
     InterCallControlBarBridge *bar = self.normalControlPanel;

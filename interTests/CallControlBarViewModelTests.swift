@@ -8,6 +8,7 @@
 //
 
 import XCTest
+import Combine
 @testable import inter
 
 @MainActor
@@ -108,6 +109,75 @@ final class CallControlBarViewModelTests: XCTestCase {
         vm.lobbyVisible = true
         XCTAssertEqual(vm.moreBadgeCount, 0)
         XCTAssertNil(CallControlBarViewModel.badgeText(vm.moreBadgeCount))
+    }
+
+    // MARK: - Interview tools (Code/Board) — interviewer-side control
+    //
+    // Covers the CallControlBarViewModel additions from the
+    // interviewer-collaborative-tools spec (task 1.2). The control is gated and
+    // MUST default fail-closed; selecting a tool round-trips the raw kind and
+    // routes it to the bridge exactly once; visibility/badge are published.
+    // _Requirements: 2.6, 4.6_
+
+    func testInterviewToolsVisibleDefaultsFailClosed() {
+        let vm = CallControlBarViewModel()
+        XCTAssertFalse(vm.interviewToolsVisible,
+                       "Code/Board control is hidden until gated visible (fail-closed)")
+    }
+
+    func testSelectedToolKindDefaultsToNone() {
+        let vm = CallControlBarViewModel()
+        XCTAssertEqual(vm.selectedToolKind, 0, "default selection is None (InterInterviewToolKind raw 0)")
+    }
+
+    func testToolBadgeActiveDefaultsToFalse() {
+        let vm = CallControlBarViewModel()
+        XCTAssertFalse(vm.toolBadgeActive, "no peer-activity awareness dot by default")
+    }
+
+    func testSelectToolRoundTripsKindAndRoutesOnce() {
+        let vm = CallControlBarViewModel()
+        var routed: [Int] = []
+        vm.onSelectTool = { routed.append($0) }
+
+        vm.selectTool(1)   // Code
+
+        XCTAssertEqual(vm.selectedToolKind, 1, "selection records the passed raw kind (round-trip)")
+        XCTAssertEqual(routed, [1], "onSelectTool fires exactly once with the chosen raw kind (routing)")
+    }
+
+    func testSelectToolRoutesEachSelectionWithItsRawValue() {
+        let vm = CallControlBarViewModel()
+        var routed: [Int] = []
+        vm.onSelectTool = { routed.append($0) }
+
+        vm.selectTool(2)   // Board
+        vm.selectTool(0)   // None
+
+        XCTAssertEqual(vm.selectedToolKind, 0)
+        XCTAssertEqual(routed, [2, 0], "each selection routes the exact raw kind, in order")
+    }
+
+    func testInterviewToolsVisiblePublishesNewValue() {
+        let vm = CallControlBarViewModel()
+        var published: [Bool] = []
+        let cancellable = vm.$interviewToolsVisible.sink { published.append($0) }
+        defer { cancellable.cancel() }
+
+        vm.interviewToolsVisible = true
+
+        XCTAssertEqual(published, [false, true], "initial value then the published change")
+    }
+
+    func testToolBadgeActivePublishesNewValue() {
+        let vm = CallControlBarViewModel()
+        var published: [Bool] = []
+        let cancellable = vm.$toolBadgeActive.sink { published.append($0) }
+        defer { cancellable.cancel() }
+
+        vm.toolBadgeActive = true
+
+        XCTAssertEqual(published, [false, true], "badge state publishes the new value")
     }
 }
 

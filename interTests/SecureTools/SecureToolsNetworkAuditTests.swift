@@ -158,27 +158,31 @@ final class SecureToolsNetworkAuditTests: XCTestCase {
             "editor text must be retained verbatim on the in-memory @Published property (R11.4)"
         )
 
-        // Whiteboard: elements live in the in-memory StrokeModel.elements.
+        // Whiteboard: elements live in the in-memory BoardDocument, surfaced via
+        // the view model's `renderedElements`. With no collaborative controller
+        // installed the view model operates purely standalone — no networking.
         let whiteboard = WhiteboardViewModel()
-        XCTAssertTrue(whiteboard.model.elements.isEmpty, "a fresh whiteboard holds no elements")
+        XCTAssertTrue(whiteboard.renderedElements.isEmpty, "a fresh whiteboard holds no elements")
 
-        whiteboard.selectTool(.text)
-        whiteboard.placeText("solution sketch", at: CGPoint(x: 12, y: 12))
+        // Place a text element through the real creation path.
+        whiteboard.commitText("solution sketch", atWorld: CGPoint(x: 12, y: 12), editing: nil)
 
-        whiteboard.selectTool(.shape)
-        whiteboard.beginShapeDrag(at: CGPoint(x: 0, y: 0))
-        whiteboard.commitShapeDrag(at: CGPoint(x: 40, y: 40))
+        // Draw a rectangle through the pointer-gesture path.
+        whiteboard.selectTool(.rectangle)
+        whiteboard.pointerDown(atScreen: CGPoint(x: 0, y: 0), additive: false)
+        whiteboard.pointerDragged(toScreen: CGPoint(x: 40, y: 40))
+        whiteboard.pointerUp(atScreen: CGPoint(x: 40, y: 40))
 
         XCTAssertEqual(
-            whiteboard.model.elements.count, 2,
-            "added elements must live in the in-memory StrokeModel.elements (R11.4)"
+            whiteboard.renderedElements.count, 2,
+            "added elements must live in the in-memory BoardDocument (R11.4)"
         )
 
-        // The content is reachable only via the in-process model — clearing the
-        // model is the only thing that drops it (no external persistence).
+        // The content is reachable only via the in-process document — clearing
+        // is the only thing that drops it (no external persistence).
         whiteboard.clear()
         XCTAssertTrue(
-            whiteboard.model.elements.isEmpty,
+            whiteboard.renderedElements.isEmpty,
             "clearing drops the in-memory elements; content has no external persistence (R11.4)"
         )
     }

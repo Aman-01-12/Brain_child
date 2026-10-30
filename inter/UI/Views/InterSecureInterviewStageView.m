@@ -25,7 +25,24 @@ static const CGFloat InterSecureStageRailTileGap = 14.0;
 static const CGFloat InterSecureStageRailTileAspectRatio = 9.0 / 16.0;
 static const CFTimeInterval InterSecureStagePreviewUpdateInterval = 1.0 / 6.0;
 static NSString * const InterSecureStageScreenShareTileKey = @"__screenshare__";
-static NSString * const InterSecureStageToolPreviewKey = @"__tool__";
+
+/// [interviewer-collaborative-tools 10.1] Candidate-side filmstrip-swap parity (Requirement 6.2).
+///
+/// The candidate's read-only local-tool preview tile uses a reserved key (`"__tool__"`) that can
+/// never be a real participant identity. The candidate stage's own frame-ingest guard rejects any
+/// real participant identity equal to this key and keeps it out of the bespoke right-rail
+/// bookkeeping.
+///
+/// The candidate secure stage does NOT use the shared layout seam's stage+filmstrip tool-tile
+/// rendering. The candidate's `remoteLayoutManager` runs in `compactPreviewMode` (which
+/// short-circuits the layout manager's internal filmstrip) and the secure capture-host arbitration
+/// owns the center stage. The read-only spotlight/swap + rail-ordering BEHAVIOR is realized through
+/// this view's bespoke right rail + `centerContent` arbitration: the `"__tool__"` tile is a
+/// read-only preview card ordered in the rail, swappable into the center main stage by click, and
+/// never editable from the tile (editing stays driven by the candidate control surface).
+static NSString *InterSecureStageToolPreviewKey(void) {
+    return @"__tool__";
+}
 
 // [B6] Pure ingest gate: admit a frame only when at least `interval` seconds
 // have elapsed since the last accepted frame. Defined here (declared in the
@@ -239,6 +256,16 @@ typedef NS_ENUM(NSUInteger, InterSecureInterviewCenterContent) {
         return;
     }
 
+    // [interviewer-collaborative-tools 10.1] Reserved-key defense-in-depth (Requirement 6.2 parity
+    // with the shared seam's reserved-key guard): a real participant identity may NEVER collide with
+    // the reserved tool tile key. Drop any camera frame attributed to it so it can never enter the
+    // bespoke right-rail bookkeeping (`remoteCameraOrder` / preview caches) and be confused with the
+    // read-only `"__tool__"` tile. The `remoteLayoutManager` already rejects this identity on its own
+    // participant-add paths; this mirrors that guard on the candidate stage's frame-ingest path.
+    if ([participantId isEqualToString:InterSecureStageToolPreviewKey()]) {
+        return;
+    }
+
     // [B6] Source-side throttle: gate ingest on the decode thread BEFORE the
     // retain + main-queue hop so only ~6 fps per participant reach main, instead
     // of every ~30 fps decoded frame. The downstream renderer is throttled to
@@ -430,7 +457,7 @@ typedef NS_ENUM(NSUInteger, InterSecureInterviewCenterContent) {
 
     if (self.activeToolKind != InterInterviewToolKindNone && !toolOwnsCenter) {
         [self refreshToolPreview];
-        [railKeys addObject:InterSecureStageToolPreviewKey];
+        [railKeys addObject:InterSecureStageToolPreviewKey()];
     }
 
     for (NSString *tileKey in remoteKeys) {
@@ -486,7 +513,7 @@ typedef NS_ENUM(NSUInteger, InterSecureInterviewCenterContent) {
 }
 
 - (InterSecureInterviewPreviewCardView *)previewCardForRailItem:(NSString *)itemKey {
-    if ([itemKey isEqualToString:InterSecureStageToolPreviewKey]) {
+    if ([itemKey isEqualToString:InterSecureStageToolPreviewKey()]) {
         self.toolPreviewView.hidden = NO;
         self.toolPreviewView.selectedCard = NO;
         return self.toolPreviewView;

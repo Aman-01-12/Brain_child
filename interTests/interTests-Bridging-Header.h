@@ -24,3 +24,10 @@
 // `InterFeatureGate.isFeature(.collaborativeCodeEditor, availableForTier:)`.
 #import "../inter/Networking/InterFeatureGate.h"
 
+// interviewer-collaborative-tools (tasks 3.4/3.5/3.6): expose the call-mode /
+// interview-role enums so the entitlement-gate property tests can express the
+// interviewer-host gate (`InterCallMode.interview` ∧ `InterInterviewRole.interviewer`
+// ∧ tools entitlement) against the real ObjC types rather than re-declaring them.
+// Test-target-only — widens no production-public API.
+#import "../inter/App/AppDelegate.h"
+
