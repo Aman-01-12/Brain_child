@@ -5764,6 +5764,14 @@ if (require.main === module) {
     console.log(`[token-server] Running on http://localhost:${PORT}`);
     // NOTE: API key intentionally NOT logged — would persist in log aggregators
     console.log(`[token-server] Redis: ${process.env.REDIS_URL || 'redis://localhost:6379'}`);
+    // Log the RESOLVED LiveKit endpoints (URLs only — never the key/secret). These are
+    // what clients are handed and what the Room/Egress clients call, so a typo'd env var
+    // name silently falling back to localhost is visible here instead of at call time.
+    console.log(`[token-server] LiveKit WS (handed to clients): ${LIVEKIT_SERVER_URL}`);
+    console.log(`[token-server] LiveKit HTTP (server-side admin/egress): ${LIVEKIT_HTTP_URL}`);
+    if (!process.env.LIVEKIT_SERVER_URL || !process.env.LIVEKIT_HTTP_URL) {
+      console.warn('[token-server] WARNING: LIVEKIT_SERVER_URL / LIVEKIT_HTTP_URL not set in .env — using local dev defaults. Set both to your wss:// and https:// cloud URLs to use cloud LiveKit.');
+    }
     console.log(`[token-server] Endpoints: POST /room/create, /room/join, /token/refresh, /auth/register, /auth/login | GET /room/info/:code, /auth/me, /health`);
     markPhantomMeetingsFailed();
 

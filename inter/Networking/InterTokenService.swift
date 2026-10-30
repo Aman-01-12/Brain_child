@@ -1579,9 +1579,7 @@ private struct TokenCacheEntry {
     /// `POST /auth/oauth/exchange`. The response format matches login/register.
     @objc public func exchangeOAuthCode(_ code: String,
                                         completion: @escaping (Bool, NSError?) -> Void) {
-        let baseURL = authServerBaseURL
-            ?? UserDefaults.standard.string(forKey: "InterDefaultTokenServerURL")
-            ?? "http://localhost:3000"
+        let baseURL = authServerBaseURL ?? InterAppConfig.tokenServerURL
 
         var body: [String: Any] = ["code": code]
         if let hwUUID = getHardwareUUID() {

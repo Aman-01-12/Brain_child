@@ -354,11 +354,9 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
     // Otherwise, show the login window.
     if (self.roomController) {
         self.roomController.tokenService.authDelegate = self;
-        NSString *tokenServerURL = [[NSUserDefaults standardUserDefaults]
-            stringForKey:@"InterDefaultTokenServerURL"];
-        if (!tokenServerURL.length) {
-            tokenServerURL = @"http://localhost:3000";
-        }
+        // Single source of truth: env → UserDefaults override → Info.plist → localhost.
+        [InterAppConfig logResolvedEndpoints];
+        NSString *tokenServerURL = InterAppConfig.tokenServerURL;
         __weak typeof(self) weakSelf = self;
         [self.roomController.tokenService attemptSessionRestoreWithServerURL:tokenServerURL
                                                                   completion:^(InterSessionRestoreResult result) {
@@ -1474,11 +1472,7 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
     [panel setLoading:YES];
     [panel clearError];
 
-    NSString *tokenServerURL = [[NSUserDefaults standardUserDefaults]
-        stringForKey:@"InterDefaultTokenServerURL"];
-    if (!tokenServerURL.length) {
-        tokenServerURL = @"http://localhost:3000";
-    }
+    NSString *tokenServerURL = InterAppConfig.tokenServerURL;
 
     __weak typeof(self) weakSelf = self;
     [self.roomController.tokenService loginWithEmail:email
@@ -1512,11 +1506,7 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
     [panel setLoading:YES];
     [panel clearError];
 
-    NSString *tokenServerURL = [[NSUserDefaults standardUserDefaults]
-        stringForKey:@"InterDefaultTokenServerURL"];
-    if (!tokenServerURL.length) {
-        tokenServerURL = @"http://localhost:3000";
-    }
+    NSString *tokenServerURL = InterAppConfig.tokenServerURL;
 
     __weak typeof(self) weakSelf = self;
     [self.roomController.tokenService registerWithEmail:email
@@ -1551,11 +1541,7 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
     didRequestPasswordResetForEmail:(NSString *)email {
     [panel clearError];
 
-    NSString *tokenServerURL = [[NSUserDefaults standardUserDefaults]
-        stringForKey:@"InterDefaultTokenServerURL"];
-    if (!tokenServerURL.length) {
-        tokenServerURL = @"http://localhost:3000";
-    }
+    NSString *tokenServerURL = InterAppConfig.tokenServerURL;
 
     // No global loading state here — that drives the primary CTA's "Signing in…" label,
     // which would be misleading for a reset request. The info/error banner is the feedback.
@@ -6878,7 +6864,7 @@ static const NSTimeInterval kIdleTimeoutSeconds = 30 * 60; // 30 minutes
             return;
         }
 
-        NSString *baseURL = self.roomController.tokenService.serverURL ?: @"http://localhost:3000";
+        NSString *baseURL = self.roomController.tokenService.serverURL ?: InterAppConfig.tokenServerURL;
         [self.roomController.tokenService loginWithEmail:email
                                                 password:password
                                                serverURL:baseURL
@@ -7221,6 +7207,11 @@ static const NSTimeInterval kIdleTimeoutSeconds = 30 * 60; // 30 minutes
     }
     if (!baseURL.length) {
         baseURL = self.roomController.tokenService.serverURL;
+    }
+    if (!baseURL.length) {
+        // Explicit UserDefaults overrides only — deliberately NOT InterAppConfig.tokenServerURL,
+        // which always answers (Info.plist / localhost) and would break the fail-closed rule below.
+        baseURL = [defaults stringForKey:InterAppConfig.tokenServerURLOverrideKey];
     }
     if (!baseURL.length) {
         baseURL = [defaults stringForKey:@"InterDefaultTokenServerURL"];

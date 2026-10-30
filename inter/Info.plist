@@ -43,6 +43,24 @@
 	<string>ws://localhost:7880</string>
 	<key>InterTokenServerURL</key>
 	<string>http://localhost:3000</string>
+	<!-- App Transport Security: full ATS enforcement is KEPT for public hosts, so a
+	     cloud token server (https://) and cloud LiveKit (wss://) must still present a
+	     valid TLS 1.2+ certificate. NSAllowsLocalNetworking only exempts loopback,
+	     .local and private/link-local addresses, which is what LAN dev testing needs:
+	     the local livekit-server (ws://localhost:7880) and a token server reached at
+	     the host Mac's LAN IP (http://192.168.x.x:3000) from a second device.
+	     NSAllowsArbitraryLoads is deliberately NOT set — it would disable ATS for
+	     public hosts too. Remove this key once both endpoints are HTTPS/WSS. -->
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsLocalNetworking</key>
+		<true/>
+	</dict>
+	<!-- macOS 15 gates LAN access behind the Local Network privacy permission.
+	     Declaring this string gives the user a meaningful prompt when the app first
+	     contacts the token server on another machine during two-device testing. -->
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>Inter connects to a token server on your local network when testing calls across two devices.</string>
 	<key>NSScreenCaptureUsageDescription</key>
 	<string>Screen sharing captures this app's secure call surface.</string>
 	<key>NSCalendarsUsageDescription</key>
