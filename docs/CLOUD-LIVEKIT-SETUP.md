@@ -1,13 +1,34 @@
 # Cloud LiveKit + Two-Device Testing
 
-Two independent switches. You can flip either one alone.
+Three independent switches. You can flip any one alone.
 
 | Switch | What it changes | Where |
 |---|---|---|
 | **A. Cloud LiveKit** | Which media server carries audio/video | `token-server/.env` |
 | **B. Non-localhost token server** | Which backend the macOS app talks to | `defaults write` on each device |
+| **C. LAN-local LiveKit** | Keeps media on the local network instead of the internet | `token-server/.env` + `livekit-server` flags |
 
-For two-device testing you need **both**: cloud LiveKit (or a LAN-reachable local LiveKit) for media, and B so the second device can reach the backend at all.
+For two-device testing you always need **B** (otherwise the second device cannot reach the backend at all), plus **either A or C** for media.
+
+## Which one do I want?
+
+**Are both devices on the same network** — same Wi-Fi, or both on one phone hotspot?
+
+- **Yes → use C (LAN-local LiveKit) + B.** Media stays on the local network: no internet round trip, lower latency, and **no mobile data burned on video** if that network is a phone hotspot. Cloud LiveKit is not needed and is actively worse here (see the warning in section C).
+- **No**, the devices are on different networks → **use A (cloud LiveKit) + B.** Also consider a tunnel for the token server (section B, "Tunnelling instead of a LAN IP"), since the second device cannot reach a private LAN address either.
+- **Same network, but the second device cannot reach the host** (`curl` to the host's LAN IP times out) → the network has **client isolation**. Many guest and public networks enforce this. Fall back to **A + a tunnel**, because a LAN-local LiveKit would be unreachable for the same reason.
+
+The 30-second test that decides it, once both devices are on the network:
+
+```sh
+# host Mac
+cd token-server && node index.js
+
+# second device
+curl http://<HOST_IP>:3000/health
+```
+
+Healthy JSON → go with C. Hang or `Connection refused` → client isolation (or firewall / wrong IP), so re-check those first, then fall back to A + tunnel.
 
 ---
 
@@ -99,6 +120,120 @@ The host Mac must accept inbound connections on port 3000. If **System Settings 
 
 On first LAN connection, macOS 15 asks the second device's app for **Local Network** access. Allow it. If the prompt was dismissed, re-enable under **System Settings → Privacy & Security → Local Network**. Without it, LAN requests fail even though the URL is correct.
 
+### Tunnelling instead of a LAN IP
+
+If the two devices are on different networks, or the shared network enforces client
+isolation, expose the token server through a tunnel and use the public URL as the
+override. `ngrok` is already installed:
+
+```sh
+# host Mac
+ngrok http 3000          # prints e.g. https://abc123.ngrok-free.app
+
+# second device
+defaults write Secure.inter InterTokenServerURLOverride "https://abc123.ngrok-free.app"
+```
+
+This needs no server change: there is no CORS or Host-header validation that would
+reject the tunnel hostname, and `SERVER_BASE_URL` is only used to build OAuth callback
+URLs (irrelevant unless you are demoing OAuth sign-in). Certificate pinning is not a
+problem either — `pinnedSPKIHashes` is empty, so the client uses default system trust
+and the tunnel's valid certificate is accepted.
+
+A tunnel has one genuine advantage over a LAN IP: it is **HTTPS**, so bearer tokens are
+not sent in cleartext.
+
+Two caveats:
+
+- **The free ngrok URL changes on every restart**, so the `defaults write` has to be
+  redone each session.
+- **`trust proxy` is not set** on the Express app, so behind a tunnel every request
+  appears to originate from the same address and IP-keyed rate limits are shared rather
+  than per-client. Harmless for a two-person demo; worth knowing if you script
+  many requests.
+
+A tunnel only covers the token server. Media still needs A or C.
+
+---
+
+## C. Keep LiveKit local on the LAN
+
+Use this when **both devices share one network** (including one phone hotspot). Media
+never leaves the local network.
+
+> **Why not cloud LiveKit on a phone hotspot?**
+> Every stream would travel Mac → mobile data → cloud SFU → mobile data → Mac. With two
+> participants each publishing and subscribing, that is roughly four video streams over
+> the hotspot. A short call can consume hundreds of megabytes, and the added latency and
+> constrained uplink visibly degrade quality. Keeping LiveKit on the LAN avoids all of it.
+
+### The problem with the default dev command
+
+`livekit-server --dev` binds **loopback only**, which you can see in its own startup log:
+
+```
+"bindAddresses": ["127.0.0.1", "::1"]
+```
+
+So the second device cannot reach it, no matter what URL it is given. Two flags fix that:
+
+```sh
+HOST_IP=$(ipconfig getifaddr en0)
+
+livekit-server --dev --bind 0.0.0.0 --node-ip "$HOST_IP"
+```
+
+- `--bind 0.0.0.0` listens on every interface instead of just loopback.
+- `--node-ip "$HOST_IP"` is the one people miss. LiveKit advertises a node address to
+  clients for the WebRTC connection; without this it can advertise `127.0.0.1`, and
+  **signalling succeeds while media silently fails** — participants connect but see no
+  video. Set it explicitly.
+
+### Point the token server at it
+
+In **`token-server/.env`**, use the host's LAN IP rather than `localhost`, then restart:
+
+```sh
+LIVEKIT_API_KEY=devkey
+LIVEKIT_API_SECRET=secret
+LIVEKIT_SERVER_URL=ws://<HOST_IP>:7880
+LIVEKIT_HTTP_URL=http://<HOST_IP>:7880
+```
+
+Confirm the startup lines show the LAN IP, not localhost:
+
+```
+[token-server] LiveKit WS (handed to clients): ws://<HOST_IP>:7880
+[token-server] LiveKit HTTP (server-side admin/egress): http://<HOST_IP>:7880
+```
+
+This works for the same reason cloud LiveKit does: the client connects to whatever
+`serverURL` the token server hands it.
+
+### Firewall
+
+The host Mac needs inbound access for **both** processes — `node` (port 3000) and
+`livekit-server` (7880 TCP, 7881 TCP, 7882+ UDP). macOS prompts on first bind; approve
+both. A denied `livekit-server` prompt is another cause of "connects but no video".
+WebRTC needs the **UDP** range, so do not open only the TCP ports.
+
+### Phone-hotspot specifics
+
+- iPhone Personal Hotspot hands out addresses in `172.20.10.x` and does permit
+  device-to-device traffic. Android varies by vendor — run the reachability test above.
+- **The host IP changes whenever the hotspot reconnects**, so `token-server/.env`
+  (`LIVEKIT_*`) and the second device's `defaults write` both need updating each
+  session. Deriving `HOST_IP` with `ipconfig getifaddr en0` rather than hardcoding it
+  keeps this to a copy-paste.
+- If re-pasting addresses every session becomes tedious, a mesh VPN such as Tailscale
+  gives each machine a stable address — at the cost of installing another tool.
+
+### Switching back to single-machine local dev
+
+Restore `ws://localhost:7880` / `http://localhost:7880` in `.env`, run plain
+`livekit-server --dev`, and `defaults delete Secure.inter InterTokenServerURLOverride`
+on the second device.
+
 ---
 
 ## Verification checklist
@@ -124,14 +259,18 @@ Run in order. Do not move on from a failing step.
    defaults read Secure.inter InterTokenServerURLOverride
    ```
 
-5. **App:** confirm the startup `Config: tokenServer=…` line shows the LAN IP, sign in on both devices, host a call on one, join by room code from the other. Audio and video both ways means the cloud media path works.
+5. **App:** confirm the startup `Config: tokenServer=…` line shows the LAN IP (or tunnel URL), sign in on both devices, host a call on one, join by room code from the other. Audio and video flowing both ways means the media path works.
+
+   If participants **join successfully but no video appears**, the signalling path is
+   fine and the media path is not. On topology C that is almost always either a missing
+   `--node-ip` or a blocked `livekit-server` firewall prompt (UDP 7882+) — see section C.
 
 ---
 
 ## Things that stay the same
 
-- **Cloud LiveKit replaces only the media layer.** Postgres, Redis and the token server still run on the host Mac, and the token server must stay running there — both devices call it for auth, room codes, tokens, chat, moderation, scheduling and recording.
-- **`livekit-server --dev` is no longer needed** once `LIVEKIT_SERVER_URL` points at the cloud. You can stop it. (Keep running it if you switch back to local URLs.)
+- **Changing the media layer changes only the media layer.** Whichever of A or C you pick, Postgres, Redis and the token server still run on the host Mac and must stay running there — both devices call the token server for auth, room codes, tokens, chat, moderation, scheduling and recording. Neither switch moves the backend.
+- **`livekit-server` is only needed for C.** Once `LIVEKIT_SERVER_URL` points at the cloud (A) you can stop it. For C it must keep running, with the `--bind` / `--node-ip` flags.
 - **Going back to local:** restore the local values in `token-server/.env`, restart, start `livekit-server --dev`.
 
 ---
