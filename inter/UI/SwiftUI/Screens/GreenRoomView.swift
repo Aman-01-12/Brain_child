@@ -405,9 +405,55 @@ struct GreenRoomView: View {
             }
 
         case .hostInterview:
-            Text("Interview session — configured on connect.")
-                .font(InterFont.swiftUI(InterFont.Size.dense11))
-                .foregroundColor(Color(nsColor: NSColor(hex: 0x737373)))
+            VStack(alignment: .leading, spacing: InterSpacing.x2) {
+                Text("Interview session — configured on connect.")
+                    .font(InterFont.swiftUI(InterFont.Size.dense11))
+                    .foregroundColor(Color(nsColor: NSColor(hex: 0x737373)))
+                presenceSection
+            }
+        }
+    }
+
+    /// PRESENCE MONITORING (provisional, server flag default OFF). Interviewer-only
+    /// and UX only — the server decides, and forces monitoring off for an
+    /// EU-resident or under-18 candidate regardless of these toggles.
+    @ViewBuilder private var presenceSection: some View {
+        if viewModel.showsPresenceControls {
+            VStack(alignment: .leading, spacing: InterSpacing.x2) {
+                Toggle(isOn: $viewModel.presenceMonitoring) {
+                    Text("Record presence events")
+                        .font(InterFont.swiftUI(InterFont.Size.caption))
+                        .foregroundColor(Color(nsColor: NSColor(hex: 0xD4D4D4)))
+                }
+                .toggleStyle(.checkbox)
+                .handCursor()
+
+                if viewModel.presenceMonitoring {
+                    Toggle(isOn: $viewModel.candidateRegionEU) {
+                        Text("Candidate is in the EU")
+                            .font(InterFont.swiftUI(InterFont.Size.dense11))
+                            .foregroundColor(Color(nsColor: NSColor(hex: 0xA3A3A3)))
+                    }
+                    .toggleStyle(.checkbox)
+                    .handCursor()
+
+                    Toggle(isOn: $viewModel.candidateUnder18) {
+                        Text("Candidate is under 18")
+                            .font(InterFont.swiftUI(InterFont.Size.dense11))
+                            .foregroundColor(Color(nsColor: NSColor(hex: 0xA3A3A3)))
+                    }
+                    .toggleStyle(.checkbox)
+                    .handCursor()
+                }
+
+                Text(viewModel.presenceCaption)
+                    .font(InterFont.swiftUI(InterFont.Size.dense10))
+                    .foregroundColor(Color(nsColor: NSColor(hex: 0x737373)))
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(InterSpacing.x3)
+            .background(RoundedRectangle(cornerRadius: InterRadius.lg, style: .continuous)
+                .fill(.white.opacity(0.04)))
         }
     }
 

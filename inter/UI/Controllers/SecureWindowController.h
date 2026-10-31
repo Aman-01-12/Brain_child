@@ -33,6 +33,16 @@ NS_ASSUME_NONNULL_BEGIN
 /// the window exists (the desired state is applied when the window is created).
 - (void)setRecordingIndicatorActive:(BOOL)active;
 
+/// PRESENCE MONITORING (provisional, server flag default OFF).
+/// Drive the persistent, non-dismissible presence chip in the candidate's
+/// chrome: 0 absent (no chip), 1 monitoring on, 2 monitoring off,
+/// 3 paused because the camera is off. Safe to call before the window exists —
+/// the desired state is stored and applied when the chrome is attached, exactly
+/// like -setRecordingIndicatorActive:. The presence coordinator (Phase 1) is the
+/// only writer. Delete this declaration and its implementation to remove the
+/// indicator. See .agents/tasks/presence-monitoring/REMOVAL.md.
+- (void)setPresenceMonitoringState:(NSInteger)state;
+
 /// Immediately hide the secure window without tearing down room/media objects.
 - (void)hideSecureWindow;
 

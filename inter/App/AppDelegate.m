@@ -203,6 +203,25 @@
 /// IDs of upcoming meetings the signed-in user HOSTS (from the last schedule
 /// fetch). Decides the green room's CTA: Start Meeting vs Join Now.
 @property (nonatomic, copy, nullable) NSSet<NSString *> *hostedScheduledMeetingIds;
+// PRESENCE MONITORING (provisional, server flag default OFF).
+// The candidate's consent window (which replaces the NSAlert only for a room the
+// server armed) and the interviewer's 15 s timeline poll. Delete these with the
+// rest of the feature. See .agents/tasks/presence-monitoring/REMOVAL.md.
+@property (nonatomic, strong, nullable) NSWindow *presenceConsentWindow;
+@property (nonatomic, strong, nullable) InterPresenceConsentHostView *presenceConsentHost;
+/// Interviewer-side poll of GET /presence/timeline. NOT Socket.IO and NOT the
+/// LiveKit DataChannel — research memo §7.6 forbids this data on either, and a
+/// push channel could not make the chip fresher than the client's own 15 s batch.
+@property (nonatomic, strong, nullable) NSTimer *presencePollTimer;
+/// The candidate identity the interviewer is reading, resolved from the roster.
+@property (nonatomic, copy, nullable) NSString *presenceCandidateIdentity;
+/// Latches YES once a recording has run in this session, so the timeline's Jump
+/// control is enabled only when there is genuinely something to jump into.
+@property (nonatomic, assign) BOOL presenceRecordingSeen;
+/// The interviewer's green-room choices, consumed once by connectAndEnterMode.
+@property (nonatomic, assign) BOOL pendingPresenceMonitoring;
+@property (nonatomic, assign) BOOL pendingCandidateRegionEU;
+@property (nonatomic, assign) BOOL pendingCandidateUnder18;
 
 @end
 
@@ -343,6 +362,14 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
             if (!gateSelf) { decide(YES); return; }
             BOOL intervieweeJoiningInterview = [roomType isEqualToString:@"interview"] && !isHost;
             if (!intervieweeJoiningInterview) { decide(YES); return; }
+            // PRESENCE MONITORING (provisional, server flag default OFF). When the flag is
+            // off the server omits the presence block from /room/join, so this is NO and the
+            // legacy path below runs byte-for-byte unchanged. Delete this `if` to remove the
+            // feature from the join flow. See .agents/tasks/presence-monitoring/REMOVAL.md.
+            if (gateSelf.roomController.activePresenceMonitoringArmed) {
+                [gateSelf showPresenceConsentWithCompletion:decide];
+                return;
+            }
             [gateSelf showIntervieweeConfirmationWithCompletion:^(BOOL accepted) {
                 decide(accepted);
             }];
@@ -784,6 +811,17 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
             [weakSelf requestExitCurrentMode];
         };
         [self.secureController createSecureWindow];
+        // PRESENCE MONITORING (provisional, server flag default OFF). ONE guarded
+        // call site for the candidate side: record the decision with the server and
+        // put the persistent chip in the chrome. Both join paths (room code and
+        // scheduled) and the lobby-admitted path converge here, which is why the
+        // guard lives in enterMode rather than being duplicated per routing branch.
+        // With the flag off `activePresenceMonitoringArmed` is false, nothing runs,
+        // and the chip never renders. Delete this block to remove the candidate side.
+        // See .agents/tasks/presence-monitoring/REMOVAL.md.
+        if (self.roomController.activePresenceMonitoringArmed) {
+            [self startCandidatePresenceSurface];
+        }
         [self.sessionCoordinator markActive];
         return;
     }
@@ -792,6 +830,17 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
     [self stopScreenMonitoring];
     [self launchNormalCallWindow];
     [self startLobbyPollingIfHost];
+    // PRESENCE MONITORING (provisional, server flag default OFF). ONE guarded call
+    // site for the interviewer side: the live chip plus the 15 s timeline poll.
+    // `activePresenceMonitoringArmed` is the SERVER's answer on both interviewer
+    // paths — /room/create echoes it for the creating host, /room/join for a
+    // rejoining one — so with the flag off it is false, nothing starts and no
+    // poll runs. Delete this block to remove the interviewer side.
+    if (mode == InterCallModeInterview
+        && role == InterInterviewRoleInterviewer
+        && self.roomController.activePresenceMonitoringArmed) {
+        [self startInterviewerPresenceSurface];
+    }
     [self.sessionCoordinator markActive];
 }
 
@@ -1909,6 +1958,17 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
     self.greenRoomWantsCamOff = !host.camOnChoice;
     self.pendingDisplayNameOverride = host.displayNameValue;
 
+    // PRESENCE MONITORING (provisional, server flag default OFF). Read the
+    // interviewer's request and the two policy declarations off the green room.
+    // Consumed in -connectAndEnterMode:role:panel: and cleared on cancel. UX only
+    // — the server re-derives arming and forces it off for an EU-resident or
+    // under-18 candidate. Delete these three lines with the rest of the feature.
+    if (role == InterGreenRoomRoleHostInterview) {
+        self.pendingPresenceMonitoring = host.presenceMonitoringChoice;
+        self.pendingCandidateRegionEU  = host.candidateRegionEUChoice;
+        self.pendingCandidateUnder18   = host.candidateUnder18Choice;
+    }
+
     if (role == InterGreenRoomRoleHostCreate) {
         // Per-meeting fields edited in the green room are authoritative.
         InterPreMeetingSettings *settings =
@@ -1965,6 +2025,11 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
     self.greenRoomWantsMicOff = NO;
     self.greenRoomWantsCamOff = NO;
     self.pendingDisplayNameOverride = nil;
+    // PRESENCE MONITORING (provisional). Backing out of the green room clears the
+    // request, so it can never leak into a later, different connect.
+    self.pendingPresenceMonitoring = NO;
+    self.pendingCandidateRegionEU = NO;
+    self.pendingCandidateUnder18 = NO;
 }
 
 - (void)closeGreenRoomWindow {
@@ -2045,6 +2110,18 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
         config.lobbyEnabled       = preMeetingSettings.lobbyEnabled;
         config.meetingPassword    = preMeetingSettings.meetingPassword ?: @"";
     }
+
+    // PRESENCE MONITORING (provisional, server flag default OFF). The interviewer's
+    // green-room request, sent with /room/create. The server ignores all three
+    // unless the master flag is on and this is an interview room its host tier
+    // allows, and forces monitoring off for an EU-resident or under-18 candidate.
+    // Delete this block to stop requesting monitoring at room creation.
+    config.presenceMonitoring = self.pendingPresenceMonitoring;
+    config.candidateRegionEU  = self.pendingCandidateRegionEU;
+    config.candidateUnder18   = self.pendingCandidateUnder18;
+    self.pendingPresenceMonitoring = NO;
+    self.pendingCandidateRegionEU  = NO;
+    self.pendingCandidateUnder18   = NO;
 
     __weak typeof(self) weakSelf = self;
     [rc connectWithConfiguration:config completion:^(NSError * _Nullable error) {
@@ -2368,6 +2445,348 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
     NSModalResponse response = [alert runModal];
     BOOL accepted = (response == NSAlertFirstButtonReturn);
     completion(accepted);
+}
+
+// PRESENCE MONITORING (provisional, server flag default OFF).
+//
+// The consent screen that replaces the NSAlert above — ONLY when the server
+// armed this room. -showIntervieweeConfirmationWithCompletion: is deliberately
+// left untouched and remains the live path for every unarmed interview.
+//
+// BOTH join buttons decide(YES): monitoring-off is a real alternative, not a
+// refusal, and the interviewer is told monitoring is off. Only "Cancel and
+// leave" decides NO, which routes into the existing, unchanged handleConsentDeclined
+// slot-release path and its benign .consentDeclined (1020) handling. No new
+// InterNetworkErrorCode is added and isExpectedJoinRejection is untouched.
+//
+// Delete this method and the one `if` in the consent gate to remove the screen.
+// See .agents/tasks/presence-monitoring/REMOVAL.md.
+- (void)showPresenceConsentWithCompletion:(void (^)(BOOL accepted))completion {
+    InterRoomController *rc = self.roomController;
+    NSInteger mode = [InterPresenceConsentHostView presentableModeWithArmed:rc.activePresenceMonitoringArmed
+                                                                  regionEU:rc.activePresenceRegionEU
+                                                                  under18:rc.activePresenceUnder18];
+    if (mode == 0) {
+        // Not armed after all — fall back to the untouched legacy path rather
+        // than inventing a screen. Defensive: the gate already checked.
+        [self showIntervieweeConfirmationWithCompletion:completion];
+        return;
+    }
+
+    static const CGFloat kW = 640.0, kH = 680.0;
+    InterPresenceConsentHostView *host =
+        [[InterPresenceConsentHostView alloc] initWithFrame:NSMakeRect(0, 0, kW, kH)
+                                                       mode:mode
+                                              retentionDays:rc.activePresenceRetentionDays
+                                              rightsContact:rc.activePresenceRightsContact ?: @""
+                                      externalDisplayPolicy:InterShouldEnforceInterviewExternalDisplayPolicy()];
+
+    NSWindow *win = [[NSWindow alloc]
+        initWithContentRect:NSMakeRect(0, 0, kW, kH)
+                  styleMask:NSWindowStyleMaskTitled
+                    backing:NSBackingStoreBuffered
+                      defer:NO];
+    win.title = @"Joining an interview session";
+    win.releasedWhenClosed = NO;
+    [win setAppearance:[NSAppearance appearanceNamed:NSAppearanceNameDarkAqua]];
+    // Every protected window reads the policy from one place — never hardcode
+    // NSWindowSharingNone.
+    [win setSharingType:InterWindowSharingType()];
+    win.contentView = host;
+    [win center];
+
+    self.presenceConsentHost = host;
+    self.presenceConsentWindow = win;
+
+    __weak typeof(self) weakSelf = self;
+    host.onDecision = ^(NSInteger decision) {
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf) { completion(decision != 0); return; }
+        [strongSelf closePresenceConsentWindow];
+        // 0 cancel · 1 join monitored · 2 join with monitoring off.
+        BOOL granted = (decision == 1);
+        NSString *state = (decision == 0) ? @"pending" : (granted ? @"granted" : @"declined");
+        [strongSelf.roomController recordPresenceConsentWithGranted:granted state:state];
+        completion(decision != 0);
+    };
+
+    [win makeKeyAndOrderFront:nil];
+}
+
+- (void)closePresenceConsentWindow {
+    [self.presenceConsentHost invalidateHandlers];
+    [self.presenceConsentWindow orderOut:nil];
+    self.presenceConsentWindow = nil;
+    self.presenceConsentHost = nil;
+}
+
+#pragma mark - Presence monitoring surfaces (provisional)
+
+// PRESENCE MONITORING (provisional, server flag default OFF).
+// Everything below is reached from exactly two guarded sites in -enterMode: and
+// is torn down in -stopPresenceSurfaces. Delete this whole section with the rest
+// of the feature. See .agents/tasks/presence-monitoring/REMOVAL.md.
+
+/// Candidate side: record the decision with the server and show the persistent chip.
+- (void)startCandidatePresenceSurface {
+    InterRoomController *rc = self.roomController;
+    if (!rc) return;
+    BOOL granted = rc.activePresenceMonitoringGranted;
+    // The chip is up before the network call returns — the candidate must never
+    // be inside a monitored session with no indicator, even for a moment.
+    [self.secureController setPresenceMonitoringState:(granted ? 1 : 2)];
+
+    NSString *serverURL = rc.tokenServerURL;
+    NSString *roomCode  = rc.roomCode;
+    NSString *identity  = rc.localParticipantIdentity;
+    if (serverURL.length == 0 || roomCode.length == 0 || identity.length == 0) return;
+
+    __weak typeof(self) weakSelf = self;
+    [rc.tokenService submitPresenceConsentWithServerURL:serverURL
+                                               roomCode:roomCode
+                                               identity:identity
+                                                granted:granted
+                                             completion:^(BOOL monitoringEnabled,
+                                                          NSString *consentState,
+                                                          NSError *error) {
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf) return;
+        if (error) {
+            // Fail honest, not optimistic: if the server did not confirm, say the
+            // monitoring is off rather than leaving a possibly-false "on" up.
+            NSLog(@"[Presence] Consent POST failed: %@", error.localizedDescription);
+            [strongSelf.secureController setPresenceMonitoringState:2];
+            return;
+        }
+        // The server is authoritative about whether the session is monitored.
+        [strongSelf.roomController recordPresenceConsentWithGranted:monitoringEnabled
+                                                             state:consentState];
+        [strongSelf.secureController setPresenceMonitoringState:(monitoringEnabled ? 1 : 2)];
+    }];
+}
+
+/// Interviewer side: the quiet chip, the evaluation panel's handlers and the 15 s poll.
+- (void)startInterviewerPresenceSurface {
+    InterCallControlBarBridge *bar = self.normalControlPanel;
+    if (!bar) return;
+
+    [bar setPresenceAvailable:YES];
+    // Nothing is claimed until the server's timeline answers.
+    [bar setPresenceMonitoringEnabled:NO];
+    [bar setPresenceLiveEventType:nil];
+    [bar setPresenceRecordingAvailable:NO];
+
+    __weak typeof(self) weakSelf = self;
+    bar.presenceTimelineRefreshHandler = ^{
+        [weakSelf pollPresenceTimeline];
+    };
+    bar.presenceJumpToHandler = ^(double offsetSeconds) {
+        [weakSelf handlePresenceJumpToOffset:offsetSeconds];
+    };
+    bar.presenceNoteHandler = ^(NSString *eventId, NSString *note) {
+        [weakSelf submitPresenceNoteForEventId:eventId text:note];
+    };
+    bar.presenceCopyJSONHandler = ^{
+        [weakSelf copyPresenceExport];
+    };
+    bar.presenceSaveCSVHandler = ^(NSString *destinationPath) {
+        [weakSelf savePresenceExportCSVToPath:destinationPath];
+    };
+
+    [self.presencePollTimer invalidate];
+    self.presencePollTimer =
+        [NSTimer scheduledTimerWithTimeInterval:15.0
+                                        repeats:YES
+                                          block:^(NSTimer * _Nonnull timer) {
+        [weakSelf pollPresenceTimeline];
+    }];
+    [self pollPresenceTimeline];
+}
+
+/// Invalidate the poll and drop the handlers. Called on every mode exit.
+- (void)stopPresenceSurfaces {
+    [self.presencePollTimer invalidate];
+    self.presencePollTimer = nil;
+    self.presenceCandidateIdentity = nil;
+    self.presenceRecordingSeen = NO;
+    [self.normalControlPanel invalidatePresenceHandlers];
+    [self closePresenceConsentWindow];
+}
+
+/// The candidate is the one remote participant in an interview room. Resolved
+/// from the roster each tick, because the interviewer may well be in the room first.
+- (nullable NSString *)resolvePresenceCandidateIdentity {
+    if (self.presenceCandidateIdentity.length > 0) return self.presenceCandidateIdentity;
+    for (NSDictionary<NSString *, NSString *> *p in [self.roomController remoteParticipantList]) {
+        NSString *identity = p[@"identity"];
+        if (identity.length > 0) {
+            self.presenceCandidateIdentity = identity;
+            return identity;
+        }
+    }
+    return nil;
+}
+
+- (void)pollPresenceTimeline {
+    InterRoomController *rc = self.roomController;
+    InterCallControlBarBridge *bar = self.normalControlPanel;
+    if (!rc || !bar) return;
+
+    if (self.normalRecordingCoordinator.state == InterRecordingStateRecording ||
+        self.normalRecordingCoordinator.state == InterRecordingStatePaused) {
+        self.presenceRecordingSeen = YES;
+    }
+    [bar setPresenceRecordingAvailable:self.presenceRecordingSeen];
+
+    NSString *serverURL = rc.tokenServerURL;
+    NSString *roomCode  = rc.roomCode;
+    NSString *caller    = rc.localParticipantIdentity;
+    NSString *candidate = [self resolvePresenceCandidateIdentity];
+    if (serverURL.length == 0 || roomCode.length == 0 || caller.length == 0 || candidate.length == 0) {
+        return; // Nothing to read yet — the next tick tries again.
+    }
+
+    __weak typeof(self) weakSelf = self;
+    [rc.tokenService fetchPresenceTimelineWithServerURL:serverURL
+                                               roomCode:roomCode
+                                               identity:candidate
+                                         callerIdentity:caller
+                                             completion:^(NSDictionary<NSString *,id> *timeline,
+                                                          NSError *error) {
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf) return;
+        InterCallControlBarBridge *innerBar = strongSelf.normalControlPanel;
+        if (!innerBar) return;
+        if (error || !timeline) {
+            // Say so rather than render an empty list, which would read as
+            // "nothing happened".
+            [innerBar setPresenceStatusText:@"Could not read the presence timeline."];
+            return;
+        }
+        [innerBar applyPresenceTimeline:timeline];
+        BOOL monitoringEnabled = [timeline[@"monitoringEnabled"] boolValue];
+        [innerBar setPresenceMonitoringEnabled:monitoringEnabled];
+        [innerBar setPresenceLiveEventType:[strongSelf openLiveEventTypeIn:timeline]];
+    }];
+}
+
+/// The live chip shows an ONGOING condition only: the most recent event the
+/// server marked live-surfaceable that has not closed yet. A finished event is
+/// history and belongs in the timeline, not on the chip.
+- (nullable NSString *)openLiveEventTypeIn:(NSDictionary<NSString *, id> *)timeline {
+    NSArray *events = timeline[@"events"];
+    if (![events isKindOfClass:[NSArray class]]) return nil;
+    NSString *openType = nil;
+    for (id raw in events) {
+        if (![raw isKindOfClass:[NSDictionary class]]) continue;
+        NSDictionary *event = (NSDictionary *)raw;
+        if (![event[@"liveSurfaceable"] boolValue]) continue;
+        id endedAt = event[@"endedAt"];
+        BOOL stillOpen = (endedAt == nil || endedAt == (id)[NSNull null]);
+        if (stillOpen) {
+            NSString *type = event[@"eventType"];
+            if ([type isKindOfClass:[NSString class]]) openType = type;
+        }
+    }
+    return openType;
+}
+
+/// Jump-to-timestamp routes to the existing recordings surface with the offset.
+/// Building an in-timeline player is out of scope for Phase 0, and the control is
+/// disabled (not hidden) with an honest caption when no recording exists.
+- (void)handlePresenceJumpToOffset:(double)offsetSeconds {
+    if (!self.presenceRecordingSeen) return;
+    NSLog(@"[Presence] Jump requested at +%.0f s — opening recordings", offsetSeconds);
+    [self toggleNormalRecordingListPanel];
+}
+
+- (void)submitPresenceNoteForEventId:(NSString *)eventId text:(NSString *)note {
+    InterRoomController *rc = self.roomController;
+    NSString *candidate = [self resolvePresenceCandidateIdentity];
+    NSString *serverURL = rc.tokenServerURL;
+    NSString *roomCode  = rc.roomCode;
+    NSString *caller    = rc.localParticipantIdentity;
+    if (serverURL.length == 0 || roomCode.length == 0 || caller.length == 0 || candidate.length == 0) return;
+
+    __weak typeof(self) weakSelf = self;
+    // Note text is never logged.
+    [rc.tokenService submitPresenceNoteWithServerURL:serverURL
+                                            roomCode:roomCode
+                                            identity:candidate
+                                      callerIdentity:caller
+                                             eventId:[eventId integerValue]
+                                                note:note
+                                          completion:^(BOOL success, NSError *error) {
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf) return;
+        if (!success) {
+            [strongSelf.normalControlPanel setPresenceStatusText:
+                error.localizedDescription ?: @"Could not save the note."];
+            return;
+        }
+        [strongSelf.normalControlPanel setPresenceStatusText:@""];
+        [strongSelf pollPresenceTimeline];
+    }];
+}
+
+- (void)copyPresenceExport {
+    InterRoomController *rc = self.roomController;
+    NSString *candidate = [self resolvePresenceCandidateIdentity];
+    NSString *serverURL = rc.tokenServerURL;
+    NSString *roomCode  = rc.roomCode;
+    NSString *caller    = rc.localParticipantIdentity;
+    if (serverURL.length == 0 || roomCode.length == 0 || caller.length == 0 || candidate.length == 0) return;
+
+    __weak typeof(self) weakSelf = self;
+    [rc.tokenService fetchPresenceExportWithServerURL:serverURL
+                                             roomCode:roomCode
+                                             identity:candidate
+                                       callerIdentity:caller
+                                               format:@"json"
+                                           completion:^(NSString *body, NSError *error) {
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf) return;
+        if (!body) {
+            [strongSelf.normalControlPanel setPresenceStatusText:@"Could not fetch the export."];
+            return;
+        }
+        NSPasteboard *pb = [NSPasteboard generalPasteboard];
+        [pb clearContents];
+        [pb setString:body forType:NSPasteboardTypeString];
+        [strongSelf.normalControlPanel setPresenceStatusText:@"Timeline JSON copied."];
+    }];
+}
+
+- (void)savePresenceExportCSVToPath:(NSString *)destinationPath {
+    if (destinationPath.length == 0) return;
+    InterRoomController *rc = self.roomController;
+    NSString *candidate = [self resolvePresenceCandidateIdentity];
+    NSString *serverURL = rc.tokenServerURL;
+    NSString *roomCode  = rc.roomCode;
+    NSString *caller    = rc.localParticipantIdentity;
+    if (serverURL.length == 0 || roomCode.length == 0 || caller.length == 0 || candidate.length == 0) return;
+
+    __weak typeof(self) weakSelf = self;
+    [rc.tokenService fetchPresenceExportWithServerURL:serverURL
+                                             roomCode:roomCode
+                                             identity:candidate
+                                       callerIdentity:caller
+                                               format:@"csv"
+                                           completion:^(NSString *body, NSError *error) {
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf) return;
+        if (!body) {
+            [strongSelf.normalControlPanel setPresenceStatusText:@"Could not fetch the export."];
+            return;
+        }
+        NSError *writeError = nil;
+        BOOL ok = [body writeToFile:destinationPath
+                         atomically:YES
+                           encoding:NSUTF8StringEncoding
+                              error:&writeError];
+        [strongSelf.normalControlPanel setPresenceStatusText:
+            ok ? @"Timeline CSV saved." : @"Could not write the CSV file."];
+    }];
 }
 
 /// [3.1.3] Map NSError codes to user-facing messages.
@@ -6323,6 +6742,9 @@ static void InterTeardownSetupWindow(NSWindow *__strong *windowRef,
 }
 
 - (void)teardownActiveWindows {
+    // PRESENCE MONITORING (provisional). Invalidate the 15 s poll and drop its
+    // handler blocks before anything they capture is released.
+    [self stopPresenceSurfaces];
     // [Phase 10] Stop recording and clean up indicator before tearing down media sources
     if (self.normalRecordingCoordinator.canStop) {
         [self.normalRecordingCoordinator stopRecording];

@@ -89,6 +89,59 @@ public final class GreenRoomViewModel: ObservableObject {
     /// Host defaults summary shown under the Meeting Settings button.
     @Published public var usingDefaultsCaption: String = "Using default settings"
 
+    // MARK: - PRESENCE MONITORING (provisional, server flag default OFF)
+    //
+    // Interviewer-only, and UX ONLY: the server re-derives arming from the master
+    // flag, the room type, the host's snapshotted tier and these two declarations,
+    // and forces monitoring OFF for an EU-resident or under-18 candidate whatever
+    // this screen says. No `users` column records region or date of birth, so the
+    // interviewer declares it per room (research memo §7.9 items 7 and 8); asking
+    // the CANDIDATE to self-declare a protected characteristic to the system that
+    // is about to monitor them would be worse. Delete this block and the rows in
+    // GreenRoomView to remove the toggles.
+    // See .agents/tasks/presence-monitoring/REMOVAL.md.
+
+    /// Interviewer asks for presence monitoring in this interview room.
+    @Published public var presenceMonitoring: Bool = false
+    /// Interviewer declares the candidate as EU-resident.
+    @Published public var candidateRegionEU: Bool = false
+    /// Interviewer declares the candidate as under 18.
+    @Published public var candidateUnder18: Bool = false
+
+    /// Shown only on the interviewer's own pre-interview screen. Deliberately not
+    /// gated on the master flag: the green room renders before the room exists, so
+    /// there is no server answer to read yet, and probing for one would add a third
+    /// reader of `PRESENCE_MONITORING_ENABLED`. The box is therefore a request, the
+    /// caption below says so, and with the flag off the server simply never arms
+    /// the room — nothing is recorded and no surface starts.
+    public var showsPresenceControls: Bool { role == .hostInterview }
+
+    /// What ticking the box actually means, stated plainly, so the interviewer is
+    /// never surprised by the server overriding the toggle. The ticked wording
+    /// must NOT promise that the candidate will be asked: this screen renders
+    /// before the room exists, so it cannot know whether the server will arm the
+    /// room, and with the master flag off the candidate is never asked at all.
+    public var presenceCaption: String {
+        Self.presenceCaption(monitoring: presenceMonitoring,
+                             regionEU: candidateRegionEU,
+                             under18: candidateUnder18)
+    }
+
+    public nonisolated static func presenceCaption(monitoring: Bool,
+                                                   regionEU: Bool,
+                                                   under18: Bool) -> String {
+        guard monitoring else {
+            return "Nothing about what the candidate's camera sees will be recorded."
+        }
+        if regionEU || under18 {
+            return "Monitoring stays off for this candidate by policy, and they are "
+                + "not offered it. You can still run the interview normally."
+        }
+        return "This is a request for this room, not a guarantee. Nothing is "
+            + "recorded unless the candidate agrees, and they can join with "
+            + "monitoring off. No decision is automated."
+    }
+
     // MARK: - Callbacks (wired by the bridge)
 
     public var onToggleMic: ((Bool) -> Void)?

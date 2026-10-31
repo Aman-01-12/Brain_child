@@ -248,6 +248,97 @@ enum InterAudioInputMatcher {
     /// Whether AI transcription should auto-start when the host joins.
     @objc public private(set) dynamic var activeAutoTranscript: Bool = false
 
+    // MARK: - PRESENCE MONITORING (provisional, server flag default OFF)
+    //
+    // Server-authoritative, read straight off the /room/join response for a
+    // joiner and off the /room/create response for the creating interviewer.
+    // When the master flag is off the server omits the presence keys from both,
+    // so `activePresenceMonitoringArmed` stays false and every consumer — the
+    // consent gate, the candidate indicator, the interviewer chip — is inert
+    // with no further guard. Delete this block to remove the feature from the
+    // room controller. See .agents/tasks/presence-monitoring/REMOVAL.md.
+
+    /// Whether the server armed presence monitoring for the active room.
+    @objc public private(set) dynamic var activePresenceMonitoringArmed: Bool = false
+    /// Retention window the candidate was told about, in days.
+    @objc public private(set) dynamic var activePresenceRetentionDays: Int = 90
+    /// Server-recorded policy flag: candidate declared EU-resident.
+    @objc public private(set) dynamic var activePresenceRegionEU: Bool = false
+    /// Server-recorded policy flag: candidate declared under 18.
+    @objc public private(set) dynamic var activePresenceUnder18: Bool = false
+    /// Whether this room allows the `multiple_faces` event type at all.
+    @objc public private(set) dynamic var activePresenceMultipleFacesEnabled: Bool = false
+    /// Detector build identifier the server stamps on stored events.
+    @objc public private(set) dynamic var activePresenceDetectorVersion: String = ""
+    /// Raw thresholds JSON *string* exactly as the server stored it.
+    @objc public private(set) dynamic var activePresenceThresholds: String = ""
+    /// Where a candidate asks for a copy or deletion of their events.
+    @objc public private(set) dynamic var activePresenceRightsContact: String = ""
+
+    /// Whether THIS candidate granted monitoring at the consent screen. The
+    /// detector may only run when this is true (checked at the single
+    /// coordinator start site). Default false — a session nobody consented to
+    /// never monitors.
+    @objc public private(set) dynamic var activePresenceMonitoringGranted: Bool = false
+    /// "pending" | "granted" | "declined". Mirrors the server's consent state.
+    @objc public private(set) dynamic var activePresenceConsentState: String = "pending"
+
+    /// The ONLY writer of the granted/state pair while a connection is being set up.
+    /// Called from the consent screen's decision handler before the connect proceeds,
+    /// so the start site downstream reads a settled value. The per-connection reset
+    /// below is the only other writer, and it runs strictly earlier.
+    @objc public func recordPresenceConsent(granted: Bool, state: String) {
+        let valid = ["pending", "granted", "declined"]
+        activePresenceMonitoringGranted = granted
+        activePresenceConsentState = valid.contains(state) ? state : "pending"
+        interLogInfo(InterLog.networking,
+                     "RoomController: presence consent recorded (granted=%d, state=%{public}@)",
+                     granted ? 1 : 0, activePresenceConsentState)
+    }
+
+    /// Clear the consent pair for a NEW connection.
+    ///
+    /// Consent is a per-ROOM fact, but this controller is created once at launch and
+    /// outlives every session (AppDelegate creates it in `-applicationDidFinishLaunching`
+    /// and releases it only in `-applicationWillTerminate`), so without this a candidate
+    /// who granted monitoring in one interview would still read `granted == true` in the
+    /// next one — and the detector's single start site would run with no consent for that
+    /// session. Called synchronously at the top of BOTH public connect entry points, on
+    /// the caller's (main) queue, so it is ordered strictly BEFORE the server's answer
+    /// (which lands in a main-queue block from the token completion) and before the
+    /// pre-connect consent gate runs.
+    ///
+    /// DO NOT call this from `handleTokenResponse`: that runs on the token completion's
+    /// thread and its main-queue hop would land AFTER the join branch's assignment,
+    /// clobbering the server's answer.
+    ///
+    /// The arming block is not reset here. It is assigned unconditionally by each of the
+    /// four connect paths from the server's own answer — see §2.2.1 of the design note — and
+    /// on the lobby-admitted path that assignment happens via `applyMeetingSettingsFromDict`
+    /// BEFORE `connect(withToken:…)` is called, so resetting it here would clobber it.
+    private func resetPresenceConsentForNewConnection() {
+        activePresenceMonitoringGranted = false
+        activePresenceConsentState = "pending"
+    }
+
+    /// Assign the presence block from a `/meetings/:id/start` (scheduled meeting) response.
+    ///
+    /// `/meetings/:id/start` never arms a room and returns no key beginning `presence`, so
+    /// `presenceMonitoringArmed` parses false by its backward-compatible default and this
+    /// reduces to the shipped defaults — which is the correct answer for a path the server
+    /// never arms. It is assigned rather than skipped so a room armed earlier in the same
+    /// app session cannot leak its arming state into a scheduled interview.
+    func applyPresenceSettingsFromScheduledMeeting(_ response: InterCreateRoomResponse) {
+        activePresenceMonitoringArmed      = response.presenceMonitoringArmed
+        activePresenceRetentionDays        = 90
+        activePresenceRegionEU             = false
+        activePresenceUnder18              = false
+        activePresenceMultipleFacesEnabled = false
+        activePresenceDetectorVersion      = ""
+        activePresenceThresholds           = ""
+        activePresenceRightsContact        = ""
+    }
+
     // MARK: - Meeting Settings Helpers
 
     /// Apply meeting settings from a dictionary (used on the lobby-admitted path where
@@ -266,6 +357,17 @@ enum InterAudioInputMatcher {
         activeAutoTranscript     = dict["autoTranscript"]     as? Bool ?? false
         activeHasPassword        = dict["hasPassword"]        as? Bool ?? false
         activeLobbyEnabled       = dict["lobbyEnabled"]       as? Bool ?? false
+        // PRESENCE MONITORING (provisional). Mirrors the join-branch assignment
+        // for the lobby-admitted path. An absent key means armed == false, which
+        // is also exactly what a flag-off server produces.
+        activePresenceMonitoringArmed      = dict["presenceMonitoringArmed"]      as? Bool ?? false
+        activePresenceRetentionDays        = dict["presenceRetentionDays"]        as? Int ?? 90
+        activePresenceRegionEU             = dict["presenceRegionEU"]             as? Bool ?? false
+        activePresenceUnder18              = dict["presenceUnder18"]              as? Bool ?? false
+        activePresenceMultipleFacesEnabled = dict["presenceMultipleFacesEnabled"] as? Bool ?? false
+        activePresenceDetectorVersion      = dict["presenceDetectorVersion"]      as? String ?? ""
+        activePresenceThresholds           = dict["presenceThresholds"]           as? String ?? ""
+        activePresenceRightsContact        = dict["presenceRightsContact"]        as? String ?? ""
     }
 
     /// Update the active "meeting has a password" flag mid-session. Called after the host
@@ -377,6 +479,10 @@ enum InterAudioInputMatcher {
         isConnecting = true
         self.configuration = configuration.copy() as? InterRoomConfiguration
         connectStartTime = CFAbsoluteTimeGetCurrent()
+        // PRESENCE MONITORING (provisional, server flag default OFF). This is a NEW
+        // room, so the previous room's consent is void. Placed after the two guards
+        // above so a rejected double-connect cannot clear a live session's consent.
+        resetPresenceConsentForNewConnection()
 
         setConnectionState(.connecting)
 
@@ -403,6 +509,13 @@ enum InterAudioInputMatcher {
                 if let self = self, let r = response, error == nil {
                     DispatchQueue.main.async {
                         if r.isHost { self.configuration?.isHost = true }
+                        // PRESENCE MONITORING (provisional, server flag default OFF).
+                        // Assigned unconditionally, exactly like the create and join
+                        // branches, so a room armed earlier in the same app session
+                        // cannot leak its arming state into a scheduled interview.
+                        // /meetings/:id/start never arms a room and returns no presence
+                        // key, so this resolves to armed == false.
+                        self.applyPresenceSettingsFromScheduledMeeting(r)
                         // Apply the meeting-settings snapshot the server stored at
                         // schedule time (parity with the /room/join settings block).
                         // Without this, scheduled meetings ran on server defaults
@@ -455,6 +568,16 @@ enum InterAudioInputMatcher {
                         self.activeAutoRecord         = configuration.autoRecord
                         self.activeAutoTranscript     = configuration.autoTranscript
                         self.activeHasPassword        = !configuration.meetingPassword.isEmpty
+                        // PRESENCE MONITORING (provisional, server flag default OFF).
+                        // The SERVER's arming answer, echoed on /room/create and
+                        // absent unless the room was really armed — never the host's
+                        // own request. Assigned unconditionally so a previously armed
+                        // room cannot leak its state into the next room this app
+                        // session creates.
+                        self.activePresenceMonitoringArmed =
+                            response?.presenceMonitoringArmed ?? false
+                        self.activePresenceRegionEU   = configuration.candidateRegionEU
+                        self.activePresenceUnder18    = configuration.candidateUnder18
                     }
                 }
                 self?.handleTokenResponse(
@@ -493,6 +616,20 @@ enum InterAudioInputMatcher {
                         // (or is promoted to) a moderator renders the in-call lobby toggle
                         // correctly and toggles it from the right baseline.
                         self.activeLobbyEnabled        = r.lobbyEnabled
+                        // PRESENCE MONITORING (provisional, server flag default OFF).
+                        // Assigned HERE — inside the same main-queue block the
+                        // activeLobbyEnabled assignment relies on — so the
+                        // pre-connect consent gate observes a settled value. The
+                        // server omits the block entirely when the flag is off, so
+                        // `armed` is then false and the legacy NSAlert path runs.
+                        self.activePresenceMonitoringArmed      = r.presenceMonitoringArmed
+                        self.activePresenceRetentionDays        = r.presenceRetentionDays
+                        self.activePresenceRegionEU             = r.presenceRegionEU
+                        self.activePresenceUnder18              = r.presenceUnder18
+                        self.activePresenceMultipleFacesEnabled = r.presenceMultipleFacesEnabled
+                        self.activePresenceDetectorVersion      = r.presenceDetectorVersion
+                        self.activePresenceThresholds           = r.presenceThresholds
+                        self.activePresenceRightsContact        = r.presenceRightsContact
                         // The server restores host status when the original host
                         // rejoins (matched by authenticated userId). Reflect it so the
                         // returning host's client shows host UI again.
@@ -534,6 +671,11 @@ enum InterAudioInputMatcher {
         isConnecting = true
         self.configuration = configuration.copy() as? InterRoomConfiguration
         connectStartTime = CFAbsoluteTimeGetCurrent()
+        // PRESENCE MONITORING (provisional, server flag default OFF). New room, so the
+        // previous room's consent is void. Only the consent pair is reset here: the
+        // caller has already applied this room's settings dict (and with it the arming
+        // block) via -applyMeetingSettingsFromDict, and that dict carries no consent.
+        resetPresenceConsentForNewConnection()
         setConnectionState(.connecting)
 
         interLogInfo(InterLog.networking, "RoomController: connecting with existing token (lobby admitted, identity=%{public}@)",

@@ -53,6 +53,7 @@ struct SecureCandidateTopBarView: View {
             if viewModel.recordingActive {
                 recordingBadge
             }
+            presenceBadge
             candidateBadge
             chatButton
         }
@@ -77,6 +78,50 @@ struct SecureCandidateTopBarView: View {
         .padding(.vertical, 3)
         .background(Capsule().fill(Color(nsColor: InterStatus.danger).opacity(0.14)))
         .accessibilityLabel("Recording in progress")
+    }
+
+    /// PRESENCE MONITORING (provisional, server flag default OFF).
+    /// Persistent for the whole session: no ×, no auto-hide, no timer. The whole
+    /// chip is the tap target and reopens the full disclosure list. Icon AND word
+    /// always paired (DESIGN-SPEC §8: never signal state by colour alone).
+    /// `presenceMonitoringState` defaults 0, so with the flag off this renders
+    /// nothing and the top bar is unchanged.
+    @ViewBuilder private var presenceBadge: some View {
+        if let label = PresenceConsentViewModel.indicatorLabel(viewModel.presenceMonitoringState) {
+            Button(action: { viewModel.onOpenPresenceDetails?() }) {
+                HStack(spacing: InterSpacing.x1) {
+                    Image(systemName: presenceBadgeIcon)
+                        .font(.system(size: 10, weight: .semibold))
+                    Text(label)
+                        .font(InterFont.swiftUI(10, .semibold))
+                }
+                .foregroundColor(Color(nsColor: presenceBadgeTint))
+                .padding(.horizontal, InterSpacing.x2)
+                .padding(.vertical, 3)
+                .background(Capsule().fill(Color(nsColor: presenceBadgeTint).opacity(0.14)))
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .handCursor()
+            .help("What is and isn't measured")
+            .accessibilityLabel(label)
+        }
+    }
+
+    private var presenceBadgeIcon: String {
+        switch viewModel.presenceMonitoringState {
+        case 1:  return "eye"
+        case 3:  return "pause.circle"
+        default: return "eye.slash"
+        }
+    }
+
+    private var presenceBadgeTint: NSColor {
+        switch viewModel.presenceMonitoringState {
+        case 1:  return InterStatus.success
+        case 3:  return InterStatus.warning
+        default: return InterColor.stageTextMuted
+        }
     }
 
     private var candidateBadge: some View {

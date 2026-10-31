@@ -401,6 +401,7 @@ Current migrations:
 | `003_multitrack_tracks.sql` | `recording_tracks` table, `manifest_url` column |
 | `015_scheduling.sql` | `scheduled_meetings`, `meeting_invitees` tables |
 | `016_calendar_teams.sql` | Calendar OAuth columns on `users`; `teams`, `team_members` tables |
+| `023_interview_presence_events.sql` | `interview_presence_sessions`, `interview_presence_events`, `interview_presence_notes` tables (presence monitoring — provisional, behind `PRESENCE_MONITORING_ENABLED`) |
 
 ---
 

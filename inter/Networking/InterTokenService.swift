@@ -42,8 +42,16 @@ import CryptoKit
     /// whose caller already holds the settings locally). Keys mirror the
     /// /room/join settings block: meetingDisplayName, muteOnJoin, …
     @objc public let roomSettings: [String: Any]?
+    // PRESENCE MONITORING (provisional, server flag default OFF)
+    //
+    // The server's own arming answer, echoed on /room/create. A flag-off server
+    // omits the key entirely, so this parses false by its default — that
+    // default IS the zero-impact guarantee for the creating interviewer.
+    // See .agents/tasks/presence-monitoring/REMOVAL.md.
+    /// Whether the server armed presence monitoring for this room. Default false.
+    @objc public let presenceMonitoringArmed: Bool
 
-    @objc public init(roomCode: String, roomName: String, token: String, serverURL: String, roomType: String = "call", isHost: Bool = false, roomSettings: [String: Any]? = nil) {
+    @objc public init(roomCode: String, roomName: String, token: String, serverURL: String, roomType: String = "call", isHost: Bool = false, roomSettings: [String: Any]? = nil, presenceMonitoringArmed: Bool = false) {
         self.roomCode = roomCode
         self.roomName = roomName
         self.token = token
@@ -51,6 +59,7 @@ import CryptoKit
         self.roomType = roomType
         self.isHost = isHost
         self.roomSettings = roomSettings
+        self.presenceMonitoringArmed = presenceMonitoringArmed
         super.init()
     }
 }
@@ -87,6 +96,33 @@ import CryptoKit
     /// of the bcrypt hash). The plaintext is never returned — only whether one exists.
     @objc public let hasPassword: Bool
 
+    // MARK: - PRESENCE MONITORING (provisional, server flag default OFF)
+    //
+    // The server emits this block ONLY for a room it actually armed. When the
+    // master flag is off the /room/join response carries no key starting with
+    // "presence", so every field below keeps its default and
+    // `presenceMonitoringArmed == false` — that default IS the zero-impact
+    // guarantee. Delete these fields to remove the feature from the join path.
+    // See .agents/tasks/presence-monitoring/REMOVAL.md.
+
+    /// Whether the server armed presence monitoring for this room. Default false.
+    @objc public let presenceMonitoringArmed: Bool
+    /// How many days presence events are retained before the server purges them.
+    @objc public let presenceRetentionDays: Int
+    /// Server-recorded policy flag: the candidate was declared EU-resident.
+    @objc public let presenceRegionEU: Bool
+    /// Server-recorded policy flag: the candidate was declared under 18.
+    @objc public let presenceUnder18: Bool
+    /// Whether the room allows the `multiple_faces` event type at all.
+    @objc public let presenceMultipleFacesEnabled: Bool
+    /// Detector build identifier stamped on every event the server stores.
+    @objc public let presenceDetectorVersion: String
+    /// The thresholds in force, as the raw JSON *string* the server stored.
+    /// Parsed client-side — the server deliberately does not re-encode it.
+    @objc public let presenceThresholds: String
+    /// Address a candidate may use to request a copy or deletion of their events.
+    @objc public let presenceRightsContact: String
+
     @objc public init(roomName: String,
                       token: String,
                       serverURL: String,
@@ -103,7 +139,15 @@ import CryptoKit
                       shareConflictPolicy: String = "oneattime",
                       lobbyEnabled: Bool = false,
                       isHost: Bool = false,
-                      hasPassword: Bool = false) {
+                      hasPassword: Bool = false,
+                      presenceMonitoringArmed: Bool = false,
+                      presenceRetentionDays: Int = 90,
+                      presenceRegionEU: Bool = false,
+                      presenceUnder18: Bool = false,
+                      presenceMultipleFacesEnabled: Bool = false,
+                      presenceDetectorVersion: String = "",
+                      presenceThresholds: String = "",
+                      presenceRightsContact: String = "") {
         self.roomName             = roomName
         self.token                = token
         self.serverURL            = serverURL
@@ -121,6 +165,14 @@ import CryptoKit
         self.lobbyEnabled         = lobbyEnabled
         self.isHost               = isHost
         self.hasPassword          = hasPassword
+        self.presenceMonitoringArmed      = presenceMonitoringArmed
+        self.presenceRetentionDays        = presenceRetentionDays
+        self.presenceRegionEU             = presenceRegionEU
+        self.presenceUnder18              = presenceUnder18
+        self.presenceMultipleFacesEnabled = presenceMultipleFacesEnabled
+        self.presenceDetectorVersion      = presenceDetectorVersion
+        self.presenceThresholds           = presenceThresholds
+        self.presenceRightsContact        = presenceRightsContact
         super.init()
     }
 }
@@ -991,12 +1043,18 @@ private struct TokenCacheEntry {
                     self?.cacheQueue.async { self?.leaveTokenStore[roomCode] = leaveToken }
                 }
 
+                // PRESENCE MONITORING (provisional, server flag default OFF). The
+                // key is absent unless the server actually armed this room, so an
+                // older or flag-off server leaves this false.
+                let presenceArmed = json["presenceMonitoringArmed"] as? Bool ?? false
+
                 let response = InterCreateRoomResponse(
                     roomCode: roomCode,
                     roomName: roomName,
                     token: token,
                     serverURL: wsURL,
-                    roomType: responseRoomType
+                    roomType: responseRoomType,
+                    presenceMonitoringArmed: presenceArmed
                 )
                 interLogInfo(InterLog.networking, "Token: room created (code=***, type=%{public}@)", responseRoomType)
                 self?.completeOnMain { completion(response, nil) }
@@ -1120,6 +1178,18 @@ private struct TokenCacheEntry {
                 let isHost              = json["isHost"] as? Bool ?? false
                 let hasPassword         = json["hasPassword"] as? Bool ?? false
 
+                // PRESENCE MONITORING (provisional, server flag default OFF). The
+                // server omits this whole block unless it armed the room, so these
+                // defaults are what a flag-off join produces — armed == false.
+                let presenceArmed       = json["presenceMonitoringArmed"] as? Bool ?? false
+                let presenceRetention   = json["presenceRetentionDays"] as? Int ?? 90
+                let presenceRegionEU    = json["presenceRegionEU"] as? Bool ?? false
+                let presenceUnder18     = json["presenceUnder18"] as? Bool ?? false
+                let presenceMultiFaces  = json["presenceMultipleFacesEnabled"] as? Bool ?? false
+                let presenceDetector    = json["presenceDetectorVersion"] as? String ?? ""
+                let presenceThresholds  = json["presenceThresholds"] as? String ?? ""
+                let presenceRights      = json["presenceRightsContact"] as? String ?? ""
+
                 let response = InterJoinRoomResponse(
                     roomName: roomName,
                     token: token,
@@ -1137,7 +1207,15 @@ private struct TokenCacheEntry {
                     shareConflictPolicy: shareConflictPolicy,
                     lobbyEnabled: lobbyEnabled,
                     isHost: isHost,
-                    hasPassword: hasPassword
+                    hasPassword: hasPassword,
+                    presenceMonitoringArmed: presenceArmed,
+                    presenceRetentionDays: presenceRetention,
+                    presenceRegionEU: presenceRegionEU,
+                    presenceUnder18: presenceUnder18,
+                    presenceMultipleFacesEnabled: presenceMultiFaces,
+                    presenceDetectorVersion: presenceDetector,
+                    presenceThresholds: presenceThresholds,
+                    presenceRightsContact: presenceRights
                 )
                 interLogInfo(InterLog.networking, "Token: room joined (code=***, type=%{public}@)", responseRoomType)
                 self?.completeOnMain { completion(response, nil) }
@@ -1363,6 +1441,330 @@ private struct TokenCacheEntry {
                 DispatchQueue.main.async { completion(error as NSError) }
             }
         }.resume()
+    }
+
+    // MARK: - PRESENCE MONITORING (provisional, server flag default OFF)
+    //
+    // Five thin wrappers over the /presence router. Nothing here is called
+    // unless the server armed the room, and the whole router answers
+    // 404 PRESENCE_DISABLED while the master flag is off. Candidate-side calls
+    // authenticate with the single-use-per-room `Leave-Token` (the uploadChatFile
+    // precedent); moderator-side calls use the bearer access token plus the
+    // server's own validateModerator cross-check. Delete this section to remove
+    // the feature from the networking layer. See
+    // .agents/tasks/presence-monitoring/REMOVAL.md.
+    //
+    // LOGGING RULE: counts and HTTP status only. Never a payload, never an
+    // identity in clear, never note text.
+
+    /// Record the candidate's consent decision. Candidate path — `Leave-Token`.
+    /// Completion is called on the main queue with the server-authoritative
+    /// `monitoringEnabled` flag and consent state ("granted" / "declined").
+    @objc public func submitPresenceConsent(serverURL: String,
+                                            roomCode: String,
+                                            identity: String,
+                                            granted: Bool,
+                                            completion: ((Bool, String, NSError?) -> Void)? = nil) {
+        guard let leaveToken = presenceLeaveToken(forRoom: roomCode) else {
+            let err = InterNetworkErrorCode.tokenFetchFailed.error(
+                message: "No leave token available for presence consent")
+            completeOnMain { completion?(false, "pending", err) }
+            return
+        }
+
+        let body: [String: Any] = [
+            "roomCode": roomCode,
+            "identity": identity,
+            "decision": granted ? "grant" : "decline"
+        ]
+
+        performPresenceRequest(url: "\(serverURL)/presence/consent",
+                               method: "POST",
+                               body: body,
+                               leaveToken: leaveToken) { [weak self] json, status, error in
+            guard let self = self else { return }
+            if let error = error {
+                interLogError(InterLog.networking,
+                              "Presence: consent POST failed (HTTP %d)", status)
+                self.completeOnMain { completion?(false, "pending", error) }
+                return
+            }
+            let enabled = json?["monitoringEnabled"] as? Bool ?? false
+            let state   = json?["consentState"] as? String ?? "pending"
+            interLogInfo(InterLog.networking,
+                         "Presence: consent recorded (monitoringEnabled=%d)", enabled ? 1 : 0)
+            self.completeOnMain { completion?(enabled, state, nil) }
+        }
+    }
+
+    /// Upload a batch of closed presence events. Candidate path — `Leave-Token`.
+    /// An EMPTY `events` array is valid and is the heartbeat the server's
+    /// `monitoring_gap` detection depends on, so the caller must keep posting on
+    /// its cadence even with nothing buffered.
+    /// Completion: (accepted event count, HTTP status, error). The status is
+    /// surfaced so the caller can stop reporting on 403 / 409 as the plan requires.
+    @objc public func uploadPresenceEvents(serverURL: String,
+                                           roomCode: String,
+                                           identity: String,
+                                           events: [[String: Any]],
+                                           completion: ((Int, Int, NSError?) -> Void)? = nil) {
+        guard let leaveToken = presenceLeaveToken(forRoom: roomCode) else {
+            let err = InterNetworkErrorCode.tokenFetchFailed.error(
+                message: "No leave token available for presence upload")
+            completeOnMain { completion?(0, 0, err) }
+            return
+        }
+
+        let body: [String: Any] = [
+            "roomCode": roomCode,
+            "identity": identity,
+            "events": events
+        ]
+
+        interLogDebug(InterLog.networking, "Presence: uploading %d event(s)", events.count)
+
+        performPresenceRequest(url: "\(serverURL)/presence/events",
+                               method: "POST",
+                               body: body,
+                               leaveToken: leaveToken) { [weak self] json, status, error in
+            guard let self = self else { return }
+            if let error = error {
+                interLogError(InterLog.networking,
+                              "Presence: event upload failed (HTTP %d)", status)
+                self.completeOnMain { completion?(0, status, error) }
+                return
+            }
+            let accepted = json?["accepted"] as? Int ?? 0
+            interLogInfo(InterLog.networking, "Presence: %d event(s) accepted", accepted)
+            self.completeOnMain { completion?(accepted, status, nil) }
+        }
+    }
+
+    /// Read a candidate's presence timeline. Moderator path — bearer token plus
+    /// the server's `validateModerator(code, callerIdentity, userId)` cross-check.
+    /// Completion receives the parsed response exactly as `§C` documents it.
+    @objc public func fetchPresenceTimeline(serverURL: String,
+                                            roomCode: String,
+                                            identity: String,
+                                            callerIdentity: String,
+                                            completion: @escaping ([String: Any]?, NSError?) -> Void) {
+        guard let accessToken = currentAccessToken else {
+            completeOnMain { completion(nil, InterNetworkErrorCode.authFailed.error(message: "Not signed in")) }
+            return
+        }
+        guard let url = presenceURL(serverURL: serverURL,
+                                    path: "/presence/timeline",
+                                    roomCode: roomCode,
+                                    identity: identity,
+                                    query: [URLQueryItem(name: "callerIdentity", value: callerIdentity)]) else {
+            completeOnMain { completion(nil, InterNetworkErrorCode.tokenFetchFailed.error(message: "Invalid presence URL")) }
+            return
+        }
+
+        performAuthHTTPRequest(url: url.absoluteString,
+                               method: "GET",
+                               body: nil,
+                               bearerToken: accessToken,
+                               retryCount: 0) { [weak self] data, httpResponse, error in
+            guard let self = self else { return }
+            let status = httpResponse?.statusCode ?? 0
+            if let error = error {
+                self.completeOnMain { completion(nil, error) }
+                return
+            }
+            guard status == 200, let data = data, let json = self.parseJSON(data) else {
+                interLogError(InterLog.networking, "Presence: timeline read failed (HTTP %d)", status)
+                self.completeOnMain {
+                    completion(nil, InterNetworkErrorCode.tokenFetchFailed.error(
+                        message: "Presence timeline unavailable (\(status))"))
+                }
+                return
+            }
+            let eventCount = (json["events"] as? [[String: Any]])?.count ?? 0
+            interLogInfo(InterLog.networking, "Presence: timeline read (%d event rows)", eventCount)
+            self.completeOnMain { completion(json, nil) }
+        }
+    }
+
+    /// Attach an interviewer note to one presence event. Moderator path.
+    /// The server requires >= 10 characters after trimming and is the control;
+    /// the UI mirrors that rule only so the Save button is honest.
+    /// Note text is NEVER logged.
+    @objc public func submitPresenceNote(serverURL: String,
+                                         roomCode: String,
+                                         identity: String,
+                                         callerIdentity: String,
+                                         eventId: Int,
+                                         note: String,
+                                         completion: @escaping (Bool, NSError?) -> Void) {
+        guard let accessToken = currentAccessToken else {
+            completeOnMain { completion(false, InterNetworkErrorCode.authFailed.error(message: "Not signed in")) }
+            return
+        }
+        guard let url = presenceURL(serverURL: serverURL,
+                                    path: "/presence/timeline",
+                                    roomCode: roomCode,
+                                    identity: identity,
+                                    suffix: "/note") else {
+            completeOnMain { completion(false, InterNetworkErrorCode.tokenFetchFailed.error(message: "Invalid presence URL")) }
+            return
+        }
+
+        let body: [String: Any] = [
+            "callerIdentity": callerIdentity,
+            "eventId": eventId,
+            "note": note
+        ]
+
+        performAuthHTTPRequest(url: url.absoluteString,
+                               method: "POST",
+                               body: body,
+                               bearerToken: accessToken,
+                               retryCount: 0) { [weak self] data, httpResponse, error in
+            guard let self = self else { return }
+            let status = httpResponse?.statusCode ?? 0
+            if let error = error {
+                self.completeOnMain { completion(false, error) }
+                return
+            }
+            guard status == 201 || status == 200 else {
+                var message = "Could not save the note (\(status))"
+                if let data = data, let json = self.parseJSON(data),
+                   let code = json["code"] as? String, code == "PRESENCE_NOTE_REASON_REQUIRED" {
+                    message = "A note needs at least 10 characters."
+                }
+                interLogError(InterLog.networking, "Presence: note rejected (HTTP %d)", status)
+                self.completeOnMain {
+                    completion(false, InterNetworkErrorCode.tokenFetchFailed.error(message: message))
+                }
+                return
+            }
+            interLogInfo(InterLog.networking, "Presence: note saved (eventId=%d)", eventId)
+            self.completeOnMain { completion(true, nil) }
+        }
+    }
+
+    /// Export a candidate's presence timeline. Moderator path.
+    /// `format` is "json" or "csv"; the body text is returned verbatim so the
+    /// caller can put it on the pasteboard or write it to a user-chosen file.
+    @objc public func fetchPresenceExport(serverURL: String,
+                                          roomCode: String,
+                                          identity: String,
+                                          callerIdentity: String,
+                                          format: String,
+                                          completion: @escaping (String?, NSError?) -> Void) {
+        guard let accessToken = currentAccessToken else {
+            completeOnMain { completion(nil, InterNetworkErrorCode.authFailed.error(message: "Not signed in")) }
+            return
+        }
+        let safeFormat = (format == "csv") ? "csv" : "json"
+        guard let url = presenceURL(serverURL: serverURL,
+                                    path: "/presence/export",
+                                    roomCode: roomCode,
+                                    identity: identity,
+                                    query: [URLQueryItem(name: "format", value: safeFormat),
+                                            URLQueryItem(name: "callerIdentity", value: callerIdentity)]) else {
+            completeOnMain { completion(nil, InterNetworkErrorCode.tokenFetchFailed.error(message: "Invalid presence URL")) }
+            return
+        }
+
+        performAuthHTTPRequest(url: url.absoluteString,
+                               method: "GET",
+                               body: nil,
+                               bearerToken: accessToken,
+                               retryCount: 0) { [weak self] data, httpResponse, error in
+            guard let self = self else { return }
+            let status = httpResponse?.statusCode ?? 0
+            if let error = error {
+                self.completeOnMain { completion(nil, error) }
+                return
+            }
+            guard status == 200, let data = data,
+                  let text = String(data: data, encoding: .utf8) else {
+                interLogError(InterLog.networking, "Presence: export failed (HTTP %d)", status)
+                self.completeOnMain {
+                    completion(nil, InterNetworkErrorCode.tokenFetchFailed.error(
+                        message: "Presence export unavailable (\(status))"))
+                }
+                return
+            }
+            interLogInfo(InterLog.networking,
+                         "Presence: export received (format=%{public}@, %d bytes)", safeFormat, data.count)
+            self.completeOnMain { completion(text, nil) }
+        }
+    }
+
+    // MARK: Presence private helpers
+
+    /// Reads (without consuming) the room's leave token on the cache queue —
+    /// the same non-destructive read `uploadChatFile` / `downloadChatFile` use.
+    /// Only `/room/leave` consumes it.
+    private func presenceLeaveToken(forRoom roomCode: String) -> String? {
+        let token: String? = cacheQueue.sync { leaveTokenStore[roomCode] }
+        guard let token = token, !token.isEmpty else { return nil }
+        return token
+    }
+
+    /// Builds `{server}{path}/{CODE}/{identity}{suffix}?{query}` with both path
+    /// components percent-encoded.
+    private func presenceURL(serverURL: String,
+                             path: String,
+                             roomCode: String,
+                             identity: String,
+                             suffix: String = "",
+                             query: [URLQueryItem] = []) -> URL? {
+        let allowed = CharacterSet.urlPathAllowed.subtracting(CharacterSet(charactersIn: "/?#"))
+        guard let code = roomCode.uppercased().addingPercentEncoding(withAllowedCharacters: allowed),
+              let who = identity.addingPercentEncoding(withAllowedCharacters: allowed),
+              var components = URLComponents(string: "\(serverURL)\(path)/\(code)/\(who)\(suffix)") else {
+            return nil
+        }
+        if !query.isEmpty { components.queryItems = query }
+        return components.url
+    }
+
+    /// Candidate-side POST with the `Leave-Token` header. Completion runs on the
+    /// URLSession queue with (parsed JSON, HTTP status, error) — callers hop to
+    /// main themselves via `completeOnMain`.
+    private func performPresenceRequest(url urlString: String,
+                                        method: String,
+                                        body: [String: Any],
+                                        leaveToken: String,
+                                        completion: @escaping ([String: Any]?, Int, NSError?) -> Void) {
+        guard let url = URL(string: urlString) else {
+            completion(nil, 0, InterNetworkErrorCode.tokenFetchFailed.error(message: "Invalid presence URL"))
+            return
+        }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = method
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue(leaveToken, forHTTPHeaderField: "Leave-Token")
+        request.httpBody = try? JSONSerialization.data(withJSONObject: body)
+
+        var taskRef: URLSessionDataTask?
+        let task = session.dataTask(with: request) { [weak self] data, response, error in
+            guard let self = self else { return }
+            if let t = taskRef { self.untrackTask(t) }
+
+            if let error = error {
+                completion(nil, 0, InterNetworkErrorCode.serverUnreachable.error(
+                    message: "Presence request failed", underlyingError: error as NSError))
+                return
+            }
+            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+            let json = data.flatMap { self.parseJSON($0) }
+            guard status == 200 || status == 201 else {
+                let code = json?["code"] as? String ?? "PRESENCE_REQUEST_FAILED"
+                completion(json, status, InterNetworkErrorCode.tokenFetchFailed.error(
+                    message: "Presence request rejected (\(status) \(code))"))
+                return
+            }
+            completion(json, status, nil)
+        }
+        taskRef = task
+        trackTask(task)
+        task.resume()
     }
 
     /// Refresh a token for an active participant. [G7]

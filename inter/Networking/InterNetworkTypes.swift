@@ -210,6 +210,27 @@ enum InterMicrophoneNetworkAction {
     ///   "anyCanPreempt"  — anyone with share permission can preempt the current sharer
     @objc public var shareConflictPolicy: String
 
+    // -----------------------------------------------------------------------
+    // PRESENCE MONITORING (provisional, server flag default OFF)
+    // -----------------------------------------------------------------------
+    // Interview-room only. The server is authoritative: it refuses to arm
+    // monitoring unless PRESENCE_MONITORING_ENABLED is on, the room is an
+    // interview, the host tier allows it, and the candidate is neither
+    // EU-resident nor under 18. These three fields are the interviewer's
+    // *request*, nothing more. Delete this block to remove the feature from
+    // room creation. See .agents/tasks/presence-monitoring/REMOVAL.md.
+
+    /// Interviewer asked for presence monitoring in this room. Default false.
+    @objc public var presenceMonitoring: Bool
+
+    /// Interviewer declared the candidate as EU-resident — the server then
+    /// forces monitoring off (research memo §7.9 item 7). Default false.
+    @objc public var candidateRegionEU: Bool
+
+    /// Interviewer declared the candidate as under 18 — the server then forces
+    /// monitoring off (research memo §7.9 item 8). Default false.
+    @objc public var candidateUnder18: Bool
+
     @objc public init(serverURL: String,
                       tokenServerURL: String,
                       roomCode: String = "",
@@ -239,6 +260,9 @@ enum InterMicrophoneNetworkAction {
         self.lobbyEnabled = false
         self.meetingPassword = ""
         self.shareConflictPolicy = "oneattime"
+        self.presenceMonitoring = false
+        self.candidateRegionEU = false
+        self.candidateUnder18 = false
         super.init()
     }
 
@@ -267,6 +291,9 @@ enum InterMicrophoneNetworkAction {
         copy.lobbyEnabled         = lobbyEnabled
         copy.meetingPassword      = meetingPassword
         copy.shareConflictPolicy  = shareConflictPolicy
+        copy.presenceMonitoring   = presenceMonitoring
+        copy.candidateRegionEU    = candidateRegionEU
+        copy.candidateUnder18     = candidateUnder18
         return copy
     }
 
@@ -284,7 +311,12 @@ enum InterMicrophoneNetworkAction {
             "autoTranscript":       autoTranscript,
             "lobbyEnabled":         lobbyEnabled,
             "password":             meetingPassword,
-            "shareConflictPolicy":  shareConflictPolicy
+            "shareConflictPolicy":  shareConflictPolicy,
+            // PRESENCE MONITORING (provisional). A request only — the server
+            // decides, and ignores all three when the master flag is off.
+            "presenceMonitoring":   presenceMonitoring,
+            "candidateRegionEU":    candidateRegionEU,
+            "candidateUnder18":     candidateUnder18
         ]
     }
 

@@ -16,6 +16,7 @@
 
 import AppKit
 import SwiftUI
+import UniformTypeIdentifiers
 
 @objc(InterCallControlBarBridge)
 public final class InterCallControlBarBridge: NSView, InterCallMediaControlSurface {
@@ -24,6 +25,10 @@ public final class InterCallControlBarBridge: NSView, InterCallMediaControlSurfa
     private let requestsViewModel = RequestsPanelViewModel()
     private var hosting: NSHostingView<CallControlBarView>!
     private var requestsPopover: NSPopover?
+    // PRESENCE MONITORING (provisional). Owned here so the popover and its view
+    // model live exactly as long as the bar does.
+    private let presenceTimelineViewModel = PresenceTimelineViewModel()
+    private var presenceTimelinePopover: NSPopover?
 
     // Queue references for the requests consolidation (weak; owned by AppDelegate).
     private weak var speakerQueue: InterSpeakerQueue?
@@ -71,6 +76,20 @@ public final class InterCallControlBarBridge: NSView, InterCallMediaControlSurfa
     @objc public var requestDenyHandler: ((String, String) -> Void)?
     /// Interviewer Code/Board tool selection (carries the `InterInterviewToolKind` raw value).
     @objc public var interviewToolChangedHandler: ((Int) -> Void)?
+
+    // MARK: - PRESENCE MONITORING handlers (provisional, server flag default OFF)
+
+    /// Asked to re-read `GET /presence/timeline` (panel opened, or Refresh).
+    @objc public var presenceTimelineRefreshHandler: (() -> Void)?
+    /// Jump to an offset (seconds) from session start in the existing recording surface.
+    @objc public var presenceJumpToHandler: ((Double) -> Void)?
+    /// (eventId as a string, note text). The server enforces the >= 10-char rule.
+    @objc public var presenceNoteHandler: ((String, String) -> Void)?
+    /// Copy the JSON export to the pasteboard.
+    @objc public var presenceCopyJSONHandler: (() -> Void)?
+    /// Write the CSV export to a user-chosen file. The bridge runs the NSSavePanel
+    /// and hands back the destination path.
+    @objc public var presenceSaveCSVHandler: ((NSString) -> Void)?
 
     @objc public override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -138,6 +157,26 @@ public final class InterCallControlBarBridge: NSView, InterCallMediaControlSurfa
                     }
                 }
             }
+        }
+
+        // PRESENCE MONITORING (provisional). Nothing here runs unless the server
+        // armed the room: `presenceAvailable` defaults false, so the chip that
+        // opens this panel does not render.
+        viewModel.onOpenPresenceTimeline = { [weak self] in self?.presentPresenceTimeline() }
+        presenceTimelineViewModel.onRefresh = { [weak self] in
+            self?.presenceTimelineRefreshHandler?()
+        }
+        presenceTimelineViewModel.onJumpToOffset = { [weak self] seconds in
+            self?.presenceJumpToHandler?(seconds)
+        }
+        presenceTimelineViewModel.onAddNote = { [weak self] eventId, text in
+            self?.presenceNoteHandler?(String(eventId), text)
+        }
+        presenceTimelineViewModel.onCopyJSON = { [weak self] in
+            self?.presenceCopyJSONHandler?()
+        }
+        presenceTimelineViewModel.onSaveCSV = { [weak self] in
+            self?.runPresenceSavePanel()
         }
 
         requestsViewModel.onApprove = { [weak self] kind, identity in
@@ -243,6 +282,88 @@ public final class InterCallControlBarBridge: NSView, InterCallMediaControlSurfa
     /// in-call request toast's "Open" action).
     @objc public func showRequestsPanel() {
         presentRequestsPanel()
+    }
+
+    // MARK: - PRESENCE MONITORING panel (provisional, server flag default OFF)
+
+    /// Same NSPopover + NSHostingController shape as `presentRequestsPanel()`.
+    private func presentPresenceTimeline() {
+        if let popover = presenceTimelinePopover, popover.isShown {
+            popover.close()
+            MainActor.assumeIsolated { viewModel.presenceTimelineVisible = false }
+            return
+        }
+        // Read fresh on every open — a stale timeline is worse than a slow one.
+        presenceTimelineRefreshHandler?()
+        let popover = NSPopover()
+        popover.behavior = .transient
+        popover.contentSize = NSSize(width: 420, height: 480)
+        popover.contentViewController = NSHostingController(
+            rootView: PresenceTimelineView(viewModel: presenceTimelineViewModel))
+        popover.show(relativeTo: bounds, of: self, preferredEdge: .maxY)
+        presenceTimelinePopover = popover
+        MainActor.assumeIsolated { viewModel.presenceTimelineVisible = true }
+    }
+
+    /// Asks for a destination, then hands the path to AppDelegate, which owns the
+    /// network call and the write. The entitlement
+    /// (`files.user-selected.read-write`) is already granted.
+    private func runPresenceSavePanel() {
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = "presence-timeline.csv"
+        panel.allowedContentTypes = [.commaSeparatedText]
+        panel.canCreateDirectories = true
+        panel.begin { [weak self] response in
+            guard response == .OK, let url = panel.url else { return }
+            self?.presenceSaveCSVHandler?(url.path as NSString)
+        }
+    }
+
+    @objc public func setPresenceAvailable(_ available: Bool) {
+        MainActor.assumeIsolated { viewModel.presenceAvailable = available }
+    }
+
+    @objc public func setPresenceMonitoringEnabled(_ enabled: Bool) {
+        MainActor.assumeIsolated { viewModel.presenceMonitoringEnabled = enabled }
+    }
+
+    /// Accepts only "multiple_faces" or "face_absent"; nil/"" clears the chip.
+    /// Anything else is ignored by the view model, not clamped.
+    @objc public func setPresenceLiveEventType(_ eventType: String?) {
+        MainActor.assumeIsolated { viewModel.setPresenceLiveEvent(eventType) }
+    }
+
+    /// Whether a recording exists for this session (drives the Jump control's
+    /// disabled state and its honest caption).
+    @objc public func setPresenceRecordingAvailable(_ available: Bool) {
+        MainActor.assumeIsolated { presenceTimelineViewModel.recordingAvailable = available }
+    }
+
+    /// Applies a `GET /presence/timeline` response to the panel.
+    @objc public func applyPresenceTimeline(_ timeline: [AnyHashable: Any]) {
+        MainActor.assumeIsolated { presenceTimelineViewModel.apply(timeline: timeline) }
+    }
+
+    /// Surfaces a read/write failure in the panel instead of showing an empty list.
+    @objc public func setPresenceStatusText(_ text: String) {
+        MainActor.assumeIsolated { presenceTimelineViewModel.statusText = text }
+    }
+
+    /// Drops the presence handler blocks and closes the panel (session teardown).
+    @objc public func invalidatePresenceHandlers() {
+        presenceTimelineRefreshHandler = nil
+        presenceJumpToHandler = nil
+        presenceNoteHandler = nil
+        presenceCopyJSONHandler = nil
+        presenceSaveCSVHandler = nil
+        presenceTimelinePopover?.close()
+        presenceTimelinePopover = nil
+        MainActor.assumeIsolated {
+            viewModel.presenceTimelineVisible = false
+            viewModel.presenceAvailable = false
+            viewModel.presenceMonitoringEnabled = false
+            viewModel.setPresenceLiveEvent(nil)
+        }
     }
 
     // MARK: - InterCallMediaControlSurface (wiring controller drives these)

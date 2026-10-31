@@ -141,6 +141,48 @@ public final class CallControlBarViewModel: ObservableObject {
     /// Peer-activity awareness dot on the Code/Board button (never auto-opens).
     @Published public var toolBadgeActive = false
 
+    // MARK: - PRESENCE MONITORING (provisional, server flag default OFF)
+    //
+    // The interviewer's quiet chip plus the entry point to the evaluation
+    // timeline. `presenceAvailable` defaults FALSE, so with the server flag off
+    // the chip is simply absent — no guard needed at the render site. Delete this
+    // block, the chip in CallControlBarView and the bridge setters to remove the
+    // interviewer surface. See .agents/tasks/presence-monitoring/REMOVAL.md.
+
+    /// Whether this room has a presence surface at all.
+    @Published public var presenceAvailable = false
+    /// Server-authoritative: whether the candidate's session is actually monitored
+    /// (a declining candidate joins with this false, and the interviewer is told).
+    @Published public var presenceMonitoringEnabled = false
+    /// The one live event type currently surfaced, or nil. Settable ONLY through
+    /// `setPresenceLiveEvent(_:)`, which refuses anything outside
+    /// `liveSurfaceableEventTypes` — the live surface cannot be widened from here
+    /// (research memo §7.9 item 4; the server computes the same restriction).
+    @Published public private(set) var presenceLiveEventType: String?
+    /// Whether the timeline popover is open.
+    @Published public var presenceTimelineVisible = false
+
+    /// Opens the evaluation timeline popover.
+    public var onOpenPresenceTimeline: (() -> Void)?
+
+    /// The ONLY two event types a live interviewer is shown mid-interview: both
+    /// are non-inferential and both are things a reasonable host would act on in
+    /// the moment. Everything else waits for the post-session timeline.
+    public nonisolated static let liveSurfaceableEventTypes: Set<String> = ["multiple_faces", "face_absent"]
+
+    /// Sets (or clears) the live event type. A type outside the allowlist is
+    /// ignored outright rather than clamped, so a future caller cannot smuggle
+    /// `image_quality_insufficient` — a fact about the video — onto the live
+    /// surface as if it were candidate behaviour.
+    public func setPresenceLiveEvent(_ eventType: String?) {
+        guard let eventType = eventType, !eventType.isEmpty else {
+            presenceLiveEventType = nil
+            return
+        }
+        guard Self.liveSurfaceableEventTypes.contains(eventType) else { return }
+        presenceLiveEventType = eventType
+    }
+
     // MARK: - Action callbacks (shell → AppDelegate handlers)
 
     public var onToggleCamera: (() -> Void)?
@@ -264,6 +306,21 @@ public final class CallControlBarViewModel: ObservableObject {
         case "hostCanPreempt": return "Host Can Take Over"
         case "anyCanPreempt":  return "Anyone Can Take Over"
         default:                return "One at a Time"
+        }
+    }
+
+    /// The interviewer's presence chip label, or nil when there is no chip.
+    /// Deliberately plain and non-accusatory: it names what the camera saw, and
+    /// nothing about what it might mean. No count, no severity, no score.
+    public nonisolated static func presenceChipLabel(available: Bool,
+                                                     monitoringEnabled: Bool,
+                                                     liveEventType: String?) -> String? {
+        guard available else { return nil }
+        guard monitoringEnabled else { return "Presence monitoring off" }
+        switch liveEventType {
+        case "multiple_faces": return "Second face visible"
+        case "face_absent":    return "Face not visible"
+        default:               return "Presence monitoring on"
         }
     }
 }

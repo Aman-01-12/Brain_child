@@ -1,0 +1,7 @@
+{
+  "task_id": "task-presence-monitoring",
+  "task_description": "Implement KioMeet's candidate presence-monitoring feature for secure interview mode: Phase 0 (consent/UX surface + server + migration 023, detector stubbed) and Phase 1 (on-device VNDetectFaceRectanglesRequest presence detector at 2 Hz with a hysteresis state machine). Per gaze-facial-analysis-research.md Part 7. Provisional and evaluation-first after the 2026-10-31 scope adjustment: ONE master server flag PRESENCE_MONITORING_ENABLED defaults OFF and must give provable zero behavioural change when off; the feature must be cheaply deletable and ship with a REMOVAL.md. No score, no emotion/affect/attention/engagement/confidence inference, no gaze/iris, no head pose, no blink/EAR, no room scan, no virtual-camera detection, no audio, no server-side frame analysis, no frame retention, no blocking consent variant, no automated action. NO GIT COMMANDS at any point - the user commits.",
+  "status": "pending",
+  "feature_order": ["FEAT-001", "FEAT-002", "FEAT-003", "FEAT-004"],
+  "blocked_reason": null
+}

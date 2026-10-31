@@ -81,6 +81,13 @@ const { createReconcileEmptyRoom } = require('./roomReconcile');
 const { createJoinCapGuard } = require('./joinGuards');
 const { createOverdueRecordingSweeper } = require('./recordingQuota');
 const tiers = require('./tiers');
+// PRESENCE MONITORING (provisional) — candidate presence monitoring for secure
+// interview mode, behind the master flag PRESENCE_MONITORING_ENABLED (default
+// OFF). Delete these three requires and the four other hunks marked with this
+// comment to remove the feature. See .agents/tasks/presence-monitoring/REMOVAL.md.
+const presenceConfig = require('./presenceConfig');
+const { createPresenceRouter } = require('./presence');
+const { createPresenceSweeper } = require('./presenceRetention');
 
 const app = express();
 
@@ -2292,6 +2299,40 @@ const sweepOverdueRecordings = createOverdueRecordingSweeper({
   roomKey,
 });
 
+// PRESENCE MONITORING (provisional) — mounted HERE, next to the other sweeper,
+// rather than up with the routers at line ~140, because the router's deps
+// (validateModerator, getRoomData, roomKey, roomLeaveTokenKey,
+// constantTimeEqual) are declared in this part of the file. The app-level
+// auth.authenticateToken still runs first, so req.user is populated for the
+// moderator paths. The router's own first middleware returns 404
+// PRESENCE_DISABLED while the master flag is off, so mounting it is inert.
+// Delete this block and the other hunks marked with this comment to remove the
+// feature. See .agents/tasks/presence-monitoring/REMOVAL.md.
+const presenceRouter = createPresenceRouter({
+  db,
+  redis,
+  crypto: require('./crypto'),
+  tiers,
+  config: presenceConfig,
+  auditLog: auth.auditLog,
+  requireAuth: auth.requireAuth,
+  validateModerator,
+  getRoomData,
+  roomKey,
+  roomLeaveTokenKey,
+  constantTimeEqual,
+  sanitizeFilename: require('./fileValidation').sanitizeFilename,
+});
+app.use('/presence', presenceRouter);
+
+// Purges presence rows whose per-row retention clock has come due and closes
+// sessions that stopped reporting. Scheduled in the require.main block below.
+const sweepPresenceRetention = createPresenceSweeper({
+  db,
+  auditLog: auth.auditLog,
+  config: presenceConfig,
+});
+
 /// Admit all lobby members for a room: generate tokens, add as participants,
 /// store polling status, then clear lobby keys. Returns the count admitted.
 /// Enforces MAX_PARTICIPANTS_PER_ROOM — excess members get status 'room_full'.
@@ -2476,6 +2517,33 @@ app.post('/room/create', auth.requireAuth, requireIdempotencyKey, async (req, re
     'lobbyEnabled',        lobbyEnabled       ? 'true' : 'false',
     'passwordHash',        passwordHash,
   );
+  // PRESENCE MONITORING (provisional) — arm candidate presence monitoring for
+  // this room, or write NOTHING. resolvePresenceArming is false unless the
+  // master flag is on, this is an interview, the host's snapshotted tier allows
+  // interviews, the host asked for it, and the candidate is neither
+  // EU-resident nor under 18. When it is false nothing below runs, so a
+  // flag-off room hash is byte-identical to one written before this feature
+  // existed — which is what makes /room/join omit the presence block and the
+  // client default to "not armed". Delete this block and the other hunks marked
+  // with this comment to remove the feature.
+  const presenceArming = presenceConfig.resolvePresenceArming({
+    featureEnabled: presenceConfig.isFeatureEnabled(),
+    roomType,
+    hostTier,
+    requested: req.body.presenceMonitoring === true,
+    candidateRegionEU: req.body.candidateRegionEU === true,
+    candidateUnder18: req.body.candidateUnder18 === true,
+  });
+  if (presenceArming.armed) {
+    pipeline.hset(roomKey(roomCode),
+      'presenceMonitoringArmed',       'true',
+      'presenceRegionEU',              req.body.candidateRegionEU === true ? 'true' : 'false',
+      'presenceUnder18',               req.body.candidateUnder18   === true ? 'true' : 'false',
+      'presenceMultipleFacesEnabled',  presenceConfig.multipleFacesEnabled() ? 'true' : 'false',
+      'presenceDetectorVersion',       presenceConfig.DETECTOR_VERSION,
+      'presenceThresholds',            JSON.stringify(presenceConfig.thresholdSnapshot()),
+    );
+  }
   pipeline.expire(roomKey(roomCode), ROOM_CODE_EXPIRY_SECONDS);
   // Participants stored as a Redis Set (identity dedup is automatic)
   pipeline.sadd(roomParticipantsKey(roomCode), identity);
@@ -2533,6 +2601,19 @@ app.post('/room/create', auth.requireAuth, requireIdempotencyKey, async (req, re
       }
     }
 
+    // PRESENCE MONITORING (provisional) — echo the arming outcome already
+    // resolved above so the creating interviewer's client reads the SERVER's
+    // answer instead of inferring one from its own request. Present ONLY when
+    // the room was actually armed; an unarmed room (which is every room while
+    // the master flag is off) yields an empty object, so the response JSON
+    // contains no key starting with "presence" and the client's
+    // backward-compatible default parses "not armed". Delete this block, the
+    // spread below, and the other hunks marked with this comment to remove the
+    // feature.
+    const presenceBlock = presenceArming.armed ? {
+      presenceMonitoringArmed: true,
+    } : {};
+
     // NEVER log the token
     res.json({
       roomCode,
@@ -2543,6 +2624,7 @@ app.post('/room/create', auth.requireAuth, requireIdempotencyKey, async (req, re
       maxParticipants: MAX_PARTICIPANTS_PER_ROOM,
       participantCount: 1,
       leaveToken,
+      ...presenceBlock, // PRESENCE MONITORING (provisional) — empty unless armed
     });
   } catch (err) {
     console.error(`[error] Token creation failed for ${identity}:`, err.message);
@@ -2795,6 +2877,23 @@ app.post('/room/join', rateLimitJoin, async (req, res) => {
       }
     }
 
+    // PRESENCE MONITORING (provisional) — present ONLY for a room that was
+    // armed at creation. An unarmed room (which is every room while the master
+    // flag is off) yields an empty object, so the response JSON contains no key
+    // starting with "presence" and the client's backward-compatible defaults
+    // parse "not armed". Delete this block, the spread below, and the other
+    // hunks marked with this comment to remove the feature.
+    const presenceBlock = (roomData.presenceMonitoringArmed === 'true') ? {
+      presenceMonitoringArmed:      true,
+      presenceRetentionDays:        presenceConfig.retentionDays(),
+      presenceRegionEU:             roomData.presenceRegionEU === 'true',
+      presenceUnder18:              roomData.presenceUnder18 === 'true',
+      presenceMultipleFacesEnabled: roomData.presenceMultipleFacesEnabled === 'true',
+      presenceDetectorVersion:      roomData.presenceDetectorVersion || presenceConfig.DETECTOR_VERSION,
+      presenceThresholds:           roomData.presenceThresholds || '',
+      presenceRightsContact:        presenceConfig.rightsContact(),
+    } : {};
+
     res.json({
       roomName: roomData.roomName,
       token: jwt,
@@ -2822,6 +2921,7 @@ app.post('/room/join', rateLimitJoin, async (req, res) => {
       // Whether a meeting password is set (presence of the bcrypt hash; the plaintext is
       // never returned). Lets a rejoining host / co-host render the password menu state.
       hasPassword:         !!roomData.passwordHash,
+      ...presenceBlock, // PRESENCE MONITORING (provisional) — empty unless armed
     });
   } catch (err) {
     console.error(`[error] Token creation failed for ${identity}:`, err.message);
@@ -5784,6 +5884,20 @@ if (require.main === module) {
     }, RECORDING_SWEEP_INTERVAL_MS);
     // Don't keep the event loop alive solely for the sweeper.
     if (typeof recordingSweepTimer.unref === 'function') recordingSweepTimer.unref();
+
+    // PRESENCE MONITORING (provisional) — the retention sweeper. Started ONLY
+    // when the master flag is on, so a flag-off server runs exactly the timers
+    // it ran before this feature existed. It discharges the retention promise
+    // (purge_after) and closes sessions that stopped reporting. Delete this
+    // block and the other hunks marked with this comment to remove the feature.
+    if (presenceConfig.isFeatureEnabled()) {
+      const presenceSweepTimer = setInterval(() => {
+        sweepPresenceRetention().catch((err) =>
+          console.error('[presence-sweeper] sweep failed:', err.message));
+      }, presenceConfig.sweepIntervalMs());
+      if (typeof presenceSweepTimer.unref === 'function') presenceSweepTimer.unref();
+      console.log(`[token-server] Presence monitoring ENABLED — retention ${presenceConfig.retentionDays()}d, sweep every ${presenceConfig.sweepIntervalMs()}ms`);
+    }
   });
 }
 

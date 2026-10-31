@@ -51,6 +51,9 @@ public final class InterSecureChromeBridge: NSObject, InterCallMediaControlSurfa
     /// Leave Interview — must route to the controller's confirmed exit path
     /// (paranoid #5: the only escape from kiosk mode).
     @objc public var leaveHandler: (() -> Void)?
+    /// PRESENCE MONITORING (provisional). The candidate tapped the persistent
+    /// chip: reopen the full "what is and isn't measured" list.
+    @objc public var presenceDetailsHandler: (() -> Void)?
 
     @objc public override init() {
         super.init()
@@ -65,6 +68,7 @@ public final class InterSecureChromeBridge: NSObject, InterCallMediaControlSurfa
         viewModel.onToggleShare = { [weak self] in self?.shareToggleHandler?() }
         viewModel.onToggleChat = { [weak self] in self?.chatToggleHandler?() }
         viewModel.onLeave = { [weak self] in self?.leaveHandler?() }
+        viewModel.onOpenPresenceDetails = { [weak self] in self?.presenceDetailsHandler?() }
     }
 
     /// Drops every handler block. Call from destroySecureWindow so no block
@@ -77,6 +81,7 @@ public final class InterSecureChromeBridge: NSObject, InterCallMediaControlSurfa
         shareToggleHandler = nil
         chatToggleHandler = nil
         leaveHandler = nil
+        presenceDetailsHandler = nil
     }
 
     private func refreshShareStatusFromState() {
@@ -162,6 +167,14 @@ public final class InterSecureChromeBridge: NSObject, InterCallMediaControlSurfa
     /// Paranoid #6: only the recording-signal path may call this.
     @objc public func setRecordingActive(_ active: Bool) {
         MainActor.assumeIsolated { viewModel.recordingActive = active }
+    }
+
+    /// PRESENCE MONITORING (provisional, server flag default OFF).
+    /// 0 absent / 1 on / 2 off / 3 paused because the camera is off. The
+    /// presence coordinator is the single writer; this is its one route to the
+    /// candidate's chrome.
+    @objc public func setPresenceMonitoringState(_ state: Int) {
+        MainActor.assumeIsolated { viewModel.presenceMonitoringState = state }
     }
 
     @objc public func setChatUnread(_ count: Int) {

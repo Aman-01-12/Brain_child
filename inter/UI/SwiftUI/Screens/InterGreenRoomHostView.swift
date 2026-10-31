@@ -58,6 +58,14 @@ public final class InterGreenRoomHostView: NSView {
 
     @objc public var displayNameValue: String { viewModel.displayName }
     @objc public var meetingNameValue: String { viewModel.meetingName }
+
+    // PRESENCE MONITORING (provisional, server flag default OFF). The
+    // interviewer's request and the two policy declarations, read by AppDelegate
+    // when `onPrimary` fires. All three are false unless the interviewer ticked
+    // them, and the server re-derives arming regardless.
+    @objc public var presenceMonitoringChoice: Bool { viewModel.presenceMonitoring }
+    @objc public var candidateRegionEUChoice: Bool { viewModel.candidateRegionEU }
+    @objc public var candidateUnder18Choice: Bool { viewModel.candidateUnder18 }
     /// Empty when "Require a password" is off or the field is blank.
     @objc public var passwordValue: String {
         PreMeetingViewModel.effectivePassword(requirePassword: viewModel.requirePassword,

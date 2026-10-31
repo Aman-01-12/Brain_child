@@ -42,6 +42,23 @@ public final class SecureCandidateChromeViewModel: ObservableObject {
     @Published public var chatUnread = 0
     @Published public var chatVisible = false
 
+    // MARK: - PRESENCE MONITORING (provisional, server flag default OFF)
+    //
+    // A PERSISTENT, NON-DISMISSIBLE chip for the whole session — never a toast.
+    // The consent-first moderation spec rejects toasts for exactly this: a toast
+    // conflates "declined" with "never saw it", and a monitoring indicator that
+    // can be missed or dismissed is not an indicator. If monitoring stops for any
+    // reason the chip must change state: a stale "on" is a lie and a stale "off"
+    // is worse. 0 absent / 1 on / 2 off / 3 paused because the camera is off.
+    // Default 0 means nothing renders unless something sets it, so a flag-off
+    // session needs no guard here. Delete this pair and the chip in
+    // SecureCandidateChromeViews to remove the indicator.
+    // See .agents/tasks/presence-monitoring/REMOVAL.md.
+    @Published public var presenceMonitoringState: Int = 0
+
+    /// Reopens the full "what is and isn't measured" list at any time.
+    public var onOpenPresenceDetails: (() -> Void)?
+
     // MARK: - Tool + share state
 
     /// InterInterviewToolKind raw value (0 none / 1 code / 2 whiteboard).

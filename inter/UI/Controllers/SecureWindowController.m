@@ -53,6 +53,16 @@ static const CGFloat InterSecureBottomWorkspaceMargin = 100.0;
 // window exists (e.g. a late-joiner status poll resolving during window construction).
 @property (nonatomic, strong, nullable) InterRecordingIndicatorView *recordingIndicatorView;
 @property (nonatomic, assign) BOOL pendingRecordingActive;
+// PRESENCE MONITORING (provisional, server flag default OFF). `pendingPresenceState`
+// holds the desired chip state when -setPresenceMonitoringState: lands before the
+// chrome exists — the same shape as pendingRecordingActive above. The details panel
+// floats one level above the secure window, like the chat overlay.
+@property (nonatomic, assign) NSInteger pendingPresenceState;
+@property (nonatomic, strong, nullable) NSPanel *presenceDetailsWindow;
+@property (nonatomic, strong, nullable) InterPresenceConsentHostView *presenceDetailsHost;
+// The Phase 1 detector. Built on the media controller's sessionQueue and torn
+// down from -destroySecureWindow on main, so the property is atomic.
+@property (atomic, strong, nullable) InterPresenceCoordinator *presenceCoordinator;
 @end
 
 @implementation SecureWindowController
@@ -153,6 +163,17 @@ static const CGFloat InterSecureBottomWorkspaceMargin = 100.0;
     self.recordingIndicatorView.indicatorActive = active;
 }
 
+// PRESENCE MONITORING (provisional, server flag default OFF). Drive the persistent
+// candidate chip. Tolerates being called before the chrome exists (stores the state,
+// applied in -attachControlPanelInView:) — the setRecordingIndicatorActive: pattern.
+// Delete this method and the one block in -attachControlPanelInView: to remove.
+- (void)setPresenceMonitoringState:(NSInteger)state {
+    self.pendingPresenceState = state;
+    [self.controlPanel setPresenceMonitoringState:state];
+    // An open details panel must never show a stale state.
+    [self.presenceDetailsHost setMonitoringState:state];
+}
+
 - (void)setupChatOverlayWindow {
     // The secure window is fullscreen borderless at NSScreenSaverWindowLevel.
     // The chat panel lives in an NSPanel one level above so it floats on top.
@@ -199,6 +220,72 @@ static const CGFloat InterSecureBottomWorkspaceMargin = 100.0;
     if (self.chatController) {
         self.chatController.chatDelegate = self;
     }
+}
+
+#pragma mark - Presence monitoring details (provisional)
+
+// PRESENCE MONITORING (provisional, server flag default OFF).
+// Presents the SAME PresenceConsentView the candidate saw before joining, in
+// read-only details mode, in an NSPanel one level above the secure window — the
+// setupChatOverlayWindow shape, including InterWindowSharingType() so the panel
+// is shielded from third-party capture exactly like every other surface above
+// the secure window. Reusing the one view is what keeps the pre-join promise and
+// the mid-session explanation from drifting apart.
+// Delete this method, the handler in -attachControlPanelInView: and
+// -closePresenceDetailsPanel to remove the indicator's detail surface.
+- (void)presentPresenceDetailsPanel {
+    if (self.presenceDetailsWindow) {
+        [self.presenceDetailsWindow makeKeyAndOrderFront:nil];
+        return;
+    }
+
+    NSScreen *targetScreen = self.secureWindow.screen ?: [NSScreen mainScreen];
+    NSRect screenFrame = targetScreen.frame;
+    CGFloat panelW = 620.0;
+    CGFloat panelH = MIN(640.0, screenFrame.size.height * 0.8);
+    CGFloat panelX = NSMidX(screenFrame) - panelW / 2.0;
+    CGFloat panelY = NSMidY(screenFrame) - panelH / 2.0;
+
+    InterRoomController *rc = self.roomController;
+    InterPresenceConsentHostView *host =
+        [[InterPresenceConsentHostView alloc] initWithDetailsWithFrame:NSMakeRect(0, 0, panelW, panelH)
+                                                      monitoringState:self.pendingPresenceState
+                                                        retentionDays:rc ? rc.activePresenceRetentionDays : 90
+                                                        rightsContact:rc.activePresenceRightsContact ?: @""
+                                                externalDisplayPolicy:NO];
+    // externalDisplayPolicy is NO on purpose: the secure-mode restriction list is
+    // a PRE-JOIN notice and the details pane does not render it. The candidate is
+    // already inside the secure window by the time this panel can open.
+    __weak typeof(self) weakSelf = self;
+    host.onCloseDetails = ^{
+        [weakSelf closePresenceDetailsPanel];
+    };
+
+    NSPanel *panel = [[NSPanel alloc] initWithContentRect:NSMakeRect(panelX, panelY, panelW, panelH)
+                                                styleMask:(NSWindowStyleMaskTitled |
+                                                           NSWindowStyleMaskClosable)
+                                                  backing:NSBackingStoreBuffered
+                                                    defer:NO];
+    [panel setLevel:NSScreenSaverWindowLevel + 1];
+    [panel setReleasedWhenClosed:NO];
+    [panel setTitle:@"What is and isn't measured"];
+    [panel setOpaque:YES];
+    [panel setHidesOnDeactivate:NO];
+    [panel setSharingType:InterWindowSharingType()];
+    [panel setAppearance:[NSAppearance appearanceNamed:NSAppearanceNameDarkAqua]];
+    host.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+    panel.contentView = host;
+
+    self.presenceDetailsHost = host;
+    self.presenceDetailsWindow = panel;
+    [panel makeKeyAndOrderFront:nil];
+}
+
+- (void)closePresenceDetailsPanel {
+    [self.presenceDetailsHost invalidateHandlers];
+    [self.presenceDetailsWindow orderOut:nil];
+    self.presenceDetailsWindow = nil;
+    self.presenceDetailsHost = nil;
 }
 
 - (void)toggleChatOverlay {
@@ -309,6 +396,13 @@ static const CGFloat InterSecureBottomWorkspaceMargin = 100.0;
     self.surfaceShareController.networkPublishSink = nil;
     self.surfaceShareController = nil;
 
+    // PRESENCE MONITORING (provisional). Stop the detector BEFORE the media
+    // controller shuts the session down: it must remove its own output while the
+    // session still exists, and its final flush closes any event still open.
+    // Nil when the feature is off or consent was declined, so this is a no-op.
+    [self.presenceCoordinator stop];
+    self.presenceCoordinator = nil;
+
     self.localMediaController.audioInputOptionsChangedHandler = nil;
     [self.localMediaController shutdown];
     self.localMediaController = nil;
@@ -343,6 +437,11 @@ static const CGFloat InterSecureBottomWorkspaceMargin = 100.0;
 
     [self.renderView removeFromSuperview];
     self.renderView = nil;
+
+    // PRESENCE MONITORING (provisional). Close the details panel and drop its
+    // blocks so none outlives the session (paranoid #8).
+    [self closePresenceDetailsPanel];
+    self.pendingPresenceState = 0;
 
     // Tear down chat overlay
     if (self.chatOverlayWindow) {
@@ -433,6 +532,16 @@ static const CGFloat InterSecureBottomWorkspaceMargin = 100.0;
         // through the confirmation alert in exitSession (never exits silently).
         [weakSelf exitSession];
     };
+    // PRESENCE MONITORING (provisional, server flag default OFF). The persistent
+    // chip reopens the SAME disclosure copy the consent screen showed, so the
+    // promise made before joining and the explanation given mid-session cannot
+    // drift. The chip itself only renders when a state has been pushed, which
+    // nothing does while the flag is off. Delete this handler, the pendingPresenceState
+    // application below and -presentPresenceDetailsPanel to remove the indicator.
+    chrome.presenceDetailsHandler = ^{
+        [weakSelf presentPresenceDetailsPanel];
+    };
+    [chrome setPresenceMonitoringState:self.pendingPresenceState];
 
     // [3.4.4] Network quality signal bars — overlays the self-preview.
     self.networkStatusView = [[InterNetworkStatusView alloc] initWithFrame:NSMakeRect(6.0, pipFrame.size.height - 22.0, 40.0, 16.0)];
@@ -495,6 +604,24 @@ static const CGFloat InterSecureBottomWorkspaceMargin = 100.0;
         [weakSelf.controlPanel setCameraEnabled:weakSelf.localMediaController.isCameraEnabled];
         [weakSelf.controlPanel setMicrophoneEnabled:weakSelf.localMediaController.isMicrophoneEnabled];
 
+        // PRESENCE MONITORING (provisional, server flag default OFF). One guard;
+        // delete this block to remove the detector. `activePresenceMonitoringGranted`
+        // is written only by the candidate's own consent decision on the join path,
+        // so with the flag off (or on a decline) nothing below ever runs and no
+        // frame is ever sampled. See .agents/tasks/presence-monitoring/REMOVAL.md.
+        if (weakSelf.roomController.activePresenceMonitoringGranted) {
+            InterLocalMediaController *media = weakSelf.localMediaController;
+            AVCaptureSession *session = media.captureSession;
+            dispatch_queue_t presenceQueue = media.sessionQueue;
+            if (session && presenceQueue) {
+                dispatch_async(presenceQueue, ^{
+                    [weakSelf startPresenceMonitoringWithSession:session
+                                                           queue:presenceQueue
+                                                           media:media];
+                });
+            }
+        }
+
         NSString *message = [weakSelf secureMediaStateSummary];
         if (failureReason.length > 0) {
             message = failureReason;
@@ -556,6 +683,50 @@ static const CGFloat InterSecureBottomWorkspaceMargin = 100.0;
 
     // [3.3.1] Wire remote rendering
     [self wireSecureRemoteRendering];
+}
+
+// PRESENCE MONITORING (provisional, server flag default OFF).
+// Build the coordinator and hand it the session it must NOT reconfigure. Runs on
+// the media controller's sessionQueue, reached from the one guard in
+// -startLocalMediaFlow. The coordinator adds and removes only its own
+// AVCaptureVideoDataOutput, never calls startRunning/stopRunning, never touches
+// an input or a LiveKit track, and does NOT co-opt
+// InterLocalMediaController.recordingFrameObserver (owned by
+// InterRecordingCoordinator — taking it would break local recording's camera PiP).
+// Delete this method with the block that calls it.
+- (void)startPresenceMonitoringWithSession:(AVCaptureSession *)session
+                                     queue:(dispatch_queue_t)queue
+                                     media:(InterLocalMediaController *)media {
+    InterRoomController *rc = self.roomController;
+    if (!rc || !session || !queue || !media) { return; }
+    if (self.presenceCoordinator) { return; }
+
+    InterPresenceCoordinator *coordinator =
+        [[InterPresenceCoordinator alloc] initWithThresholdsJSON:rc.activePresenceThresholds ?: @""];
+
+    // The coordinator is the SINGLE writer of the chip state from here on
+    // (0 absent · 1 on · 2 off · 3 paused — camera off).
+    __weak typeof(self) weakSelf = self;
+    coordinator.monitoringStateHandler = ^(NSInteger state) {
+        [weakSelf setPresenceMonitoringState:state];
+    };
+    // Read-only view of the camera switch. `isCameraEnabled` is atomic, and the
+    // strong capture keeps the controller alive for the block's lifetime; the
+    // coordinator never mutes, unmutes or reconfigures anything.
+    coordinator.cameraEnabledProvider = ^BOOL{
+        return media.isCameraEnabled;
+    };
+
+    self.presenceCoordinator = coordinator;
+
+    [coordinator startWithCaptureSession:session
+                           sessionQueue:queue
+                           tokenService:rc.tokenService
+                              serverURL:rc.tokenServerURL ?: @""
+                               roomCode:rc.roomCode ?: @""
+                               identity:rc.localParticipantIdentity ?: @""
+                   multipleFacesEnabled:rc.activePresenceMultipleFacesEnabled
+                        detectorVersion:rc.activePresenceDetectorVersion ?: @""];
 }
 
 - (NSString *)secureMediaStateSummary {

@@ -120,6 +120,7 @@ struct CallControlBarView: View {
             || !viewModel.shareStatusText.isEmpty
             || viewModel.networkQuality > 0
             || viewModel.showReactComingSoon
+            || viewModel.presenceAvailable
         if hasContent {
             HStack(spacing: InterSpacing.x3) {
                 if viewModel.networkQuality > 0 {
@@ -134,6 +135,7 @@ struct CallControlBarView: View {
                 if !viewModel.roomCode.isEmpty {
                     roomCodeChip
                 }
+                presenceChip
                 if viewModel.showReactComingSoon {
                     Text("Reactions aren't available yet.")
                         .font(InterFont.swiftUI(10, .medium))
@@ -183,6 +185,53 @@ struct CallControlBarView: View {
         .padding(.vertical, 1)
         .background(RoundedRectangle(cornerRadius: InterRadius.sm)
             .fill(Color.white.opacity(0.08)))
+    }
+
+    // MARK: - Presence chip (interviewer; PRESENCE MONITORING, provisional)
+    //
+    // Quiet and non-blocking by design (research memo §7.3): it reports what the
+    // camera saw and nothing about what it means, never interrupts, and offers no
+    // action against the candidate. Tapping it opens the evaluation timeline.
+    // `presenceAvailable` defaults false, so this renders nothing at all unless
+    // the server armed the room. Icon + word always paired — never colour alone.
+
+    @ViewBuilder private var presenceChip: some View {
+        if let label = CallControlBarViewModel.presenceChipLabel(
+            available: viewModel.presenceAvailable,
+            monitoringEnabled: viewModel.presenceMonitoringEnabled,
+            liveEventType: viewModel.presenceLiveEventType) {
+            Button(action: { viewModel.onOpenPresenceTimeline?() }) {
+                HStack(spacing: InterSpacing.x1) {
+                    Image(systemName: presenceChipIcon)
+                        .font(.system(size: 9, weight: .semibold))
+                    Text(label)
+                        .font(InterFont.swiftUI(10, .semibold))
+                }
+                .foregroundColor(Color(nsColor: presenceChipTint))
+                .padding(.horizontal, InterSpacing.x1_5)
+                .padding(.vertical, 2)
+                .background(RoundedRectangle(cornerRadius: InterRadius.sm)
+                    .fill(Color(nsColor: presenceChipTint).opacity(0.14)))
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .handCursor()
+            .help("Open the presence timeline for this interview")
+        }
+    }
+
+    private var presenceChipIcon: String {
+        guard viewModel.presenceMonitoringEnabled else { return "eye.slash" }
+        switch viewModel.presenceLiveEventType {
+        case "multiple_faces": return "person.2"
+        case "face_absent":    return "person.crop.circle.badge.questionmark"
+        default:               return "eye"
+        }
+    }
+
+    private var presenceChipTint: NSColor {
+        guard viewModel.presenceMonitoringEnabled else { return InterColor.stageTextMuted }
+        return viewModel.presenceLiveEventType == nil ? InterStatus.success : InterStatus.warning
     }
 
     private func copyRoomCode() {
